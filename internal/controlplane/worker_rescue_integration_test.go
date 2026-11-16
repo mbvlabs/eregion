@@ -36,24 +36,9 @@ func TestIntegrationWorkerRescuesThisHostsOrphanedPlatformJobs(t *testing.T) {
 		t.Fatal(err)
 	}
 	hostPrefix := workerHostPrefix(host)
-	setRunning := func(op contract.Operation, clientID string, attempt int32) {
-		t.Helper()
-		if _, err := pool.Exec(ctx, `UPDATE eregion_operations SET state='running', attempt=$2 WHERE id=$1`, op.ID, attempt); err != nil {
-			t.Fatal(err)
-		}
-		tag, err := pool.Exec(ctx, `UPDATE river_job SET state='running', attempt=$2,
-            attempted_at=clock_timestamp(), attempted_by=ARRAY[$3]
-            WHERE id=(SELECT job_id FROM eregion_operations WHERE id=$1)`, op.ID, attempt, clientID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if tag.RowsAffected() != 1 {
-			t.Fatalf("operation %s has no runnable River job", op.ID)
-		}
-	}
-	setRunning(rescued, hostPrefix+"previous-start", 1)
-	setRunning(exhausted, hostPrefix+"previous-start", jobargs.PlatformMaxAttempts)
-	setRunning(foreign, workerHostPrefix("another-host")+"live", 1)
+	setRunningPlatformJob(t, ctx, pool, rescued, hostPrefix+"previous-start", 1)
+	setRunningPlatformJob(t, ctx, pool, exhausted, hostPrefix+"previous-start", jobargs.PlatformMaxAttempts)
+	setRunningPlatformJob(t, ctx, pool, foreign, workerHostPrefix("another-host")+"live", 1)
 
 	run := testRuntime(t, pool, 1)
 	if id := run.Jobs.ID(); !strings.HasPrefix(id, hostPrefix) {
@@ -97,21 +82,8 @@ func TestIntegrationWorkerRescuesThisHostsOrphanedPlatformJobs(t *testing.T) {
 	if current.Attempt != 2 {
 		t.Fatalf("rescued attempt = %d, want 2", current.Attempt)
 	}
-	awaitEvent := func(operationID contract.OperationID, want string) {
-		t.Helper()
-		page, err := run.Service.Events(ctx, testActor, contract.Cursor{OperationID: operationID}, 200)
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, event := range page.Events {
-			if event.Kind == "warning" && strings.Contains(event.Message, want) {
-				return
-			}
-		}
-		t.Fatalf("operation %s has no warning event containing %q", operationID, want)
-	}
-	awaitEvent(rescued.ID, "Recovered orphaned platform job")
-	awaitEvent(exhausted.ID, "Discarded platform job")
+	awaitOperationWarning(t, ctx, run, rescued.ID, "Recovered orphaned platform job")
+	awaitOperationWarning(t, ctx, run, exhausted.ID, "Discarded platform job")
 
 	if state := riverJobState(t, pool, foreign.ID); state != "running" {
 		t.Fatalf("another host's job changed state to %q", state)
@@ -165,6 +137,43 @@ func TestIntegrationWorkerRescueRechecksTheObservedOwner(t *testing.T) {
 	if len(attemptedBy) != 1 || attemptedBy[0] != "client-b" {
 		t.Fatalf("attempted_by = %q, want the new owner", attemptedBy)
 	}
+}
+
+func setRunningPlatformJob(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	op contract.Operation,
+	clientID string,
+	attempt int32,
+) {
+	t.Helper()
+	if _, err := pool.Exec(ctx, `UPDATE eregion_operations SET state='running', attempt=$2 WHERE id=$1`, op.ID, attempt); err != nil {
+		t.Fatal(err)
+	}
+	tag, err := pool.Exec(ctx, `UPDATE river_job SET state='running', attempt=$2,
+        attempted_at=clock_timestamp(), attempted_by=ARRAY[$3]
+        WHERE id=(SELECT job_id FROM eregion_operations WHERE id=$1)`, op.ID, attempt, clientID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tag.RowsAffected() != 1 {
+		t.Fatalf("operation %s has no runnable River job", op.ID)
+	}
+}
+
+func awaitOperationWarning(t *testing.T, ctx context.Context, run *Runtime, operationID contract.OperationID, want string) {
+	t.Helper()
+	page, err := run.Service.Events(ctx, testActor, contract.Cursor{OperationID: operationID}, 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range page.Events {
+		if event.Kind == "warning" && strings.Contains(event.Message, want) {
+			return
+		}
+	}
+	t.Fatalf("operation %s has no warning event containing %q", operationID, want)
 }
 
 func riverJobState(t *testing.T, pool *pgxpool.Pool, id contract.OperationID) string {

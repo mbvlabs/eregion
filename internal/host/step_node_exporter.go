@@ -140,7 +140,7 @@ func (s *nodeExporterStep) identityMetric(ctx context.Context) ([]byte, error) {
 
 func (s *nodeExporterStep) writeIdentityMetric(metric []byte) error {
 	_, textfile := s.dirs()
-	return writePublicFile(filepath.Join(textfile, "eregion_node.prom"), metric, "root", "root")
+	return writePublicFile(filepath.Join(textfile, "eregion_node.prom"), metric, "root")
 }
 
 func (s *nodeExporterStep) checkApplyDirectories(parent, textfile string) error {
@@ -235,7 +235,7 @@ func (s *nodeExporterStep) Check(ctx context.Context, _ engine.Runtime) (engine.
 if systemctl is-enabled node-exporter.service >/dev/null 2>&1; then echo enabled:ok; else echo enabled:missing; fi
 if systemctl is-active --quiet node-exporter.service; then echo active:ok; else echo active:missing; fi`,
 		s.binaryPath(), nodeExporterVersion)
-	output, err := checkOutput(ctx, engine.Runtime{}, s.exec, script)
+	output, err := checkOutput(ctx, s.exec, script)
 	if err != nil {
 		return engine.CheckResult{}, err
 	}
@@ -341,7 +341,7 @@ fi`,
 	if err := s.writeIdentityMetric(metric); err != nil {
 		return engine.ApplyResult{}, err
 	}
-	if err := writePublicFile(s.unitPath(), s.unit(), "root", "root"); err != nil {
+	if err := writePublicFile(s.unitPath(), s.unit(), "root"); err != nil {
 		return engine.ApplyResult{}, err
 	}
 	// node_exporter is loopback-only and independent of WireGuard. It starts

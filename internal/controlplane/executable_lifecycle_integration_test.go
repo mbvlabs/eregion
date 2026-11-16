@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/api"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/operations"
@@ -54,6 +55,22 @@ func executableRegistryIdentity(t *testing.T, nodeDir string) RegistryHostIdenti
 	return identity
 }
 
+type executableProcess struct {
+	cmd     *exec.Cmd
+	done    <-chan error
+	stopped bool
+}
+
+type executableLifecycleFixture struct {
+	pool        *pgxpool.Pool
+	ctx         context.Context
+	binary      string
+	endpoint    string
+	credential  string
+	environment []string
+	nodeDir     string
+}
+
 func TestIntegrationExecutableLifecycle(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("node service processes require Linux")
@@ -61,12 +78,43 @@ func TestIntegrationExecutableLifecycle(t *testing.T) {
 	if os.Getenv("EREGION_TEST_DATABASE_URL") == "" {
 		t.Skip("set EREGION_TEST_DATABASE_URL to run isolated PostgreSQL integration tests")
 	}
+	f := newExecutableLifecycleFixture(t)
+	server := startExecutableProcess(t, f, "node", "serve", "--workers=false", "--listen", strings.TrimPrefix(f.endpoint, "http://"), "--json")
+	awaitExecutableReady(t, f)
+	client, err := api.NewClient(f.endpoint, f.credential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := client.Test(f.ctx, operations.TestInput{Steps: 5, StepDelayMS: 25}, "cli:durable-1", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var accepted contract.Operation
+	if err := json.Unmarshal(raw, &accepted); err != nil || accepted.State != contract.Queued {
+		t.Fatalf("API did not durably queue: %s %v", raw, err)
+	}
+	worker := startExecutableProcess(t, f, "node", "worker", "--concurrency", "2", "--json")
+	await(t, 30*time.Second, func() bool {
+		var state contract.State
+		err := f.pool.QueryRow(f.ctx, `SELECT state FROM eregion_operations WHERE id=$1`, accepted.ID).Scan(&state)
+		return err == nil && state == contract.Succeeded
+	})
+	if got := effectCount(t, f.nodeDir, accepted.ID, 5); got != 5 {
+		t.Fatalf("executable lifecycle effects: %d", got)
+	}
+	if got := completedStepRows(t, f.pool, accepted.ID); got != 5 {
+		t.Fatalf("executable lifecycle completed steps: %d", got)
+	}
+	stopExecutableProcesses(t, worker, server)
+}
+
+func newExecutableLifecycleFixture(t *testing.T) executableLifecycleFixture {
+	t.Helper()
 	nodeDir := t.TempDir()
 	identity := executableRegistryIdentity(t, nodeDir)
 	pool, dsn := testPool(t, true)
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-	defer cancel()
-
+	t.Cleanup(cancel)
 	binary := filepath.Join(t.TempDir(), "eregion")
 	if out, err := exec.CommandContext(ctx, "go", "build", "-o", binary, "../../cmd/eregion").CombinedOutput(); err != nil {
 		t.Fatalf("build executable: %v: %s", err, out)
@@ -92,7 +140,6 @@ func TestIntegrationExecutableLifecycle(t *testing.T) {
 	if _, err := AssignWorkspace(ctx, newTestEntities(t, pool), "test", identity); err != nil {
 		t.Fatal(err)
 	}
-
 	reserved, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -101,47 +148,49 @@ func TestIntegrationExecutableLifecycle(t *testing.T) {
 	if err := reserved.Close(); err != nil {
 		t.Fatal(err)
 	}
-	endpoint := "http://" + address
 	home := t.TempDir()
-	environment := []string{
-		"PATH=" + os.Getenv("PATH"), "HOME=" + home, "TMPDIR=" + home,
-		"EREGION_DATABASE_URL=" + dsn, "EREGION_AUTH_FILE=" + authFile,
-		"EREGION_NODE_STATE_DIR=" + nodeDir, "EREGION_NODE_NAME=local",
-		"EREGION_NODE_CONFIG=" + nodeConfigPath, "EREGION_NODE_TRANSPORT=local",
-		"EREGION_REGISTRY_LISTEN=127.0.0.1:5000",
+	return executableLifecycleFixture{
+		pool: pool, ctx: ctx, binary: binary, endpoint: "http://" + address,
+		credential: credential, nodeDir: nodeDir,
+		environment: []string{
+			"PATH=" + os.Getenv("PATH"), "HOME=" + home, "TMPDIR=" + home,
+			"EREGION_DATABASE_URL=" + dsn, "EREGION_AUTH_FILE=" + authFile,
+			"EREGION_NODE_STATE_DIR=" + nodeDir, "EREGION_NODE_NAME=local",
+			"EREGION_NODE_CONFIG=" + nodeConfigPath, "EREGION_NODE_TRANSPORT=local",
+			"EREGION_REGISTRY_LISTEN=127.0.0.1:5000",
+		},
 	}
-	type process struct {
-		cmd     *exec.Cmd
-		done    <-chan error
-		stopped bool
+}
+
+func startExecutableProcess(t *testing.T, f executableLifecycleFixture, args ...string) *executableProcess {
+	t.Helper()
+	command := exec.CommandContext(f.ctx, f.binary, args...)
+	command.Env = f.environment
+	command.Stdout, command.Stderr = io.Discard, io.Discard
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
 	}
-	start := func(args ...string) *process {
-		t.Helper()
-		command := exec.CommandContext(ctx, binary, args...)
-		command.Env = environment
-		command.Stdout, command.Stderr = io.Discard, io.Discard
-		if err := command.Start(); err != nil {
-			t.Fatal(err)
-		}
-		done := make(chan error, 1)
-		p := &process{cmd: command, done: done}
-		go func() { done <- command.Wait() }()
-		t.Cleanup(func() {
-			if !p.stopped {
-				_ = p.cmd.Process.Kill()
-				select {
-				case <-p.done:
-				case <-time.After(5 * time.Second):
-					t.Error("could not reap node service process")
-				}
+	done := make(chan error, 1)
+	p := &executableProcess{cmd: command, done: done}
+	go func() { done <- command.Wait() }()
+	t.Cleanup(func() {
+		if !p.stopped {
+			_ = p.cmd.Process.Kill()
+			select {
+			case <-p.done:
+			case <-time.After(5 * time.Second):
+				t.Error("could not reap node service process")
 			}
-		})
-		return p
-	}
-	server := start("node", "serve", "--workers=false", "--listen", address, "--json")
+		}
+	})
+	return p
+}
+
+func awaitExecutableReady(t *testing.T, f executableLifecycleFixture) {
+	t.Helper()
 	httpClient := &http.Client{Timeout: time.Second}
 	await(t, 15*time.Second, func() bool {
-		request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"/readyz", nil)
+		request, err := http.NewRequestWithContext(f.ctx, http.MethodGet, f.endpoint+"/readyz", nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -152,31 +201,11 @@ func TestIntegrationExecutableLifecycle(t *testing.T) {
 		_ = response.Body.Close()
 		return response.StatusCode == http.StatusOK
 	})
-	client, err := api.NewClient(endpoint, credential)
-	if err != nil {
-		t.Fatal(err)
-	}
-	raw, err = client.Test(ctx, operations.TestInput{Steps: 5, StepDelayMS: 25}, "cli:durable-1", false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var accepted contract.Operation
-	if err := json.Unmarshal(raw, &accepted); err != nil || accepted.State != contract.Queued {
-		t.Fatalf("API did not durably queue: %s %v", raw, err)
-	}
-	worker := start("node", "worker", "--concurrency", "2", "--json")
-	await(t, 30*time.Second, func() bool {
-		var state contract.State
-		err := pool.QueryRow(ctx, `SELECT state FROM eregion_operations WHERE id=$1`, accepted.ID).Scan(&state)
-		return err == nil && state == contract.Succeeded
-	})
-	if got := effectCount(t, nodeDir, accepted.ID, 5); got != 5 {
-		t.Fatalf("executable lifecycle effects: %d", got)
-	}
-	if got := completedStepRows(t, pool, accepted.ID); got != 5 {
-		t.Fatalf("executable lifecycle completed steps: %d", got)
-	}
-	for _, p := range []*process{worker, server} {
+}
+
+func stopExecutableProcesses(t *testing.T, processes ...*executableProcess) {
+	t.Helper()
+	for _, p := range processes {
 		if err := p.cmd.Process.Signal(syscall.SIGTERM); err != nil {
 			t.Fatal(err)
 		}

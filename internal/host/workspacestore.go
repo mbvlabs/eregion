@@ -261,44 +261,8 @@ type WorkspaceGroup struct {
 }
 
 func (s *WorkspaceStore) Groups() []WorkspaceGroup {
-	byID := map[string]*WorkspaceGroup{}
-	order := make([]string, 0)
-	for _, access := range s.Access {
-		if access.Workspace == nil {
-			continue
-		}
-		group, ok := byID[access.Workspace.ID]
-		if !ok {
-			group = &WorkspaceGroup{ID: access.Workspace.ID, Name: access.Workspace.Name}
-			byID[access.Workspace.ID] = group
-			order = append(order, access.Workspace.ID)
-		} else if group.Name != "" && group.Name != access.Workspace.Name {
-			group.Name = ""
-			group.Conflict = "workspace ID has records with different names"
-		}
-		group.Access = append(group.Access, access)
-	}
-	nameIDs := map[string]map[string]bool{}
-	for _, group := range byID {
-		if group.Name == "" {
-			continue
-		}
-		if nameIDs[group.Name] == nil {
-			nameIDs[group.Name] = map[string]bool{}
-		}
-		nameIDs[group.Name][group.ID] = true
-	}
-	for _, ids := range nameIDs {
-		if len(ids) < 2 {
-			continue
-		}
-		for id := range ids {
-			group := byID[id]
-			if group.Conflict == "" {
-				group.Conflict = "workspace name is used by multiple workspace IDs"
-			}
-		}
-	}
+	byID, order := groupWorkspaceAccess(s.Access)
+	markWorkspaceNameConflicts(byID)
 	groups := make([]WorkspaceGroup, 0, len(order))
 	for _, id := range order {
 		groups = append(groups, *byID[id])
@@ -316,6 +280,50 @@ func (s *WorkspaceStore) Groups() []WorkspaceGroup {
 		return groups[i].Name < groups[j].Name
 	})
 	return groups
+}
+
+func groupWorkspaceAccess(accesses []WorkspaceAccess) (map[string]*WorkspaceGroup, []string) {
+	byID := map[string]*WorkspaceGroup{}
+	order := make([]string, 0)
+	for _, access := range accesses {
+		if access.Workspace == nil {
+			continue
+		}
+		group, ok := byID[access.Workspace.ID]
+		if !ok {
+			group = &WorkspaceGroup{ID: access.Workspace.ID, Name: access.Workspace.Name}
+			byID[access.Workspace.ID] = group
+			order = append(order, access.Workspace.ID)
+		} else if group.Name != "" && group.Name != access.Workspace.Name {
+			group.Name = ""
+			group.Conflict = "workspace ID has records with different names"
+		}
+		group.Access = append(group.Access, access)
+	}
+	return byID, order
+}
+
+func markWorkspaceNameConflicts(byID map[string]*WorkspaceGroup) {
+	nameIDs := map[string]map[string]bool{}
+	for _, group := range byID {
+		if group.Name == "" {
+			continue
+		}
+		if nameIDs[group.Name] == nil {
+			nameIDs[group.Name] = map[string]bool{}
+		}
+		nameIDs[group.Name][group.ID] = true
+	}
+	for _, ids := range nameIDs {
+		if len(ids) < 2 {
+			continue
+		}
+		for id := range ids {
+			if group := byID[id]; group.Conflict == "" {
+				group.Conflict = "workspace name is used by multiple workspace IDs"
+			}
+		}
+	}
 }
 
 func (s *WorkspaceStore) ListWorkspaces() []WorkspaceView {
@@ -479,46 +487,59 @@ func (s *WorkspaceStore) CurrentAccess() (WorkspaceAccess, error) {
 // can address a group with a name conflict.
 func (s *WorkspaceStore) ShowWorkspace(selector string) (WorkspaceView, error) {
 	selector = strings.TrimSpace(selector)
-	groups := s.Groups()
-	var group *WorkspaceGroup
-	if strings.HasPrefix(selector, "ws_") {
-		for index := range groups {
-			if groups[index].ID == selector {
-				group = &groups[index]
-				break
-			}
-		}
-	} else if selector != "" {
-		matching := s.groupsByName(selector)
-		if len(matching) == 1 {
-			group = &matching[0]
-		} else if len(matching) > 1 {
-			return WorkspaceView{}, contract.NewFault(contract.Conflict, "workspace name "+selector+" is used by multiple workspace IDs", "Pass the exact workspace ID.")
-		}
-	} else {
-		access, err := s.CurrentAccess()
-		if err != nil {
-			return WorkspaceView{}, err
-		}
-		if access.Workspace == nil {
-			return WorkspaceView{}, contract.NewFault(contract.PreconditionFailed, "the current access record has no verified workspace identity", "Initialize a workspace or log in with a current protected export.")
-		}
-		for index := range groups {
-			if groups[index].ID == access.Workspace.ID {
-				group = &groups[index]
-				break
-			}
-		}
+	group, err := s.resolveWorkspaceGroup(selector)
+	if err != nil {
+		return WorkspaceView{}, err
 	}
 	if group == nil {
-		return WorkspaceView{}, contract.NewFault(contract.NotFound, "workspace "+selector+" was not found", "List saved workspaces with eregion workspace list.")
+		return WorkspaceView{}, workspaceNotFound(selector)
 	}
 	for _, view := range s.ListWorkspaces() {
 		if view.ID == group.ID {
 			return view, nil
 		}
 	}
-	return WorkspaceView{}, contract.NewFault(contract.NotFound, "workspace "+selector+" was not found", "List saved workspaces with eregion workspace list.")
+	return WorkspaceView{}, workspaceNotFound(selector)
+}
+
+func (s *WorkspaceStore) resolveWorkspaceGroup(selector string) (*WorkspaceGroup, error) {
+	groups := s.Groups()
+	switch {
+	case strings.HasPrefix(selector, "ws_"):
+		return workspaceGroupByID(groups, selector), nil
+	case selector != "":
+		matching := s.groupsByName(selector)
+		switch len(matching) {
+		case 0:
+			return nil, nil
+		case 1:
+			return &matching[0], nil
+		default:
+			return nil, contract.NewFault(contract.Conflict, "workspace name "+selector+" is used by multiple workspace IDs", "Pass the exact workspace ID.")
+		}
+	default:
+		access, err := s.CurrentAccess()
+		if err != nil {
+			return nil, err
+		}
+		if access.Workspace == nil {
+			return nil, contract.NewFault(contract.PreconditionFailed, "the current access record has no verified workspace identity", "Initialize a workspace or log in with a current protected export.")
+		}
+		return workspaceGroupByID(groups, access.Workspace.ID), nil
+	}
+}
+
+func workspaceGroupByID(groups []WorkspaceGroup, id string) *WorkspaceGroup {
+	for index := range groups {
+		if groups[index].ID == id {
+			return &groups[index]
+		}
+	}
+	return nil
+}
+
+func workspaceNotFound(selector string) error {
+	return contract.NewFault(contract.NotFound, "workspace "+selector+" was not found", "List saved workspaces with eregion workspace list.")
 }
 
 // UseWorkspace selects a workspace's resolved local access record.
@@ -685,22 +706,41 @@ func (s *WorkspaceStore) provablyOwnedCredentialDir(candidate string, otherCandi
 	if err != nil {
 		return false
 	}
+	candidateAbs, ok := cleanCredentialCandidate(rootAbs, candidate)
+	if !ok {
+		return false
+	}
+	refs, err := s.credentialDirReferences()
+	if err != nil {
+		return false
+	}
+	if credentialPathsOverlap(candidateAbs, refs) {
+		return false
+	}
+	return otherCandidatesDoNotOverlap(candidateAbs, candidate, otherCandidates)
+}
+
+func cleanCredentialCandidate(rootAbs, candidate string) (string, bool) {
 	candidateAbs, err := filepath.Abs(candidate)
 	if err != nil || candidateAbs == rootAbs || !withinPath(rootAbs, candidateAbs) {
-		return false
+		return "", false
 	}
 	// Any symlink in the candidate or its ancestors makes ownership ambiguous.
 	realCandidate, err := filepath.EvalSymlinks(candidateAbs)
 	if err != nil || filepath.Clean(realCandidate) != filepath.Clean(candidateAbs) {
-		return false
+		return "", false
 	}
-	refs := make([]string, 0)
+	return candidateAbs, true
+}
+
+func (s *WorkspaceStore) credentialDirReferences() ([]string, error) {
+	refs := make([]string, 0, len(s.Access)*2)
 	for _, access := range s.Access {
-		if dir, err := s.CredentialDirFor(access); err == nil {
-			refs = append(refs, dir)
-		} else {
-			return false
+		dir, err := s.CredentialDirFor(access)
+		if err != nil {
+			return nil, err
 		}
+		refs = append(refs, dir)
 		if access.SSH != nil {
 			refs = append(refs, access.SSH.Identity, access.SSH.KnownHosts)
 			if access.SSH.WireGuard != nil {
@@ -708,25 +748,37 @@ func (s *WorkspaceStore) provablyOwnedCredentialDir(candidate string, otherCandi
 			}
 		}
 	}
+	return refs, nil
+}
+
+func credentialPathsOverlap(candidateAbs string, refs []string) bool {
+	realCandidate, err := filepath.EvalSymlinks(candidateAbs)
+	if err != nil {
+		return true
+	}
 	for _, ref := range refs {
 		if strings.TrimSpace(ref) == "" {
 			continue
 		}
 		refAbs, err := filepath.Abs(ref)
 		if err != nil {
-			return false
+			return true
 		}
 		if pathsOverlap(candidateAbs, refAbs) {
-			return false
+			return true
 		}
 		if realRef, err := filepath.EvalSymlinks(refAbs); err == nil {
 			if pathsOverlap(realCandidate, realRef) {
-				return false
+				return true
 			}
 		} else if !errors.Is(err, os.ErrNotExist) {
-			return false
+			return true
 		}
 	}
+	return false
+}
+
+func otherCandidatesDoNotOverlap(candidateAbs, candidate string, otherCandidates []string) bool {
 	for _, other := range otherCandidates {
 		if filepath.Clean(other) == filepath.Clean(candidate) {
 			continue
@@ -754,49 +806,72 @@ func pathsOverlap(left, right string) bool {
 func (s *WorkspaceStore) SetWorkspaceIdentity(name string, identity *WorkspaceIdentity, expected *WorkspaceSSH) (WorkspaceView, error) {
 	var view WorkspaceView
 	err := s.withMutation(func(fresh *WorkspaceStore) error {
-		if err := validateWorkspaceIdentity(identity); err != nil {
-			return err
-		}
-		for index := range fresh.Access {
-			if fresh.Access[index].Name != name {
-				continue
-			}
-			if expected != nil && !SameWorkspaceRoute(fresh.Access[index].SSH, expected) {
-				fault := contract.NewFault(contract.Conflict,
-					"workspace access "+name+" changed while the apply was running",
-					"Reload the workspace and retry; identity was not written over the replacement.")
-				fault.Details = map[string]any{"workspace_access": name}
-				return fault
-			}
-			if fresh.Access[index].Workspace != nil && !sameWorkspaceIdentity(fresh.Access[index].Workspace, identity) {
-				return workspaceIdentityConflict(name, fresh.Access[index].Workspace, identity)
-			}
-			if identity != nil {
-				for _, other := range fresh.Access {
-					if other.Name == name || other.Workspace == nil {
-						continue
-					}
-					if other.Workspace.Name == identity.Name && other.Workspace.ID != identity.ID {
-						return workspaceAccessNameConflict(identity.Name, other)
-					}
-				}
-			}
-			if identity == nil {
-				fresh.Access[index].Workspace = nil
-			} else {
-				copied := *identity
-				fresh.Access[index].Workspace = &copied
-			}
-			fresh.Access[index].UpdatedAt = fresh.Now().UTC()
-			if err := fresh.saveLocked(); err != nil {
-				return err
-			}
-			view = fresh.viewOfAccess(fresh.Access[index])
-			return nil
-		}
-		return contract.NewFault(contract.NotFound, "workspace access "+name+" was not found", "Run eregion login or server init first.")
+		var err error
+		view, err = fresh.setWorkspaceIdentityLocked(name, identity, expected)
+		return err
 	})
 	return view, err
+}
+
+func (s *WorkspaceStore) setWorkspaceIdentityLocked(name string, identity *WorkspaceIdentity, expected *WorkspaceSSH) (WorkspaceView, error) {
+	if err := validateWorkspaceIdentity(identity); err != nil {
+		return WorkspaceView{}, err
+	}
+	index := s.accessIndexByName(name)
+	if index < 0 {
+		return WorkspaceView{}, contract.NewFault(contract.NotFound, "workspace access "+name+" was not found", "Run eregion login or server init first.")
+	}
+	if err := s.validateWorkspaceIdentityUpdate(index, name, identity, expected); err != nil {
+		return WorkspaceView{}, err
+	}
+	access := s.Access[index]
+	if identity == nil {
+		access.Workspace = nil
+	} else {
+		copied := *identity
+		access.Workspace = &copied
+	}
+	access.UpdatedAt = s.Now().UTC()
+	s.Access[index] = access
+	if err := s.saveLocked(); err != nil {
+		return WorkspaceView{}, err
+	}
+	return s.viewOfAccess(access), nil
+}
+
+func (s *WorkspaceStore) accessIndexByName(name string) int {
+	for index := range s.Access {
+		if s.Access[index].Name == name {
+			return index
+		}
+	}
+	return -1
+}
+
+func (s *WorkspaceStore) validateWorkspaceIdentityUpdate(index int, name string, identity *WorkspaceIdentity, expected *WorkspaceSSH) error {
+	access := s.Access[index]
+	if expected != nil && !SameWorkspaceRoute(access.SSH, expected) {
+		fault := contract.NewFault(contract.Conflict,
+			"workspace access "+name+" changed while the apply was running",
+			"Reload the workspace and retry; identity was not written over the replacement.")
+		fault.Details = map[string]any{"workspace_access": name}
+		return fault
+	}
+	if access.Workspace != nil && !sameWorkspaceIdentity(access.Workspace, identity) {
+		return workspaceIdentityConflict(name, access.Workspace, identity)
+	}
+	if identity == nil {
+		return nil
+	}
+	for _, other := range s.Access {
+		if other.Name == name || other.Workspace == nil {
+			continue
+		}
+		if other.Workspace.Name == identity.Name && other.Workspace.ID != identity.ID {
+			return workspaceAccessNameConflict(identity.Name, other)
+		}
+	}
+	return nil
 }
 
 // PublishWorkspace atomically installs one verified access record for id. When
@@ -805,82 +880,120 @@ func (s *WorkspaceStore) SetWorkspaceIdentity(name string, identity *WorkspaceId
 func (s *WorkspaceStore) PublishWorkspace(id, name string, access WorkspaceAccess, replace bool) (WorkspaceView, error) {
 	var view WorkspaceView
 	err := s.withMutation(func(fresh *WorkspaceStore) error {
-		if strings.TrimSpace(id) == "" || strings.TrimSpace(name) == "" {
-			return contract.NewFault(contract.ValidationFailed, "the workspace identity is incomplete", "Use a current protected export with both the workspace name and ID.")
-		}
-		access.Name = strings.TrimSpace(access.Name)
-		if access.Name == "" {
-			access.Name = name
-		}
-		if !accessNamePattern.MatchString(access.Name) {
-			return contract.NewFault(contract.ValidationFailed, "the workspace name is not usable as a private access key", "Use a validated workspace name.")
-		}
-		access.Workspace = &WorkspaceIdentity{ID: id, Name: name}
-		if err := validateWorkspaceAccess(access); err != nil {
-			return err
-		}
-		existingGroups := fresh.Groups()
-		replaced := false
-		for _, group := range existingGroups {
-			if group.ID == id {
-				for _, existing := range group.Access {
-					if existing.Workspace != nil && existing.Workspace.Name != name {
-						return workspaceGroupNameConflict(group, name)
-					}
-				}
-				if !replace {
-					fault := contract.NewFault(contract.Conflict,
-						"workspace "+name+" is already saved on this machine",
-						"Pass --replace "+name+" to replace its local access records with the verified export.")
-					fault.Details = map[string]any{"workspace": name, "workspace_id": id}
-					return fault
-				}
-				replaced = true
-			}
-		}
-		for _, existing := range fresh.Access {
-			if existing.Workspace != nil && existing.Workspace.ID != id && existing.Workspace.Name == name {
-				fault := contract.NewFault(contract.Conflict,
-					"workspace name "+name+" is already used by workspace "+existing.Workspace.ID,
-					"A workspace name identifies one immutable workspace ID. Import the export for that workspace, or remove the conflicting local access explicitly.")
-				fault.Details = map[string]any{"workspace": name, "workspace_id": existing.Workspace.ID, "incoming_workspace_id": id}
-				return fault
-			}
-		}
-		if replaced {
-			kept := make([]WorkspaceAccess, 0, len(fresh.Access))
-			for _, existing := range fresh.Access {
-				if existing.Workspace != nil && existing.Workspace.ID == id {
-					continue
-				}
-				kept = append(kept, existing)
-			}
-			fresh.Access = kept
-		}
-		for _, existing := range fresh.Access {
-			if existing.Name == access.Name {
-				return contract.NewFault(contract.Conflict,
-					"the private workspace access key is already in use",
-					"Remove the conflicting local access explicitly; names are never arbitrary aliases for another workspace.")
-			}
-		}
-		kept := make([]WorkspaceAccess, 0, len(fresh.Access))
-		for _, existing := range fresh.Access {
-			if existing.Name == access.Name {
-				continue
-			}
-			kept = append(kept, existing)
-		}
-		fresh.Access = append(kept, access)
-		sort.Slice(fresh.Access, func(i, j int) bool { return fresh.Access[i].Name < fresh.Access[j].Name })
-		fresh.Current = access.Name
-		if err := fresh.saveLocked(); err != nil {
-			return err
-		}
-		view = fresh.viewOfAccess(access)
-		return nil
+		var err error
+		view, err = fresh.publishWorkspaceLocked(id, name, access, replace)
+		return err
 	})
 	return view, err
+}
+
+func (s *WorkspaceStore) publishWorkspaceLocked(id, name string, access WorkspaceAccess, replace bool) (WorkspaceView, error) {
+	access, err := prepareWorkspaceAccess(id, name, access)
+	if err != nil {
+		return WorkspaceView{}, err
+	}
+	replaced, err := s.checkWorkspacePublishConflicts(id, name, replace)
+	if err != nil {
+		return WorkspaceView{}, err
+	}
+	if replaced {
+		s.Access = removeWorkspaceIDAccess(s.Access, id)
+	}
+	if workspaceAccessNameInUse(s.Access, access.Name) {
+		return WorkspaceView{}, contract.NewFault(contract.Conflict,
+			"the private workspace access key is already in use",
+			"Remove the conflicting local access explicitly; names are never arbitrary aliases for another workspace.")
+	}
+	s.Access = appendWorkspaceAccess(s.Access, access)
+	s.Current = access.Name
+	if err := s.saveLocked(); err != nil {
+		return WorkspaceView{}, err
+	}
+	return s.viewOfAccess(access), nil
+}
+
+func prepareWorkspaceAccess(id, name string, access WorkspaceAccess) (WorkspaceAccess, error) {
+	if strings.TrimSpace(id) == "" || strings.TrimSpace(name) == "" {
+		return WorkspaceAccess{}, contract.NewFault(contract.ValidationFailed, "the workspace identity is incomplete", "Use a current protected export with both the workspace name and ID.")
+	}
+	access.Name = strings.TrimSpace(access.Name)
+	if access.Name == "" {
+		access.Name = name
+	}
+	if !accessNamePattern.MatchString(access.Name) {
+		return WorkspaceAccess{}, contract.NewFault(contract.ValidationFailed, "the workspace name is not usable as a private access key", "Use a validated workspace name.")
+	}
+	access.Workspace = &WorkspaceIdentity{ID: id, Name: name}
+	if err := validateWorkspaceAccess(access); err != nil {
+		return WorkspaceAccess{}, err
+	}
+	return access, nil
+}
+
+func (s *WorkspaceStore) checkWorkspacePublishConflicts(id, name string, replace bool) (bool, error) {
+	existingGroups := s.Groups()
+	replaced := false
+	for _, group := range existingGroups {
+		if group.ID != id {
+			continue
+		}
+		for _, existing := range group.Access {
+			if existing.Workspace != nil && existing.Workspace.Name != name {
+				return false, workspaceGroupNameConflict(group, name)
+			}
+		}
+		if !replace {
+			fault := contract.NewFault(contract.Conflict,
+				"workspace "+name+" is already saved on this machine",
+				"Pass --replace "+name+" to replace its local access records with the verified export.")
+			fault.Details = map[string]any{"workspace": name, "workspace_id": id}
+			return false, fault
+		}
+		replaced = true
+	}
+	for _, existing := range s.Access {
+		if existing.Workspace != nil && existing.Workspace.ID != id && existing.Workspace.Name == name {
+			fault := contract.NewFault(contract.Conflict,
+				"workspace name "+name+" is already used by workspace "+existing.Workspace.ID,
+				"A workspace name identifies one immutable workspace ID. Import the export for that workspace, or remove the conflicting local access explicitly.")
+			fault.Details = map[string]any{"workspace": name, "workspace_id": existing.Workspace.ID, "incoming_workspace_id": id}
+			return false, fault
+		}
+	}
+	return replaced, nil
+}
+
+func removeWorkspaceIDAccess(accesses []WorkspaceAccess, id string) []WorkspaceAccess {
+	kept := make([]WorkspaceAccess, 0, len(accesses))
+	for _, existing := range accesses {
+		if existing.Workspace != nil && existing.Workspace.ID == id {
+			continue
+		}
+		kept = append(kept, existing)
+	}
+	return kept
+}
+
+func workspaceAccessNameInUse(accesses []WorkspaceAccess, name string) bool {
+	for _, existing := range accesses {
+		if existing.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func appendWorkspaceAccess(accesses []WorkspaceAccess, access WorkspaceAccess) []WorkspaceAccess {
+	kept := make([]WorkspaceAccess, 0, len(accesses)+1)
+	for _, existing := range accesses {
+		if existing.Name == access.Name {
+			continue
+		}
+		kept = append(kept, existing)
+	}
+	kept = append(kept, access)
+	sort.Slice(kept, func(i, j int) bool { return kept[i].Name < kept[j].Name })
+	return kept
 }
 
 // PublishInitializedWorkspace publishes verified initialization access, or
@@ -888,38 +1001,15 @@ func (s *WorkspaceStore) PublishWorkspace(id, name string, access WorkspaceAcces
 func (s *WorkspaceStore) PublishInitializedWorkspace(id, name string, access WorkspaceAccess) (WorkspaceView, error) {
 	var view WorkspaceView
 	err := s.withMutation(func(fresh *WorkspaceStore) error {
-		access.Name = strings.TrimSpace(access.Name)
-		if access.Name == "" {
-			access.Name = name
-		}
-		identity := &WorkspaceIdentity{ID: id, Name: name}
-		if access.Workspace != nil && !sameWorkspaceIdentity(access.Workspace, identity) {
-			return contract.NewFault(contract.Conflict, "the initialization workspace identity changed", "Retry initialization with the verified identity.")
-		}
-		access.Workspace = identity
-		if err := validateWorkspaceAccess(access); err != nil {
+		prepared, err := prepareInitializedAccess(id, name, access)
+		if err != nil {
 			return err
 		}
-		found := false
-		for _, existing := range fresh.Access {
-			if existing.Name == access.Name || existing.Workspace.ID == id || existing.Workspace.Name == name {
-				old, incoming := existing, access
-				old.CreatedAt, old.UpdatedAt = time.Time{}, time.Time{}
-				incoming.CreatedAt, incoming.UpdatedAt = time.Time{}, time.Time{}
-				if !found && reflect.DeepEqual(old, incoming) {
-					found = true
-					continue
-				}
-				return contract.NewFault(contract.Conflict,
-					"workspace initialization conflicts with saved access",
-					"Reload the workspace; initialization never replaces existing access.")
-			}
-		}
-		if !found {
-			fresh.Access = append(fresh.Access, access)
+		if err := mergeInitializedAccess(fresh, id, name, prepared); err != nil {
+			return err
 		}
 		sort.Slice(fresh.Access, func(i, j int) bool { return fresh.Access[i].Name < fresh.Access[j].Name })
-		fresh.Current = access.Name
+		fresh.Current = prepared.Name
 		if err := fresh.saveLocked(); err != nil {
 			return err
 		}
@@ -927,6 +1017,49 @@ func (s *WorkspaceStore) PublishInitializedWorkspace(id, name string, access Wor
 		return nil
 	})
 	return view, err
+}
+
+func prepareInitializedAccess(id, name string, access WorkspaceAccess) (WorkspaceAccess, error) {
+	access.Name = strings.TrimSpace(access.Name)
+	if access.Name == "" {
+		access.Name = name
+	}
+	identity := &WorkspaceIdentity{ID: id, Name: name}
+	if access.Workspace != nil && !sameWorkspaceIdentity(access.Workspace, identity) {
+		return WorkspaceAccess{}, contract.NewFault(contract.Conflict, "the initialization workspace identity changed", "Retry initialization with the verified identity.")
+	}
+	access.Workspace = identity
+	if err := validateWorkspaceAccess(access); err != nil {
+		return WorkspaceAccess{}, err
+	}
+	return access, nil
+}
+
+func mergeInitializedAccess(fresh *WorkspaceStore, id, name string, access WorkspaceAccess) error {
+	found := false
+	for _, existing := range fresh.Access {
+		matches := existing.Name == access.Name
+		if existing.Workspace != nil {
+			matches = matches || existing.Workspace.ID == id || existing.Workspace.Name == name
+		}
+		if !matches {
+			continue
+		}
+		old, incoming := existing, access
+		old.CreatedAt, old.UpdatedAt = time.Time{}, time.Time{}
+		incoming.CreatedAt, incoming.UpdatedAt = time.Time{}, time.Time{}
+		if !found && reflect.DeepEqual(old, incoming) {
+			found = true
+			continue
+		}
+		return contract.NewFault(contract.Conflict,
+			"workspace initialization conflicts with saved access",
+			"Reload the workspace; initialization never replaces existing access.")
+	}
+	if !found {
+		fresh.Access = append(fresh.Access, access)
+	}
+	return nil
 }
 
 func (s *WorkspaceStore) viewOfAccess(access WorkspaceAccess) WorkspaceView {

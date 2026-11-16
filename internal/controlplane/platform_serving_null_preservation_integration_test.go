@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/platform"
@@ -22,6 +23,24 @@ func TestIntegrationFirstDeployRestoreServingPreservesNullPointers(t *testing.T)
 	ctx := context.Background()
 	service := &Service{entities: f.store}
 
+	operationID, deploymentID := seedFirstRestoreDeployment(t, ctx, pool, f)
+	seedRestoreOwnerAndCleanup(t, ctx, service, f, operationID, deploymentID)
+	// This is the production first-deploy restore write. It previously stored
+	// empty strings in the three nullable serving pointers.
+	if err := service.recordDeploymentRestoreServing(ctx, f.env, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	env := assertRestoredEnvironmentNulls(t, ctx, pool, service, f)
+	assertRestoredCleanupOwner(t, ctx, service, f, env, deploymentID)
+}
+
+func seedFirstRestoreDeployment(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	f *platformFixture,
+) (contract.OperationID, platform.DeploymentID) {
+	t.Helper()
 	operationID, err := contract.NewOperationID()
 	if err != nil {
 		t.Fatal(err)
@@ -75,7 +94,6 @@ func TestIntegrationFirstDeployRestoreServingPreservesNullPointers(t *testing.T)
 	}); err != nil {
 		t.Fatal(err)
 	}
-
 	var previousNull bool
 	if err := pool.QueryRow(ctx, `SELECT previous_release_id IS NULL AND previous_deployment_id IS NULL
         FROM eregion_platform_deployments WHERE id=$1`, deploymentID).Scan(&previousNull); err != nil {
@@ -84,7 +102,18 @@ func TestIntegrationFirstDeployRestoreServingPreservesNullPointers(t *testing.T)
 	if !previousNull {
 		t.Fatal("fixture deployment unexpectedly has a predecessor")
 	}
+	return operationID, deploymentID
+}
 
+func seedRestoreOwnerAndCleanup(
+	t *testing.T,
+	ctx context.Context,
+	service *Service,
+	f *platformFixture,
+	operationID contract.OperationID,
+	deploymentID platform.DeploymentID,
+) {
+	t.Helper()
 	inserted, err := f.store.Platform().Owners().Insert(ctx, entities.OwnerInsert{
 		EnvironmentID: f.env.ID, OperationID: operationID, DeploymentID: deploymentID, Attempt: 1,
 		Phase: string(deploymentOwnerRestored),
@@ -100,25 +129,26 @@ func TestIntegrationFirstDeployRestoreServingPreservesNullPointers(t *testing.T)
 	); err != nil {
 		t.Fatal(err)
 	}
+}
 
-	// This is the production first-deploy restore write. It previously stored
-	// empty strings in the three nullable serving pointers.
-	if err := service.recordDeploymentRestoreServing(ctx, f.env, "", ""); err != nil {
-		t.Fatal(err)
-	}
-
+func assertRestoredEnvironmentNulls(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	service *Service,
+	f *platformFixture,
+) platform.Environment {
+	t.Helper()
 	env, err := service.environment(ctx, f.app.Name, f.env.Name)
 	if err != nil {
 		t.Fatalf("environment read after restore: %v", err)
 	}
 	if env.AppliedRelease != "" || env.ServingRelease != "" || env.ServingDeploymentID != "" {
-		t.Fatalf("restored serving pointers = %q/%q/%q, want empty",
-			env.AppliedRelease, env.ServingRelease, env.ServingDeploymentID)
+		t.Fatalf("restored serving pointers = %q/%q/%q, want empty", env.AppliedRelease, env.ServingRelease, env.ServingDeploymentID)
 	}
 	if env.HealthState != platform.HealthUnknown {
 		t.Fatalf("restored health state = %q, want unknown", env.HealthState)
 	}
-
 	appsInventory, err := service.Inventory(ctx, testActor, platform.InventoryQuery{
 		Collection: "apps", App: f.app.Name, Limit: 1,
 	})
@@ -140,20 +170,28 @@ func TestIntegrationFirstDeployRestoreServingPreservesNullPointers(t *testing.T)
 		t.Fatalf("environment inventory items = %#v", environmentsInventory.Items)
 	}
 	if environments[0].AppliedRelease != "" || environments[0].ServingRelease != "" || environments[0].ServingDeploymentID != "" {
-		t.Fatalf("inventory serving pointers = %q/%q/%q, want empty",
-			environments[0].AppliedRelease, environments[0].ServingRelease, environments[0].ServingDeploymentID)
+		t.Fatalf("inventory serving pointers = %q/%q/%q, want empty", environments[0].AppliedRelease, environments[0].ServingRelease, environments[0].ServingDeploymentID)
 	}
-
 	var appliedNull, servingNull, deploymentNull bool
 	if err := pool.QueryRow(ctx, `SELECT applied_release_id IS NULL,serving_release_id IS NULL,serving_deployment_id IS NULL
         FROM eregion_platform_environments WHERE id=$1`, f.env.ID).Scan(&appliedNull, &servingNull, &deploymentNull); err != nil {
 		t.Fatal(err)
 	}
 	if !appliedNull || !servingNull || !deploymentNull {
-		t.Fatalf("stored serving pointers null = %t/%t/%t, want true/true/true",
-			appliedNull, servingNull, deploymentNull)
+		t.Fatalf("stored serving pointers null = %t/%t/%t, want true/true/true", appliedNull, servingNull, deploymentNull)
 	}
+	return env
+}
 
+func assertRestoredCleanupOwner(
+	t *testing.T,
+	ctx context.Context,
+	service *Service,
+	f *platformFixture,
+	env platform.Environment,
+	deploymentID platform.DeploymentID,
+) {
+	t.Helper()
 	owner, hasOwner, err := f.store.Platform().Owners().Get(ctx, f.env.ID)
 	if err != nil {
 		t.Fatal(err)

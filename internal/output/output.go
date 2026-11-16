@@ -45,22 +45,18 @@ func OptionsFromArgs(args []string, valueFlags ...string) (Mode, error) {
 			parseErr = contract.NewFault(contract.Usage, "invalid --json value", "Use --json, --json=true, or --json=false.")
 		case arg == "--output":
 			outputSet = true
-			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "-") {
+			value, next, ok := outputValue(args, i)
+			if !ok {
 				parseErr = contract.NewFault(contract.InputRequired, "--output requires a value", "Use --output plain or --output json.")
 				continue
 			}
-			i++
-			selected = args[i]
+			i = next
+			selected = value
 		case strings.HasPrefix(arg, "--output="):
 			outputSet = true
 			selected = strings.TrimPrefix(arg, "--output=")
-		default:
-			for _, name := range valueFlags {
-				if arg == "--"+name && i+1 < len(args) {
-					i++ // A value that resembles --json is still a value.
-					break
-				}
-			}
+		case isValueFlag(arg, valueFlags) && i+1 < len(args):
+			i++ // A value that resembles --json is still a value.
 		}
 	}
 	if selected == string(JSON) || jsonEnabled {
@@ -76,6 +72,22 @@ func OptionsFromArgs(args []string, valueFlags ...string) (Mode, error) {
 		return mode, contract.NewFault(contract.InvalidOutputMode, "conflicting output modes", "Use --json or --output json; do not combine --json with --output plain.")
 	}
 	return mode, nil
+}
+
+func outputValue(args []string, index int) (string, int, bool) {
+	if index+1 >= len(args) || strings.HasPrefix(args[index+1], "-") {
+		return "", index, false
+	}
+	return args[index+1], index + 1, true
+}
+
+func isValueFlag(arg string, names []string) bool {
+	for _, name := range names {
+		if arg == "--"+name {
+			return true
+		}
+	}
+	return false
 }
 
 type Writer struct {
@@ -209,24 +221,33 @@ func redactEnvelope(registry *secrets.Registry, envelope contract.Envelope) (con
 		clean.Data = json.RawMessage(data)
 	}
 	if envelope.Error != nil {
-		fault := *envelope.Error
-		fault.Message = registry.Redact(fault.Message)
-		fault.Hint = registry.Redact(fault.Hint)
-		if fault.Details != nil {
-			data, err := redactFaultDetails(registry, fault.Details, fault.FollowDetails)
-			if err != nil {
-				return contract.Envelope{}, err
-			}
-			decoder := json.NewDecoder(strings.NewReader(string(data)))
-			decoder.UseNumber()
-			fault.Details = nil // Decode into a fresh map; never retain/mutate raw keys.
-			if err := decoder.Decode(&fault.Details); err != nil {
-				return contract.Envelope{}, err
-			}
+		fault, err := redactFault(registry, envelope.Error)
+		if err != nil {
+			return contract.Envelope{}, err
 		}
-		clean.Error = &fault
+		clean.Error = fault
 	}
 	return clean, nil
+}
+
+func redactFault(registry *secrets.Registry, fault *contract.FaultError) (*contract.FaultError, error) {
+	clean := *fault
+	clean.Message = registry.Redact(fault.Message)
+	clean.Hint = registry.Redact(fault.Hint)
+	if clean.Details == nil {
+		return &clean, nil
+	}
+	data, err := redactFaultDetails(registry, clean.Details, clean.FollowDetails)
+	if err != nil {
+		return nil, err
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(data)))
+	decoder.UseNumber()
+	clean.Details = nil // Decode into a fresh map; never retain/mutate raw keys.
+	if err := decoder.Decode(&clean.Details); err != nil {
+		return nil, err
+	}
+	return &clean, nil
 }
 
 func writeAll(out io.Writer, data []byte) error {

@@ -161,7 +161,7 @@ func databaseError(dsn string, err error) error {
 	if err == nil {
 		return nil
 	}
-	var fault *contract.Fault
+	var fault *contract.FaultError
 	if errors.As(err, &fault) && fault.Code != contract.Unavailable && fault.Code != contract.Internal {
 		return err
 	}

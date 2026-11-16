@@ -423,7 +423,7 @@ func secretTimestamp(value pgtype.Timestamptz) (time.Time, error) {
 	return value.Time.UTC(), nil
 }
 
-func secretCorrupt(message string) *contract.Fault {
+func secretCorrupt(message string) *contract.FaultError {
 	return contract.NewFault(contract.Unavailable, message, "Restore the secret from backup; do not infer state from a malformed row.")
 }
 
@@ -432,11 +432,11 @@ func isSecretConstraintViolation(err error, constraint string) bool {
 	return errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == constraint
 }
 
-func secretConflict(message string) *contract.Fault {
+func secretConflict(message string) *contract.FaultError {
 	return contract.NewFault(contract.Conflict, message, "Read the current secret metadata; do not continue in the aborted transaction.")
 }
 
-func secretUnavailable(err error) *contract.Fault {
+func secretUnavailable(err error) *contract.FaultError {
 	fault := contract.NewFault(contract.Unavailable, "secret storage is unavailable", "Check PostgreSQL connectivity and schema readiness before retrying.")
 	fault.Cause = err
 	return fault

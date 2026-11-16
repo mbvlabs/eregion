@@ -94,7 +94,7 @@ func LoadKeyRing(path string) (*KeyRing, error) {
 	return ring, nil
 }
 
-func keyFileFault(message string) *contract.Fault {
+func keyFileFault(message string) *contract.FaultError {
 	fault := contract.NewFault(contract.ValidationFailed, message, "Regenerate the master-key file with 32-byte keys and unique IDs.")
 	return fault
 }
@@ -223,7 +223,7 @@ func readProtectedFile(path string, max int64) ([]byte, error) {
 	if err != nil {
 		return nil, contract.NewFault(contract.PreconditionFailed, "protected file could not be opened", "Check ownership and permissions.")
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	opened, err := file.Stat()
 	if err != nil || !os.SameFile(info, opened) || !opened.Mode().IsRegular() || opened.Mode().Perm()&0o077 != 0 {
 		return nil, contract.NewFault(contract.PreconditionFailed, "protected file changed while it was opened", "Replace the file atomically and retry.")

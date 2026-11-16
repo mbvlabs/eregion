@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/api"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/entities"
@@ -20,9 +19,24 @@ func TestIntegrationOperationFollowSessionReadsSnapshotAndEvents(t *testing.T) {
 	pool, _ := testPool(t, true)
 	run := testRuntime(t, pool, 0)
 	ctx := context.Background()
+	op := seedFollowOperation(t, ctx, run, "follow-session", 205)
+	app := api.AppService{Operations: run.Service}
+	assertFollowSnapshotPages(t, ctx, app, op)
+	assertFollowResume(t, ctx, app, op)
+	processed := assertFollowDisconnect(t, ctx, app, op)
+	assertFollowReconnect(t, ctx, app, op, processed)
+	assertFollowCallbackStop(t, ctx, app, op)
+	after, err := app.GetOperation(ctx, testActor, op.ID)
+	if err != nil || after.State != op.State || after.LastSequence != op.LastSequence {
+		t.Fatalf("read changed operation: %+v err=%v", after, err)
+	}
+}
+
+func seedFollowOperation(t *testing.T, ctx context.Context, run *Runtime, key string, logs int) contract.Operation {
+	t.Helper()
 	op, err := run.Service.Submit(ctx, operations.Submission{
 		Kind: operations.TestKind, Target: operations.TestTarget, Actor: testActor,
-		IdempotencyKey: "follow-session", Input: []byte(`{}`),
+		IdempotencyKey: key, Input: []byte(`{}`),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -31,13 +45,8 @@ func TestIntegrationOperationFollowSessionReadsSnapshotAndEvents(t *testing.T) {
 		if _, found, err := tx.Operations().ClaimAttempt(ctx, op.ID, 1); err != nil || !found {
 			return unavailable(err)
 		}
-		for range 205 {
-			if err := appendEvent(
-				ctx,
-				tx,
-				&op,
-				contract.Event{Kind: "log", Message: "follow fixture"},
-			); err != nil {
+		for range logs {
+			if err := appendEvent(ctx, tx, &op, contract.Event{Kind: "log", Message: "follow fixture"}); err != nil {
 				return err
 			}
 		}
@@ -45,17 +54,16 @@ func TestIntegrationOperationFollowSessionReadsSnapshotAndEvents(t *testing.T) {
 		if err := tx.Operations().SetState(ctx, op.ID, op.State, ""); err != nil {
 			return err
 		}
-		return appendEvent(
-			ctx,
-			tx,
-			&op,
-			contract.Event{Kind: "state", State: contract.Succeeded},
-		)
+		return appendEvent(ctx, tx, &op, contract.Event{Kind: "state", State: contract.Succeeded})
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	app := api.AppService{Operations: run.Service}
+	return op
+}
+
+func assertFollowSnapshotPages(t *testing.T, ctx context.Context, app api.AppService, op contract.Operation) {
+	t.Helper()
 	var sequence uint64
 	var snapshots, pages int
 	result, err := app.FollowOperation(
@@ -83,17 +91,14 @@ func TestIntegrationOperationFollowSessionReadsSnapshotAndEvents(t *testing.T) {
 	if err != nil || snapshots == 0 || pages < 2 || sequence != op.LastSequence ||
 		result.Cursor.After != sequence ||
 		result.Operation.State != contract.Succeeded {
-		t.Fatalf(
-			"result=%+v snapshots=%d pages=%d sequence=%d err=%v",
-			result,
-			snapshots,
-			pages,
-			sequence,
-			err,
-		)
+		t.Fatalf("result=%+v snapshots=%d pages=%d sequence=%d err=%v", result, snapshots, pages, sequence, err)
 	}
+}
+
+func assertFollowResume(t *testing.T, ctx context.Context, app api.AppService, op contract.Operation) {
+	t.Helper()
 	var resumed uint64
-	_, err = app.FollowOperation(
+	_, err := app.FollowOperation(
 		ctx,
 		testActor,
 		contract.Cursor{OperationID: op.ID, After: 200},
@@ -112,9 +117,13 @@ func TestIntegrationOperationFollowSessionReadsSnapshotAndEvents(t *testing.T) {
 	if err != nil || resumed != op.LastSequence-200 {
 		t.Fatalf("resume count=%d err=%v", resumed, err)
 	}
+}
+
+func assertFollowDisconnect(t *testing.T, ctx context.Context, app api.AppService, op contract.Operation) uint64 {
+	t.Helper()
 	disconnect := errors.New("simulated disconnect")
 	var processed uint64
-	_, err = app.FollowOperation(
+	_, err := app.FollowOperation(
 		ctx,
 		testActor,
 		contract.Cursor{OperationID: op.ID},
@@ -131,8 +140,13 @@ func TestIntegrationOperationFollowSessionReadsSnapshotAndEvents(t *testing.T) {
 	if !errors.Is(err, disconnect) || processed != 100 {
 		t.Fatalf("disconnect cursor=%d err=%v", processed, err)
 	}
+	return processed
+}
+
+func assertFollowReconnect(t *testing.T, ctx context.Context, app api.AppService, op contract.Operation, processed uint64) {
+	t.Helper()
 	replayed := uint64(0)
-	_, err = app.FollowOperation(
+	_, err := app.FollowOperation(
 		ctx,
 		testActor,
 		contract.Cursor{OperationID: op.ID, After: processed},
@@ -151,8 +165,12 @@ func TestIntegrationOperationFollowSessionReadsSnapshotAndEvents(t *testing.T) {
 	if err != nil || replayed != op.LastSequence-processed {
 		t.Fatalf("reconnect count=%d err=%v", replayed, err)
 	}
+}
+
+func assertFollowCallbackStop(t *testing.T, ctx context.Context, app api.AppService, op contract.Operation) {
+	t.Helper()
 	stop := errors.New("reader stopped")
-	_, err = app.FollowOperation(
+	_, err := app.FollowOperation(
 		ctx,
 		testActor,
 		contract.Cursor{OperationID: op.ID},
@@ -168,24 +186,33 @@ func TestIntegrationOperationFollowSessionReadsSnapshotAndEvents(t *testing.T) {
 	if !errors.Is(err, stop) {
 		t.Fatalf("callback error=%v", err)
 	}
-	after, err := app.GetOperation(ctx, testActor, op.ID)
-	if err != nil || after.State != op.State || after.LastSequence != op.LastSequence {
-		t.Fatalf("read changed operation: %+v err=%v", after, err)
-	}
 }
 
 func TestIntegrationOperationFollowSessionTerminalRaceAndDetach(t *testing.T) {
 	pool, _ := testPool(t, true)
 	run := testRuntime(t, pool, 0)
 	ctx := context.Background()
+	op := submitQueuedOperation(t, ctx, run, "follow-race")
+	app := api.AppService{Operations: run.Service}
+	assertFollowTerminalRace(t, ctx, run, app, &op)
+	assertFollowAuthority(t, ctx, app, op)
+	assertFollowDetach(t, ctx, run, app)
+}
+
+func submitQueuedOperation(t *testing.T, ctx context.Context, run *Runtime, key string) contract.Operation {
+	t.Helper()
 	op, err := run.Service.Submit(ctx, operations.Submission{
 		Kind: operations.TestKind, Target: operations.TestTarget, Actor: testActor,
-		IdempotencyKey: "follow-race", Input: []byte(`{}`),
+		IdempotencyKey: key, Input: []byte(`{}`),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	app := api.AppService{Operations: run.Service}
+	return op
+}
+
+func assertFollowTerminalRace(t *testing.T, ctx context.Context, run *Runtime, app api.AppService, op *contract.Operation) {
+	t.Helper()
 	var snapshots []contract.State
 	var last uint64
 	result, err := app.FollowOperation(
@@ -198,21 +225,7 @@ func TestIntegrationOperationFollowSessionTerminalRaceAndDetach(t *testing.T) {
 			if observation.Snapshot != nil {
 				snapshots = append(snapshots, observation.Snapshot.State)
 				if len(snapshots) == 1 {
-					return run.Service.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
-						if _, found, err := tx.Operations().ClaimAttempt(ctx, op.ID, 1); err != nil || !found {
-							return unavailable(err)
-						}
-						op.State, op.Attempt = contract.Succeeded, 1
-						if err := tx.Operations().SetState(ctx, op.ID, op.State, ""); err != nil {
-							return err
-						}
-						return appendEvent(
-							ctx,
-							tx,
-							&op,
-							contract.Event{Kind: "state", State: contract.Succeeded},
-						)
-					})
+					return completeFollowOperation(ctx, run, op)
 				}
 			}
 			for _, event := range observation.Events {
@@ -231,27 +244,30 @@ func TestIntegrationOperationFollowSessionTerminalRaceAndDetach(t *testing.T) {
 		result.Cursor.After != last {
 		t.Fatalf("snapshots=%v result=%+v last=%d err=%v", snapshots, result, last, err)
 	}
+}
+
+func completeFollowOperation(ctx context.Context, run *Runtime, op *contract.Operation) error {
+	return run.Service.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		if _, found, err := tx.Operations().ClaimAttempt(ctx, op.ID, 1); err != nil || !found {
+			return unavailable(err)
+		}
+		op.State, op.Attempt = contract.Succeeded, 1
+		if err := tx.Operations().SetState(ctx, op.ID, op.State, ""); err != nil {
+			return err
+		}
+		return appendEvent(ctx, tx, op, contract.Event{Kind: "state", State: contract.Succeeded})
+	})
+}
+
+func assertFollowAuthority(t *testing.T, ctx context.Context, app api.AppService, op contract.Operation) {
+	t.Helper()
 	other := contract.Actor{Kind: "ci", Subject: "other"}
-	_, err = app.FollowOperation(
-		ctx,
-		other,
-		contract.Cursor{OperationID: op.ID},
-		200,
-		time.Millisecond,
-		nil,
-	)
+	_, err := app.FollowOperation(ctx, other, contract.Cursor{OperationID: op.ID}, 200, time.Millisecond, nil)
 	if err == nil {
 		t.Fatal("another actor could follow the operation")
 	}
 	operator := operations.OperatorAuthority(contract.Actor{Kind: "operator", Subject: "operator"})
-	if _, err := app.FollowOperation(
-		ctx,
-		operator,
-		contract.Cursor{OperationID: op.ID},
-		200,
-		time.Millisecond,
-		nil,
-	); err != nil {
+	if _, err := app.FollowOperation(ctx, operator, contract.Cursor{OperationID: op.ID}, 200, time.Millisecond, nil); err != nil {
 		t.Fatalf("operator authority: %v", err)
 	}
 	if _, err := app.FollowOperation(
@@ -264,15 +280,13 @@ func TestIntegrationOperationFollowSessionTerminalRaceAndDetach(t *testing.T) {
 	); err == nil {
 		t.Fatal("ahead cursor was accepted")
 	}
-	pending, err := run.Service.Submit(ctx, operations.Submission{
-		Kind: operations.TestKind, Target: operations.TestTarget, Actor: testActor,
-		IdempotencyKey: "follow-detach", Input: []byte(`{}`),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+}
+
+func assertFollowDetach(t *testing.T, ctx context.Context, run *Runtime, app api.AppService) {
+	t.Helper()
+	pending := submitQueuedOperation(t, ctx, run, "follow-detach")
 	readCtx, cancel := context.WithCancel(ctx)
-	_, err = app.FollowOperation(
+	_, err := app.FollowOperation(
 		readCtx,
 		testActor,
 		contract.Cursor{OperationID: pending.ID},
@@ -311,7 +325,7 @@ func TestIntegrationOperationFollowSessionReadBudgetAndMissingTail(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rollback(tx)
+	defer rollback(ctx, tx)
 	if _, err := tx.Exec(
 		ctx,
 		"LOCK TABLE eregion_operations IN ACCESS EXCLUSIVE MODE",
@@ -437,35 +451,11 @@ func (f *followDelivery) FollowSession(
 		serviceLimit,
 		interval,
 		func(o api.OperationFollowObservation) error {
-			if f.duplicate && f.last != nil && len(o.Events) != 0 {
-				replayed := *f.last
-				if err := emit(
-					viewer.SessionObservation{
-						Events: []contract.Event{replayed},
-						Cursor: contract.Cursor{
-							OperationID: cursor.OperationID,
-							After:       replayed.Sequence,
-						},
-					},
-				); err != nil {
-					return err
-				}
+			if err := f.emitDuplicate(cursor, len(o.Events) != 0, emit); err != nil {
+				return err
 			}
-			events := append([]contract.Event(nil), o.Events...)
-			if f.mixed && f.last != nil && len(events) != 0 {
-				events = append([]contract.Event{*f.last}, events...)
-				f.mixedSeen = true
-				if f.malformed {
-					events[len(events)-1].Sequence++
-					o.Cursor.After = events[len(events)-1].Sequence
-				}
-			}
-			for i := range events {
-				if f.contradict && events[i].Kind == "state" &&
-					events[i].State == contract.Succeeded {
-					events[i].State, events[i].ErrorCode = contract.Failed, contract.PreconditionFailed
-				}
-			}
+			events := f.prepareEvents(o.Events, &o.Cursor)
+			f.contradictEvents(events)
 			if len(events) > 0 {
 				last := events[len(events)-1]
 				f.last = &last
@@ -475,65 +465,87 @@ func (f *followDelivery) FollowSession(
 			); err != nil {
 				return err
 			}
-			if f.interrupt && !f.interrupted && len(events) != 0 {
-				f.interrupted = true
-				return contract.NewFault(
-					contract.Unavailable,
-					"controlled stream interruption",
-					"Reconnect.",
-				)
-			}
-			return nil
+			return f.interruptFault(events)
 		},
 	)
 	return viewer.SessionResult{Operation: result.Operation, Cursor: result.Cursor}, err
+}
+
+func (f *followDelivery) emitDuplicate(
+	cursor contract.Cursor,
+	hasEvents bool,
+	emit func(viewer.SessionObservation) error,
+) error {
+	if !f.duplicate || f.last == nil || !hasEvents {
+		return nil
+	}
+	replayed := *f.last
+	return emit(viewer.SessionObservation{
+		Events: []contract.Event{replayed},
+		Cursor: contract.Cursor{
+			OperationID: cursor.OperationID,
+			After:       replayed.Sequence,
+		},
+	})
+}
+
+func (f *followDelivery) prepareEvents(events []contract.Event, cursor *contract.Cursor) []contract.Event {
+	prepared := append([]contract.Event(nil), events...)
+	if !f.mixed || f.last == nil || len(prepared) == 0 {
+		return prepared
+	}
+	prepared = append([]contract.Event{*f.last}, prepared...)
+	f.mixedSeen = true
+	if f.malformed {
+		prepared[len(prepared)-1].Sequence++
+		cursor.After = prepared[len(prepared)-1].Sequence
+	}
+	return prepared
+}
+
+func (f *followDelivery) contradictEvents(events []contract.Event) {
+	if !f.contradict {
+		return
+	}
+	for i := range events {
+		if events[i].Kind == "state" && events[i].State == contract.Succeeded {
+			events[i].State, events[i].ErrorCode = contract.Failed, contract.PreconditionFailed
+		}
+	}
+}
+
+func (f *followDelivery) interruptFault(events []contract.Event) error {
+	if !f.interrupt || f.interrupted || len(events) == 0 {
+		return nil
+	}
+	f.interrupted = true
+	return contract.NewFault(
+		contract.Unavailable,
+		"controlled stream interruption",
+		"Reconnect.",
+	)
 }
 
 func TestIntegrationOperationFollowSessionConsumerReplayAndContradiction(t *testing.T) {
 	pool, _ := testPool(t, true)
 	run := testRuntime(t, pool, 0)
 	ctx := context.Background()
-	op, err := run.Service.Submit(ctx, operations.Submission{
-		Kind: operations.TestKind, Target: operations.TestTarget, Actor: testActor,
-		IdempotencyKey: "follow-consumer", Input: []byte(`{}`),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = run.Service.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
-		if _, found, err := tx.Operations().ClaimAttempt(ctx, op.ID, 1); err != nil || !found {
-			return unavailable(err)
-		}
-		for range 4 {
-			if err := appendEvent(
-				ctx,
-				tx,
-				&op,
-				contract.Event{Kind: "log", Message: "fixture"},
-			); err != nil {
-				return err
-			}
-		}
-		op.State, op.Attempt = contract.Succeeded, 1
-		if err := tx.Operations().SetState(ctx, op.ID, op.State, ""); err != nil {
-			return err
-		}
-		return appendEvent(
-			ctx,
-			tx,
-			&op,
-			contract.Event{Kind: "state", State: contract.Succeeded},
-		)
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	op := seedFollowOperation(t, ctx, run, "follow-consumer", 4)
 	client := &followDelivery{
 		app:       api.AppService{Operations: run.Service},
 		actor:     testActor,
 		duplicate: true,
 		interrupt: true,
 	}
+	assertFollowDuplicateReplay(t, ctx, client, op)
+	assertFollowMixedReplay(t, ctx, client, op)
+	assertFollowMalformedMixed(t, ctx, client, op)
+	assertFollowContradiction(t, ctx, client, op)
+	assertFollowFailedRetrieval(t, ctx, run, client)
+}
+
+func assertFollowDuplicateReplay(t *testing.T, ctx context.Context, client *followDelivery, op contract.Operation) {
+	t.Helper()
 	var last uint64
 	summary, err := viewer.Follow(
 		ctx,
@@ -553,9 +565,13 @@ func TestIntegrationOperationFollowSessionConsumerReplayAndContradiction(t *test
 	if err != nil || last != op.LastSequence || summary.State != contract.Succeeded {
 		t.Fatalf("summary=%+v last=%d err=%v", summary, last, err)
 	}
+}
+
+func assertFollowMixedReplay(t *testing.T, ctx context.Context, client *followDelivery, op contract.Operation) {
+	t.Helper()
 	mixedClient := &followDelivery{app: client.app, actor: testActor, mixed: true}
-	last = 0
-	summary, err = viewer.Follow(
+	var last uint64
+	summary, err := viewer.Follow(
 		ctx,
 		mixedClient,
 		op.ID,
@@ -563,11 +579,7 @@ func TestIntegrationOperationFollowSessionConsumerReplayAndContradiction(t *test
 		func(o viewer.Observation) error {
 			for _, event := range o.Events {
 				if event.Sequence != last+1 {
-					t.Fatalf(
-						"mixed batch replayed or missed event after %d: %d",
-						last,
-						event.Sequence,
-					)
+					t.Fatalf("mixed batch replayed or missed event after %d: %d", last, event.Sequence)
 				}
 				last = event.Sequence
 			}
@@ -575,17 +587,15 @@ func TestIntegrationOperationFollowSessionConsumerReplayAndContradiction(t *test
 		},
 	)
 	if err != nil || !mixedClient.mixedSeen || last != op.LastSequence || summary.Cursor != last {
-		t.Fatalf(
-			"mixed summary=%+v last=%d mixed=%t err=%v",
-			summary,
-			last,
-			mixedClient.mixedSeen,
-			err,
-		)
+		t.Fatalf("mixed summary=%+v last=%d mixed=%t err=%v", summary, last, mixedClient.mixedSeen, err)
 	}
+}
+
+func assertFollowMalformedMixed(t *testing.T, ctx context.Context, client *followDelivery, op contract.Operation) {
+	t.Helper()
 	badClient := &followDelivery{app: client.app, actor: testActor, mixed: true, malformed: true}
-	last = 0
-	summary, err = viewer.Follow(
+	var last uint64
+	summary, err := viewer.Follow(
 		ctx,
 		badClient,
 		op.ID,
@@ -601,16 +611,14 @@ func TestIntegrationOperationFollowSessionConsumerReplayAndContradiction(t *test
 		!badClient.mixedSeen ||
 		last != 2 ||
 		summary.Cursor != 2 {
-		t.Fatalf(
-			"malformed mixed batch advanced: summary=%+v last=%d mixed=%t err=%v",
-			summary,
-			last,
-			badClient.mixedSeen,
-			err,
-		)
+		t.Fatalf("malformed mixed batch advanced: summary=%+v last=%d mixed=%t err=%v", summary, last, badClient.mixedSeen, err)
 	}
+}
+
+func assertFollowContradiction(t *testing.T, ctx context.Context, client *followDelivery, op contract.Operation) {
+	t.Helper()
 	client.duplicate, client.contradict, client.interrupt = false, true, false
-	_, err = viewer.Follow(
+	_, err := viewer.Follow(
 		ctx,
 		client,
 		op.ID,
@@ -620,14 +628,12 @@ func TestIntegrationOperationFollowSessionConsumerReplayAndContradiction(t *test
 	if err == nil || contract.Classify(err).Code != contract.ValidationFailed {
 		t.Fatalf("contradictory terminal event accepted: %v", err)
 	}
-	failed, err := run.Service.Submit(ctx, operations.Submission{
-		Kind: operations.TestKind, Target: operations.TestTarget, Actor: testActor,
-		IdempotencyKey: "follow-failed", Input: []byte(`{}`),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = run.Service.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+}
+
+func assertFollowFailedRetrieval(t *testing.T, ctx context.Context, run *Runtime, client *followDelivery) {
+	t.Helper()
+	failed := submitQueuedOperation(t, ctx, run, "follow-failed")
+	err := run.Service.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
 		failed.State, failed.Attempt, failed.ErrorCode = contract.Failed, 1, contract.PreconditionFailed
 		if _, found, err := tx.Operations().ClaimAttempt(ctx, failed.ID, 1); err != nil || !found {
 			return unavailable(err)
@@ -803,7 +809,6 @@ func (f *wireFollowDelivery) sessionResult(
 // and evidence projections; messages and timing are never rewritten.
 func wireFollowFixture(
 	t *testing.T,
-	pool *pgxpool.Pool,
 	run *Runtime,
 	state contract.State,
 	code contract.Code,
@@ -848,53 +853,7 @@ func wireFollowFixture(
 	if err := result.Validate(); err != nil {
 		t.Fatalf("fixture result: %v", err)
 	}
-	op.State, op.Attempt, op.ErrorCode = state, 1, code
-	err = run.Service.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
-		if _, found, err := tx.Operations().ClaimAttempt(ctx, op.ID, 1); err != nil || !found {
-			return unavailable(err)
-		}
-		if err := tx.Operations().SetState(ctx, op.ID, state, code); err != nil {
-			return err
-		}
-		switch evidenceMode {
-		case "present":
-			evidence := contract.Event{Kind: "step", Stage: "deploy", Message: "candidate failed",
-				NodeEvidence: &contract.NodeExecutionEvidence{
-					Attempt: 1, Outcome: "failed", Stage: "candidate", OutputAvailability: "available",
-					RedactionContext: "not_required", Stdout: "bounded stdout",
-					Stderr: "bounded stderr\nsecond line",
-				}}
-			if err := appendEvent(ctx, tx, &op, evidence); err != nil {
-				t.Fatal(err)
-			}
-		case "unavailable":
-			loss := contract.Event{
-				Kind:    "step",
-				Stage:   "evidence",
-				Message: "Node execution evidence could not be retained.",
-				EvidenceLoss: &contract.NodeEvidenceLoss{
-					ExecutionID: string(op.ID) + ":1:capture-v1",
-					Attempt:     1,
-				},
-			}
-			if err := appendEvent(ctx, tx, &op, loss); err != nil {
-				t.Fatal(err)
-			}
-		}
-		if err := appendEvent(
-			ctx,
-			tx,
-			&op,
-			contract.Event{Kind: "state", State: state, ErrorCode: code, Result: result},
-		); err != nil {
-			return err
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	stored, err := run.Service.Get(ctx, testActor, op.ID)
+	stored, err := storeWireFollowFixture(t, ctx, run, op, state, code, result, evidenceMode)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -904,11 +863,76 @@ func wireFollowFixture(
 	return stored
 }
 
+func storeWireFollowFixture(
+	t *testing.T,
+	ctx context.Context,
+	run *Runtime,
+	op contract.Operation,
+	state contract.State,
+	code contract.Code,
+	result *contract.ActionResult,
+	evidenceMode string,
+) (contract.Operation, error) {
+	t.Helper()
+	op.State, op.Attempt, op.ErrorCode = state, 1, code
+	err := run.Service.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		if _, found, err := tx.Operations().ClaimAttempt(ctx, op.ID, 1); err != nil || !found {
+			return unavailable(err)
+		}
+		if err := tx.Operations().SetState(ctx, op.ID, state, code); err != nil {
+			return err
+		}
+		if err := appendWireEvidence(t, ctx, tx, &op, evidenceMode); err != nil {
+			return err
+		}
+		return appendEvent(
+			ctx,
+			tx,
+			&op,
+			contract.Event{Kind: "state", State: state, ErrorCode: code, Result: result},
+		)
+	})
+	if err != nil {
+		return contract.Operation{}, err
+	}
+	return run.Service.Get(ctx, testActor, op.ID)
+}
+
+func appendWireEvidence(t *testing.T, ctx context.Context, tx *entities.StoreTx, op *contract.Operation, evidenceMode string) error {
+	t.Helper()
+	switch evidenceMode {
+	case "present":
+		evidence := contract.Event{Kind: "step", Stage: "deploy", Message: "candidate failed",
+			NodeEvidence: &contract.NodeExecutionEvidence{
+				Attempt: 1, Outcome: "failed", Stage: "candidate", OutputAvailability: "available",
+				RedactionContext: "not_required", Stdout: "bounded stdout",
+				Stderr: "bounded stderr\nsecond line",
+			}}
+		if err := appendEvent(ctx, tx, op, evidence); err != nil {
+			t.Fatal(err)
+		}
+	case "unavailable":
+		loss := contract.Event{
+			Kind:    "step",
+			Stage:   "evidence",
+			Message: "Node execution evidence could not be retained.",
+			EvidenceLoss: &contract.NodeEvidenceLoss{
+				ExecutionID: string(op.ID) + ":1:capture-v1",
+				Attempt:     1,
+			},
+		}
+		if err := appendEvent(ctx, tx, op, loss); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return nil
+}
+
 func TestIntegrationOperationFollowWireEvidence(t *testing.T) {
 	pool, _ := testPool(t, true)
 	run := testRuntime(t, pool, 0)
 	ctx := context.Background()
-	succeeded, succeededDelivery := runWireFollowCases(t, ctx, pool, run)
+	succeeded, succeededDelivery := runWireFollowCases(t, ctx, run)
 	if succeeded.ID == "" {
 		t.Fatal("succeeded wire fixture missing")
 	}
@@ -935,7 +959,6 @@ type wireFollowCase struct {
 func runWireFollowCases(
 	t *testing.T,
 	ctx context.Context,
-	pool *pgxpool.Pool,
 	run *Runtime,
 ) (contract.Operation, *wireFollowDelivery) {
 	t.Helper()
@@ -947,7 +970,7 @@ func runWireFollowCases(
 	var succeeded contract.Operation
 	var succeededDelivery *wireFollowDelivery
 	for _, tc := range cases {
-		op, delivery := runWireFollowCase(t, ctx, pool, run, tc)
+		op, delivery := runWireFollowCase(t, ctx, run, tc)
 		if tc.state == contract.Succeeded {
 			succeeded, succeededDelivery = op, delivery
 		}
@@ -958,12 +981,11 @@ func runWireFollowCases(
 func runWireFollowCase(
 	t *testing.T,
 	ctx context.Context,
-	pool *pgxpool.Pool,
 	run *Runtime,
 	tc wireFollowCase,
 ) (contract.Operation, *wireFollowDelivery) {
 	t.Helper()
-	op := wireFollowFixture(t, pool, run, tc.state, tc.code, tc.evidence) //nolint:contextcheck // fixture rollback owns a bounded detached cleanup context
+	op := wireFollowFixture(t, run, tc.state, tc.code, tc.evidence) //nolint:contextcheck // fixture rollback owns a bounded detached cleanup context
 	delivery := &wireFollowDelivery{
 		app:   api.AppService{Operations: run.Service},
 		actor: testActor,

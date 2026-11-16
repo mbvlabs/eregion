@@ -226,7 +226,7 @@ func bootstrapReporter(a *app, cmd *cobra.Command) engine.Reporter {
 		if strings.TrimSpace(message) == "" {
 			message = event.Step
 		}
-		fmt.Fprintf(cmd.ErrOrStderr(), "bootstrap %s: %s\n", event.Step, message)
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "bootstrap %s: %s\n", event.Step, message)
 	}
 }
 
@@ -271,7 +271,7 @@ func (a *app) bootstrapRemote(cmd *cobra.Command, _ []string) (result, error) {
 		return result{}, remoteErr
 	}
 	if err := session.Remove(cmd.Context()); err != nil {
-		fmt.Fprintf(cmd.ErrOrStderr(), "bootstrap remote: uploaded bundle cleanup failed: %v\n", err)
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "bootstrap remote: uploaded bundle cleanup failed: %v\n", err)
 	}
 	return hostResult(report), nil
 }
@@ -331,11 +331,11 @@ func remoteBundleDir(cfg host.Config, address string) (string, error) {
 }
 
 func fileDigest(path string) (string, error) {
-	file, err := os.Open(path) //nolint:gosec // G304: operator-provided bootstrap input.
+	file, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	hash := sha256.New()
 	if _, err := io.Copy(hash, file); err != nil {
 		return "", err
@@ -401,7 +401,7 @@ func remotePlan(ctx context.Context, session *remoteSession) (host.Plan, error) 
 	if err != nil {
 		return host.Plan{}, err
 	}
-	return decodeRemoteEnvelope[host.Plan](raw, "plan")
+	return decodeRemoteEnvelope[host.Plan](raw)
 }
 
 func remoteApply(ctx context.Context, session *remoteSession, token string, stderr io.Writer) (host.ApplyReport, error) {
@@ -409,7 +409,7 @@ func remoteApply(ctx context.Context, session *remoteSession, token string, stde
 	if err != nil {
 		return host.ApplyReport{}, err
 	}
-	return decodeRemoteEnvelope[host.ApplyReport](raw, "apply")
+	return decodeRemoteEnvelope[host.ApplyReport](raw)
 }
 
 func remoteBundle(cfg host.Config, dir string) ([]host.RemoteFile, []string, error) {
@@ -418,7 +418,7 @@ func remoteBundle(cfg host.Config, dir string) ([]host.RemoteFile, []string, err
 	if err != nil {
 		return nil, nil, contract.NewFault(contract.ValidationFailed, "cannot locate the node binary", "Supply --binary explicitly.")
 	}
-	raw, err := os.ReadFile(binary) //nolint:gosec // G304: the operator-selected node binary.
+	raw, err := os.ReadFile(binary)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -435,7 +435,7 @@ func remoteBundle(cfg host.Config, dir string) ([]host.RemoteFile, []string, err
 		args = append(args, "--database-url-file", filepath.Join(dir, "database-url"))
 	}
 	uploadPair := func(name, source string) error {
-		raw, err := os.ReadFile(source) //nolint:gosec // G304: operator-provided bootstrap input.
+		raw, err := os.ReadFile(source)
 		if err != nil {
 			return err
 		}
@@ -465,7 +465,8 @@ func remoteBundle(cfg host.Config, dir string) ([]host.RemoteFile, []string, err
 }
 
 func remoteCommand(dir, action string, args []string, extra []string) string {
-	parts := []string{shellPath(filepath.Join(dir, "eregion")), "node", "bootstrap", action}
+	parts := make([]string, 0, 4+len(args)+1+len(extra))
+	parts = append(parts, shellPath(filepath.Join(dir, "eregion")), "node", "bootstrap", action)
 	for _, value := range args {
 		parts = append(parts, shellPath(value))
 	}
@@ -481,7 +482,7 @@ func shellPath(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", `'\''`) + "'"
 }
 
-func decodeRemoteEnvelope[T any](raw []byte, action string) (T, error) {
+func decodeRemoteEnvelope[T any](raw []byte) (T, error) {
 	var zero T
 	var envelope struct {
 		OK    bool            `json:"ok"`
@@ -526,12 +527,12 @@ func (a *app) bootstrapRemoteConfirm(cmd *cobra.Command, id string) (result, err
 	if err != nil {
 		return result{}, err
 	}
-	report, err := decodeRemoteEnvelope[host.ConfirmReport](raw, "confirm")
+	report, err := decodeRemoteEnvelope[host.ConfirmReport](raw)
 	if err != nil {
 		return result{}, err
 	}
 	if err := session.Remove(cmd.Context()); err != nil {
-		fmt.Fprintf(cmd.ErrOrStderr(), "bootstrap confirm: uploaded bundle cleanup failed: %v\n", err)
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "bootstrap confirm: uploaded bundle cleanup failed: %v\n", err)
 	}
 	return hostResult(report), nil
 }

@@ -130,47 +130,60 @@ func candidateResultEvidence(ctx context.Context, tx *entities.StoreTx, result *
 	if err != nil {
 		return err
 	}
-	type captureState struct {
-		captured bool
-		summary  string
-	}
-	captures := make(map[string]*captureState)
+	captures := make(map[string]*candidateCaptureState)
 	for _, row := range rows {
 		// Step identifies the capture claim. Older events without a step are
 		// grouped by deployment and remain generically readable.
 		key := row.DeploymentID + "\x00" + row.Step
 		capture := captures[key]
 		if capture == nil {
-			capture = &captureState{}
+			capture = &candidateCaptureState{}
 			captures[key] = capture
 		}
 		if row.Status == "captured" || row.Status == "observed" {
 			capture.captured = true
 		}
 		if row.Status == "captured" && result.Excerpt == "" && row.Message != "" {
-			if row.RedactionContext != "original" && row.RedactionContext != "not_required" {
-				result.ExcerptOmitted = "original redaction context unavailable"
-				continue
-			}
-			// Retained candidate log lines have already passed the original
-			// action's pinned redaction boundary and existing event limits.
-			message := row.Message
-			const max = 4096 // Existing worker event text bound.
-			if len(message) > max {
-				message = message[:max]
-				for !utf8.ValidString(message) {
-					message = message[:len(message)-1]
-				}
-			}
-			result.Excerpt = message
-			result.ExcerptOmitted = ""
-			cursor := contract.Cursor{OperationID: result.OperationID, After: row.Sequence - 1}
-			result.ExcerptCursor = &cursor
+			applyCandidateExcerpt(result, row)
 		}
 		if strings.HasPrefix(row.Message, "Candidate diagnostic capture: ") {
 			capture.summary = row.Status
 		}
 	}
+	result.Evidence = candidateEvidence(captures)
+	if len(captures) != 0 {
+		result.EvidenceSources = append(result.EvidenceSources, contract.EvidenceSource{Kind: "candidate", Status: result.Evidence})
+	}
+	return nil
+}
+
+type candidateCaptureState struct {
+	captured bool
+	summary  string
+}
+
+func applyCandidateExcerpt(result *contract.ActionResult, row entities.CandidateDiagnostic) {
+	if row.RedactionContext != "original" && row.RedactionContext != "not_required" {
+		result.ExcerptOmitted = "original redaction context unavailable"
+		return
+	}
+	// Retained candidate log lines have already passed the original action's
+	// pinned redaction boundary and existing event limits.
+	message := row.Message
+	const max = 4096 // Existing worker event text bound.
+	if len(message) > max {
+		message = message[:max]
+		for !utf8.ValidString(message) {
+			message = message[:len(message)-1]
+		}
+	}
+	result.Excerpt = message
+	result.ExcerptOmitted = ""
+	cursor := contract.Cursor{OperationID: result.OperationID, After: row.Sequence - 1}
+	result.ExcerptCursor = &cursor
+}
+
+func candidateEvidence(captures map[string]*candidateCaptureState) string {
 	interrupted, truncated, partial, unavailable, complete := false, false, false, false, false
 	for _, capture := range captures {
 		switch {
@@ -188,22 +201,18 @@ func candidateResultEvidence(ctx context.Context, tx *entities.StoreTx, result *
 	}
 	switch {
 	case len(captures) == 0:
-		result.Evidence = "not_collected"
+		return "not_collected"
 	case interrupted:
-		result.Evidence = "interrupted"
+		return "interrupted"
 	case truncated:
-		result.Evidence = "truncated"
+		return "truncated"
 	case partial || (unavailable && complete):
-		result.Evidence = "partial"
+		return "partial"
 	case unavailable:
-		result.Evidence = "unavailable"
+		return "unavailable"
 	default:
-		result.Evidence = "full"
+		return "full"
 	}
-	if len(captures) != 0 {
-		result.EvidenceSources = append(result.EvidenceSources, contract.EvidenceSource{Kind: "candidate", Status: result.Evidence})
-	}
-	return nil
 }
 
 func (s *Service) resultText(text string) string {
@@ -293,7 +302,7 @@ func trustedIntegrationFields(op contract.Operation, normalized platform.Normali
 	out := map[string]bool{}
 	registered := normalized.Executor()
 	typ := reflect.TypeOf(executor)
-	if normalized.Kind != op.Kind || typ == nil || typ.Kind() != reflect.Ptr ||
+	if normalized.Kind != op.Kind || typ == nil || typ.Kind() != reflect.Pointer ||
 		typ.Elem().PkgPath() != "github.com/mbvlabs/eregion/internal/integrations" ||
 		typ.Elem().Name() != "actionExecutor" || reflect.TypeOf(registered) != typ ||
 		reflect.ValueOf(executor).Pointer() != reflect.ValueOf(registered).Pointer() {

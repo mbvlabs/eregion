@@ -44,7 +44,7 @@ func ParseDatabaseConfig(dsn string) (*pgxpool.Config, error) {
 	}
 	q := u.Query()
 	mode := q.Get("sslmode")
-	if len(q["sslmode"]) != 1 || (mode != "verify-full" && !(PlaintextDatabaseHostAllowed(u.Hostname()) && mode == "disable")) || q.Has("host") || q.Has("port") || q.Has("service") {
+	if len(q["sslmode"]) != 1 || (mode != "verify-full" && (!PlaintextDatabaseHostAllowed(u.Hostname()) || mode != "disable")) || q.Has("host") || q.Has("port") || q.Has("service") {
 		return nil, contract.NewFault(contract.ValidationFailed, "database TLS policy is unsafe or ambiguous", "Use sslmode=verify-full; sslmode=disable is allowed only for loopback and tailnet hosts. Host overrides are not supported.")
 	}
 	config, err := pgxpool.ParseConfig(dsn)
@@ -82,10 +82,6 @@ func Open(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 		return nil, contract.NewFault(contract.ValidationFailed, "PostgreSQL 17 or newer is required", "Use a supported external PostgreSQL server.")
 	}
 	return pool, nil
-}
-
-func migrator(pool *pgxpool.Pool) (*rivermigrate.Migrator[pgx.Tx], error) {
-	return rivermigrate.New(riverpgxv5.New(pool), &rivermigrate.Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 }
 
 func schemaMigrator(pool *pgxpool.Pool, schema string) (*rivermigrate.Migrator[pgx.Tx], error) {
@@ -126,7 +122,7 @@ func (c migrationConnector) Connect(ctx context.Context) (driver.Conn, error) {
 	}
 	pgxConn, ok := conn.(*stdlib.Conn)
 	if !ok {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("unexpected PostgreSQL connector")
 	}
 	facts, err := entities.NewSessionStore(pgxConn.Conn()).DatabaseIdentity(ctx)
@@ -138,7 +134,7 @@ func (c migrationConnector) Connect(ctx context.Context) (driver.Conn, error) {
 		}
 	}
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, err
 	}
 	return conn, nil
@@ -172,7 +168,8 @@ func inspectApplicationMigrations(ctx context.Context, pool *pgxpool.Pool) (plan
 	ctx, end := beginReadyStage(ctx, "application_versions")
 	defer func() { end(resultErr) }()
 	db := stdlib.OpenDBFromPool(pool)
-	defer db.Close() // releases wrapper connections, not the underlying pgx pool
+	// Closing the wrapper releases its connections, not the underlying pgx pool.
+	defer func() { _ = db.Close() }()
 	provider, err := gooseProvider(db)
 	if err != nil {
 		return plan, identity, err
@@ -199,7 +196,7 @@ func inspectApplicationMigrations(ctx context.Context, pool *pgxpool.Pool) (plan
 	if err != nil {
 		return plan, identity, unavailable(err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	snapshot := entities.NewMigrationSnapshot(tx)
 	// Match Goose's PostgreSQL TableExists predicate, including its restriction
 	// to tables in current_schema. Neither ledger is read before presence is known.
@@ -257,7 +254,7 @@ func readRiverMigrations(ctx context.Context, pool *pgxpool.Pool, m *rivermigrat
 	if err != nil {
 		return unavailable(err)
 	}
-	defer rollback(tx)
+	defer rollback(ctx, tx)
 	facts, err := entities.NewSessionStore(conn.Conn()).DatabaseIdentity(ctx)
 	if err != nil {
 		return unavailable(err)
@@ -305,7 +302,7 @@ func acquireMigrationLock(ctx context.Context, pool *pgxpool.Pool) (*pgxpool.Con
 		locked, err := entities.NewSessionStore(conn.Conn()).TrySessionLock(ctx, migrationLock)
 		if err != nil {
 			// A lost response can leave the session locked; discard it.
-			closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			_ = conn.Conn().Close(closeCtx)
 			cancel()
 			conn.Release()
@@ -345,44 +342,19 @@ func migrateWithFS(ctx context.Context, pool *pgxpool.Pool, migrations fs.FS, af
 		return MigrationPlan{}, unavailable(err)
 	}
 	defer conn.Release()
-	defer func() {
-		unlockCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if _, err := entities.NewSessionStore(conn.Conn()).UnlockSession(unlockCtx, migrationLock); err != nil {
-			_ = conn.Conn().Close(unlockCtx)
-		}
-	}()
+	defer releaseMigrationLock(ctx, conn)
 	plan, identity, err := planMigrations(ctx, pool)
 	if err != nil {
 		return plan, err
 	}
-	facts, err := entities.NewSessionStore(conn.Conn()).DatabaseIdentity(ctx)
-	if err != nil {
-		return plan, unavailable(err)
-	}
-	lockIdentity, err := checkedIdentity(facts.SchemaCount, facts.Schema, facts.Role)
-	if err != nil {
+	if err := verifyMigrationConnection(ctx, conn, identity); err != nil {
 		return plan, err
 	}
-	if lockIdentity != identity {
-		return plan, contract.NewFault(contract.PreconditionFailed, "inconsistent database pool schema or role", "Use the same single-schema search_path and role on every pool connection.")
-	}
-	db := sql.OpenDB(migrationConnector{Connector: stdlib.GetPoolConnector(pool), want: identity})
-	defer db.Close()
-	provider, err := goose.NewProvider(goose.DialectPostgres, db, migrations)
-	if err != nil {
-		return plan, err
-	}
-	if _, err := provider.Up(ctx); err != nil {
-		var fault *contract.Fault
+	if err := runGooseMigrations(ctx, pool, migrations, identity); err != nil {
+		var fault *contract.FaultError
 		if errors.As(err, &fault) {
 			return plan, fault
 		}
-		return plan, unavailable(err)
-	}
-	// Release the checked Goose session before River acquires the second pool
-	// connection. Closing the wrapper never closes the pgx pool.
-	if err := db.Close(); err != nil {
 		return plan, unavailable(err)
 	}
 	plan.Current = plan.Required
@@ -391,56 +363,101 @@ func migrateWithFS(ctx context.Context, pool *pgxpool.Pool, migrations fs.FS, af
 			return plan, err
 		}
 	}
-	m, err := schemaMigrator(pool, identity.schema)
-	if err != nil {
+	if err := runRiverMigrations(ctx, pool, identity); err != nil {
 		return plan, err
-	}
-	riverConn, err := pool.Acquire(ctx)
-	if err != nil {
-		return plan, unavailable(err)
-	}
-	defer riverConn.Release()
-	riverFacts, err := entities.NewSessionStore(riverConn.Conn()).DatabaseIdentity(ctx)
-	if err != nil {
-		return plan, unavailable(err)
-	}
-	riverIdentity, err := checkedIdentity(riverFacts.SchemaCount, riverFacts.Schema, riverFacts.Role)
-	if err != nil {
-		return plan, err
-	}
-	if riverIdentity != identity {
-		return plan, contract.NewFault(contract.PreconditionFailed, "inconsistent database pool schema or role", "Use the same single-schema search_path and role on every pool connection.")
-	}
-	// River versions require separate commits (some use new enum values).
-	// One version per outer transaction pins all work to the checked session.
-	for {
-		tx, err := riverConn.Begin(ctx)
-		if err != nil {
-			return plan, unavailable(err)
-		}
-		result, err := m.MigrateTx(ctx, tx, rivermigrate.DirectionUp, &rivermigrate.MigrateOpts{MaxSteps: 1})
-		if err != nil {
-			rollback(tx)
-			return plan, unavailable(err)
-		}
-		if err := tx.Commit(ctx); err != nil {
-			return plan, unavailable(err)
-		}
-		if len(result.Versions) == 0 {
-			break
-		}
 	}
 	plan.RiverCurrent = plan.RiverRequired
 	return plan, nil
 }
 
-func rollback(tx pgx.Tx) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+func releaseMigrationLock(parent context.Context, conn *pgxpool.Conn) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), 5*time.Second)
+	defer cancel()
+	if _, err := entities.NewSessionStore(conn.Conn()).UnlockSession(ctx, migrationLock); err != nil {
+		_ = conn.Conn().Close(ctx)
+	}
+}
+
+func verifyMigrationConnection(ctx context.Context, conn *pgxpool.Conn, want migrationIdentity) error {
+	facts, err := entities.NewSessionStore(conn.Conn()).DatabaseIdentity(ctx)
+	if err != nil {
+		return unavailable(err)
+	}
+	got, err := checkedIdentity(facts.SchemaCount, facts.Schema, facts.Role)
+	if err != nil {
+		return err
+	}
+	if got != want {
+		return contract.NewFault(contract.PreconditionFailed, "inconsistent database pool schema or role", "Use the same single-schema search_path and role on every pool connection.")
+	}
+	return nil
+}
+
+// runGooseMigrations applies every application migration through a wrapper
+// that checks each acquired connection's schema and role before any SQL.
+func runGooseMigrations(ctx context.Context, pool *pgxpool.Pool, migrations fs.FS, identity migrationIdentity) error {
+	db := sql.OpenDB(migrationConnector{Connector: stdlib.GetPoolConnector(pool), want: identity})
+	provider, err := goose.NewProvider(goose.DialectPostgres, db, migrations)
+	if err != nil {
+		_ = db.Close()
+		return err
+	}
+	if _, err := provider.Up(ctx); err != nil {
+		_ = db.Close()
+		return err
+	}
+	// Release the checked Goose session before River acquires the second pool
+	// connection. Closing the wrapper never closes the pgx pool.
+	return db.Close()
+}
+
+// runRiverMigrations applies River versions one at a time on a
+// schema-checked session. River migrations require separate commits because
+// some use new enum values.
+func runRiverMigrations(ctx context.Context, pool *pgxpool.Pool, identity migrationIdentity) error {
+	m, err := schemaMigrator(pool, identity.schema)
+	if err != nil {
+		return err
+	}
+	riverConn, err := pool.Acquire(ctx)
+	if err != nil {
+		return unavailable(err)
+	}
+	defer riverConn.Release()
+	if err := verifyMigrationConnection(ctx, riverConn, identity); err != nil {
+		return err
+	}
+	for {
+		tx, err := riverConn.Begin(ctx)
+		if err != nil {
+			return unavailable(err)
+		}
+		// MigrateTx pins each one-version migration to the identity-checked
+		// riverConn session. Migrate would acquire an arbitrary pool connection,
+		// which can deadlock the migration lock holder's pool and bypass the
+		// checked-session invariant.
+		//nolint:staticcheck // SA1019: checked-session, one-version migrations require MigrateTx.
+		result, err := m.MigrateTx(ctx, tx, rivermigrate.DirectionUp, &rivermigrate.MigrateOpts{MaxSteps: 1})
+		if err != nil {
+			rollback(ctx, tx)
+			return unavailable(err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return unavailable(err)
+		}
+		if len(result.Versions) == 0 {
+			return nil
+		}
+	}
+}
+
+func rollback(ctx context.Context, tx pgx.Tx) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 	defer cancel()
 	_ = tx.Rollback(ctx)
 }
 
-func unavailable(causes ...error) *contract.Fault {
+func unavailable(causes ...error) *contract.FaultError {
 	fault := contract.NewFault(contract.Unavailable, "control-plane database is unavailable", "Check database connectivity and schema readiness. Reuse the same idempotency key after an ambiguous submission.")
 	if len(causes) > 0 {
 		fault.Cause = causes[0]

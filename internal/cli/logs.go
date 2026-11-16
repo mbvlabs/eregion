@@ -14,6 +14,7 @@ import (
 	"github.com/mbvlabs/eregion/internal/operations"
 	"github.com/mbvlabs/eregion/internal/output"
 	"github.com/mbvlabs/eregion/internal/platform"
+	"github.com/mbvlabs/eregion/internal/viewer"
 	"github.com/spf13/cobra"
 )
 
@@ -38,7 +39,7 @@ func (a *app) logsSpecs() []spec {
 	return []spec{{
 		use:  "logs <app> <environment>",
 		meta: meta,
-		args: platformTwoNames("app", "environment"),
+		args: platformTwoNames(),
 		flags: func(cmd *cobra.Command) {
 			cmd.Flags().String("operation", "", "Read captured diagnostics for this deployment operation")
 			cmd.Flags().String("deployment", "", "Read available live containers of this deployment")
@@ -53,63 +54,22 @@ func (a *app) logsSpecs() []spec {
 
 func (a *app) logs(cmd *cobra.Command, args []string) (result, error) {
 	appName, environment := args[0], args[1]
-	follow, _ := cmd.Flags().GetBool("follow")
-	operation, _ := cmd.Flags().GetString("operation")
-	deployment, _ := cmd.Flags().GetString("deployment")
-	if operation != "" && deployment != "" {
-		return result{}, contract.NewFault(contract.Usage, "--operation and --deployment are mutually exclusive", "Choose one selector.")
-	}
-	if operation != "" && follow {
-		return result{}, contract.NewFault(contract.Usage, "--operation cannot follow container logs", "Use eregion operations follow "+operation+" --output ndjson to follow operation events.")
-	}
-	config := followConfig(cmd)
-	streamJSON, err := logsOutputMode(config, follow)
+	request, err := parseLogsRequest(cmd, appName, environment)
 	if err != nil {
 		return result{}, err
 	}
-	process, _ := cmd.Flags().GetString("process")
-	since, _ := cmd.Flags().GetDuration("since")
-	tail, _ := cmd.Flags().GetInt("tail")
-	query := platform.LogQuery{
-		App: appName, Environment: environment, DeploymentID: platform.DeploymentID(deployment),
-		Process: process, Follow: follow, Since: since, Tail: tail,
-	}
-	if err := query.Validate(); err != nil {
+	config := followConfig(cmd)
+	streamJSON, err := logsOutputMode(config, request.follow)
+	if err != nil {
 		return result{}, err
 	}
 	client, err := a.client(cmd)
 	if err != nil {
 		return result{}, err
 	}
-	if operation == "" && deployment == "" {
-		env, _, err := a.readEnvironment(cmd, appName, environment)
-		if err != nil {
-			return result{}, err
-		}
-		if env.ServingDeploymentID == "" {
-			return result{}, contract.NewFault(contract.PreconditionFailed, "environment has no serving deployment", "Use --operation to inspect captured candidate diagnostics, or deploy a release first.")
-		}
-		query.DeploymentID = env.ServingDeploymentID
-	}
-	if deployment != "" {
-		raw, err := client.PlatformInventory(cmd.Context(), "deployments", url.Values{"app": {appName}, "environment": {environment}, "deployment": {deployment}, "limit": {"1"}})
-		if err != nil {
-			return result{}, err
-		}
-		var page struct {
-			Items []platform.Deployment `json:"items"`
-		}
-		if json.Unmarshal(raw, &page) != nil {
-			return result{}, invalidNodeData("deployment inventory")
-		}
-		if len(page.Items) != 1 || string(page.Items[0].ID) != deployment || page.Items[0].App != appName || page.Items[0].Environment != environment {
-			return result{}, contract.NewFault(contract.NotFound, "deployment not found for this environment", "Choose a deployment belonging to the requested app and environment.")
-		}
-		for _, instance := range page.Items[0].Instances {
-			if process == "" || process == instance.Process {
-				query.ExpectedContainers = append(query.ExpectedContainers, instance.Name)
-			}
-		}
+	query, err := a.selectLogDeployment(cmd, client, request, appName, environment)
+	if err != nil {
+		return result{}, err
 	}
 	out := cmd.OutOrStdout()
 	if config != nil {
@@ -124,32 +84,95 @@ func (a *app) logs(cmd *cobra.Command, args []string) (result, error) {
 		return err
 	}
 	var lines platform.LogResult
-	if operation != "" {
-		lines, err = candidateOperationLogs(cmd.Context(), client, contract.OperationID(operation), query)
+	if request.operation != "" {
+		lines, err = candidateOperationLogs(cmd.Context(), client, contract.OperationID(request.operation), query)
 	} else {
 		lines, err = client.Logs(cmd.Context(), query, emit)
 	}
-	if err != nil {
-		if follow && (errors.Is(err, context.Canceled) || cmd.Context().Err() != nil) {
-			if streamJSON {
-				_ = writeLogResult(out, contract.Failure(cmd.CommandPath(), detachedLogsFault(lines.Count)))
-			}
-			return result{data: lines, streamed: true}, detachedLogsFault(lines.Count)
+	return finishLogs(cmd, out, lines, request.follow, streamJSON, err, emit, clean)
+}
+
+type logsRequest struct {
+	follow     bool
+	operation  string
+	deployment string
+	process    string
+	query      platform.LogQuery
+}
+
+func parseLogsRequest(cmd *cobra.Command, appName, environment string) (logsRequest, error) {
+	follow, _ := cmd.Flags().GetBool("follow")
+	operation, _ := cmd.Flags().GetString("operation")
+	deployment, _ := cmd.Flags().GetString("deployment")
+	if operation != "" && deployment != "" {
+		return logsRequest{}, contract.NewFault(contract.Usage, "--operation and --deployment are mutually exclusive", "Choose one selector.")
+	}
+	if operation != "" && follow {
+		return logsRequest{}, contract.NewFault(contract.Usage, "--operation cannot follow container logs", "Use eregion operations follow "+operation+" --output ndjson to follow operation events.")
+	}
+	process, _ := cmd.Flags().GetString("process")
+	since, _ := cmd.Flags().GetDuration("since")
+	tail, _ := cmd.Flags().GetInt("tail")
+	query := platform.LogQuery{
+		App: appName, Environment: environment, DeploymentID: platform.DeploymentID(deployment),
+		Process: process, Follow: follow, Since: since, Tail: tail,
+	}
+	if err := query.Validate(); err != nil {
+		return logsRequest{}, err
+	}
+	return logsRequest{follow: follow, operation: operation, deployment: deployment, process: process, query: query}, nil
+}
+
+func (a *app) selectLogDeployment(cmd *cobra.Command, client Backend, request logsRequest, appName, environment string) (platform.LogQuery, error) {
+	query := request.query
+	if request.operation == "" && request.deployment == "" {
+		env, err := a.readEnvironment(cmd, appName, environment)
+		if err != nil {
+			return query, err
 		}
-		return result{}, err
+		if env.ServingDeploymentID == "" {
+			return query, contract.NewFault(contract.PreconditionFailed, "environment has no serving deployment", "Use --operation to inspect captured candidate diagnostics, or deploy a release first.")
+		}
+		query.DeploymentID = env.ServingDeploymentID
+	}
+	if request.deployment == "" {
+		return query, nil
+	}
+	raw, err := client.PlatformInventory(cmd.Context(), "deployments", url.Values{"app": {appName}, "environment": {environment}, "deployment": {request.deployment}, "limit": {"1"}})
+	if err != nil {
+		return query, err
+	}
+	var page struct {
+		Items []platform.Deployment `json:"items"`
+	}
+	if json.Unmarshal(raw, &page) != nil {
+		return query, invalidNodeData("deployment inventory")
+	}
+	if len(page.Items) != 1 || string(page.Items[0].ID) != request.deployment || page.Items[0].App != appName || page.Items[0].Environment != environment {
+		return query, contract.NewFault(contract.NotFound, "deployment not found for this environment", "Choose a deployment belonging to the requested app and environment.")
+	}
+	for _, instance := range page.Items[0].Instances {
+		if request.process == "" || request.process == instance.Process {
+			query.ExpectedContainers = append(query.ExpectedContainers, instance.Name)
+		}
+	}
+	return query, nil
+}
+
+func finishLogs(
+	cmd *cobra.Command,
+	out io.Writer,
+	lines platform.LogResult,
+	follow, streamJSON bool,
+	err error,
+	emit func(platform.LogLine) error,
+	clean viewer.Cleaner,
+) (result, error) {
+	if err != nil {
+		return finishLogsError(cmd, out, lines, follow, streamJSON, err)
 	}
 	if streamJSON {
-		if !follow {
-			for _, line := range lines.Lines {
-				if err := emit(line); err != nil {
-					return result{}, err
-				}
-			}
-		}
-		if err := writeLogResult(out, contract.Success(cmd.CommandPath(), lines, nil)); err != nil {
-			return result{}, contract.NewFault(contract.Internal, "could not write command output", "Check the output stream and retry.")
-		}
-		return result{data: lines, streamed: true}, nil
+		return finishStreamingLogs(cmd, out, lines, follow, emit)
 	}
 	if follow {
 		if lines.Unavailable {
@@ -157,6 +180,46 @@ func (a *app) logs(cmd *cobra.Command, args []string) (result, error) {
 		}
 		return result{data: lines, streamed: true}, nil
 	}
+	return result{data: lines, plain: plainLogsText(lines, clean)}, nil
+}
+
+func finishLogsError(
+	cmd *cobra.Command,
+	out io.Writer,
+	lines platform.LogResult,
+	follow, streamJSON bool,
+	err error,
+) (result, error) {
+	if follow && (errors.Is(err, context.Canceled) || cmd.Context().Err() != nil) {
+		if streamJSON {
+			_ = writeLogResult(out, contract.Failure(cmd.CommandPath(), detachedLogsFault(lines.Count)))
+		}
+		return result{data: lines, streamed: true}, detachedLogsFault(lines.Count)
+	}
+	return result{}, err
+}
+
+func finishStreamingLogs(
+	cmd *cobra.Command,
+	out io.Writer,
+	lines platform.LogResult,
+	follow bool,
+	emit func(platform.LogLine) error,
+) (result, error) {
+	if !follow {
+		for _, line := range lines.Lines {
+			if err := emit(line); err != nil {
+				return result{}, err
+			}
+		}
+	}
+	if err := writeLogResult(out, contract.Success(cmd.CommandPath(), lines, nil)); err != nil {
+		return result{}, contract.NewFault(contract.Internal, "could not write command output", "Check the output stream and retry.")
+	}
+	return result{data: lines, streamed: true}, nil
+}
+
+func plainLogsText(lines platform.LogResult, clean viewer.Cleaner) string {
 	var plain strings.Builder
 	if len(lines.Lines) == 0 {
 		if lines.Unavailable {
@@ -177,71 +240,103 @@ func (a *app) logs(cmd *cobra.Command, args []string) (result, error) {
 	if lines.DiagnosticStatus != "" {
 		plain.WriteString("Candidate capture: " + lines.DiagnosticStatus + "\n")
 	}
-	return result{data: lines, plain: plain.String()}, nil
+	return plain.String()
 }
 
 func candidateOperationLogs(ctx context.Context, client Backend, id contract.OperationID, query platform.LogQuery) (platform.LogResult, error) {
-	result := platform.LogResult{Unavailable: true, DiagnosticStatus: "unavailable"}
-	if err := id.Validate(); err != nil {
-		return result, err
-	}
-	raw, err := client.Get(ctx, id)
+	op, result, err := loadCandidateOperation(ctx, client, id, query)
 	if err != nil {
 		return result, err
 	}
+	lines, result, err := collectCandidateLines(ctx, client, op, query, result)
+	if err != nil {
+		return result, err
+	}
+	result.Lines = tailLogLines(lines, query.Tail)
+	result.Count = len(result.Lines)
+	return result, nil
+}
+
+func loadCandidateOperation(ctx context.Context, client Backend, id contract.OperationID, query platform.LogQuery) (contract.Operation, platform.LogResult, error) {
+	result := platform.LogResult{Unavailable: true, DiagnosticStatus: "unavailable"}
+	if err := id.Validate(); err != nil {
+		return contract.Operation{}, result, err
+	}
+	raw, err := client.Get(ctx, id)
+	if err != nil {
+		return contract.Operation{}, result, err
+	}
 	var op contract.Operation
 	if json.Unmarshal(raw, &op) != nil || op.Validate() != nil {
-		return result, invalidNodeData("operation")
+		return contract.Operation{}, result, invalidNodeData("operation")
 	}
 	if op.ID != id || op.Target != "env/"+query.App+"/"+query.Environment || (op.Kind != platform.KindDeploy && op.Kind != platform.KindRollback && op.Kind != platform.KindRestart && op.Kind != platform.KindPromote) {
-		return result, contract.NewFault(contract.NotFound, "deployment operation not found for this environment", "Choose a deployment operation belonging to the requested app and environment.")
+		return contract.Operation{}, result, contract.NewFault(contract.NotFound, "deployment operation not found for this environment", "Choose a deployment operation belonging to the requested app and environment.")
 	}
+	return op, result, nil
+}
+
+func collectCandidateLines(
+	ctx context.Context,
+	client Backend,
+	op contract.Operation,
+	query platform.LogQuery,
+	result platform.LogResult,
+) ([]platform.LogLine, platform.LogResult, error) {
 	var lines []platform.LogLine
 	cutoff := time.Now().Add(-query.Since)
 	for cursor := uint64(0); cursor < op.LastSequence; {
-		raw, err := client.Events(ctx, contract.Cursor{OperationID: id, After: cursor}, 200)
+		raw, err := client.Events(ctx, contract.Cursor{OperationID: op.ID, After: cursor}, 200)
 		if err != nil {
-			return result, err
+			return nil, result, err
 		}
 		var page operations.EventPage
-		if json.Unmarshal(raw, &page) != nil || page.Cursor.OperationID != id || page.Cursor.After <= cursor || len(page.Events) == 0 {
-			return result, invalidNodeData("operation event page")
+		if json.Unmarshal(raw, &page) != nil || page.Cursor.OperationID != op.ID || page.Cursor.After <= cursor || len(page.Events) == 0 {
+			return nil, result, invalidNodeData("operation event page")
 		}
 		for _, event := range page.Events {
 			if event.Sequence > op.LastSequence {
 				break
 			}
-			d := event.CandidateDiagnostic
-			if event.Stage != platform.CandidateDiagnosticStage || d == nil {
-				continue
-			}
-			if d.Status != "captured" {
-				result.DiagnosticStatus = d.Status
-				result.Truncated = strings.Contains(d.Status, "truncated")
-				result.Unavailable = strings.Contains(d.Status, "unavailable")
-				continue
-			}
-			if (query.Process != "" && query.Process != d.Process) || d.Timestamp.Before(cutoff) {
-				continue
-			}
-			at := d.Timestamp
-			lines = append(lines, platform.LogLine{App: query.App, Environment: query.Environment, Process: d.Process, Replica: d.Replica, Container: d.Container, Stream: "combined", Timestamp: &at, Message: event.Message})
+			appendCandidateEvent(event, query, cutoff, &result, &lines)
 		}
 		cursor = page.Cursor.After
 	}
+	return lines, result, nil
+}
+
+func appendCandidateEvent(event contract.Event, query platform.LogQuery, cutoff time.Time, result *platform.LogResult, lines *[]platform.LogLine) {
+	d := event.CandidateDiagnostic
+	if event.Stage != platform.CandidateDiagnosticStage || d == nil {
+		return
+	}
+	if d.Status != "captured" {
+		result.DiagnosticStatus = d.Status
+		result.Truncated = strings.Contains(d.Status, "truncated")
+		result.Unavailable = strings.Contains(d.Status, "unavailable")
+		return
+	}
+	if (query.Process != "" && query.Process != d.Process) || d.Timestamp.Before(cutoff) {
+		return
+	}
+	at := d.Timestamp
+	*lines = append(*lines, platform.LogLine{App: query.App, Environment: query.Environment, Process: d.Process, Replica: d.Replica, Container: d.Container, Stream: "combined", Timestamp: &at, Message: event.Message})
+}
+
+func tailLogLines(lines []platform.LogLine, tail int) []platform.LogLine {
 	counts := map[string]int{}
+	tailed := make([]platform.LogLine, 0, len(lines))
 	for i := len(lines) - 1; i >= 0; i-- {
 		key := lines[i].Container
 		counts[key]++
-		if counts[key] <= query.Tail {
-			result.Lines = append(result.Lines, lines[i])
+		if counts[key] <= tail {
+			tailed = append(tailed, lines[i])
 		}
 	}
-	for i, j := 0, len(result.Lines)-1; i < j; i, j = i+1, j-1 {
-		result.Lines[i], result.Lines[j] = result.Lines[j], result.Lines[i]
+	for i, j := 0, len(tailed)-1; i < j; i, j = i+1, j-1 {
+		tailed[i], tailed[j] = tailed[j], tailed[i]
 	}
-	result.Count = len(result.Lines)
-	return result, nil
+	return tailed
 }
 
 // logsOutputMode selects the logs wire format. Only --output ndjson streams

@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"strconv"
@@ -35,7 +36,7 @@ func (a *app) deliverySpecs() []spec {
 		{
 			use:  "deploy <app> <environment>",
 			meta: deliveryMeta("Build the environment's source at a ref and deploy it with a blue/green switch", "eregion deploy api production --json"),
-			args: platformTwoNames("app", "environment"),
+			args: platformTwoNames(),
 			flags: func(cmd *cobra.Command) {
 				addDeliveryFlags(cmd)
 				cmd.Flags().String("ref", "", "Git branch, tag, or commit to build; defaults to the current revision's ref")
@@ -49,7 +50,7 @@ func (a *app) deliverySpecs() []spec {
 		{
 			use:  "rollback <app> <environment>",
 			meta: deliveryRollbackMeta(),
-			args: platformTwoNames("app", "environment"),
+			args: platformTwoNames(),
 			flags: func(cmd *cobra.Command) {
 				addDeliveryFlags(cmd)
 				cmd.Flags().String("to", "", "Release to restore; defaults to the previous successful release")
@@ -60,7 +61,7 @@ func (a *app) deliverySpecs() []spec {
 		{
 			use:  "restart <app> <environment>",
 			meta: deliveryMeta("Reapply the serving release with the current revision through the blue/green path", "eregion restart api production --json"),
-			args: platformTwoNames("app", "environment"),
+			args: platformTwoNames(),
 			flags: func(cmd *cobra.Command) {
 				addDeliveryFlags(cmd)
 			},
@@ -95,7 +96,7 @@ func (a *app) buildSpec() spec {
 			{
 				use:  "list <app> <environment>",
 				meta: deliveryReadMeta("List builds for one environment", "eregion build list api production --json"),
-				args: platformTwoNames("app", "environment"),
+				args: platformTwoNames(),
 				flags: func(cmd *cobra.Command) {
 					cmd.Flags().Int("limit", 50, "Maximum builds (1–200)")
 					cmd.Flags().String("state", "", "Filter by pending, running, succeeded, failed, or cancelled")
@@ -144,7 +145,7 @@ func (a *app) releaseSpec() spec {
 			{
 				use:  "list <app> <environment>",
 				meta: deliveryReadMeta("List releases for one environment with their commit and image identity", "eregion release list api production --json"),
-				args: platformTwoNames("app", "environment"),
+				args: platformTwoNames(),
 				flags: func(cmd *cobra.Command) {
 					cmd.Flags().Int("limit", 50, "Maximum releases (1–200)")
 					cmd.Flags().String("state", "", "Filter by pending, ready, or failed")
@@ -337,17 +338,7 @@ func (a *app) followGuidedCreate(cmd *cobra.Command, client Backend, op contract
 	created, err := a.followAccepted(cmd, client, op)
 	if err != nil {
 		if followed, ok := created.data.(followResult); ok && followed.Detached && op.FirstDeployOperationID != "" {
-			// The ordinary follow already printed the create's resume command.
-			// Name the queued deploy too, without changing the detach contract.
-			if config := followConfig(cmd); config != nil {
-				line := "first deploy: " + resumeCommand + " " + string(op.FirstDeployOperationID)
-				_, _ = fmt.Fprintln(config.out, a.followCleaner()(line))
-			}
-			if fault, ok := err.(*contract.Fault); ok && fault.Code == contract.Cancelled {
-				copy := *fault
-				copy.Hint = strings.TrimSpace(copy.Hint) + "\nThe first deploy is queued: " + resumeCommand + " " + string(op.FirstDeployOperationID) + "."
-				err = &copy
-			}
+			err = a.noteGuidedCreateDetach(cmd, op, err)
 		}
 		return created, err
 	}
@@ -376,7 +367,7 @@ func (a *app) followGuidedCreateNDJSON(cmd *cobra.Command, client Backend, op co
 		return result{}, err
 	}
 	opts := viewer.FollowOptions{PollInterval: interval, Clean: clean}
-	stream, summary, err := a.followNDJSONSummary(cmd, client, op.ID, opts, config, clean)
+	stream, summary, err := a.followNDJSONSummary(cmd, client, op.ID, opts, config)
 	if err != nil || summary.State != contract.Succeeded || op.FirstDeployOperationID == "" {
 		if summary.Detached && op.FirstDeployOperationID != "" {
 			err = withFirstDeployResume(err, op.FirstDeployOperationID)
@@ -387,7 +378,7 @@ func (a *app) followGuidedCreateNDJSON(cmd *cobra.Command, client Backend, op co
 	deploy := contract.Operation{
 		ID: op.FirstDeployOperationID, Kind: platform.KindDeploy, Target: deployTarget,
 	}
-	stream, summary, err = a.followNDJSONSummary(cmd, client, deploy.ID, opts, config, clean)
+	stream, summary, err = a.followNDJSONSummary(cmd, client, deploy.ID, opts, config)
 	err = finishNDJSON(stream, cmd, summary, err)
 	return result{data: newFollowResult(summary), streamed: true}, err
 }
@@ -395,6 +386,21 @@ func (a *app) followGuidedCreateNDJSON(cmd *cobra.Command, client Backend, op co
 // withFirstDeployResume names the deploy queued by a guided create when the
 // create viewer detaches. The operation is not cancelled, so the operator can
 // resume the create or the first deploy.
+func (a *app) noteGuidedCreateDetach(cmd *cobra.Command, op contract.Operation, err error) error {
+	// The ordinary follow already printed the create's resume command. Name
+	// the queued deploy too, without changing the detach contract.
+	if config := followConfig(cmd); config != nil {
+		line := "first deploy: " + resumeCommand + " " + string(op.FirstDeployOperationID)
+		_, _ = fmt.Fprintln(config.out, a.followCleaner()(line))
+	}
+	if fault := new(contract.Fault); errors.As(err, &fault) && fault.Code == contract.Cancelled {
+		copy := *fault
+		copy.Hint = strings.TrimSpace(copy.Hint) + "\nThe first deploy is queued: " + resumeCommand + " " + string(op.FirstDeployOperationID) + "."
+		return &copy
+	}
+	return err
+}
+
 func withFirstDeployResume(err error, id contract.OperationID) error {
 	fault := contract.Classify(err)
 	if fault.Code != contract.Cancelled || id == "" {
@@ -566,21 +572,9 @@ type buildLogsResult struct {
 }
 
 func (a *app) buildLogs(cmd *cobra.Command, args []string) (result, error) {
-	afterText, _ := cmd.Flags().GetString("after")
-	follow, _ := cmd.Flags().GetBool("follow")
-	var after uint64
-	if cmd.Flags().Changed("after") {
-		if follow || streamsNDJSON(cmd) {
-			return result{}, contract.NewFault(contract.ValidationFailed, "--after cannot be combined with --follow or NDJSON", "Use a bounded read with --after, or follow without it.")
-		}
-		if afterText == "" || strings.Trim(afterText, "0123456789") != "" {
-			return result{}, contract.NewFault(contract.ValidationFailed, "invalid --after cursor", "Use a nonnegative event cursor from a build logs result.")
-		}
-		var parseErr error
-		after, parseErr = strconv.ParseUint(afterText, 10, 63)
-		if parseErr != nil {
-			return result{}, contract.NewFault(contract.ValidationFailed, "invalid --after cursor", "Use a nonnegative event cursor from a build logs result.")
-		}
+	after, err := parseBuildLogsAfter(cmd)
+	if err != nil {
+		return result{}, err
 	}
 	client, err := a.client(cmd)
 	if err != nil {
@@ -590,7 +584,7 @@ func (a *app) buildLogs(cmd *cobra.Command, args []string) (result, error) {
 	if err != nil {
 		return result{}, err
 	}
-	if follow || streamsNDJSON(cmd) {
+	if follow, _ := cmd.Flags().GetBool("follow"); follow || streamsNDJSON(cmd) {
 		return a.followBuildLogs(cmd, client, build)
 	}
 	events, cursor, partial, err := fetchOperationEvents(cmd.Context(), client, build.OperationID, after)
@@ -601,32 +595,68 @@ func (a *app) buildLogs(cmd *cobra.Command, args []string) (result, error) {
 	if !plainOutput(cmd) {
 		return result{data: data}, nil
 	}
+	plain, err := a.renderBuildLogs(cmd, args[0], build, events, cursor, partial)
+	if err != nil {
+		return result{}, err
+	}
+	return result{data: data, plain: plain}, nil
+}
+
+func parseBuildLogsAfter(cmd *cobra.Command) (uint64, error) {
+	if !cmd.Flags().Changed("after") {
+		return 0, nil
+	}
+	afterText, _ := cmd.Flags().GetString("after")
+	follow, _ := cmd.Flags().GetBool("follow")
+	if follow || streamsNDJSON(cmd) {
+		return 0, contract.NewFault(contract.ValidationFailed, "--after cannot be combined with --follow or NDJSON", "Use a bounded read with --after, or follow without it.")
+	}
+	if afterText == "" || strings.Trim(afterText, "0123456789") != "" {
+		return 0, contract.NewFault(contract.ValidationFailed, "invalid --after cursor", "Use a nonnegative event cursor from a build logs result.")
+	}
+	after, parseErr := strconv.ParseUint(afterText, 10, 63)
+	if parseErr != nil {
+		return 0, contract.NewFault(contract.ValidationFailed, "invalid --after cursor", "Use a nonnegative event cursor from a build logs result.")
+	}
+	return after, nil
+}
+
+func (a *app) renderBuildLogs(
+	cmd *cobra.Command,
+	buildID string,
+	build platform.BuildRecord,
+	events []contract.Event,
+	cursor uint64,
+	partial bool,
+) (string, error) {
 	config := followConfig(cmd)
 	if config == nil {
-		return result{}, contract.NewFault(contract.Internal, "viewer output is not configured", "Invoke the command through the eregion CLI entry point.")
+		return "", contract.NewFault(contract.Internal, "viewer output is not configured", "Invoke the command through the eregion CLI entry point.")
 	}
 	var plain strings.Builder
 	fmt.Fprintf(&plain, "build %s (%s)\n", build.ID, build.State)
 	presenter := viewer.NewPlain(&plain, config.err, a.followCleaner())
 	if len(events) > 0 {
 		if err := presenter.Observe(viewer.Observation{Kind: viewer.ObservationEvents, Events: events}); err != nil {
-			return result{}, contract.NewFault(contract.Internal, "could not write command output", "Check the output stream and retry.")
+			return "", contract.NewFault(contract.Internal, "could not write command output", "Check the output stream and retry.")
 		}
-	}
-	if len(events) == 0 {
+	} else {
 		plain.WriteString("no build log events yet\n")
 	}
 	if partial {
-		command := "eregion"
-		for _, name := range []string{"workspace", "workspace-file"} {
-			if flag := cmd.InheritedFlags().Lookup(name); flag != nil && flag.Changed {
-				command += " --" + name + " '" + strings.ReplaceAll(flag.Value.String(), "'", "'\\''") + "'"
-			}
-		}
-		command += " build logs '" + strings.ReplaceAll(args[0], "'", "'\\''") + "' --after " + strconv.FormatUint(cursor, 10)
-		fmt.Fprintf(&plain, "Partial event read; continue with: %s\n", command)
+		fmt.Fprintf(&plain, "Partial event read; continue with: %s\n", buildLogsResumeCommand(cmd, buildID, cursor))
 	}
-	return result{data: data, plain: plain.String()}, nil
+	return plain.String(), nil
+}
+
+func buildLogsResumeCommand(cmd *cobra.Command, buildID string, cursor uint64) string {
+	command := "eregion"
+	for _, name := range []string{"workspace", "workspace-file"} {
+		if flag := cmd.InheritedFlags().Lookup(name); flag != nil && flag.Changed {
+			command += " --" + name + " '" + strings.ReplaceAll(flag.Value.String(), "'", "'\\''") + "'"
+		}
+	}
+	return command + " build logs '" + strings.ReplaceAll(buildID, "'", "'\\''") + "' --after " + strconv.FormatUint(cursor, 10)
 }
 
 func (a *app) followBuildLogs(cmd *cobra.Command, client Backend, build platform.BuildRecord) (result, error) {
@@ -783,60 +813,11 @@ func (a *app) renderDeployPlan(plan deployPlan) string {
 	env := plan.Environment
 	var out strings.Builder
 	fmt.Fprintf(&out, "Deploy %s/%s\n", env.App, env.Name)
-	if plan.Release != nil {
-		fmt.Fprintf(&out, "artifact: %s %s (release)\n", plan.Release.ID, plan.Release.Image)
-		if plan.Release.CommitSHA != "" {
-			fmt.Fprintf(&out, "commit: %s\n", shortCommit(plan.Release.CommitSHA))
-		}
-	} else if plan.ImageTag != "" || plan.ImageDigest != "" || plan.Image != "" {
-		switch {
-		case plan.ImageTag != "":
-			fmt.Fprintf(&out, "artifact selector: image-tag %s\n", plan.ImageTag)
-		case plan.ImageDigest != "":
-			fmt.Fprintf(&out, "artifact selector: image-digest %s\n", plan.ImageDigest)
-		default:
-			fmt.Fprintf(&out, "artifact selector: image %s\n", plan.Image)
-		}
-		fmt.Fprintln(&out, "artifact availability: unverified by this preview")
-	} else if env.Revision != nil {
-		source := env.Revision.Source
-		if source.URL != "" {
-			fmt.Fprintf(&out, "source: git %s\n", source.URL)
-			ref := plan.Ref
-			if ref == "" {
-				ref = source.Ref
-			}
-			if ref != "" {
-				fmt.Fprintf(&out, "ref: %s\n", ref)
-			}
-		} else {
-			fmt.Fprintln(&out, "source: none (select an explicit artifact)")
-		}
-	} else {
-		fmt.Fprintln(&out, "source: (no current revision)")
-	}
+	writeDeployPlanArtifact(&out, plan)
 	if env.Revision != nil && env.Revision.ID != "" {
 		fmt.Fprintf(&out, "revision: #%d %s\n", env.Revision.Number, env.Revision.ID)
 	}
-	processes := env.Processes
-	if env.Revision != nil && len(env.Revision.Processes) > 0 {
-		processes = env.Revision.Processes
-	}
-	if len(processes) > 0 {
-		parts := make([]string, 0, len(processes))
-		for _, process := range processes {
-			replicas := process.Replicas
-			if replicas == 0 {
-				replicas = 1
-			}
-			part := fmt.Sprintf("%s x%d", process.Name, replicas)
-			if process.ContainerPort > 0 {
-				part += fmt.Sprintf(" port %d", process.ContainerPort)
-			}
-			parts = append(parts, part)
-		}
-		fmt.Fprintf(&out, "processes: %s\n", strings.Join(parts, ", "))
-	}
+	writeDeployPlanProcesses(&out, env)
 	if env.ServingRelease != "" {
 		fmt.Fprintf(&out, "serving: %s (stays until the switch passes)\n", env.ServingRelease)
 	}
@@ -846,45 +827,114 @@ func (a *app) renderDeployPlan(plan deployPlan) string {
 	return out.String()
 }
 
+func writeDeployPlanArtifact(out *strings.Builder, plan deployPlan) {
+	if plan.Release != nil {
+		fmt.Fprintf(out, "artifact: %s %s (release)\n", plan.Release.ID, plan.Release.Image)
+		if plan.Release.CommitSHA != "" {
+			fmt.Fprintf(out, "commit: %s\n", shortCommit(plan.Release.CommitSHA))
+		}
+		return
+	}
+	if plan.ImageTag != "" || plan.ImageDigest != "" || plan.Image != "" {
+		switch {
+		case plan.ImageTag != "":
+			fmt.Fprintf(out, "artifact selector: image-tag %s\n", plan.ImageTag)
+		case plan.ImageDigest != "":
+			fmt.Fprintf(out, "artifact selector: image-digest %s\n", plan.ImageDigest)
+		default:
+			fmt.Fprintf(out, "artifact selector: image %s\n", plan.Image)
+		}
+		fmt.Fprintln(out, "artifact availability: unverified by this preview")
+		return
+	}
+	env := plan.Environment
+	if env.Revision == nil {
+		fmt.Fprintln(out, "source: (no current revision)")
+		return
+	}
+	source := env.Revision.Source
+	if source.URL == "" {
+		fmt.Fprintln(out, "source: none (select an explicit artifact)")
+		return
+	}
+	fmt.Fprintf(out, "source: git %s\n", source.URL)
+	ref := plan.Ref
+	if ref == "" {
+		ref = source.Ref
+	}
+	if ref != "" {
+		fmt.Fprintf(out, "ref: %s\n", ref)
+	}
+}
+
+func writeDeployPlanProcesses(out *strings.Builder, env platform.Environment) {
+	processes := env.Processes
+	if env.Revision != nil && len(env.Revision.Processes) > 0 {
+		processes = env.Revision.Processes
+	}
+	if len(processes) == 0 {
+		return
+	}
+	parts := make([]string, 0, len(processes))
+	for _, process := range processes {
+		replicas := process.Replicas
+		if replicas == 0 {
+			replicas = 1
+		}
+		part := fmt.Sprintf("%s x%d", process.Name, replicas)
+		if process.ContainerPort > 0 {
+			part += fmt.Sprintf(" port %d", process.ContainerPort)
+		}
+		parts = append(parts, part)
+	}
+	fmt.Fprintf(out, "processes: %s\n", strings.Join(parts, ", "))
+}
+
 func (a *app) deployOutcome(app, environment string) func(context.Context, Backend, contract.Operation) []string {
 	return func(ctx context.Context, client Backend, operation contract.Operation) []string {
-		raw, err := client.PlatformInventory(ctx, "environments", url.Values{"app": {app}, "environment": {environment}, "limit": {"200"}})
-		if err != nil {
+		env, ok := a.deployedEnvironment(ctx, client, app, environment)
+		if !ok {
 			return nil
 		}
-		var page struct {
-			Items []platform.Environment `json:"items"`
-		}
-		if json.Unmarshal(raw, &page) != nil {
-			return nil
-		}
-		var env platform.Environment
-		found := false
-		for _, item := range page.Items {
-			if item.App == app && item.Name == environment {
-				env, found = item, true
-				break
-			}
-		}
-		if !found {
-			return nil
-		}
-		lines := []string{}
-		if build, ok := a.buildForOperation(ctx, client, operation.ID); ok && build.CommitSHA != "" {
-			lines = append(lines, "commit: "+shortCommit(build.CommitSHA))
-		}
-		if env.ServingRelease == "" {
-			lines = append(lines, "serving release: none")
-		} else {
-			lines = append(lines, "serving release: "+string(env.ServingRelease))
-		}
-		if public := publicURL(env); public != "" {
-			lines = append(lines, "public url: "+public)
-		} else {
-			lines = append(lines, "public url: no domain binding")
-		}
-		return lines
+		return a.deployOutcomeLines(ctx, client, operation, env)
 	}
+}
+
+func (a *app) deployedEnvironment(ctx context.Context, client Backend, app, environment string) (platform.Environment, bool) {
+	raw, err := client.PlatformInventory(ctx, "environments", url.Values{"app": {app}, "environment": {environment}, "limit": {"200"}})
+	if err != nil {
+		return platform.Environment{}, false
+	}
+	var page struct {
+		Items []platform.Environment `json:"items"`
+	}
+	if json.Unmarshal(raw, &page) != nil {
+		return platform.Environment{}, false
+	}
+	for _, item := range page.Items {
+		if item.App == app && item.Name == environment {
+			return item, true
+		}
+	}
+	return platform.Environment{}, false
+}
+
+func (a *app) deployOutcomeLines(ctx context.Context, client Backend, operation contract.Operation, env platform.Environment) []string {
+	lines := []string{}
+	if build, ok := a.buildForOperation(ctx, client, operation.ID); ok && build.CommitSHA != "" {
+		lines = append(lines, "commit: "+shortCommit(build.CommitSHA))
+	}
+	if env.ServingRelease == "" {
+		lines = append(lines, "serving release: none")
+	} else {
+		lines = append(lines, "serving release: "+string(env.ServingRelease))
+	}
+	if public := publicURL(env); public != "" {
+		lines = append(lines, "public url: "+public)
+	} else {
+		lines = append(lines, "public url: no domain binding")
+	}
+	return lines
 }
 
 func (a *app) buildOutcome(ctx context.Context, client Backend, operation contract.Operation) []string {

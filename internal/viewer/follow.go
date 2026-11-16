@@ -123,128 +123,225 @@ func Follow(ctx context.Context, client Client, id contract.OperationID, opts Fo
 		return emit(observation)
 	}
 
-	backoff := opts.PollInterval
-	gapRefetches := 0
-	tailNoProgress := 0
+	follower := &follower{
+		client:  client,
+		id:      id,
+		opts:    opts,
+		model:   model,
+		emit:    emitObservation,
+		backoff: opts.PollInterval,
+	}
 	for {
-		now := opts.Now()
-		if err := ctx.Err(); err != nil {
-			return detach(model, now, emitObservation, err)
-		}
-		model.Tick(now)
-		if err := emitObservation(Observation{Kind: ObservationTick, At: now}); err != nil {
-			return modelSummary(model), err
-		}
-
-		raw, err := client.Get(ctx, id)
+		done, err := follower.runOnce(ctx)
 		if err != nil {
-			if fatalFollowError(err) || ctx.Err() != nil {
-				return failFollow(ctx, model, now, err, emitObservation)
+			var transport *followTransportError
+			if errors.As(err, &transport) {
+				return failFollow(ctx, model, transport.at, transport.err, emitObservation)
 			}
-			model.PollFailed(err, now)
-			if emitErr := emitObservation(Observation{Kind: ObservationFailed, At: now, Err: err}); emitErr != nil {
-				return modelSummary(model), emitErr
-			}
-			backoff = nextBackoff(backoff)
-			if !wait(ctx, backoff, opts.Now, model) {
-				return detach(model, opts.Now(), emitObservation, ctx.Err())
-			}
-			continue
-		}
-		snapshot, err := decodeOperation(raw)
-		if err == nil && snapshot.ID != id {
-			err = invalidFollowData()
-		}
-		if err != nil {
 			return modelSummary(model), err
 		}
-		model.Snapshot(snapshot, now)
-		model.PollSucceeded(now)
-		backoff = opts.PollInterval
-		if err := emitObservation(Observation{Kind: ObservationSnapshot, At: now, Snapshot: &snapshot}); err != nil {
-			return modelSummary(model), err
-		}
-
-		pageFailed := false
-		cursorBeforePages := model.Cursor
-		for {
-			previousCursor := model.Cursor
-			page, err := fetchPage(ctx, client, id, model.Cursor, opts.PageLimit)
-			if err != nil {
-				now = opts.Now()
-				if fatalFollowError(err) || ctx.Err() != nil {
-					return failFollow(ctx, model, now, err, emitObservation)
-				}
-				model.PollFailed(err, now)
-				if emitErr := emitObservation(Observation{Kind: ObservationFailed, At: now, Err: err}); emitErr != nil {
-					return modelSummary(model), emitErr
-				}
-				pageFailed = true
-				break
-			}
-			if err := model.Page(page.Events, now); err != nil {
-				gap := ErrGap(err)
-				if gap == nil {
-					return modelSummary(model), err
-				}
-				gapRefetches++
-				if gapRefetches > 2 {
-					return modelSummary(model), gap
-				}
-				model.PollFailed(err, now)
-				if emitErr := emitObservation(Observation{Kind: ObservationFailed, At: now, Err: err}); emitErr != nil {
-					return modelSummary(model), emitErr
-				}
-				pageFailed = true
-				break
-			}
-			gapRefetches = 0
-			model.PollSucceeded(now)
-			if len(page.Events) > 0 {
-				if err := emitObservation(Observation{Kind: ObservationEvents, At: now, Events: page.Events}); err != nil {
-					return modelSummary(model), err
-				}
-			}
-			if len(page.Events) < opts.PageLimit {
-				break
-			}
-			// A full page may have more events immediately; keep reading without
-			// waiting for the poll interval. A defensive cursor check prevents a
-			// server that returns a full page without progress from spinning.
-			if model.Cursor <= previousCursor {
-				break
-			}
-		}
-		if pageFailed {
-			backoff = nextBackoff(backoff)
-			if !wait(ctx, backoff, opts.Now, model) {
-				return detach(model, opts.Now(), emitObservation, ctx.Err())
-			}
-			continue
-		}
-
-		// A terminal event can arrive after the snapshot was fetched. Do not
-		// finish until a fresh authoritative terminal snapshot includes it.
-		if snapshot.State.Terminal() && model.Terminal() && model.Cursor == snapshot.LastSequence {
-			now = opts.Now()
-			model.Close(now)
-			if err := emitObservation(Observation{Kind: ObservationClosed, At: now}); err != nil {
-				return modelSummary(model), err
-			}
+		if done {
 			return modelSummary(model), nil
 		}
-		if snapshot.State.Terminal() && model.Cursor < snapshot.LastSequence && model.Cursor == cursorBeforePages {
-			tailNoProgress++
-			if tailNoProgress > 2 {
-				return modelSummary(model), contract.NewFault(contract.PreconditionFailed, "operation terminal event tail is unavailable", "Inspect the operation history; missing events were not skipped.")
-			}
-		} else {
-			tailNoProgress = 0
+	}
+}
+
+// followTransportError marks a poll failure that must pass through failFollow,
+// which decides between a retry summary and a detached session.
+type followTransportError struct {
+	err error
+	at  time.Time
+}
+
+func (e *followTransportError) Error() string { return e.err.Error() }
+func (e *followTransportError) Unwrap() error { return e.err }
+
+type follower struct {
+	client Client
+	id     contract.OperationID
+	opts   FollowOptions
+	model  *Model
+	emit   func(Observation) error
+
+	backoff        time.Duration
+	gapRefetches   int
+	tailNoProgress int
+}
+
+func (f *follower) runOnce(ctx context.Context) (bool, error) {
+	now := f.opts.Now()
+	if err := ctx.Err(); err != nil {
+		return false, &followTransportError{err: err, at: now}
+	}
+	f.model.Tick(now)
+	if err := f.emit(Observation{Kind: ObservationTick, At: now}); err != nil {
+		return false, err
+	}
+
+	snapshot, retry, err := f.snapshot(ctx, now)
+	if err != nil {
+		return false, err
+	}
+	if retry {
+		return false, nil
+	}
+
+	cursorBeforePages := f.model.Cursor
+	pageFailed, err := f.fetchPages(ctx, now)
+	if err != nil {
+		return false, err
+	}
+	if pageFailed {
+		return false, nil
+	}
+
+	// A terminal event can arrive after the snapshot was fetched. Do not finish
+	// until a fresh authoritative terminal snapshot includes it.
+	if snapshot.State.Terminal() && f.model.Terminal() && f.model.Cursor == snapshot.LastSequence {
+		now = f.opts.Now()
+		f.model.Close(now)
+		if err := f.emit(Observation{Kind: ObservationClosed, At: now}); err != nil {
+			return false, err
 		}
-		if !wait(ctx, opts.PollInterval, opts.Now, model) {
-			return detach(model, opts.Now(), emitObservation, ctx.Err())
+		return true, nil
+	}
+	if err := f.checkTail(snapshot, cursorBeforePages); err != nil {
+		return false, err
+	}
+	if !wait(ctx, f.opts.PollInterval, f.opts.Now, f.model) {
+		return false, &followTransportError{err: ctx.Err(), at: f.opts.Now()}
+	}
+	return false, nil
+}
+
+func (f *follower) snapshot(ctx context.Context, now time.Time) (contract.Operation, bool, error) {
+	raw, err := f.client.Get(ctx, f.id)
+	if err != nil {
+		if fatalFollowError(err) || ctx.Err() != nil {
+			return contract.Operation{}, false, &followTransportError{err: err, at: now}
+		}
+		f.model.PollFailed(err, now)
+		if emitErr := f.emit(Observation{Kind: ObservationFailed, At: now, Err: err}); emitErr != nil {
+			return contract.Operation{}, false, emitErr
+		}
+		f.backoff = nextBackoff(f.backoff)
+		if !wait(ctx, f.backoff, f.opts.Now, f.model) {
+			return contract.Operation{}, false, &followTransportError{err: ctx.Err(), at: f.opts.Now()}
+		}
+		return contract.Operation{}, true, nil
+	}
+	snapshot, err := decodeOperation(raw)
+	if err == nil && snapshot.ID != f.id {
+		err = invalidFollowData()
+	}
+	if err != nil {
+		return contract.Operation{}, false, err
+	}
+	f.model.Snapshot(snapshot, now)
+	f.model.PollSucceeded(now)
+	f.backoff = f.opts.PollInterval
+	if err := f.emit(Observation{Kind: ObservationSnapshot, At: now, Snapshot: &snapshot}); err != nil {
+		return contract.Operation{}, false, err
+	}
+	return snapshot, false, nil
+}
+
+func (f *follower) fetchPages(ctx context.Context, now time.Time) (bool, error) {
+	pageFailed := false
+	for {
+		previousCursor := f.model.Cursor
+		page, failed, err := f.fetchPage(ctx)
+		if err != nil {
+			return false, err
+		}
+		if failed {
+			pageFailed = true
+			break
+		}
+		failed, err = f.applyPage(page, now)
+		if err != nil {
+			return false, err
+		}
+		if failed {
+			pageFailed = true
+			break
+		}
+		if len(page.Events) < f.opts.PageLimit {
+			break
+		}
+		// A full page may have more events immediately; keep reading without
+		// waiting for the poll interval. A defensive cursor check prevents a
+		// server that returns a full page without progress from spinning.
+		if f.model.Cursor <= previousCursor {
+			break
 		}
 	}
+	if pageFailed {
+		return f.retryPage(ctx)
+	}
+	return false, nil
+}
+
+func (f *follower) fetchPage(ctx context.Context) (eventPage, bool, error) {
+	page, err := fetchPage(ctx, f.client, f.id, f.model.Cursor, f.opts.PageLimit)
+	if err == nil {
+		return page, false, nil
+	}
+	now := f.opts.Now()
+	if fatalFollowError(err) || ctx.Err() != nil {
+		return eventPage{}, false, &followTransportError{err: err, at: now}
+	}
+	f.model.PollFailed(err, now)
+	if emitErr := f.emit(Observation{Kind: ObservationFailed, At: now, Err: err}); emitErr != nil {
+		return eventPage{}, false, emitErr
+	}
+	return eventPage{}, true, nil
+}
+
+func (f *follower) applyPage(page eventPage, now time.Time) (bool, error) {
+	if err := f.model.Page(page.Events, now); err != nil {
+		gap := ErrGap(err)
+		if gap == nil {
+			return false, err
+		}
+		f.gapRefetches++
+		if f.gapRefetches > 2 {
+			return false, gap
+		}
+		f.model.PollFailed(err, now)
+		if emitErr := f.emit(Observation{Kind: ObservationFailed, At: now, Err: err}); emitErr != nil {
+			return false, emitErr
+		}
+		return true, nil
+	}
+	f.gapRefetches = 0
+	f.model.PollSucceeded(now)
+	if len(page.Events) > 0 {
+		if err := f.emit(Observation{Kind: ObservationEvents, At: now, Events: page.Events}); err != nil {
+			return false, err
+		}
+	}
+	return false, nil
+}
+
+func (f *follower) retryPage(ctx context.Context) (bool, error) {
+	f.backoff = nextBackoff(f.backoff)
+	if !wait(ctx, f.backoff, f.opts.Now, f.model) {
+		return false, &followTransportError{err: ctx.Err(), at: f.opts.Now()}
+	}
+	return true, nil
+}
+
+func (f *follower) checkTail(snapshot contract.Operation, cursorBeforePages uint64) error {
+	if snapshot.State.Terminal() && f.model.Cursor < snapshot.LastSequence && f.model.Cursor == cursorBeforePages {
+		f.tailNoProgress++
+		if f.tailNoProgress > 2 {
+			return contract.NewFault(contract.PreconditionFailed, "operation terminal event tail is unavailable", "Inspect the operation history; missing events were not skipped.")
+		}
+		return nil
+	}
+	f.tailNoProgress = 0
+	return nil
 }
 
 func failFollow(ctx context.Context, model *Model, now time.Time, err error, emit func(Observation) error) (Summary, error) {
@@ -366,13 +463,15 @@ func fatalFollowError(err error) bool {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return true
 	}
-	var fault *contract.Fault
+	var fault *contract.FaultError
 	if !errors.As(err, &fault) {
 		return false
 	}
 	switch fault.Code {
 	case contract.Usage, contract.InvalidOutputMode, contract.InputRequired, contract.ValidationFailed, contract.NotFound, contract.Unauthenticated, contract.Forbidden, contract.PreconditionFailed, contract.Conflict, contract.NodeVersionMismatch:
 		return true
+	case contract.MissingTool, contract.DoctorFailed, contract.ConfirmationRequired, contract.RemoteUnreachable, contract.Unavailable, contract.Cancelled, contract.Internal:
+		return false
 	default:
 		return false
 	}

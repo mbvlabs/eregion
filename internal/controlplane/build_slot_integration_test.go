@@ -293,19 +293,7 @@ func TestIntegrationReleaseBuildSlotQueuesAndRuns(t *testing.T) {
 	if blocked.ErrorCode != contract.PreconditionFailed {
 		t.Fatalf("capacity failure code=%s", blocked.ErrorCode)
 	}
-	page, err := s.Events(ctx, testActor, contract.Cursor{OperationID: blocked.ID}, 200)
-	if err != nil {
-		t.Fatal(err)
-	}
-	queued := false
-	for _, event := range page.Events {
-		if strings.Contains(event.Message, "build_queued") {
-			queued = true
-		}
-	}
-	if !queued {
-		t.Fatalf("no build_queued event was emitted: %+v", page.Events)
-	}
+	assertBuildSlotEvent(t, ctx, s, blocked.ID, "build_queued")
 	if got := transport.runCount(deploymentPackStep); got != 0 {
 		t.Fatalf("a build ran without a slot: %d", got)
 	}
@@ -332,17 +320,19 @@ func TestIntegrationReleaseBuildSlotQueuesAndRuns(t *testing.T) {
 	if got := transport.runCount(deploymentPackStep); got != 1 {
 		t.Fatalf("pack ran %d times", got)
 	}
-	page, err = s.Events(ctx, testActor, contract.Cursor{OperationID: ready.ID}, 200)
+	assertBuildSlotEvent(t, ctx, s, ready.ID, "build_running")
+}
+
+func assertBuildSlotEvent(t *testing.T, ctx context.Context, s *Service, id contract.OperationID, fragment string) {
+	t.Helper()
+	page, err := s.Events(ctx, testActor, contract.Cursor{OperationID: id}, 200)
 	if err != nil {
 		t.Fatal(err)
 	}
-	running := false
 	for _, event := range page.Events {
-		if strings.Contains(event.Message, "build_running") {
-			running = true
+		if strings.Contains(event.Message, fragment) {
+			return
 		}
 	}
-	if !running {
-		t.Fatalf("no build_running event was emitted: %+v", page.Events)
-	}
+	t.Fatalf("no %s event was emitted: %+v", fragment, page.Events)
 }

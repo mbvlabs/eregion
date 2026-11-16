@@ -70,10 +70,7 @@ func (a *app) workspaceUI(cmd *cobra.Command, _ []string) (result, error) {
 	if err != nil {
 		return result{}, err
 	}
-	workspaceAPI, err := newWorkspaceAPI(client)
-	if err != nil {
-		return result{}, err
-	}
+	workspaceAPI := newWorkspaceAPI(client)
 	ascii, _ := cmd.Flags().GetBool("ascii")
 	noColor, _ := cmd.Flags().GetBool("no-color")
 	reduced, _ := cmd.Flags().GetBool("reduced-motion")
@@ -155,8 +152,8 @@ type workspaceLiveAPI struct {
 	client Backend
 }
 
-func newWorkspaceAPI(client Backend) (workspaceui.API, error) {
-	return workspaceLiveAPI{client: client}, nil
+func newWorkspaceAPI(client Backend) workspaceui.API {
+	return workspaceLiveAPI{client: client}
 }
 
 func (w workspaceLiveAPI) PlatformInventory(ctx context.Context, collection string, filters url.Values) (json.RawMessage, error) {

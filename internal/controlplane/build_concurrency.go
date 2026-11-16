@@ -44,35 +44,42 @@ func (s *Service) buildConcurrency(ctx context.Context, actor contract.Actor, in
 		if !found {
 			return contract.NewFault(contract.PreconditionFailed, "the verified main node is not registered", "Finish main-node initialization first.")
 		}
-		if node.BuildConcurrency < 1 || node.BuildConcurrency > platform.MaxBuildConcurrency ||
-			node.Transport != "local" || node.Enrollment != platform.EnrollmentRegistered || !contains(node.Roles, platform.RoleBuilder) {
-			return contract.NewFault(contract.PreconditionFailed, "the main node is not a verified builder", "Finish main-node enrollment and correct invalid node state.")
-		}
-		result = api.BuildConcurrencyResult{Node: binding.NodeName, Previous: node.BuildConcurrency, Effective: node.BuildConcurrency, Warnings: []string{
-			"Higher concurrency consumes additional CPU, memory, disk and cache space.",
-			"Worker concurrency and database pool limits can prevent reaching this capacity.",
-			"The limit bounds live advisory admissions; a detached build after database session loss may outlive its slot.",
-			"Reducing capacity does not cancel running builds or restart workers.",
-		}}
-		if input != nil {
-			result.DryRun = input.DryRun
-			result.Effective = input.Value
-			if !input.DryRun {
-				if _, err := tx.Nodes().SetBuildConcurrency(ctx, binding.NodeName, input.Value); err != nil {
-					return unavailable(err)
-				}
-			}
-		}
-		return nil
+		result, err = applyBuildConcurrency(ctx, tx, binding.NodeName, node, input)
+		return err
 	})
 	if err != nil {
 		if entities.IsBeginFailure(err) || entities.IsCommitFailure(err) {
 			return api.BuildConcurrencyResult{}, unavailable(err)
 		}
-		var fault *contract.Fault
+		var fault *contract.FaultError
 		if errors.As(err, &fault) {
 			return api.BuildConcurrencyResult{}, err
 		}
+		return api.BuildConcurrencyResult{}, unavailable(err)
+	}
+	return result, nil
+}
+
+func applyBuildConcurrency(ctx context.Context, tx *entities.StoreTx, nodeName string, node entities.BuildConcurrencyState, input *api.BuildConcurrencyInput) (api.BuildConcurrencyResult, error) {
+	if node.BuildConcurrency < 1 || node.BuildConcurrency > platform.MaxBuildConcurrency ||
+		node.Transport != "local" || node.Enrollment != platform.EnrollmentRegistered || !contains(node.Roles, platform.RoleBuilder) {
+		return api.BuildConcurrencyResult{}, contract.NewFault(contract.PreconditionFailed, "the main node is not a verified builder", "Finish main-node enrollment and correct invalid node state.")
+	}
+	result := api.BuildConcurrencyResult{Node: nodeName, Previous: node.BuildConcurrency, Effective: node.BuildConcurrency, Warnings: []string{
+		"Higher concurrency consumes additional CPU, memory, disk and cache space.",
+		"Worker concurrency and database pool limits can prevent reaching this capacity.",
+		"The limit bounds live advisory admissions; a detached build after database session loss may outlive its slot.",
+		"Reducing capacity does not cancel running builds or restart workers.",
+	}}
+	if input == nil {
+		return result, nil
+	}
+	result.DryRun = input.DryRun
+	result.Effective = input.Value
+	if input.DryRun {
+		return result, nil
+	}
+	if _, err := tx.Nodes().SetBuildConcurrency(ctx, nodeName, input.Value); err != nil {
 		return api.BuildConcurrencyResult{}, unavailable(err)
 	}
 	return result, nil

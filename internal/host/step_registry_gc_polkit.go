@@ -128,7 +128,7 @@ func (s *registryGCPolkitStep) Apply(_ context.Context, _ engine.Runtime, _ engi
 	if err := chownIfRoot(s.dir, "root", registryGCPolkitRuleGroup); err != nil {
 		return engine.ApplyResult{}, err
 	}
-	if err := writePublicFile(s.rulePath(), s.rule(), "root", "root"); err != nil {
+	if err := writePublicFile(s.rulePath(), s.rule(), "root"); err != nil {
 		return engine.ApplyResult{}, err
 	}
 	return engine.ApplyResult{

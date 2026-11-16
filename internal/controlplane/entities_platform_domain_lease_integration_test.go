@@ -15,7 +15,6 @@ func TestIntegrationEntitiesPlatformDomainDNSAndLeases(t *testing.T) {
 	pool, _ := testPool(t, true)
 	f := newPlatformFixture(t, pool, "dns")
 	ctx := context.Background()
-	store := f.store
 	domainID, err := platform.NewDomainID()
 	if err != nil {
 		t.Fatal(err)
@@ -24,20 +23,31 @@ func TestIntegrationEntitiesPlatformDomainDNSAndLeases(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
+	seedDomainDNS(t, ctx, f, domainID, operationID)
+	checkDomainDNSReads(t, ctx, f, domainID, operationID)
+	checkDomainOutcomes(t, ctx, f, operationID)
+	checkDomainLeases(t, ctx, f)
+}
+
+func seedDomainDNS(t *testing.T, ctx context.Context, f *platformFixture, domainID platform.DomainID, operationID contract.OperationID) {
+	t.Helper()
+	if err := f.store.WithinTx(ctx, func(tx *entities.StoreTx) error {
 		if _, err := tx.Platform().Domains().Insert(ctx, entities.DomainInsert{
 			ID: domainID, Domain: "dns.example.test", EnvironmentID: f.env.ID, Primary: true,
 			Addresses: []string{"127.0.0.1"}, CheckPath: "/health",
 		}); err != nil {
 			return err
 		}
-		if _, err := tx.Platform().DomainDNS().UpsertIntent(ctx, domainID, "zone-1", "example.test", "marker-dns", []string{"127.0.0.1"}, false, operationID); err != nil {
-			return err
-		}
-		return nil
+		_, err := tx.Platform().DomainDNS().UpsertIntent(ctx, domainID, "zone-1", "example.test", "marker-dns", []string{"127.0.0.1"}, false, operationID)
+		return err
 	}); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func checkDomainDNSReads(t *testing.T, ctx context.Context, f *platformFixture, domainID platform.DomainID, operationID contract.OperationID) {
+	t.Helper()
+	store := f.store
 	if ledger, found, err := store.Platform().DomainDNS().GetByAppEnvironmentDomain(ctx, f.app.Name, f.env.Name, "dns.example.test"); err != nil || !found || ledger.ZoneID != "zone-1" {
 		t.Fatalf("ledger = %+v, %v, %v", ledger, found, err)
 	}
@@ -68,6 +78,11 @@ func TestIntegrationEntitiesPlatformDomainDNSAndLeases(t *testing.T) {
 	if err := store.Platform().Domains().LockRouteWrite(ctx, 1); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func checkDomainOutcomes(t *testing.T, ctx context.Context, f *platformFixture, operationID contract.OperationID) {
+	t.Helper()
+	store := f.store
 	if facts, found, err := store.Platform().Outcomes().ProtectionFacts(ctx, f.app.Name, f.env.Name); err != nil || !found || !facts.Protected {
 		t.Fatalf("protection facts = %+v, %v, %v", facts, found, err)
 	}
@@ -80,7 +95,11 @@ func TestIntegrationEntitiesPlatformDomainDNSAndLeases(t *testing.T) {
 	if exists, err := store.Platform().Outcomes().DefinitionReservationExists(ctx, f.app.Name, f.env.Name, operationID, "platform.test", "app/"+f.app.Name, json.RawMessage(`{}`), platform.KindDefinitionApply, contract.Actor{Kind: "system", Subject: "test"}); err != nil || exists {
 		t.Fatalf("definition reservation = %v, %v", exists, err)
 	}
+}
 
+func checkDomainLeases(t *testing.T, ctx context.Context, f *platformFixture) {
+	t.Helper()
+	store := f.store
 	lease, err := store.Platform().Locks().AcquireTargets(ctx, []int64{11, 12})
 	if err != nil {
 		t.Fatal(err)

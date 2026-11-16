@@ -157,7 +157,7 @@ func TestIntegrationResourceCancelSettlesStateAndAllowsRetryAndDestroy(t *testin
 		t.Fatal(err)
 	}
 	err = s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
-		return s.ensureNoLiveResourcesTx(ctx, tx, "cancelapi", "", appID, "")
+		return s.ensureNoLiveResourcesTx(ctx, tx, appID, "")
 	})
 	if err != nil {
 		t.Fatalf("destroyed resource still blocks environment deletion: %v", err)
@@ -217,7 +217,7 @@ func TestIntegrationResourceCancelAfterSuccessfulStepIsHonored(t *testing.T) {
 	if cancelled.ID != apply.ID {
 		t.Fatalf("cancelled operation = %s", cancelled.ID)
 	}
-	state, volumes, errorCode, _ := resourceState(t, pool, "cancelok", "db")
+	state, volumes, errorCode, _ := resourceState(t, pool, "cancelok")
 	if state != string(platform.ResourceDegraded) || errorCode != string(contract.Cancelled) {
 		t.Fatalf("after cancellation: state=%s error=%s", state, errorCode)
 	}
@@ -292,7 +292,7 @@ func TestIntegrationResourceApplyCancelBeforeFinalizationIsHonored(t *testing.T)
 	if err := <-cancelResult; err != nil {
 		t.Fatalf("request cancel: %v", err)
 	}
-	state, volumes, errorCode, _ := resourceState(t, pool, "cancelfinalize", "db")
+	state, volumes, errorCode, _ := resourceState(t, pool, "cancelfinalize")
 	if state != string(platform.ResourceDegraded) || errorCode != string(contract.Cancelled) {
 		t.Fatalf("after finalization cancellation: state=%s error=%s", state, errorCode)
 	}
@@ -358,7 +358,7 @@ func TestIntegrationResourceDestroyCancelBeforeFinalizationIsHonored(t *testing.
 	if err := <-cancelResult; err != nil {
 		t.Fatalf("request cancel: %v", err)
 	}
-	state, volumes, errorCode, _ := resourceState(t, pool, "destroycancelfinalize", "db")
+	state, volumes, errorCode, _ := resourceState(t, pool, "destroycancelfinalize")
 	if state != string(platform.ResourceDegraded) || errorCode != string(contract.Cancelled) {
 		t.Fatalf("after destroy finalization cancellation: state=%s error=%s", state, errorCode)
 	}
@@ -409,7 +409,7 @@ func TestIntegrationReconcileTerminalResourceStatesRepairsExistingStuckRows(t *t
 	if err := s.Reconcile(ctx); err != nil {
 		t.Fatal(err)
 	}
-	state, volumes, errorCode, detail := resourceState(t, pool, "stuckapi", "db")
+	state, volumes, errorCode, detail := resourceState(t, pool, "stuckapi")
 	if state != string(platform.ResourceDegraded) || errorCode != string(contract.Cancelled) || !strings.Contains(volumes, volumeName) || !strings.Contains(detail, "apply") {
 		t.Fatalf("cancelled stuck row = state=%s error=%s detail=%q volumes=%s", state, errorCode, detail, volumes)
 	}
@@ -424,7 +424,7 @@ func TestIntegrationReconcileTerminalResourceStatesRepairsExistingStuckRows(t *t
 	if err := s.Reconcile(ctx); err != nil {
 		t.Fatal(err)
 	}
-	state, volumes, errorCode, detail = resourceState(t, pool, "stuckapi", "db")
+	state, volumes, errorCode, detail = resourceState(t, pool, "stuckapi")
 	if state != string(platform.ResourceDegraded) || errorCode != string(contract.Unavailable) || !strings.Contains(volumes, volumeName) || !strings.Contains(detail, "destroy") {
 		t.Fatalf("failed stuck row = state=%s error=%s detail=%q volumes=%s", state, errorCode, detail, volumes)
 	}
@@ -435,14 +435,15 @@ func TestIntegrationReconcileTerminalResourceStatesRepairsExistingStuckRows(t *t
 	if err := s.Reconcile(ctx); err != nil {
 		t.Fatal(err)
 	}
-	state, _, _, _ = resourceState(t, pool, "stuckapi", "db")
+	state, _, _, _ = resourceState(t, pool, "stuckapi")
 	if state != string(platform.ResourcePending) {
 		t.Fatalf("newer operation was clobbered: state=%s", state)
 	}
 }
 
-func resourceState(t *testing.T, pool *pgxpool.Pool, app, name string) (state, volumes, errorCode, detail string) {
+func resourceState(t *testing.T, pool *pgxpool.Pool, app string) (state, volumes, errorCode, detail string) {
 	t.Helper()
+	const name = "db"
 	if err := pool.QueryRow(context.Background(), `SELECT r.state,r.volumes::text,r.error_code,r.health_detail
         FROM eregion_platform_resources r
         JOIN eregion_platform_apps a ON a.id=r.app_id

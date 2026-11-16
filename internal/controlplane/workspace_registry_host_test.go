@@ -41,19 +41,7 @@ func ensureTestRegistryHost(t *testing.T, pool *pgxpool.Pool, stateDir string) R
 		t.Fatal(err)
 	}
 	if workspace.Configured {
-		if workspace.RegistryHost == nil {
-			t.Fatal("test runtime requires a verified registry-host binding; use explicit test setup for an unbound workspace")
-		}
-		if strings.TrimSpace(stateDir) != "" {
-			canonical, err := CanonicalRegistryHostStateDir(stateDir)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if canonical != workspace.RegistryHost.StateDir {
-				t.Fatalf("test runtime state directory %q does not match the existing workspace registry-host binding %q", canonical, workspace.RegistryHost.StateDir)
-			}
-		}
-		return *workspace.RegistryHost
+		return verifyExistingRegistryHost(t, workspace, stateDir)
 	}
 	if strings.TrimSpace(stateDir) == "" {
 		stateDir = t.TempDir()
@@ -71,6 +59,23 @@ func ensureTestRegistryHost(t *testing.T, pool *pgxpool.Pool, stateDir string) R
 		t.Fatal("workspace assignment did not record the registry-host binding")
 	}
 	return *assigned.RegistryHost
+}
+
+func verifyExistingRegistryHost(t *testing.T, workspace WorkspaceIdentity, stateDir string) RegistryHostIdentity {
+	t.Helper()
+	if workspace.RegistryHost == nil {
+		t.Fatal("test runtime requires a verified registry-host binding; use explicit test setup for an unbound workspace")
+	}
+	if strings.TrimSpace(stateDir) != "" {
+		canonical, err := CanonicalRegistryHostStateDir(stateDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if canonical != workspace.RegistryHost.StateDir {
+			t.Fatalf("test runtime state directory %q does not match the existing workspace registry-host binding %q", canonical, workspace.RegistryHost.StateDir)
+		}
+	}
+	return *workspace.RegistryHost
 }
 
 // TestIntegrationTestRuntimeRegistryHostBindingAllowsAppDelete proves the

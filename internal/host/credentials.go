@@ -21,15 +21,6 @@ var tokenPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{32,256}$`)
 
 var scopes = []string{"operations:submit", "operations:read", "operations:cancel", "system:read"}
 
-func knownScope(scope string) bool {
-	for _, known := range scopes {
-		if scope == known {
-			return true
-		}
-	}
-	return false
-}
-
 // KnownScopes returns a copy of the server's accepted API scopes.
 func KnownScopes() []string { return append([]string(nil), scopes...) }
 
@@ -58,13 +49,6 @@ func generateToken() (string, error) {
 func tokenHash(token string) string {
 	hash := sha256.Sum256([]byte(token))
 	return hex.EncodeToString(hash[:])
-}
-
-// Principal returns the server credential for a token. The token itself is
-// never stored in the auth file.
-func principal(actor contract.Actor, token string, scopes []string) api.Principal {
-	copied := append([]string(nil), scopes...)
-	return api.Principal{Actor: actor, TokenSHA256: tokenHash(token), Scopes: copied}
 }
 
 // AuthPrincipals builds the deterministic initial auth file contents. Setup
@@ -100,8 +84,6 @@ func CredentialFingerprint(token string) string {
 	}
 	return tokenHash(token)[:12]
 }
-
-func tokenFingerprint(token string) string { return CredentialFingerprint(token) }
 
 // decodeAuthFile applies the API's strict token-store rules without requiring
 // any particular principals. It never rewrites the file.

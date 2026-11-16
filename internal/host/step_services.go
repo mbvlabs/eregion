@@ -95,7 +95,7 @@ func (s *serviceStep) Check(ctx context.Context, _ engine.Runtime) (engine.Check
 	}
 	script := fmt.Sprintf(`if systemctl is-enabled %s >/dev/null 2>&1; then echo enabled:ok; else echo enabled:missing; fi
 if systemctl is-active %s >/dev/null 2>&1; then echo active:ok; else echo active:missing; fi`, s.service, s.service)
-	output, err := checkOutput(ctx, engine.Runtime{}, s.exec, script)
+	output, err := checkOutput(ctx, s.exec, script)
 	if err != nil {
 		return engine.CheckResult{}, err
 	}
@@ -148,7 +148,7 @@ func applyUnit(ctx context.Context, exec Exec, path string, desired []byte, serv
 	if err != nil {
 		return err
 	}
-	if err := writePublicFile(path, desired, "root", "root"); err != nil {
+	if err := writePublicFile(path, desired, "root"); err != nil {
 		return err
 	}
 	script := fmt.Sprintf("set -euo pipefail\nsystemctl daemon-reload\nsystemctl enable %s\nsystemctl restart %s\nsystemctl is-active --quiet %s", service, service, service)

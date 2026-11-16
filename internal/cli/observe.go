@@ -78,7 +78,7 @@ func (a *app) appStatusView(cmd *cobra.Command, app string) (result, error) {
 
 // envStatusView is the extended `env status`.
 func (a *app) envStatusView(cmd *cobra.Command, app, environment string) (result, error) {
-	env, _, err := a.readEnvironment(cmd, app, environment)
+	env, err := a.readEnvironment(cmd, app, environment)
 	if err != nil {
 		return result{}, err
 	}
@@ -181,8 +181,16 @@ func writeEnvironmentObservation(observation platform.EnvironmentObservation) st
 	env := observation.Environment
 	var out strings.Builder
 	fmt.Fprintf(&out, "%s\n", ui.Header(fmt.Sprintf("Environment %s/%s (%s)", env.App, env.Name, env.ID), 72))
+	writeObservationFields(&out, env, observation)
+	writeObservationProcesses(&out, observation)
+	writeObservationDomains(&out, observation)
+	writeObservationOperations(&out, observation)
+	return out.String()
+}
+
+func writeObservationFields(out *strings.Builder, env platform.Environment, observation platform.EnvironmentObservation) {
 	field := func(name, value string) {
-		fmt.Fprintf(&out, "  %s %s\n", ui.Dim(fmt.Sprintf("%-17s", name+":")), value)
+		fmt.Fprintf(out, "  %s %s\n", ui.Dim(fmt.Sprintf("%-17s", name+":")), value)
 	}
 	field("node", env.Node)
 	protection := "unprotected"
@@ -221,76 +229,82 @@ func writeEnvironmentObservation(observation platform.EnvironmentObservation) st
 	if observation.WorkloadError != "" {
 		field("workload observation", ui.State("unknown")+" ("+observation.WorkloadError+")")
 	}
+}
+
+func writeObservationProcesses(out *strings.Builder, observation platform.EnvironmentObservation) {
 	rows := make([][]string, 0)
 	for _, process := range observation.Processes {
 		for _, replica := range process.Replicas {
-			container := replica.Container
-			if container == "" {
-				container = "-"
-			}
-			port := "-"
-			if replica.HostPort > 0 {
-				port = fmt.Sprint(replica.HostPort)
-			}
-			serving := "no"
-			if replica.Serving {
-				serving = "yes"
-			}
-			rows = append(rows, []string{process.Name, process.Kind, replica.Replica, replica.State, container, port, serving})
+			rows = append(rows, observationReplicaRow(process.Name, process.Kind, replica))
 		}
 	}
 	for _, replica := range observation.OtherContainers {
-		container := replica.Container
-		if container == "" {
-			container = "-"
-		}
-		port := "-"
-		if replica.HostPort > 0 {
-			port = fmt.Sprint(replica.HostPort)
-		}
-		serving := "no"
-		if replica.Serving {
-			serving = "yes"
-		}
-		rows = append(rows, []string{"other", "unexpected", replica.Replica, replica.State, container, port, serving})
+		rows = append(rows, observationReplicaRow("other", "unexpected", replica))
 	}
 	out.WriteString(ui.Section("Processes") + "\n")
 	if len(rows) == 0 {
 		out.WriteString("  (none observed and none desired)\n")
-	} else {
-		out.WriteString(writeTable([]string{"PROCESS", "KIND", "REPLICA", "STATE", "CONTAINER", "HOST PORT", "SERVING"}, rows))
+		return
 	}
+	out.WriteString(writeTable([]string{"PROCESS", "KIND", "REPLICA", "STATE", "CONTAINER", "HOST PORT", "SERVING"}, rows))
+}
+
+func observationReplicaRow(name, kind string, replica platform.ReplicaObservation) []string {
+	container := replica.Container
+	if container == "" {
+		container = "-"
+	}
+	port := "-"
+	if replica.HostPort > 0 {
+		port = fmt.Sprint(replica.HostPort)
+	}
+	serving := "no"
+	if replica.Serving {
+		serving = "yes"
+	}
+	return []string{name, kind, replica.Replica, replica.State, container, port, serving}
+}
+
+func writeObservationDomains(out *strings.Builder, observation platform.EnvironmentObservation) {
 	if observation.DomainsError != "" {
-		fmt.Fprintf(&out, "%s\n", ui.Warn("domains unavailable: "+observation.DomainsError))
-	} else if len(observation.Domains) > 0 {
-		out.WriteString(ui.Section("Domains") + "\n")
-		domainRows := make([][]string, 0, len(observation.Domains))
-		for _, domain := range observation.Domains {
-			primary := "no"
-			if domain.Primary {
-				primary = "yes"
-			}
-			ready := "no"
-			if domain.Ready {
-				ready = "yes"
-			}
-			domainRows = append(domainRows, []string{
-				domain.Domain, primary, string(domain.RouteState), string(domain.DNSState),
-				string(domain.CertificateState), string(domain.PublicState), ready,
-			})
-			if message := domainBindingError(domain.DomainBinding); message != "" {
-				domainRows = append(domainRows, []string{domain.Domain, "", "", "", "", "", message})
-			}
+		fmt.Fprintf(out, "%s\n", ui.Warn("domains unavailable: "+observation.DomainsError))
+		return
+	}
+	if len(observation.Domains) == 0 {
+		return
+	}
+	out.WriteString(ui.Section("Domains") + "\n")
+	domainRows := make([][]string, 0, len(observation.Domains))
+	for _, domain := range observation.Domains {
+		primary := "no"
+		if domain.Primary {
+			primary = "yes"
 		}
-		out.WriteString(writeTable([]string{"DOMAIN", "PRIMARY", "ROUTE", "DNS", "CERTIFICATE", "PUBLIC", "READY"}, domainRows))
+		ready := "no"
+		if domain.Ready {
+			ready = "yes"
+		}
+		domainRows = append(domainRows, []string{
+			domain.Domain, primary, string(domain.RouteState), string(domain.DNSState),
+			string(domain.CertificateState), string(domain.PublicState), ready,
+		})
+		if message := domainBindingError(domain.DomainBinding); message != "" {
+			domainRows = append(domainRows, []string{domain.Domain, "", "", "", "", "", message})
+		}
 	}
+	out.WriteString(writeTable([]string{"DOMAIN", "PRIMARY", "ROUTE", "DNS", "CERTIFICATE", "PUBLIC", "READY"}, domainRows))
+}
+
+func writeObservationOperations(out *strings.Builder, observation platform.EnvironmentObservation) {
 	if observation.OperationsError != "" {
-		fmt.Fprintf(&out, "%s\n", ui.Warn("last operations unavailable: "+observation.OperationsError))
-	} else if len(observation.Operations) > 0 {
-		out.WriteString(ui.Section("Last operations") + "\n")
-		out.WriteString(writeOperationTable(observation.Operations))
+		fmt.Fprintf(out, "%s\n", ui.Warn("last operations unavailable: "+observation.OperationsError))
+		return
 	}
-	return out.String()
+	if len(observation.Operations) == 0 {
+		return
+	}
+	out.WriteString(ui.Section("Last operations") + "\n")
+	out.WriteString(writeOperationTable(observation.Operations))
 }
 
 func writeOperationTable(items []contract.Operation) string {

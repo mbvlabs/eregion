@@ -28,39 +28,13 @@ func (s *Service) previewDomainDNS(ctx context.Context, actor contract.Actor, in
 	if err := s.domainDNS.AuthorizeRead(ctx, actor); err != nil {
 		return integrations.DomainDNSPlan{}, err
 	}
-	var ledger *domainDNSLedger
-	var err error
-	ledger, err = s.loadDomainDNSLedger(ctx, input.App, input.Environment, input.Domain)
+	ledger, err := s.loadDomainDNSLedger(ctx, input.App, input.Environment, input.Domain)
 	if err != nil {
 		return integrations.DomainDNSPlan{}, err
 	}
-	var zone integrations.DNSZone
-	var domainID platform.DomainID
-	ownership := ""
-	if ledger != nil {
-		zone = integrations.DNSZone{ZoneID: ledger.ZoneID, ZoneName: ledger.ZoneName}
-		domainID = ledger.DomainID
-		ownership = ledger.Ownership
-		if input.DNSZone != "" {
-			requested, err := s.resolveDomainDNSZone(ctx, input.DNSZone)
-			if err != nil {
-				return integrations.DomainDNSPlan{}, err
-			}
-			if requested.ZoneID != ledger.ZoneID {
-				return integrations.DomainDNSPlan{}, contract.NewFault(contract.Conflict, "managed DNS zone does not match the binding ledger", "Omit --dns-zone to use the persisted zone, or correct the flag.")
-			}
-		}
-	} else {
-		zone, err = s.resolveDomainDNSZone(ctx, input.DNSZone)
-		if err != nil {
-			return integrations.DomainDNSPlan{}, err
-		}
-		id, idErr := platform.NewDomainID()
-		if idErr != nil {
-			return integrations.DomainDNSPlan{}, contract.NewFault(contract.Internal, "could not allocate a preview domain identity", "Report the command and binary version.")
-		}
-		domainID = id
-		ownership = integrations.DomainDNSOwnership(string(domainID), zone.ZoneID)
+	zone, domainID, ownership, err := s.previewDomainDNSIdentity(ctx, input, ledger)
+	if err != nil {
+		return integrations.DomainDNSPlan{}, err
 	}
 	request := integrations.DomainDNSRequest{
 		ZoneID: zone.ZoneID, ZoneName: zone.ZoneName, DomainID: string(domainID),
@@ -87,6 +61,31 @@ func (s *Service) previewDomainDNS(ctx context.Context, actor contract.Actor, in
 	return plan, nil
 }
 
+func (s *Service) previewDomainDNSIdentity(ctx context.Context, input *platform.DomainInput, ledger *domainDNSLedger) (integrations.DNSZone, platform.DomainID, string, error) {
+	if ledger == nil {
+		zone, err := s.resolveDomainDNSZone(ctx, input.DNSZone)
+		if err != nil {
+			return integrations.DNSZone{}, "", "", err
+		}
+		id, err := platform.NewDomainID()
+		if err != nil {
+			return integrations.DNSZone{}, "", "", contract.NewFault(contract.Internal, "could not allocate a preview domain identity", "Report the command and binary version.")
+		}
+		return zone, id, integrations.DomainDNSOwnership(string(id), zone.ZoneID), nil
+	}
+	zone := integrations.DNSZone{ZoneID: ledger.ZoneID, ZoneName: ledger.ZoneName}
+	if input.DNSZone != "" {
+		requested, err := s.resolveDomainDNSZone(ctx, input.DNSZone)
+		if err != nil {
+			return integrations.DNSZone{}, "", "", err
+		}
+		if requested.ZoneID != ledger.ZoneID {
+			return integrations.DNSZone{}, "", "", contract.NewFault(contract.Conflict, "managed DNS zone does not match the binding ledger", "Omit --dns-zone to use the persisted zone, or correct the flag.")
+		}
+	}
+	return zone, ledger.DomainID, ledger.Ownership, nil
+}
+
 // applyDomainDNSEffect performs the durable provider effect for one accepted
 // domain operation using the persisted ledger, never operation-only intent.
 func (s *Service) applyDomainDNSEffect(ctx context.Context, op contract.Operation, attempt uint32, input *platform.DomainInput, remove bool) error {
@@ -95,20 +94,7 @@ func (s *Service) applyDomainDNSEffect(ctx context.Context, op contract.Operatio
 		return err
 	}
 	if remove {
-		if ledger == nil {
-			if input.DNSMode == integrations.DomainDNSModeCloudflare {
-				exists, err := s.domainBindingExists(ctx, input.App, input.Environment, input.Domain)
-				if err != nil {
-					return err
-				}
-				if exists {
-					return contract.NewFault(contract.PreconditionFailed, "managed DNS ledger is missing for this binding", "Do not delete a provider-managed binding without its durable cleanup ledger; inspect domain status and retry.")
-				}
-			}
-			// Already cleaned, or a manual binding that never had managed DNS.
-			return nil
-		}
-		return s.cleanupDomainDNSLedger(ctx, op, attempt, *ledger)
+		return s.removeDomainDNSEffect(ctx, op, attempt, input, ledger)
 	}
 	if input.DNSMode != integrations.DomainDNSModeCloudflare {
 		return nil
@@ -117,6 +103,25 @@ func (s *Service) applyDomainDNSEffect(ctx context.Context, op contract.Operatio
 		return contract.NewFault(contract.PreconditionFailed, "managed DNS ledger is missing for this binding", "Do not apply provider changes outside a persisted binding intent; re-add the binding explicitly.")
 	}
 	return s.applyDomainDNSLedger(ctx, op, attempt, *ledger)
+}
+
+func (s *Service) removeDomainDNSEffect(ctx context.Context, op contract.Operation, attempt uint32, input *platform.DomainInput, ledger *domainDNSLedger) error {
+	if ledger != nil {
+		return s.cleanupDomainDNSLedger(ctx, op, attempt, *ledger)
+	}
+	if input.DNSMode != integrations.DomainDNSModeCloudflare {
+		// Already cleaned, or a manual binding that never had managed DNS.
+		return nil
+	}
+	exists, err := s.domainBindingExists(ctx, input.App, input.Environment, input.Domain)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return contract.NewFault(contract.PreconditionFailed, "managed DNS ledger is missing for this binding", "Do not delete a provider-managed binding without its durable cleanup ledger; inspect domain status and retry.")
+	}
+	// Already cleaned.
+	return nil
 }
 
 // deleteDomainBindingRowOwned removes the desired binding after provider

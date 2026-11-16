@@ -22,11 +22,11 @@ func (s *tlsStep) certPath() string {
 func (s *tlsStep) keyPath() string { return filepath.Join(s.cfg.Layout.ConfigDir, "tls", "server.key") }
 
 func (s *tlsStep) Inputs() ([]byte, error) {
-	cert, err := os.ReadFile(s.cfg.APITLSCert) //nolint:gosec // G304: operator-provided TLS certificate.
+	cert, err := os.ReadFile(s.cfg.APITLSCert)
 	if err != nil {
 		return nil, err
 	}
-	key, err := os.ReadFile(s.cfg.APITLSKey) //nolint:gosec // G304: operator-provided TLS key.
+	key, err := os.ReadFile(s.cfg.APITLSKey)
 	if err != nil {
 		return nil, err
 	}
@@ -39,11 +39,11 @@ func (s *tlsStep) Inputs() ([]byte, error) {
 }
 
 func (s *tlsStep) Check(_ context.Context, _ engine.Runtime) (engine.CheckResult, error) {
-	cert, err := os.ReadFile(s.cfg.APITLSCert) //nolint:gosec // G304: operator-provided TLS certificate.
+	cert, err := os.ReadFile(s.cfg.APITLSCert)
 	if err != nil {
 		return engine.CheckResult{}, err
 	}
-	key, err := os.ReadFile(s.cfg.APITLSKey) //nolint:gosec // G304: operator-provided TLS key.
+	key, err := os.ReadFile(s.cfg.APITLSKey)
 	if err != nil {
 		return engine.CheckResult{}, err
 	}
@@ -62,15 +62,15 @@ func (s *tlsStep) Check(_ context.Context, _ engine.Runtime) (engine.CheckResult
 }
 
 func (s *tlsStep) Apply(_ context.Context, _ engine.Runtime, _ engine.Reporter) (engine.ApplyResult, error) {
-	cert, err := os.ReadFile(s.cfg.APITLSCert) //nolint:gosec // G304: operator-provided TLS certificate.
+	cert, err := os.ReadFile(s.cfg.APITLSCert)
 	if err != nil {
 		return engine.ApplyResult{}, err
 	}
-	key, err := os.ReadFile(s.cfg.APITLSKey) //nolint:gosec // G304: operator-provided TLS key.
+	key, err := os.ReadFile(s.cfg.APITLSKey)
 	if err != nil {
 		return engine.ApplyResult{}, err
 	}
-	if err := writePublicFile(s.certPath(), cert, "root", s.cfg.Layout.Group); err != nil {
+	if err := writePublicFile(s.certPath(), cert, s.cfg.Layout.Group); err != nil {
 		return engine.ApplyResult{}, err
 	}
 	if err := writeFile(s.keyPath(), key, 0o600, s.cfg.Layout.User, s.cfg.Layout.Group); err != nil {

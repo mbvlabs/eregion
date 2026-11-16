@@ -34,6 +34,14 @@ func TestIntegrationRetentionPolicyRepository(t *testing.T) {
 		}},
 	})
 
+	assertServerRetentionPolicy(t, ctx, pool, s)
+	assertEffectiveRetentionPolicy(t, ctx, s)
+	assertRetentionCarryForward(t, ctx, pool, s)
+	assertRetentionRunInsert(t, ctx, pool)
+}
+
+func assertServerRetentionPolicy(t *testing.T, ctx context.Context, pool *pgxpool.Pool, s *Service) {
+	t.Helper()
 	server, err := s.ServerRetentionPolicy(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -59,7 +67,10 @@ func TestIntegrationRetentionPolicyRepository(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_server_settings`).Scan(&invalidWrites); err != nil || invalidWrites != 1 {
 		t.Fatalf("settings rows = %d err=%v, want the single valid row", invalidWrites, err)
 	}
+}
 
+func assertEffectiveRetentionPolicy(t *testing.T, ctx context.Context, s *Service) {
+	t.Helper()
 	effective, err := s.EffectiveRetentionPolicy(ctx, "retention", "production")
 	if err != nil {
 		t.Fatal(err)
@@ -73,10 +84,13 @@ func TestIntegrationRetentionPolicyRepository(t *testing.T) {
 	if _, err := s.EffectiveRetentionPolicy(ctx, "retention", "missing"); contract.Classify(err).Code != contract.NotFound {
 		t.Fatalf("unknown environment error = %v", err)
 	}
+}
 
+func assertRetentionCarryForward(t *testing.T, ctx context.Context, pool *pgxpool.Pool, s *Service) {
+	t.Helper()
 	// A config change commits another revision. The retention block must be
 	// carried forward unchanged by that unrelated desired-state change.
-	platformSubmit(t, s, platform.KindConfigSet, "env/retention/production", "retention-config", map[string]any{
+	platformSubmitContext(ctx, t, s, platform.KindConfigSet, "env/retention/production", "retention-config", map[string]any{
 		"config": map[string]string{"LOG_LEVEL": "debug"},
 	})
 	var raw []byte
@@ -93,14 +107,17 @@ func TestIntegrationRetentionPolicyRepository(t *testing.T) {
 	if carried.KeepReleases == nil || *carried.KeepReleases != 3 {
 		t.Fatalf("current revision retention = %s, want the carried keep_releases=3 override", raw)
 	}
-	effective, err = s.EffectiveRetentionPolicy(ctx, "retention", "production")
+	effective, err := s.EffectiveRetentionPolicy(ctx, "retention", "production")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if effective.KeepReleases != 3 {
 		t.Fatalf("effective after a config change = %+v, want keep_releases=3", effective)
 	}
+}
 
+func assertRetentionRunInsert(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
+	t.Helper()
 	runID, err := retention.NewRunID()
 	if err != nil {
 		t.Fatal(err)
@@ -139,46 +156,60 @@ func TestIntegrationPrunedReleaseRefusesDeployAndRollback(t *testing.T) {
 	prunedAt := time.Date(2026, 11, 3, 10, 30, 0, 0, time.UTC)
 	releaseID := insertRetentionRelease(t, pool, "pruned", "production", &prunedAt)
 
-	for _, test := range []struct {
-		name  string
-		kind  string
-		key   string
-		input map[string]any
-	}{
+	for _, test := range []prunedReleaseCase{
 		{name: "deploy explicit release", kind: platform.KindDeploy, key: "pruned-deploy", input: map[string]any{"release_id": releaseID}},
 		{name: "rollback", kind: platform.KindRollback, key: "pruned-rollback", input: map[string]any{"to_release_id": releaseID}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			_, err := s.Submit(ctx, platformSubmission(test.kind, "env/pruned/production", test.key, test.input))
-			if err == nil {
-				t.Fatal("submission to a pruned release was accepted")
-			}
-			fault := contract.Classify(err)
-			if fault.Code != contract.PreconditionFailed {
-				t.Fatalf("code = %s, want %s: %v", fault.Code, contract.PreconditionFailed, err)
-			}
-			for _, want := range []string{string(releaseID), "2026-11-03T10:30:00Z"} {
-				if !strings.Contains(fault.Message, want) {
-					t.Fatalf("message %q does not name %q", fault.Message, want)
-				}
-			}
-			if !strings.Contains(strings.ToLower(fault.Hint), "deploy a new build") {
-				t.Fatalf("hint %q does not tell the operator to deploy a new build", fault.Hint)
-			}
-			var operations, deployments int
-			if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_operations WHERE idempotency_key=$1`, test.key).Scan(&operations); err != nil {
-				t.Fatal(err)
-			}
-			if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_platform_deployments d
-                JOIN eregion_platform_environments e ON e.id=d.environment_id
-                JOIN eregion_platform_apps a ON a.id=e.app_id
-                WHERE a.name='pruned' AND e.name='production'`).Scan(&deployments); err != nil {
-				t.Fatal(err)
-			}
-			if operations != 0 || deployments != 0 {
-				t.Fatalf("refused submission wrote %d operation(s) and %d deployment(s)", operations, deployments)
-			}
+			assertPrunedReleaseRefused(t, ctx, pool, s, test, releaseID)
 		})
+	}
+}
+
+type prunedReleaseCase struct {
+	name  string
+	kind  string
+	key   string
+	input map[string]any
+}
+
+func assertPrunedReleaseRefused(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	s *Service,
+	test prunedReleaseCase,
+	releaseID platform.ReleaseID,
+) {
+	t.Helper()
+	_, err := s.Submit(ctx, platformSubmission(test.kind, "env/pruned/production", test.key, test.input))
+	if err == nil {
+		t.Fatal("submission to a pruned release was accepted")
+	}
+	fault := contract.Classify(err)
+	if fault.Code != contract.PreconditionFailed {
+		t.Fatalf("code = %s, want %s: %v", fault.Code, contract.PreconditionFailed, err)
+	}
+	for _, want := range []string{string(releaseID), "2026-11-03T10:30:00Z"} {
+		if !strings.Contains(fault.Message, want) {
+			t.Fatalf("message %q does not name %q", fault.Message, want)
+		}
+	}
+	if !strings.Contains(strings.ToLower(fault.Hint), "deploy a new build") {
+		t.Fatalf("hint %q does not tell the operator to deploy a new build", fault.Hint)
+	}
+	var operations, deployments int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_operations WHERE idempotency_key=$1`, test.key).Scan(&operations); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_platform_deployments d
+        JOIN eregion_platform_environments e ON e.id=d.environment_id
+        JOIN eregion_platform_apps a ON a.id=e.app_id
+        WHERE a.name='pruned' AND e.name='production'`).Scan(&deployments); err != nil {
+		t.Fatal(err)
+	}
+	if operations != 0 || deployments != 0 {
+		t.Fatalf("refused submission wrote %d operation(s) and %d deployment(s)", operations, deployments)
 	}
 }
 
@@ -296,6 +327,17 @@ func TestIntegrationPrunedReleasePreviewsRefuse(t *testing.T) {
 
 func previewSubmission(t *testing.T, s *Service, kind, target string, input any) (platform.Preview, error) {
 	t.Helper()
+	return previewSubmissionContext(context.Background(), t, s, kind, target, input)
+}
+
+func previewSubmissionContext(
+	ctx context.Context,
+	t *testing.T,
+	s *Service,
+	kind, target string,
+	input any,
+) (platform.Preview, error) {
+	t.Helper()
 	raw, err := json.Marshal(input)
 	if err != nil {
 		t.Fatal(err)
@@ -304,7 +346,7 @@ func previewSubmission(t *testing.T, s *Service, kind, target string, input any)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return s.Preview(context.Background(), testActor, normalized, "")
+	return s.Preview(ctx, testActor, normalized, "")
 }
 
 func insertRetentionDeployment(t *testing.T, pool *pgxpool.Pool, app, environment string, releaseID platform.ReleaseID) {

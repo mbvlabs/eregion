@@ -99,13 +99,11 @@ func walkDomainObservationPages(
 func (s *Service) observeDomain(ctx context.Context, domain domainObservation) error {
 	now := time.Now().UTC()
 	dnsState := platform.DNSPending
-	dnsAddresses := []string{}
-	dnsError := ""
 	dnsCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	dnsObservation := platform.LookupPublicDNS(dnsCtx, domain.name)
 	cancel()
-	dnsAddresses = dnsObservation.Addresses
-	dnsError = dnsObservation.Error
+	dnsAddresses := dnsObservation.Addresses
+	dnsError := dnsObservation.Error
 	if len(domain.expected) == 0 {
 		dnsError = "the main node's public address was not recorded; re-run domain add"
 	} else {
@@ -167,9 +165,9 @@ func validateDomainObservationWrite(dns platform.DNSState, certificate platform.
 	return nil
 }
 
-func logDomainMaintenance(what string, err error) {
+func logDomainMaintenance(ctx context.Context, what string, err error) {
 	if err == nil || errors.Is(err, context.Canceled) {
 		return
 	}
-	slog.WarnContext(context.Background(), "domain "+what+" failed", "error", err)
+	slog.WarnContext(context.WithoutCancel(ctx), "domain "+what+" failed", "error", err)
 }

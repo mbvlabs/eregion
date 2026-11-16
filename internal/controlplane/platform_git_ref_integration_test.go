@@ -38,9 +38,9 @@ func gitDeployFixture(t *testing.T) (*Service, *pgxpool.Pool) {
 // moveEnvironmentSource publishes a new current revision with another source,
 // the way an environment update does while a deploy submission is resolving.
 // Revisions are immutable, so a source change is always a new revision.
-func moveEnvironmentSource(t *testing.T, s *Service, key string, source map[string]any) {
+func moveEnvironmentSource(t *testing.T, ctx context.Context, s *Service, key string, source map[string]any) {
 	t.Helper()
-	platformSubmit(t, s, platform.KindEnvironmentUpdate, "env/shop/production", key, map[string]any{"source": source})
+	platformSubmitContext(ctx, t, s, platform.KindEnvironmentUpdate, "env/shop/production", key, map[string]any{"source": source})
 }
 
 func TestIntegrationDeployStoresTheResolvedCommitAtInsert(t *testing.T) {
@@ -78,7 +78,7 @@ func TestIntegrationDeployRefusesARevisionThatChangedAfterResolution(t *testing.
 	s.resolveGitRef = func(ctx context.Context, url, ref string, credential []byte) (string, error) {
 		// Publish a new revision after the source was read for resolution but
 		// before the submission transaction reads it again.
-		moveEnvironmentSource(t, s, "move-ref", map[string]any{
+		moveEnvironmentSource(t, ctx, s, "move-ref", map[string]any{
 			"url": "https://github.com/acme/app.git", "ref": "other", "builder": "paketobuildpacks/builder-jammy-base",
 		})
 		return submittedGitCommit, nil
@@ -104,7 +104,7 @@ func TestIntegrationDeployRefusesAGitSourceClearedAfterResolution(t *testing.T) 
 		// before the submission transaction reads it again. Git absence is
 		// explicit now, so a resolved commit can never fall through to an
 		// artifact deploy.
-		moveEnvironmentSource(t, s, "move-kind", map[string]any{})
+		moveEnvironmentSource(t, ctx, s, "move-kind", map[string]any{})
 		return submittedGitCommit, nil
 	}
 	_, err := s.Submit(ctx, platformSubmission(platform.KindDeploy, "env/shop/production", "deploy-kind-moved", map[string]any{}))
@@ -126,7 +126,7 @@ func TestIntegrationDeployRefChangeWithOverrideDoesNotConflict(t *testing.T) {
 	var resolvedRef string
 	s.resolveGitRef = func(ctx context.Context, url, ref string, credential []byte) (string, error) {
 		resolvedRef = ref
-		moveEnvironmentSource(t, s, "move-ref", map[string]any{
+		moveEnvironmentSource(t, ctx, s, "move-ref", map[string]any{
 			"url": "https://github.com/acme/app.git", "ref": "other", "builder": "paketobuildpacks/builder-jammy-base",
 		})
 		return submittedGitCommit, nil

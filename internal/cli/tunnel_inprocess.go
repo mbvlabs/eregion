@@ -20,7 +20,7 @@ var (
 	inProcessDialers = map[string]*transport.WireGuardDialer{}
 )
 
-func inProcessWireGuardDial(wg *host.WorkspaceWireGuard) (func(context.Context, string, string) (net.Conn, error), error) {
+func inProcessWireGuardDial(ctx context.Context, wg *host.WorkspaceWireGuard) (func(context.Context, string, string) (net.Conn, error), error) {
 	key, err := transport.ReadWireGuardKey(wg.PrivateKeyFile)
 	if err != nil {
 		return nil, err
@@ -43,7 +43,7 @@ func inProcessWireGuardDial(wg *host.WorkspaceWireGuard) (func(context.Context, 
 	if err != nil {
 		return nil, err
 	}
-	dialer, err := transport.NewWireGuardDialer(transport.WireGuardConfig{PrivateKey: key, Address: self, NodeAddress: nodeAddr, PeerPublicKey: peer, Endpoint: wg.Endpoint})
+	dialer, err := transport.NewWireGuardDialer(ctx, transport.WireGuardConfig{PrivateKey: key, Address: self, NodeAddress: nodeAddr, PeerPublicKey: peer, Endpoint: wg.Endpoint})
 	if err != nil {
 		return nil, err
 	}

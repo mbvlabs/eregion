@@ -460,7 +460,7 @@ func describeClients(clients []SharedClient) string {
 }
 
 func sharedError(err error) error {
-	var fault *contract.Fault
+	var fault *contract.FaultError
 	if errors.As(err, &fault) {
 		return err
 	}
@@ -531,11 +531,11 @@ func (d *SharedDialer) Close() {
 
 // lockFile takes an exclusive flock on path, waiting until ctx ends.
 func lockFile(ctx context.Context, path string) (func(), error) {
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600) //nolint:gosec // G304: a lock file in the operator's private directory.
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		return nil, err
 	}
-	fd := int(f.Fd()) //nolint:gosec // G115: file descriptors fit in int.
+	fd := int(f.Fd())
 	for {
 		err := syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB)
 		if err == nil {

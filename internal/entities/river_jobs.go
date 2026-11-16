@@ -103,12 +103,8 @@ func (tx *RiverJobTx) GetForUpdate(ctx context.Context, id int64) (string, bool,
 
 // DiscardRunning applies the observed-owner conditional discard.
 func (tx *RiverJobTx) DiscardRunning(ctx context.Context, rescue RiverRescue, reason string) (bool, error) {
-	attempt, err := riverAttempt(rescue.Attempt)
-	if err != nil {
-		return false, err
-	}
 	rows, err := tx.q.DiscardRunningRiverJob(ctx, riverquery.DiscardRunningRiverJobParams{
-		ID: rescue.ID, Queue: rescue.Queue, Attempt: attempt,
+		ID: rescue.ID, Queue: rescue.Queue, Attempt: int64(rescue.Attempt),
 		LastClient: rescue.LastClient, Reason: reason,
 	})
 	return rows == 1, err
@@ -116,12 +112,8 @@ func (tx *RiverJobTx) DiscardRunning(ctx context.Context, rescue RiverRescue, re
 
 // RequeueRunning applies the observed-owner conditional available update.
 func (tx *RiverJobTx) RequeueRunning(ctx context.Context, rescue RiverRescue) (bool, error) {
-	attempt, err := riverAttempt(rescue.Attempt)
-	if err != nil {
-		return false, err
-	}
 	rows, err := tx.q.RequeueRunningRiverJob(ctx, riverquery.RequeueRunningRiverJobParams{
-		ID: rescue.ID, Queue: rescue.Queue, Attempt: attempt, LastClient: rescue.LastClient,
+		ID: rescue.ID, Queue: rescue.Queue, Attempt: int64(rescue.Attempt), LastClient: rescue.LastClient,
 	})
 	return rows == 1, err
 }
@@ -132,12 +124,8 @@ func (tx *RiverJobTx) Snooze(ctx context.Context, id int64, attempt uint32, dela
 	if id < 0 || delaySeconds < 0 {
 		return false, errors.New("entities: invalid River snooze parameters")
 	}
-	value, err := riverAttempt(attempt)
-	if err != nil {
-		return false, err
-	}
 	rows, err := tx.q.SnoozeRiverJobWithAttempt(ctx, riverquery.SnoozeRiverJobWithAttemptParams{
-		ID: id, Attempt: value, DelaySeconds: int64(delaySeconds),
+		ID: id, Attempt: int64(attempt), DelaySeconds: int64(delaySeconds),
 	})
 	return rows == 1, err
 }
@@ -168,8 +156,4 @@ func (s *RiverJobStore) ListReconcileCandidateOperations(ctx context.Context, li
 		result = append(result, contract.OperationID(id))
 	}
 	return result, nil
-}
-
-func riverAttempt(attempt uint32) (int64, error) {
-	return int64(attempt), nil
 }

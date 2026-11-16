@@ -13,7 +13,7 @@ func TargetPlatform(architecture string) (string, error) {
 		return "linux/" + architecture, nil
 	default:
 		return "", fmt.Errorf(
-			"Buildpacks publishing is not available for host architecture %s",
+			"buildpacks publishing is not available for host architecture %s",
 			architecture,
 		)
 	}

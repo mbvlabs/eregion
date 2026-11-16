@@ -373,13 +373,6 @@ func ReleaseCommandLabels(app, environment string, release ReleaseID, deployment
 	}
 }
 
-func trimForError(value string) string {
-	if len(value) > 160 {
-		return value[:160] + "…"
-	}
-	return value
-}
-
 func validatePort(port, minimum int) error {
 	if port < minimum || port > 65535 {
 		return contract.NewFault(contract.ValidationFailed, "port out of range", fmt.Sprintf("Use a port from %d to 65535.", minimum))

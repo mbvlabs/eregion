@@ -48,7 +48,7 @@ func (s *journalAccessStep) checkScript() string {
 }
 
 func (s *journalAccessStep) Check(ctx context.Context, _ engine.Runtime) (engine.CheckResult, error) {
-	output, err := checkOutput(ctx, engine.Runtime{}, s.exec, s.checkScript())
+	output, err := checkOutput(ctx, s.exec, s.checkScript())
 	if err != nil {
 		return engine.CheckResult{}, err
 	}

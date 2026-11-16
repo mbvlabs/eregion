@@ -51,7 +51,9 @@ func run(ctx context.Context, args []string) error {
 	moved, err := advance(ctx, store, func(current pointer) (bool, error) {
 		switch *channel {
 		case "edge":
-			return edgePromotes(current, candidate, gitAncestor)
+			return edgePromotes(current, candidate, func(a, b string) (bool, error) {
+				return gitAncestor(ctx, a, b)
+			})
 		case "rc":
 			return release.PromotesRC(current.version, candidate.version)
 		default:

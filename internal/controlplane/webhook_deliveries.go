@@ -69,67 +69,82 @@ func (s *PostgresWebhookDeliveries) Admit(ctx context.Context, incoming api.Webh
 	var result api.WebhookAdmission
 	var created bool
 	err := s.store.WithinTx(ctx, func(tx *entities.StoreTx) error {
-		var jobID int64
-		var firstSeen time.Time
-		var admitted bool
-		scopeErr := tx.WithinSavepoint(ctx, func(nested *entities.StoreTx) error {
-			var err error
-			jobID, err = nested.Jobs().EnqueueWebhook(ctx, incoming.EnvironmentID, incoming.DeliveryIDHash)
-			if err != nil {
-				return err
-			}
-			firstSeen, admitted, err = nested.Webhooks().Admit(ctx, webhookReceiptInsert(incoming, jobID))
-			if err != nil {
-				return err
-			}
-			if !admitted {
-				return errWebhookSpeculativeDuplicate
-			}
-			return nil
-		})
-		if scopeErr == errWebhookSpeculativeDuplicate {
-			existing, found, err := tx.Webhooks().Get(ctx, incoming.EnvironmentID, incoming.DeliveryIDHash)
-			if err != nil {
-				return err
-			}
-			if !found {
-				return contract.NewFault(contract.PreconditionFailed, "webhook delivery reservation disappeared", "Do not resubmit; the delivery record is no longer available.")
-			}
-			if err := compareWebhookAdmission(webhookAdmissionFromReceipt(existing), incoming); err != nil {
-				return err
-			}
-			result, created = webhookAdmissionFromReceipt(existing), false
-			return nil
-		}
-		if scopeErr != nil {
-			return scopeErr
-		}
-		current, err := webhookBindingCurrentTx(ctx, tx, incoming)
-		if err != nil {
-			return err
-		}
-		if !current {
-			return api.ErrWebhookBindingChanged
-		}
-		result = incoming
-		result.State = api.WebhookDeliveryAdmitted
-		result.JobID = jobID
-		result.AdmissionAttempts = 1
-		result.FirstSeenAt = firstSeen.UTC()
-		created = true
-		return nil
+		var err error
+		result, created, err = s.admitTx(ctx, tx, incoming)
+		return err
 	})
 	if err != nil {
 		if errors.Is(err, api.ErrWebhookBindingChanged) {
 			return api.WebhookAdmission{}, false, api.ErrWebhookBindingChanged
 		}
-		var fault *contract.Fault
+		var fault *contract.FaultError
 		if errors.As(err, &fault) {
 			return api.WebhookAdmission{}, false, err
 		}
 		return api.WebhookAdmission{}, false, unavailable(err)
 	}
 	return result, created, nil
+}
+
+func (s *PostgresWebhookDeliveries) admitTx(ctx context.Context, tx *entities.StoreTx, incoming api.WebhookAdmission) (api.WebhookAdmission, bool, error) {
+	jobID, firstSeen, admitted, err := enqueueAndAdmitWebhook(ctx, tx, incoming)
+	if errors.Is(err, errWebhookSpeculativeDuplicate) {
+		result, err := resolveDuplicateWebhookAdmission(ctx, tx, incoming)
+		return result, false, err
+	}
+	if err != nil {
+		return api.WebhookAdmission{}, false, err
+	}
+	_ = admitted
+	current, err := webhookBindingCurrentTx(ctx, tx, incoming)
+	if err != nil {
+		return api.WebhookAdmission{}, false, err
+	}
+	if !current {
+		return api.WebhookAdmission{}, false, api.ErrWebhookBindingChanged
+	}
+	result := incoming
+	result.State = api.WebhookDeliveryAdmitted
+	result.JobID = jobID
+	result.AdmissionAttempts = 1
+	result.FirstSeenAt = firstSeen.UTC()
+	return result, true, nil
+}
+
+func enqueueAndAdmitWebhook(ctx context.Context, tx *entities.StoreTx, incoming api.WebhookAdmission) (int64, time.Time, bool, error) {
+	var jobID int64
+	var firstSeen time.Time
+	var admitted bool
+	err := tx.WithinSavepoint(ctx, func(nested *entities.StoreTx) error {
+		var err error
+		jobID, err = nested.Jobs().EnqueueWebhook(ctx, incoming.EnvironmentID, incoming.DeliveryIDHash)
+		if err != nil {
+			return err
+		}
+		firstSeen, admitted, err = nested.Webhooks().Admit(ctx, webhookReceiptInsert(incoming, jobID))
+		if err != nil {
+			return err
+		}
+		if !admitted {
+			return errWebhookSpeculativeDuplicate
+		}
+		return nil
+	})
+	return jobID, firstSeen, admitted, err
+}
+
+func resolveDuplicateWebhookAdmission(ctx context.Context, tx *entities.StoreTx, incoming api.WebhookAdmission) (api.WebhookAdmission, error) {
+	existing, found, err := tx.Webhooks().Get(ctx, incoming.EnvironmentID, incoming.DeliveryIDHash)
+	if err != nil {
+		return api.WebhookAdmission{}, err
+	}
+	if !found {
+		return api.WebhookAdmission{}, contract.NewFault(contract.PreconditionFailed, "webhook delivery reservation disappeared", "Do not resubmit; the delivery record is no longer available.")
+	}
+	if err := compareWebhookAdmission(webhookAdmissionFromReceipt(existing), incoming); err != nil {
+		return api.WebhookAdmission{}, err
+	}
+	return webhookAdmissionFromReceipt(existing), nil
 }
 
 // ReconcileLegacy links an old pending row to the operation its former
@@ -148,54 +163,57 @@ func (s *PostgresWebhookDeliveries) ReconcileLegacy(ctx context.Context, incomin
 	var result api.WebhookAdmission
 	var linked bool
 	err := s.store.WithinTx(ctx, func(tx *entities.StoreTx) error {
-		record, found, err := tx.Webhooks().Lock(ctx, incoming.EnvironmentID, incoming.DeliveryIDHash)
-		if err != nil {
-			return err
-		}
-		if !found {
-			return contract.NewFault(contract.PreconditionFailed, "webhook delivery reservation disappeared", "Do not resubmit; the delivery record is no longer available.")
-		}
-		existing := webhookAdmissionFromReceipt(record)
-		if err := compareWebhookAdmission(existing, incoming); err != nil {
-			return err
-		}
-		if existing.State == api.WebhookDeliverySubmitted || existing.State != api.WebhookDeliveryPending {
-			result, linked = existing, true
-			return nil
-		}
-		identity, found, err := tx.Operations().IdentityForShare(ctx, entities.OperationKey{
-			Kind: incoming.Kind, Target: incoming.Target, Actor: incoming.Actor, IdempotencyKey: legacyKey,
-		})
-		if err != nil {
-			return err
-		}
-		if !found {
-			result, linked = existing, false
-			return nil
-		}
-		if identity.InputHash != sha256Hex(canonical) {
-			return idempotencyInputConflict()
-		}
-		submitted, err := tx.Webhooks().Submit(ctx, incoming.EnvironmentID, incoming.DeliveryIDHash, identity.ID, string(api.WebhookDeliveryPending))
-		if err != nil {
-			return err
-		}
-		if !submitted {
-			return contract.NewFault(contract.PreconditionFailed, "webhook delivery reservation changed", "Retry the redelivery; do not submit a second operation.")
-		}
-		existing.State = api.WebhookDeliverySubmitted
-		existing.OperationID = identity.ID
-		result, linked = existing, true
-		return nil
+		var err error
+		result, linked, err = s.reconcileLegacyTx(ctx, tx, incoming, legacyKey, canonical)
+		return err
 	})
 	if err != nil {
-		var fault *contract.Fault
+		var fault *contract.FaultError
 		if errors.As(err, &fault) {
 			return api.WebhookAdmission{}, false, err
 		}
 		return api.WebhookAdmission{}, false, unavailable(err)
 	}
 	return result, linked, nil
+}
+
+func (s *PostgresWebhookDeliveries) reconcileLegacyTx(ctx context.Context, tx *entities.StoreTx, incoming api.WebhookAdmission, legacyKey string, canonical []byte) (api.WebhookAdmission, bool, error) {
+	record, found, err := tx.Webhooks().Lock(ctx, incoming.EnvironmentID, incoming.DeliveryIDHash)
+	if err != nil {
+		return api.WebhookAdmission{}, false, err
+	}
+	if !found {
+		return api.WebhookAdmission{}, false, contract.NewFault(contract.PreconditionFailed, "webhook delivery reservation disappeared", "Do not resubmit; the delivery record is no longer available.")
+	}
+	existing := webhookAdmissionFromReceipt(record)
+	if err := compareWebhookAdmission(existing, incoming); err != nil {
+		return api.WebhookAdmission{}, false, err
+	}
+	if existing.State == api.WebhookDeliverySubmitted || existing.State != api.WebhookDeliveryPending {
+		return existing, true, nil
+	}
+	identity, found, err := tx.Operations().IdentityForShare(ctx, entities.OperationKey{
+		Kind: incoming.Kind, Target: incoming.Target, Actor: incoming.Actor, IdempotencyKey: legacyKey,
+	})
+	if err != nil {
+		return api.WebhookAdmission{}, false, err
+	}
+	if !found {
+		return existing, false, nil
+	}
+	if identity.InputHash != sha256Hex(canonical) {
+		return api.WebhookAdmission{}, false, idempotencyInputConflict()
+	}
+	submitted, err := tx.Webhooks().Submit(ctx, incoming.EnvironmentID, incoming.DeliveryIDHash, identity.ID, string(api.WebhookDeliveryPending))
+	if err != nil {
+		return api.WebhookAdmission{}, false, err
+	}
+	if !submitted {
+		return api.WebhookAdmission{}, false, contract.NewFault(contract.PreconditionFailed, "webhook delivery reservation changed", "Retry the redelivery; do not submit a second operation.")
+	}
+	existing.State = api.WebhookDeliverySubmitted
+	existing.OperationID = identity.ID
+	return existing, true, nil
 }
 
 // Lookup reads one record. It is exposed for tests and status reporting.
@@ -257,7 +275,7 @@ func webhookBindingCurrentTx(ctx context.Context, tx *entities.StoreTx, record a
 	return snapshot.CurrentRevisionID == platform.RevisionID(record.RevisionID) &&
 		snapshot.AutoDeploy && snapshot.WebhookSecretName == binding.WebhookSecretName &&
 		snapshot.SecretState == string(vault.StateActive) &&
-		snapshot.LatestRevision == int64(record.SecretRevision) &&
+		snapshot.LatestRevision == int64(record.SecretRevision) && //nolint:gosec // G115: secret revisions are positive database counters.
 		snapshot.RevisionHash == record.SecretRevisionHash, nil
 }
 

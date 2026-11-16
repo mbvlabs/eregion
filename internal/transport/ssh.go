@@ -118,7 +118,7 @@ func NewSSHTransport(config SSHConfig) (*SSHTransport, error) {
 	if info.Mode().Perm()&0o077 != 0 {
 		return nil, fmt.Errorf("the node identity %s must not be readable by group or others", config.IdentityFile)
 	}
-	raw, err := os.ReadFile(config.IdentityFile) //nolint:gosec // G304: the operator's own identity file.
+	raw, err := os.ReadFile(config.IdentityFile)
 	if err != nil {
 		return nil, fmt.Errorf("read the node identity: %w", err)
 	}
@@ -328,26 +328,8 @@ func (t *SSHTransport) runSession(client *ssh.Client, request node.Request, onEv
 	}
 	writer := bufio.NewWriter(stdin)
 	reader := bufio.NewReader(stdout)
-
-	if err := node.WriteFrame(writer, node.Frame{Type: node.FrameHello, Version: node.ProtocolVersion}); err != nil {
-		return node.Response{}, t.streamFailure(err, stderr, registry)
-	}
-	if err := writer.Flush(); err != nil {
-		return node.Response{}, t.streamFailure(err, stderr, registry)
-	}
-	hello, err := node.ReadFrame(reader)
-	if err != nil {
-		return node.Response{}, t.streamFailure(err, stderr, registry)
-	}
-	switch {
-	case hello.Type == node.FrameError:
-		return node.Response{}, &HandshakeError{Address: t.config.Address, Reason: hello.Error}
-	case hello.Type != node.FrameHello:
-		return node.Response{}, &HandshakeError{Address: t.config.Address, Reason: "unexpected frame " + hello.Type}
-	case hello.Version != node.ProtocolVersion:
-		return node.Response{}, &VersionMismatchError{Address: t.config.Address, Got: hello.Version, Want: node.ProtocolVersion}
-	case t.config.ExpectedNode != "" && hello.Node != t.config.ExpectedNode:
-		return node.Response{}, &HandshakeError{Address: t.config.Address, Reason: fmt.Sprintf("the node reports the name %q, expected %q", hello.Node, t.config.ExpectedNode)}
+	if err := t.handshake(writer, reader, stderr, registry); err != nil {
+		return node.Response{}, err
 	}
 
 	frame := node.Frame{Type: node.FrameRequest, Version: node.ProtocolVersion, Request: &request}
@@ -357,6 +339,36 @@ func (t *SSHTransport) runSession(client *ssh.Client, request node.Request, onEv
 	if err := writer.Flush(); err != nil {
 		return node.Response{}, t.streamFailure(err, stderr, registry)
 	}
+	return t.readResponse(reader, stderr, onEvent, registry)
+}
+
+// handshake sends the hello and validates the node's hello.
+func (t *SSHTransport) handshake(writer *bufio.Writer, reader *bufio.Reader, stderr *tailBuffer, registry *secrets.Registry) error {
+	if err := node.WriteFrame(writer, node.Frame{Type: node.FrameHello, Version: node.ProtocolVersion}); err != nil {
+		return t.streamFailure(err, stderr, registry)
+	}
+	if err := writer.Flush(); err != nil {
+		return t.streamFailure(err, stderr, registry)
+	}
+	hello, err := node.ReadFrame(reader)
+	if err != nil {
+		return t.streamFailure(err, stderr, registry)
+	}
+	switch {
+	case hello.Type == node.FrameError:
+		return &HandshakeError{Address: t.config.Address, Reason: hello.Error}
+	case hello.Type != node.FrameHello:
+		return &HandshakeError{Address: t.config.Address, Reason: "unexpected frame " + hello.Type}
+	case hello.Version != node.ProtocolVersion:
+		return &VersionMismatchError{Address: t.config.Address, Got: hello.Version, Want: node.ProtocolVersion}
+	case t.config.ExpectedNode != "" && hello.Node != t.config.ExpectedNode:
+		return &HandshakeError{Address: t.config.Address, Reason: fmt.Sprintf("the node reports the name %q, expected %q", hello.Node, t.config.ExpectedNode)}
+	}
+	return nil
+}
+
+// readResponse reads events until the node reports its response.
+func (t *SSHTransport) readResponse(reader *bufio.Reader, stderr *tailBuffer, onEvent func(node.Event), registry *secrets.Registry) (node.Response, error) {
 	for {
 		next, err := node.ReadFrame(reader)
 		if err != nil {

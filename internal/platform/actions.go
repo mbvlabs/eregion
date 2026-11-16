@@ -23,7 +23,7 @@ const (
 	DefaultBind          = "127.0.0.1"
 	// DefaultWebhookSecretName is the stable vault name for an enabled
 	// push-to-deploy webhook when the caller does not name one.
-	DefaultWebhookSecretName = "EREGION_WEBHOOK_SECRET"
+	DefaultWebhookSecretName = "EREGION_WEBHOOK_SECRET" //nolint:gosec // G101: this is the environment-style vault entry name, not a credential.
 )
 
 var (
@@ -435,6 +435,26 @@ func DefaultEnvironmentProtection(name string) bool {
 }
 
 func normalizeEnvironmentSpec(spec *EnvironmentSpec) error {
+	if err := normalizeEnvironmentBasics(spec); err != nil {
+		return err
+	}
+	if err := normalizeEnvironmentDomains(spec); err != nil {
+		return err
+	}
+	return normalizeEnvironmentState(spec)
+}
+
+func normalizeEnvironmentBasics(spec *EnvironmentSpec) error {
+	if err := normalizeEnvironmentIdentity(spec); err != nil {
+		return err
+	}
+	if err := normalizeEnvironmentPorts(spec); err != nil {
+		return err
+	}
+	return normalizeEnvironmentRuntime(spec)
+}
+
+func normalizeEnvironmentIdentity(spec *EnvironmentSpec) error {
 	if err := ValidateName(spec.Name); err != nil {
 		return err
 	}
@@ -446,10 +466,12 @@ func normalizeEnvironmentSpec(spec *EnvironmentSpec) error {
 		return err
 	}
 	if spec.BuildNode != "" {
-		if err := ValidateName(spec.BuildNode); err != nil {
-			return err
-		}
+		return ValidateName(spec.BuildNode)
 	}
+	return nil
+}
+
+func normalizeEnvironmentPorts(spec *EnvironmentSpec) error {
 	if spec.ContainerPort != 0 {
 		if err := validatePort(spec.ContainerPort, 1); err != nil {
 			return err
@@ -466,6 +488,10 @@ func normalizeEnvironmentSpec(spec *EnvironmentSpec) error {
 	if net.ParseIP(spec.Bind) == nil || strings.Contains(spec.Bind, "/") {
 		return invalid("bind address", "Use a literal IPv4 or IPv6 address such as 127.0.0.1 or 0.0.0.0.")
 	}
+	return nil
+}
+
+func normalizeEnvironmentRuntime(spec *EnvironmentSpec) error {
 	health, err := normalizeHealth(spec.Health)
 	if err != nil {
 		return err
@@ -489,26 +515,43 @@ func normalizeEnvironmentSpec(spec *EnvironmentSpec) error {
 	if spec.Processes == nil {
 		spec.Processes = []ProcessSpec{}
 	}
+	return nil
+}
+
+func normalizeEnvironmentDomains(spec *EnvironmentSpec) error {
 	domain, addresses, err := normalizeDomainBinding(spec.Domain, spec.DomainAddresses)
 	if err != nil {
 		return err
 	}
 	if len(spec.Domains) > 0 {
-		if domain != "" || spec.DomainPrimary || spec.DomainCheckPath != "" {
-			return invalid("domain", "Use either domain/domain_primary/domain_check_path or domains, not both.")
-		}
-		if err := normalizeDomainDeclarations(spec.Domains); err != nil {
+		if err := normalizeDeclaredEnvironmentDomains(spec, domain); err != nil {
 			return err
 		}
-	} else {
-		if domain == "" && (spec.DomainPrimary || len(addresses) > 0 || spec.DomainCheckPath != "") {
-			return invalid("domain", "A primary flag, addresses or check path need a domain name.")
-		}
-		if spec.DomainCheckPath != "" && !validAbsolutePath(spec.DomainCheckPath) {
-			return invalid("domain check path", "Use an absolute path such as /healthz without a scheme, host, whitespace, controls, query, or fragment, up to 256 bytes.")
-		}
+	} else if err := normalizeSingleEnvironmentDomain(spec, domain, addresses); err != nil {
+		return err
 	}
 	spec.Domain, spec.DomainAddresses = domain, addresses
+	return nil
+}
+
+func normalizeDeclaredEnvironmentDomains(spec *EnvironmentSpec, domain string) error {
+	if domain != "" || spec.DomainPrimary || spec.DomainCheckPath != "" {
+		return invalid("domain", "Use either domain/domain_primary/domain_check_path or domains, not both.")
+	}
+	return normalizeDomainDeclarations(spec.Domains)
+}
+
+func normalizeSingleEnvironmentDomain(spec *EnvironmentSpec, domain string, addresses []string) error {
+	if domain == "" && (spec.DomainPrimary || len(addresses) > 0 || spec.DomainCheckPath != "") {
+		return invalid("domain", "A primary flag, addresses or check path need a domain name.")
+	}
+	if spec.DomainCheckPath != "" && !validAbsolutePath(spec.DomainCheckPath) {
+		return invalid("domain check path", "Use an absolute path such as /healthz without a scheme, host, whitespace, controls, query, or fragment, up to 256 bytes.")
+	}
+	return nil
+}
+
+func normalizeEnvironmentState(spec *EnvironmentSpec) error {
 	state := RevisionState{
 		Source:            spec.Source,
 		AutoDeploy:        spec.AutoDeploy,
@@ -653,54 +696,82 @@ func normalizeEnvironmentUpdate(target Target, raw json.RawMessage) (ActionInput
 		return nil, invalid("environment", "The app and environment fields must match the target, or be omitted.")
 	}
 	input.App, input.Environment = target.App, target.Environment
+	if err := normalizeUpdateNodes(&input); err != nil {
+		return nil, err
+	}
+	if err := normalizeUpdateSourceRuntime(&input); err != nil {
+		return nil, err
+	}
+	if err := normalizeUpdateCollections(&input); err != nil {
+		return nil, err
+	}
+	if err := normalizeUpdatePolicy(&input); err != nil {
+		return nil, err
+	}
+	return &input, nil
+}
+
+func normalizeUpdateNodes(input *EnvironmentUpdateInput) error {
 	if input.Node != nil {
 		if err := ValidateName(*input.Node); err != nil {
-			return nil, err
+			return err
 		}
 	}
 	if input.BuildNode != nil && *input.BuildNode != "" {
 		if err := ValidateName(*input.BuildNode); err != nil {
-			return nil, err
+			return err
 		}
 	}
+	return nil
+}
+
+func normalizeUpdateSourceRuntime(input *EnvironmentUpdateInput) error {
 	if input.Source != nil {
 		if err := normalizeSourceBinding(input.Source, true); err != nil {
-			return nil, err
+			return err
 		}
 	}
 	if input.Runtime != nil {
 		if err := normalizeRuntime(input.Runtime); err != nil {
-			return nil, err
+			return err
 		}
 	}
+	return nil
+}
+
+func normalizeUpdateCollections(input *EnvironmentUpdateInput) error {
 	if input.Processes != nil {
 		processes, err := normalizeProcessSpecs(*input.Processes)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		input.Processes = &processes
 	}
 	if input.Config != nil {
 		if err := validateEnv(*input.Config, "environment configuration"); err != nil {
-			return nil, err
+			return err
 		}
 	}
 	if input.SecretNames != nil {
 		names, err := normalizeSecretNames(*input.SecretNames)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		input.SecretNames = &names
 	}
 	if input.WebhookSecretName != nil {
 		name, err := normalizeOptionalSecretName(*input.WebhookSecretName)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		input.WebhookSecretName = &name
 	}
+	return nil
+}
+
+func normalizeUpdatePolicy(input *EnvironmentUpdateInput) error {
 	if input.RotateWebhookSecret && input.AutoDeploy != nil && !*input.AutoDeploy {
-		return nil, invalid("rotate_webhook_secret", "Webhook rotation requires push to deploy to remain enabled.")
+		return invalid("rotate_webhook_secret", "Webhook rotation requires push to deploy to remain enabled.")
 	}
 	if input.AutoDeploy != nil && *input.AutoDeploy && input.WebhookSecretName == nil {
 		// Resolve the default before hashing so the requested auto-enable
@@ -710,15 +781,15 @@ func normalizeEnvironmentUpdate(target Target, raw json.RawMessage) (ActionInput
 	}
 	if input.Retention != nil {
 		if err := input.Retention.Validate(); err != nil {
-			return nil, err
+			return err
 		}
 	}
 	if input.ExpectedRevisionID != "" {
 		if err := input.ExpectedRevisionID.Validate(); err != nil {
-			return nil, err
+			return err
 		}
 	}
-	return &input, nil
+	return nil
 }
 
 func normalizeProcessScale(target Target, raw json.RawMessage) (ActionInput, error) {
@@ -1067,73 +1138,89 @@ func normalizeProcessSpecs(processes []ProcessSpec) ([]ProcessSpec, error) {
 	seen := map[string]bool{}
 	web := 0
 	for _, process := range processes {
-		process.Name = strings.ToLower(strings.TrimSpace(process.Name))
-		process.Kind = strings.ToLower(strings.TrimSpace(process.Kind))
-		process.Command = strings.TrimSpace(process.Command)
-		if process.Args == nil {
-			process.Args = []string{}
+		normalized, err := normalizeProcessSpec(process, seen)
+		if err != nil {
+			return nil, err
 		}
-		if process.Replicas == 0 {
-			process.Replicas = 1
-		}
-		if !processNamePattern.MatchString(process.Name) {
-			return nil, invalid("process name", "Use a lowercase name of 1–63 letters, digits, underscores, or hyphens.")
-		}
-		if seen[process.Name] {
-			return nil, invalid("process name", "Use each process name once.")
-		}
-		seen[process.Name] = true
-		switch process.Kind {
-		case "web", "worker", "service":
-		default:
-			return nil, invalid("process kind", "Use web, worker, or service.")
-		}
-		if process.Replicas < 1 || process.Replicas > 32 {
-			return nil, invalid("process replicas", "Use between 1 and 32 replicas.")
-		}
-		if len(process.Command) > 1024 || strings.ContainsAny(process.Command, "\x00\r\n") {
-			return nil, invalid("process command", "Use at most 1024 bytes without NUL or line breaks.")
-		}
-		if len(process.Args) > 128 {
-			return nil, invalid("process arguments", "Use at most 128 arguments.")
-		}
-		for _, arg := range process.Args {
-			if len(arg) > 4096 || strings.ContainsAny(arg, "\x00\r\n") {
-				return nil, invalid("process argument", "Arguments cannot contain NUL or line breaks, and are limited to 4096 bytes.")
-			}
-		}
-		if process.Kind == "web" {
+		if normalized.Kind == "web" {
 			web++
-			if process.Name != "web" || process.ContainerPort < 1 || process.ContainerPort > 65535 {
-				return nil, invalid("web process", "The web process must be named web and declare a valid container port.")
-			}
 		}
-		if process.Kind == "worker" {
-			if process.ContainerPort != 0 {
-				return nil, invalid("process port", "A worker process cannot publish a container port.")
-			}
-			if process.Command == "" {
-				return nil, invalid("process command", "A worker process needs a command.")
-			}
-		}
-		if process.Kind == "service" {
-			if process.Name == "web" {
-				return nil, invalid("process name", "web is reserved for the web process.")
-			}
-			if process.Command == "" {
-				return nil, invalid("process command", "A service process needs a command.")
-			}
-			if process.ContainerPort < 1 || process.ContainerPort > 65535 {
-				return nil, invalid("process port", "A service process needs a valid container port.")
-			}
-		}
-		out = append(out, process)
+		out = append(out, normalized)
 	}
 	if web > 1 {
 		return nil, invalid("web process", "Use at most one web process.")
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, nil
+}
+
+func normalizeProcessSpec(process ProcessSpec, seen map[string]bool) (ProcessSpec, error) {
+	process.Name = strings.ToLower(strings.TrimSpace(process.Name))
+	process.Kind = strings.ToLower(strings.TrimSpace(process.Kind))
+	process.Command = strings.TrimSpace(process.Command)
+	if process.Args == nil {
+		process.Args = []string{}
+	}
+	if process.Replicas == 0 {
+		process.Replicas = 1
+	}
+	if !processNamePattern.MatchString(process.Name) {
+		return ProcessSpec{}, invalid("process name", "Use a lowercase name of 1–63 letters, digits, underscores, or hyphens.")
+	}
+	if seen[process.Name] {
+		return ProcessSpec{}, invalid("process name", "Use each process name once.")
+	}
+	seen[process.Name] = true
+	switch process.Kind {
+	case "web", "worker", "service":
+	default:
+		return ProcessSpec{}, invalid("process kind", "Use web, worker, or service.")
+	}
+	if process.Replicas < 1 || process.Replicas > 32 {
+		return ProcessSpec{}, invalid("process replicas", "Use between 1 and 32 replicas.")
+	}
+	if len(process.Command) > 1024 || strings.ContainsAny(process.Command, "\x00\r\n") {
+		return ProcessSpec{}, invalid("process command", "Use at most 1024 bytes without NUL or line breaks.")
+	}
+	if len(process.Args) > 128 {
+		return ProcessSpec{}, invalid("process arguments", "Use at most 128 arguments.")
+	}
+	for _, arg := range process.Args {
+		if len(arg) > 4096 || strings.ContainsAny(arg, "\x00\r\n") {
+			return ProcessSpec{}, invalid("process argument", "Arguments cannot contain NUL or line breaks, and are limited to 4096 bytes.")
+		}
+	}
+	if err := validateProcessKind(process); err != nil {
+		return ProcessSpec{}, err
+	}
+	return process, nil
+}
+
+func validateProcessKind(process ProcessSpec) error {
+	switch process.Kind {
+	case "web":
+		if process.Name != "web" || process.ContainerPort < 1 || process.ContainerPort > 65535 {
+			return invalid("web process", "The web process must be named web and declare a valid container port.")
+		}
+	case "worker":
+		if process.ContainerPort != 0 {
+			return invalid("process port", "A worker process cannot publish a container port.")
+		}
+		if process.Command == "" {
+			return invalid("process command", "A worker process needs a command.")
+		}
+	case "service":
+		if process.Name == "web" {
+			return invalid("process name", "web is reserved for the web process.")
+		}
+		if process.Command == "" {
+			return invalid("process command", "A service process needs a command.")
+		}
+		if process.ContainerPort < 1 || process.ContainerPort > 65535 {
+			return invalid("process port", "A service process needs a valid container port.")
+		}
+	}
+	return nil
 }
 
 func normalizeSecretNames(names []string) ([]string, error) {
@@ -1246,23 +1333,7 @@ func CloneRevisionState(state RevisionState) RevisionState {
 		out.Source.GoTargets = append([]buildpacks.GoTarget{}, state.Source.GoTargets...)
 	}
 	if state.Source.Buildpacks != nil {
-		settings := *state.Source.Buildpacks
-		settings.KeepFiles = append([]string(nil), settings.KeepFiles...)
-		if settings.Order != nil {
-			settings.Order = append([]string{}, settings.Order...)
-		}
-		if settings.Frontend != nil {
-			frontend := *settings.Frontend
-			if frontend.Scripts != nil {
-				frontend.Scripts = append([]string{}, frontend.Scripts...)
-			}
-			settings.Frontend = &frontend
-		}
-		if settings.Advanced != nil {
-			advanced := *settings.Advanced
-			settings.Advanced = &advanced
-		}
-		out.Source.Buildpacks = &settings
+		out.Source.Buildpacks = cloneBuildpackSettings(state.Source.Buildpacks)
 	}
 	out.Config = cloneStringMap(state.Config)
 	out.SecretNames = append([]string(nil), state.SecretNames...)
@@ -1279,6 +1350,26 @@ func CloneRevisionState(state RevisionState) RevisionState {
 		out.Runtime.ReleaseCommand = &command
 	}
 	return out
+}
+
+func cloneBuildpackSettings(source *buildpacks.Settings) *buildpacks.Settings {
+	settings := *source
+	settings.KeepFiles = append([]string(nil), settings.KeepFiles...)
+	if settings.Order != nil {
+		settings.Order = append([]string{}, settings.Order...)
+	}
+	if settings.Frontend != nil {
+		frontend := *settings.Frontend
+		if frontend.Scripts != nil {
+			frontend.Scripts = append([]string{}, frontend.Scripts...)
+		}
+		settings.Frontend = &frontend
+	}
+	if settings.Advanced != nil {
+		advanced := *settings.Advanced
+		settings.Advanced = &advanced
+	}
+	return &settings
 }
 
 func cloneStringMap(values map[string]string) map[string]string {
@@ -1487,49 +1578,61 @@ func normalizeDeploy(target Target, raw json.RawMessage) (ActionInput, error) {
 		return nil, invalid("environment", "The environment field must match the target environment, or be omitted.")
 	}
 	input.App, input.Environment = target.App, target.Environment
+	if err := normalizeDeploySelector(&input); err != nil {
+		return nil, err
+	}
+	return &input, nil
+}
+
+func normalizeDeploySelector(input *DeployInput) error {
 	if input.ReleaseID != "" {
 		if err := input.ReleaseID.Validate(); err != nil {
-			return nil, err
+			return err
 		}
 	}
 	input.Ref = strings.TrimSpace(input.Ref)
 	input.ImageTag = strings.TrimSpace(input.ImageTag)
 	input.ImageDigest = strings.TrimSpace(input.ImageDigest)
 	input.Image = strings.TrimSpace(input.Image)
-	selectors := 0
-	for _, value := range []string{input.Ref, string(input.ReleaseID), input.ImageTag, input.ImageDigest, input.Image} {
-		if value != "" {
-			selectors++
-		}
-	}
-	if selectors > 1 {
-		return nil, invalid("artifact selector", "Use exactly one of --ref, --release, --image-tag, --image-digest, or --image.")
+	if deploySelectorCount(input) > 1 {
+		return invalid("artifact selector", "Use exactly one of --ref, --release, --image-tag, --image-digest, or --image.")
 	}
 	if input.Ref != "" && !validGitRef(input.Ref) {
-		return nil, invalid("ref", "Use a branch or tag of 1–128 letters, digits, dot, underscore, slash, or hyphen; it cannot contain .. or start with -.")
+		return invalid("ref", "Use a branch or tag of 1–128 letters, digits, dot, underscore, slash, or hyphen; it cannot contain .. or start with -.")
 	}
 	if input.ImageTag != "" {
 		tag, err := NormalizeImageTag(input.ImageTag)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		input.ImageTag = tag
 	}
 	if input.ImageDigest != "" {
 		digest, err := NormalizeImageDigest(input.ImageDigest)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		input.ImageDigest = digest
 	}
-	if input.Image != "" {
-		reference, err := ParseFullyQualifiedImage(input.Image)
-		if err != nil {
-			return nil, err
-		}
-		input.Image = reference.Original
+	if input.Image == "" {
+		return nil
 	}
-	return &input, nil
+	reference, err := ParseFullyQualifiedImage(input.Image)
+	if err != nil {
+		return err
+	}
+	input.Image = reference.Original
+	return nil
+}
+
+func deploySelectorCount(input *DeployInput) int {
+	selectors := 0
+	for _, value := range []string{input.Ref, string(input.ReleaseID), input.ImageTag, input.ImageDigest, input.Image} {
+		if value != "" {
+			selectors++
+		}
+	}
+	return selectors
 }
 
 func normalizePromote(target Target, raw json.RawMessage) (ActionInput, error) {
@@ -1837,27 +1940,8 @@ func normalizeDomain(target Target, raw json.RawMessage) (ActionInput, error) {
 	if input.CheckPath != "" && !validAbsolutePath(input.CheckPath) {
 		return nil, invalid("check path", "Use an absolute path such as /users/sign-in without a scheme, host, whitespace, controls, query, or fragment, up to 256 bytes.")
 	}
-	input.DNSMode = strings.ToLower(strings.TrimSpace(input.DNSMode))
-	switch input.DNSMode {
-	case "", "manual":
-		input.DNSMode = ""
-		if input.DNSZone != "" || input.DNSProxied != nil || len(input.DNSOrigins) > 0 {
-			return nil, invalid("dns mode", "Omit --dns-zone, --dns-origin and --dns-proxy for manual DNS; manual DNS is the default and leaves the provider untouched.")
-		}
-	case "cloudflare":
-		input.DNSZone = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(input.DNSZone), "."))
-		if !validDNSZoneReference(input.DNSZone) {
-			return nil, invalid("dns zone", "Use a configured zone name or its lowercase 32-character ID; configure it with eregion dns configure --provider cloudflare.")
-		}
-		if len(input.DNSOrigins) > 0 {
-			origins, err := NormalizeDNSOrigins(input.DNSOrigins)
-			if err != nil {
-				return nil, err
-			}
-			input.DNSOrigins = origins
-		}
-	default:
-		return nil, invalid("dns mode", "Use manual (the default) or cloudflare.")
+	if err := normalizeDomainDNS(&input); err != nil {
+		return nil, err
 	}
 	if input.Confirm != "" {
 		input.Confirm = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(input.Confirm), "."))
@@ -1866,6 +1950,32 @@ func normalizeDomain(target Target, raw json.RawMessage) (ActionInput, error) {
 		}
 	}
 	return &input, nil
+}
+
+func normalizeDomainDNS(input *DomainInput) error {
+	input.DNSMode = strings.ToLower(strings.TrimSpace(input.DNSMode))
+	switch input.DNSMode {
+	case "", "manual":
+		input.DNSMode = ""
+		if input.DNSZone != "" || input.DNSProxied != nil || len(input.DNSOrigins) > 0 {
+			return invalid("dns mode", "Omit --dns-zone, --dns-origin and --dns-proxy for manual DNS; manual DNS is the default and leaves the provider untouched.")
+		}
+	case "cloudflare":
+		input.DNSZone = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(input.DNSZone), "."))
+		if !validDNSZoneReference(input.DNSZone) {
+			return invalid("dns zone", "Use a configured zone name or its lowercase 32-character ID; configure it with eregion dns configure --provider cloudflare.")
+		}
+		if len(input.DNSOrigins) > 0 {
+			origins, err := NormalizeDNSOrigins(input.DNSOrigins)
+			if err != nil {
+				return err
+			}
+			input.DNSOrigins = origins
+		}
+	default:
+		return invalid("dns mode", "Use manual (the default) or cloudflare.")
+	}
+	return nil
 }
 
 // RetentionPruneInput is the accepted disk-retention prune for one node. The
@@ -2012,7 +2122,7 @@ func ValidateDomain(name string) error {
 			return errors.New("each label must be 1–63 letters, digits or hyphens")
 		}
 		for _, r := range label {
-			if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-') {
+			if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '-' {
 				return errors.New("use lowercase letters, digits, hyphens and dots")
 			}
 		}

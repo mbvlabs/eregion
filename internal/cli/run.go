@@ -35,7 +35,9 @@ func Run(ctx context.Context, args []string, in io.Reader, out, stderr io.Writer
 		return serveNodeRPC(ctx, in, out, stderr)
 	}
 	if len(args) >= 2 && args[0] == "node" && args[1] == "unlock-ssh" {
-		return runNodeUnlockSSH(args[2:], out, stderr)
+		// node unlock-ssh is a standalone root-only break-glass command whose
+		// access helper owns its own subprocess lifetime.
+		return runNodeUnlockSSH(args[2:], out, stderr) //nolint:contextcheck // independent break-glass service lifetime.
 	}
 	if len(args) > 0 && args[0] == "node-agent" {
 		return nodeagent.Run(args[1:], in, out, stderr)
@@ -44,7 +46,7 @@ func Run(ctx context.Context, args []string, in io.Reader, out, stderr io.Writer
 }
 
 func run(ctx context.Context, args []string, in io.Reader, out, stderr io.Writer, registry *secrets.Registry) int {
-	return runApp(ctx, args, in, out, stderr, registry, newApp())
+	return runApp(ctx, args, in, out, stderr, registry, newApp()) //nolint:contextcheck // newApp builds a lazy command tree; cmd.Context is read at invocation.
 }
 
 // runApp is run with a caller-supplied app, so tests can add a command that
@@ -54,6 +56,15 @@ func runApp(ctx context.Context, args []string, in io.Reader, out, stderr io.Wri
 	registerEnvironmentSecrets(registry)
 	a.secrets = registry
 	selection := a.followSelection(args)
+	mode, followMode, err := resolveRunModes(args, a, selection)
+	ctx = context.WithValue(ctx, followIOKey{}, &followIO{in: in, out: out, err: stderr, mode: followMode})
+	ctx = context.WithValue(ctx, workspaceSnapshotKey{}, &workspaceSnapshot{})
+	writer := output.Writer{Out: out, Err: stderr, Mode: mode, Secrets: registry}
+	command, err := executeRunCommand(ctx, args, in, stderr, a, err, obsoleteEnvErr)
+	return emitRunResult(writer, out, stderr, registry, selection, followMode, command, err, a.result)
+}
+
+func resolveRunModes(args []string, a *app, selection followSelection) (output.Mode, string, error) {
 	mode, err := output.OptionsFromArgs(args, a.valueFlags()...)
 	followMode := string(output.Plain)
 	if selection.NDJSON {
@@ -72,10 +83,20 @@ func runApp(ctx context.Context, args []string, in io.Reader, out, stderr io.Wri
 	} else if mode == output.JSON {
 		followMode = string(output.JSON)
 	}
-	ctx = context.WithValue(ctx, followIOKey{}, &followIO{in: in, out: out, err: stderr, mode: followMode})
-	ctx = context.WithValue(ctx, workspaceSnapshotKey{}, &workspaceSnapshot{})
-	writer := output.Writer{Out: out, Err: stderr, Mode: mode, Secrets: registry}
+	return mode, followMode, err
+}
+
+func executeRunCommand(
+	ctx context.Context,
+	args []string,
+	in io.Reader,
+	stderr io.Writer,
+	a *app,
+	initialErr error,
+	obsoleteEnvErr error,
+) (string, error) {
 	command := "eregion"
+	err := initialErr
 	if err == nil {
 		err = obsoleteEnvErr
 	}
@@ -85,36 +106,50 @@ func runApp(ctx context.Context, args []string, in io.Reader, out, stderr io.Wri
 	if err == nil {
 		err = ctx.Err()
 	}
-	if err == nil {
-		a.root.SetIn(in)
-		a.root.SetOut(io.Discard)
-		a.root.SetErr(stderr)
-		a.root.SetArgs(args)
-		cmd, executeErr := a.root.ExecuteContextC(ctx)
-		if cmd != nil {
-			command = cmd.CommandPath()
-		}
-		err = executeErr
-		if err == nil && a.helpErr != nil {
-			err = a.helpErr
-		}
-		var fault *contract.Fault
-		if err != nil && !a.started && !errors.As(err, &fault) {
-			suggestions := suggestCommandPaths(cmd, unknownCommandToken(err))
-			err = unknownCommandFault(err.Error(), suggestions)
-		}
+	if err != nil {
+		return command, err
 	}
+	a.root.SetIn(in)
+	a.root.SetOut(io.Discard)
+	a.root.SetErr(stderr)
+	a.root.SetArgs(args)
+	cmd, executeErr := a.root.ExecuteContextC(ctx)
+	if cmd != nil {
+		command = cmd.CommandPath()
+	}
+	err = executeErr
+	if err == nil && a.helpErr != nil {
+		err = a.helpErr
+	}
+	var fault *contract.Fault
+	if err != nil && !a.started && !errors.As(err, &fault) {
+		suggestions := suggestCommandPaths(cmd, unknownCommandToken(err))
+		err = unknownCommandFault(err.Error(), suggestions)
+	}
+	return command, err
+}
+
+func emitRunResult(
+	writer output.Writer,
+	out, stderr io.Writer,
+	registry *secrets.Registry,
+	selection followSelection,
+	followMode string,
+	command string,
+	err error,
+	runResult result,
+) int {
 	var envelope contract.Envelope
 	if err != nil {
 		envelope = contract.Failure(command, err)
 	} else {
-		envelope = contract.Success(a.result.command, a.result.data, a.result.next)
+		envelope = contract.Success(runResult.command, runResult.data, runResult.next)
 	}
-	if a.result.streamed {
+	if runResult.streamed {
 		// The presenter already wrote its protocol (NDJSON result, stable plain
 		// summary, restored TUI plus summary, or an interactive SSH shell).
-		if a.result.streamFault != nil {
-			failure := contract.Failure(a.result.command, a.result.streamFault)
+		if runResult.streamFault != nil {
+			failure := contract.Failure(runResult.command, runResult.streamFault)
 			if writeErr := writer.Write(failure, ""); writeErr != nil {
 				_, _ = io.WriteString(stderr, "error [internal_error]: could not write command output\n")
 				return 70
@@ -134,7 +169,7 @@ func runApp(ctx context.Context, args []string, in io.Reader, out, stderr io.Wri
 		}
 		return contract.ExitCode(err)
 	}
-	if writeErr := writer.Write(envelope, a.result.plain); writeErr != nil {
+	if writeErr := writer.Write(envelope, runResult.plain); writeErr != nil {
 		// Do not append a second JSON envelope after a possibly partial write.
 		// Never expose arbitrary I/O/serialization errors on an unredacted path.
 		_, _ = io.WriteString(stderr, "error [internal_error]: could not write command output\n")

@@ -106,6 +106,21 @@ func telemetryLocal(facts Facts) []Result {
 		}
 		return one(Fail, "node_exporter does not answer on "+telemetry.Endpoint+": "+telemetry.EndpointError, "check node-exporter.service and retry")
 	}
+	if results := telemetryCollectors(telemetry); results != nil {
+		return results
+	}
+	detail := "node_exporter answers with textfile and systemd collectors and node_textfile_scrape_error=0"
+	if telemetry.ExporterVersion != "" {
+		detail = "node_exporter " + telemetry.ExporterVersion + " answers with textfile and systemd collectors and node_textfile_scrape_error=0"
+	}
+	detail += "; textfile directory " + telemetry.Textfile.Path + " is root:root 0755"
+	if extra := unsupportedCollectors(telemetry.Collectors); extra != "" {
+		detail += " (" + extra + " also reported)"
+	}
+	return one(Pass, detail, "")
+}
+
+func telemetryCollectors(telemetry TelemetryFacts) []Result {
 	for _, collector := range []string{"*", "textfile", "systemd"} {
 		if telemetry.CollectorsAmbiguous[collector] {
 			name := collector
@@ -133,15 +148,7 @@ func telemetryLocal(facts Facts) []Result {
 	if *telemetry.TextfileScrapeError != 0 {
 		return one(Fail, "node_exporter reported node_textfile_scrape_error="+formatTelemetryValue(*telemetry.TextfileScrapeError), "inspect node_exporter logs and the textfile directory; a non-zero scrape error is a failed textfile read")
 	}
-	detail := "node_exporter answers with textfile and systemd collectors and node_textfile_scrape_error=0"
-	if telemetry.ExporterVersion != "" {
-		detail = "node_exporter " + telemetry.ExporterVersion + " answers with textfile and systemd collectors and node_textfile_scrape_error=0"
-	}
-	detail += "; textfile directory " + telemetry.Textfile.Path + " is root:root 0755"
-	if extra := unsupportedCollectors(telemetry.Collectors); extra != "" {
-		detail += " (" + extra + " also reported)"
-	}
-	return one(Pass, detail, "")
+	return nil
 }
 
 // telemetryEndpoint checks the public HTTPS authenticated endpoint. It probes

@@ -95,6 +95,9 @@ func (s AppService) FollowOperation(ctx context.Context, authority operations.Au
 				if emit != nil {
 					return emit(OperationFollowObservation{Events: observation.Events, Cursor: contract.Cursor{OperationID: cursor.OperationID, After: observation.Cursor}})
 				}
+			case viewer.ObservationSucceeded, viewer.ObservationTick, viewer.ObservationClosed:
+				// Terminal, poll and close observations need no extra handling
+				// here; the shared viewer owns their lifecycle.
 			}
 			return nil
 		})

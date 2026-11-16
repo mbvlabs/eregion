@@ -30,7 +30,7 @@ const webhookIntegrationSecretValue = "0123456789abcdef"
 // These integration cases need an explicit disposable PostgreSQL DSN. They are
 // skipped unless EREGION_TEST_DATABASE_URL is set, and they never read an
 // ambient production DSN or start Docker.
-func webhookIntegrationFixture(t *testing.T, pool *pgxpool.Pool, run *Runtime) (api.WebhookAdmission, *vault.Service) {
+func webhookIntegrationFixture(t *testing.T, pool *pgxpool.Pool) (api.WebhookAdmission, *vault.Service) {
 	t.Helper()
 	ctx := context.Background()
 	appID, err := platform.NewAppID()
@@ -151,9 +151,9 @@ type webhookIntegrationResponse struct {
 
 func TestIntegrationPushWebhookResolverReadsFreshSecret(t *testing.T) {
 	pool, _ := testPool(t, true)
-	run := testRuntime(t, pool, 0)
+	testRuntime(t, pool, 0)
 	ctx := context.Background()
-	record, secrets := webhookIntegrationFixture(t, pool, run)
+	record, secrets := webhookIntegrationFixture(t, pool)
 	appName, envName := webhookRecordApp(t, record)
 	resolver := NewPushWebhookResolver(newTestEntities(t, pool), secrets)
 	target, enabled, err := resolver.ResolvePushWebhook(ctx, appName, envName)
@@ -184,7 +184,7 @@ func TestIntegrationWebhookAdmissionQueuesAtomically(t *testing.T) {
 	pool, _ := testPool(t, true)
 	run := testRuntime(t, pool, 0)
 	ctx := context.Background()
-	record, _ := webhookIntegrationFixture(t, pool, run)
+	record, _ := webhookIntegrationFixture(t, pool)
 	admitted, created, err := run.WebhookDeliveries.Admit(ctx, record)
 	if err != nil || !created {
 		t.Fatalf("Admit created=%v err=%v", created, err)
@@ -192,6 +192,26 @@ func TestIntegrationWebhookAdmissionQueuesAtomically(t *testing.T) {
 	if admitted.State != api.WebhookDeliveryAdmitted || admitted.JobID == 0 {
 		t.Fatalf("admitted = %+v", admitted)
 	}
+	assertAdmittedWebhookRows(t, ctx, pool, record, admitted)
+	again, created, err := run.WebhookDeliveries.Admit(ctx, record)
+	if err != nil || created || again.State != api.WebhookDeliveryAdmitted {
+		t.Fatalf("duplicate created=%v state=%s err=%v", created, again.State, err)
+	}
+	var jobs int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM river_job WHERE args->>'delivery_id_hash'=$1`, record.DeliveryIDHash).Scan(&jobs); err != nil || jobs != 1 {
+		t.Fatalf("jobs=%d err=%v", jobs, err)
+	}
+	assertWebhookDeliveryRowSanitized(t, ctx, pool, record.DeliveryIDHash)
+}
+
+func assertAdmittedWebhookRows(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	record api.WebhookAdmission,
+	admitted api.WebhookAdmission,
+) {
+	t.Helper()
 	var storedJobID int64
 	if err := pool.QueryRow(ctx, `SELECT job_id FROM eregion_webhook_deliveries WHERE delivery_id_hash=$1`, record.DeliveryIDHash).Scan(&storedJobID); err != nil || storedJobID != admitted.JobID {
 		t.Fatalf("receipt job_id=%d admitted=%d err=%v", storedJobID, admitted.JobID, err)
@@ -213,16 +233,12 @@ func TestIntegrationWebhookAdmissionQueuesAtomically(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_operations`).Scan(&operations); err != nil || operations != 0 {
 		t.Fatalf("synchronous operations=%d err=%v", operations, err)
 	}
-	again, created, err := run.WebhookDeliveries.Admit(ctx, record)
-	if err != nil || created || again.State != api.WebhookDeliveryAdmitted {
-		t.Fatalf("duplicate created=%v state=%s err=%v", created, again.State, err)
-	}
-	var jobs int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM river_job WHERE args->>'delivery_id_hash'=$1`, record.DeliveryIDHash).Scan(&jobs); err != nil || jobs != 1 {
-		t.Fatalf("jobs=%d err=%v", jobs, err)
-	}
+}
+
+func assertWebhookDeliveryRowSanitized(t *testing.T, ctx context.Context, pool *pgxpool.Pool, deliveryIDHash string) {
+	t.Helper()
 	var rowText string
-	if err := pool.QueryRow(ctx, `SELECT to_jsonb(d)::text FROM eregion_webhook_deliveries d WHERE d.delivery_id_hash=$1`, record.DeliveryIDHash).Scan(&rowText); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT to_jsonb(d)::text FROM eregion_webhook_deliveries d WHERE d.delivery_id_hash=$1`, deliveryIDHash).Scan(&rowText); err != nil {
 		t.Fatal(err)
 	}
 	for _, forbidden := range []string{"integration body", "0123456789abcdef", "integration-delivery-"} {
@@ -236,7 +252,7 @@ func TestIntegrationWebhookAdmissionConflictLeavesNoSpeculativeJob(t *testing.T)
 	pool, _ := testPool(t, true)
 	run := testRuntime(t, pool, 0)
 	ctx := context.Background()
-	record, _ := webhookIntegrationFixture(t, pool, run)
+	record, _ := webhookIntegrationFixture(t, pool)
 	if _, _, err := run.WebhookDeliveries.Admit(ctx, record); err != nil {
 		t.Fatal(err)
 	}
@@ -256,9 +272,9 @@ func TestIntegrationWebhookAdmissionConflictLeavesNoSpeculativeJob(t *testing.T)
 
 func TestIntegrationWebhookAdmissionRollsBackWhenQueueFails(t *testing.T) {
 	pool, _ := testPool(t, true)
-	run := testRuntime(t, pool, 0)
+	testRuntime(t, pool, 0)
 	ctx := context.Background()
-	record, _ := webhookIntegrationFixture(t, pool, run)
+	record, _ := webhookIntegrationFixture(t, pool)
 	record.DeliveryIDHash = api.WebhookDeliveryHash("rollback-" + record.EnvironmentID)
 	store := NewWebhookDeliveryStore(newTestEntities(t, pool))
 	for _, statement := range []string{
@@ -292,7 +308,7 @@ func TestIntegrationWebhookAdmissionRejectsRotatedSecret(t *testing.T) {
 	pool, _ := testPool(t, true)
 	run := testRuntime(t, pool, 0)
 	ctx := context.Background()
-	record, secrets := webhookIntegrationFixture(t, pool, run)
+	record, secrets := webhookIntegrationFixture(t, pool)
 	record.DeliveryIDHash = api.WebhookDeliveryHash("rotation-" + record.EnvironmentID)
 	appName, envName := webhookRecordApp(t, record)
 	namespace, _ := vault.NewNamespace(appName, envName, "WEBHOOK_SECRET")
@@ -315,7 +331,7 @@ func TestIntegrationWebhookAdmissionSerializesSecretRotation(t *testing.T) {
 	pool, _ := testPool(t, true)
 	run := testRuntime(t, pool, 0)
 	ctx := context.Background()
-	record, secrets := webhookIntegrationFixture(t, pool, run)
+	record, secrets := webhookIntegrationFixture(t, pool)
 	appName, envName := webhookRecordApp(t, record)
 	locked := make(chan struct{})
 	release := make(chan struct{})
@@ -364,7 +380,7 @@ func TestIntegrationWebhookAdmissionAndDeletionLockOrder(t *testing.T) {
 	pool, _ := testPool(t, true)
 	run := testRuntime(t, pool, 0)
 	ctx := context.Background()
-	record, _ := webhookIntegrationFixture(t, pool, run)
+	record, _ := webhookIntegrationFixture(t, pool)
 	appName, envName := webhookRecordApp(t, record)
 	// Simulate deleteEnvironmentRowsTx: lock the environment row first, then
 	// attempt the secret row. Admission must take the same environment-then-
@@ -373,7 +389,7 @@ func TestIntegrationWebhookAdmissionAndDeletionLockOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rollback(deleteTx)
+	defer rollback(ctx, deleteTx)
 	if _, err := deleteTx.Exec(ctx, `UPDATE eregion_platform_environments
         SET updated_at=clock_timestamp() WHERE id=$1`, record.EnvironmentID); err != nil {
 		t.Fatal(err)
@@ -416,7 +432,7 @@ func TestIntegrationWebhookWorkerSubmitsOnce(t *testing.T) {
 	pool, _ := testPool(t, true)
 	run := testRuntime(t, pool, 0)
 	ctx := context.Background()
-	record, _ := webhookIntegrationFixture(t, pool, run)
+	record, _ := webhookIntegrationFixture(t, pool)
 	admitted, _, err := run.WebhookDeliveries.Admit(ctx, record)
 	if err != nil {
 		t.Fatal(err)
@@ -454,7 +470,7 @@ func TestIntegrationWebhookLegacyReconcileNeverResubmits(t *testing.T) {
 	pool, _ := testPool(t, true)
 	run := testRuntime(t, pool, 0)
 	ctx := context.Background()
-	record, _ := webhookIntegrationFixture(t, pool, run)
+	record, _ := webhookIntegrationFixture(t, pool)
 	rawDelivery := "legacy-delivery-" + record.EnvironmentID
 	record.DeliveryIDHash = api.WebhookDeliveryHash(rawDelivery)
 	record.BodySHA256 = api.WebhookBodyHash([]byte("legacy body"))
@@ -491,7 +507,7 @@ func TestIntegrationWebhookLegacyMissingOperationIsAmbiguous(t *testing.T) {
 	pool, _ := testPool(t, true)
 	run := testRuntime(t, pool, 0)
 	ctx := context.Background()
-	record, _ := webhookIntegrationFixture(t, pool, run)
+	record, _ := webhookIntegrationFixture(t, pool)
 	rawDelivery := "legacy-missing-" + record.EnvironmentID
 	record.DeliveryIDHash = api.WebhookDeliveryHash(rawDelivery)
 	record.BodySHA256 = api.WebhookBodyHash([]byte("legacy missing body"))
@@ -517,7 +533,7 @@ func TestIntegrationWebhookHTTPLegacyPendingRetainsOperation(t *testing.T) {
 	pool, _ := testPool(t, true)
 	run := testRuntime(t, pool, 0)
 	ctx := context.Background()
-	record, secrets := webhookIntegrationFixture(t, pool, run)
+	record, secrets := webhookIntegrationFixture(t, pool)
 	appName, envName := webhookRecordApp(t, record)
 	rawDelivery := "legacy-http-retained-" + strings.ReplaceAll(record.EnvironmentID, "_", "-")
 	body := webhookIntegrationPushBody(record.Commit)
@@ -568,7 +584,7 @@ func TestIntegrationWebhookHTTPLegacyPendingMissingReportsAmbiguous(t *testing.T
 	pool, _ := testPool(t, true)
 	run := testRuntime(t, pool, 0)
 	ctx := context.Background()
-	record, secrets := webhookIntegrationFixture(t, pool, run)
+	record, secrets := webhookIntegrationFixture(t, pool)
 	appName, envName := webhookRecordApp(t, record)
 	rawDelivery := "legacy-http-missing-" + strings.ReplaceAll(record.EnvironmentID, "_", "-")
 	body := webhookIntegrationPushBody(record.Commit)
@@ -613,7 +629,7 @@ func TestIntegrationWebhookMaintenanceRequeuesMissingJobAndFailsDiscarded(t *tes
 	pool, _ := testPool(t, true)
 	run := testRuntime(t, pool, 0)
 	ctx := context.Background()
-	record, _ := webhookIntegrationFixture(t, pool, run)
+	record, _ := webhookIntegrationFixture(t, pool)
 	admitted, _, err := run.WebhookDeliveries.Admit(ctx, record)
 	if err != nil {
 		t.Fatal(err)
@@ -650,7 +666,7 @@ func TestIntegrationWebhookMaintenanceFiltersActionableBeforeLimit(t *testing.T)
 	pool, _ := testPool(t, true)
 	run := testRuntime(t, pool, 0)
 	ctx := context.Background()
-	record, _ := webhookIntegrationFixture(t, pool, run)
+	record, _ := webhookIntegrationFixture(t, pool)
 	for index := 0; index < 101; index++ {
 		healthy := record
 		healthy.DeliveryIDHash = api.WebhookDeliveryHash(fmt.Sprintf("healthy-%d-%s", index, record.EnvironmentID))
@@ -685,7 +701,7 @@ func TestIntegrationWebhookMaintenanceRechecksCurrentJobUnderLock(t *testing.T) 
 	pool, _ := testPool(t, true)
 	run := testRuntime(t, pool, 0)
 	ctx := context.Background()
-	record, _ := webhookIntegrationFixture(t, pool, run)
+	record, _ := webhookIntegrationFixture(t, pool)
 	admitted, _, err := run.WebhookDeliveries.Admit(ctx, record)
 	if err != nil {
 		t.Fatal(err)
@@ -734,7 +750,7 @@ func TestIntegrationWebhookWorkerRejectsRebindAndDeletedEnvironment(t *testing.T
 	pool, _ := testPool(t, true)
 	run := testRuntime(t, pool, 0)
 	ctx := context.Background()
-	record, _ := webhookIntegrationFixture(t, pool, run)
+	record, _ := webhookIntegrationFixture(t, pool)
 	admitted, _, err := run.WebhookDeliveries.Admit(ctx, record)
 	if err != nil {
 		t.Fatal(err)
@@ -765,7 +781,7 @@ func TestIntegrationWebhookWorkerRejectsRebindAndDeletedEnvironment(t *testing.T
 		t.Fatalf("rebind state=%q code=%q", state, code)
 	}
 
-	second, _ := webhookIntegrationFixture(t, pool, run)
+	second, _ := webhookIntegrationFixture(t, pool)
 	second.DeliveryIDHash = api.WebhookDeliveryHash("deleted-" + second.EnvironmentID)
 	secondAdmitted, _, err := run.WebhookDeliveries.Admit(ctx, second)
 	if err != nil {

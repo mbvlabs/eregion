@@ -65,8 +65,7 @@ func (f *textField) Update(message tea.KeyPressMsg) {
 		}
 		return
 	}
-	inserted := []rune(message.Text)
-	for _, r := range inserted {
+	for _, r := range message.Text {
 		if unicode.IsControl(r) || f.cursor >= f.limit {
 			continue
 		}

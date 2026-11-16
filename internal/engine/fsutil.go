@@ -106,7 +106,7 @@ func createTemp(dir, name string, perm os.FileMode) (string, *os.File, error) {
 		return "", nil, err
 	}
 	tmp := filepath.Join(dir, "."+name+"."+hex.EncodeToString(suffix)+".tmp")
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm) //nolint:gosec // G304: temp file beside the caller's node path.
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
 	if err != nil {
 		return "", nil, err
 	}
@@ -114,7 +114,7 @@ func createTemp(dir, name string, perm os.FileMode) (string, *os.File, error) {
 }
 
 func syncDir(dir string) error {
-	d, err := os.Open(dir) //nolint:gosec // G304: directory of a caller's node path.
+	d, err := os.Open(dir)
 	if err != nil {
 		return err
 	}
@@ -136,7 +136,7 @@ func ValidateNodeName(name string) error {
 		return fmt.Errorf("node name must be 1-64 bytes")
 	}
 	for _, r := range name {
-		if !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '_') {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '-' && r != '_' {
 			return fmt.Errorf("node name has unsafe characters")
 		}
 	}

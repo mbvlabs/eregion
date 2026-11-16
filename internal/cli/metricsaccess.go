@@ -15,17 +15,14 @@ import (
 	"github.com/spf13/cobra"
 )
 
-const metricsCredentialFile = "metrics-credential.json"
+const metricsCredentialFile = "metrics-credential.json" //nolint:gosec // G101: the credential file's name, not a credential value.
 
-func metricsCredentialPath(dir string) (string, error) {
-	return filepath.Join(dir, metricsCredentialFile), nil
+func metricsCredentialPath(dir string) string {
+	return filepath.Join(dir, metricsCredentialFile)
 }
 
 func loadMetricsCredential(dir string) (*telemetry.Credential, error) {
-	path, err := metricsCredentialPath(dir)
-	if err != nil {
-		return nil, err
-	}
+	path := metricsCredentialPath(dir)
 	info, err := os.Lstat(path)
 	if os.IsNotExist(err) {
 		return nil, nil
@@ -36,7 +33,7 @@ func loadMetricsCredential(dir string) (*telemetry.Credential, error) {
 	if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
 		return nil, contract.NewFault(contract.PreconditionFailed, "the local telemetry credential is not an owner-only regular file", "Remove or repair "+path+" before configuring scrapers.")
 	}
-	raw, err := os.ReadFile(path) //nolint:gosec // G304: eregion's own owner-only credential file.
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
@@ -54,14 +51,11 @@ func saveMetricsCredential(dir string, credential telemetry.Credential) error {
 	if err := credential.Validate(); err != nil {
 		return err
 	}
-	path, err := metricsCredentialPath(dir)
-	if err != nil {
-		return err
-	}
+	path := metricsCredentialPath(dir)
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	raw, err := json.MarshalIndent(credential, "", "  ")
+	raw, err := json.MarshalIndent(credential, "", "  ") //nolint:gosec // G117: writing the node telemetry credential is the intended operation.
 	if err != nil {
 		return err
 	}
@@ -69,10 +63,7 @@ func saveMetricsCredential(dir string, credential telemetry.Credential) error {
 }
 
 func removeMetricsCredential(dir string) error {
-	path, err := metricsCredentialPath(dir)
-	if err != nil {
-		return err
-	}
+	path := metricsCredentialPath(dir)
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return err
 	}
@@ -210,29 +201,68 @@ func metricsEndpointText(view metricsEndpointView) string {
 }
 
 func (a *app) metricsConfig(cmd *cobra.Command, _ []string) (result, error) {
-	client, err := a.client(cmd)
+	request, err := a.readMetricsConfigRequest(cmd)
 	if err != nil {
 		return result{}, err
+	}
+	password := telemetry.PasswordPlaceholder
+	if request.outPath != "" && request.credential != nil {
+		password = request.credential.Password
+	}
+	documents, err := buildMetricsConfigDocuments(request.info, password)
+	if err != nil {
+		return result{}, err
+	}
+	data := map[string]any{
+		"node": request.info.Node, "hostname": request.info.Hostname, "state": request.info.State,
+		"listen": request.info.Listen, "metrics_url": request.info.MetricsURL,
+		"discovery_url": request.info.DiscoveryURL, "username": telemetry.Username,
+		"credential_available": request.credential != nil, "node_credential": request.info.Credential,
+		"password_in_output": false,
+		"prometheus_config":  documents.prometheusPlaceholder,
+		"alloy_config":       documents.alloyPlaceholder,
+		"targets_json":       string(documents.targets),
+	}
+	if warnings := metricsConfigWarnings(request.credential, request.info); len(warnings) > 0 {
+		data["warnings"] = warnings
+	}
+	if request.outPath != "" {
+		return writeMetricsConfigFile(request, documents, data)
+	}
+	return result{data: data, plain: metricsConfigText(request.format, data)}, nil
+}
+
+type metricsConfigRequest struct {
+	info       telemetry.EndpointInfo
+	credential *telemetry.Credential
+	format     string
+	outPath    string
+}
+
+func (a *app) readMetricsConfigRequest(cmd *cobra.Command) (metricsConfigRequest, error) {
+	client, err := a.client(cmd)
+	if err != nil {
+		return metricsConfigRequest{}, err
 	}
 	backend, ok := client.(metricsEndpointClient)
 	if !ok {
-		return result{}, contract.NewFault(contract.Internal, "this client cannot read the telemetry endpoint", "Use a saved workspace over SSH inside WireGuard.")
+		return metricsConfigRequest{}, contract.NewFault(contract.Internal, "this client cannot read the telemetry endpoint", "Use a saved workspace over SSH inside WireGuard.")
 	}
 	current, err := selectedWorkspaceAccess(cmd)
 	if err != nil {
-		return result{}, err
+		return metricsConfigRequest{}, err
 	}
 	info, err := backend.MetricsEndpoint(cmd.Context())
 	if err != nil {
-		return result{}, err
+		return metricsConfigRequest{}, err
 	}
 	credentialDir, err := workspaceCredentialDir(cmd, current)
 	if err != nil {
-		return result{}, err
+		return metricsConfigRequest{}, err
 	}
 	credential, err := loadMetricsCredential(credentialDir)
 	if err != nil {
-		return result{}, err
+		return metricsConfigRequest{}, err
 	}
 	if credential != nil {
 		a.secrets.Add(credential.Password)
@@ -242,55 +272,60 @@ func (a *app) metricsConfig(cmd *cobra.Command, _ []string) (result, error) {
 	switch format {
 	case "all", "prometheus", "alloy", "targets":
 	default:
-		return result{}, contract.NewFault(contract.Usage, "unknown telemetry config format "+format, "Use all, prometheus, alloy or targets.")
+		return metricsConfigRequest{}, contract.NewFault(contract.Usage, "unknown telemetry config format "+format, "Use all, prometheus, alloy or targets.")
 	}
 	if outPath != "" && format == "all" {
-		return result{}, contract.NewFault(contract.Usage, "--out needs one --format value", "Choose prometheus, alloy or targets; all three cannot share one file.")
+		return metricsConfigRequest{}, contract.NewFault(contract.Usage, "--out needs one --format value", "Choose prometheus, alloy or targets; all three cannot share one file.")
 	}
 	if outPath != "" && format != "targets" && credential == nil {
-		return result{}, contract.NewFault(contract.PreconditionFailed,
+		return metricsConfigRequest{}, contract.NewFault(contract.PreconditionFailed,
 			"this machine has no telemetry credential to write",
 			"Import the protected handoff with eregion login, or run eregion metrics rotate.")
 	}
 	if info.State == telemetry.EndpointStateUnconfigured || strings.TrimSpace(info.Hostname) == "" {
-		return result{}, contract.NewFault(contract.PreconditionFailed,
+		return metricsConfigRequest{}, contract.NewFault(contract.PreconditionFailed,
 			"the node has no public hostname, so the telemetry endpoint is unconfigured",
 			"Configure the main node's public hostname and public ingress; there is no WireGuard or listener-address fallback target.")
 	}
-	password := telemetry.PasswordPlaceholder
-	if outPath != "" && credential != nil {
-		password = credential.Password
-	}
+	return metricsConfigRequest{info: info, credential: credential, format: format, outPath: outPath}, nil
+}
+
+type metricsConfigDocuments struct {
+	targets               []byte
+	prometheus            string
+	alloy                 string
+	prometheusPlaceholder string
+	alloyPlaceholder      string
+}
+
+func buildMetricsConfigDocuments(info telemetry.EndpointInfo, password string) (metricsConfigDocuments, error) {
 	targets, err := telemetry.TargetsJSON(info.Node, info.Hostname)
 	if err != nil {
-		return result{}, contract.NewFault(contract.ValidationFailed, "the node reported an invalid telemetry hostname", "Re-run eregion apply with a valid main hostname.")
+		return metricsConfigDocuments{}, contract.NewFault(contract.ValidationFailed, "the node reported an invalid telemetry hostname", "Re-run eregion apply with a valid main hostname.")
 	}
 	prometheus, err := telemetry.PrometheusConfig(info.Node, info.Hostname, telemetry.Username, password)
 	if err != nil {
-		return result{}, contract.NewFault(contract.ValidationFailed, "the node reported an invalid telemetry hostname", "Re-run eregion apply with a valid main hostname.")
+		return metricsConfigDocuments{}, contract.NewFault(contract.ValidationFailed, "the node reported an invalid telemetry hostname", "Re-run eregion apply with a valid main hostname.")
 	}
 	alloy, err := telemetry.AlloyConfig(info.Node, info.Hostname, telemetry.Username, password)
 	if err != nil {
-		return result{}, contract.NewFault(contract.ValidationFailed, "the node reported an invalid telemetry hostname", "Re-run eregion apply with a valid main hostname.")
+		return metricsConfigDocuments{}, contract.NewFault(contract.ValidationFailed, "the node reported an invalid telemetry hostname", "Re-run eregion apply with a valid main hostname.")
 	}
 	prometheusPlaceholder, err := telemetry.PrometheusConfig(info.Node, info.Hostname, telemetry.Username, telemetry.PasswordPlaceholder)
 	if err != nil {
-		return result{}, err
+		return metricsConfigDocuments{}, err
 	}
 	alloyPlaceholder, err := telemetry.AlloyConfig(info.Node, info.Hostname, telemetry.Username, telemetry.PasswordPlaceholder)
 	if err != nil {
-		return result{}, err
+		return metricsConfigDocuments{}, err
 	}
-	data := map[string]any{
-		"node": info.Node, "hostname": info.Hostname, "state": info.State,
-		"listen": info.Listen, "metrics_url": info.MetricsURL,
-		"discovery_url": info.DiscoveryURL, "username": telemetry.Username,
-		"credential_available": credential != nil, "node_credential": info.Credential,
-		"password_in_output": false,
-		"prometheus_config":  prometheusPlaceholder,
-		"alloy_config":       alloyPlaceholder,
-		"targets_json":       string(targets),
-	}
+	return metricsConfigDocuments{
+		targets: targets, prometheus: prometheus, alloy: alloy,
+		prometheusPlaceholder: prometheusPlaceholder, alloyPlaceholder: alloyPlaceholder,
+	}, nil
+}
+
+func metricsConfigWarnings(credential *telemetry.Credential, info telemetry.EndpointInfo) []map[string]string {
 	var warnings []map[string]string
 	switch {
 	case credential == nil:
@@ -300,34 +335,31 @@ func (a *app) metricsConfig(cmd *cobra.Command, _ []string) (result, error) {
 	case info.State == telemetry.EndpointStateNeedsApply:
 		warnings = append(warnings, map[string]string{"code": "metrics_endpoint_needs_apply", "message": "the node has a telemetry credential but its gateway file is not the current loopback render; run eregion apply before relying on the snippets."})
 	}
-	if len(warnings) > 0 {
-		data["warnings"] = warnings
+	return warnings
+}
+
+func writeMetricsConfigFile(request metricsConfigRequest, documents metricsConfigDocuments, data map[string]any) (result, error) {
+	content := ""
+	switch request.format {
+	case "prometheus":
+		content = documents.prometheus
+	case "alloy":
+		content = documents.alloy
+	case "targets":
+		content = string(documents.targets)
 	}
-	if outPath != "" {
-		content := ""
-		switch format {
-		case "prometheus":
-			content = prometheus
-		case "alloy":
-			content = alloy
-		case "targets":
-			content = string(targets)
-		}
-		expanded := expandHome(strings.TrimSpace(outPath))
-		if _, err := os.Lstat(expanded); err == nil {
-			return result{}, contract.NewFault(contract.PreconditionFailed, expanded+" already exists", "Choose a new path; the file may contain a credential.")
-		} else if !os.IsNotExist(err) {
-			return result{}, err
-		}
-		if err := engine.WriteFileAtomic(expanded, []byte(content), 0o600); err != nil {
-			return result{}, contract.NewFault(contract.ValidationFailed, "could not write the telemetry config", err.Error())
-		}
-		data["out"] = expanded
-		data["format"] = format
-		plain := "Wrote " + format + " config to " + expanded + " (owner-only).\nThe password is not printed. Keep the file private and update the scraper.\n"
-		return result{data: data, plain: plain}, nil
+	expanded := expandHome(strings.TrimSpace(request.outPath))
+	if _, err := os.Lstat(expanded); err == nil {
+		return result{}, contract.NewFault(contract.PreconditionFailed, expanded+" already exists", "Choose a new path; the file may contain a credential.")
+	} else if !os.IsNotExist(err) {
+		return result{}, err
 	}
-	plain := metricsConfigText(format, data)
+	if err := engine.WriteFileAtomic(expanded, []byte(content), 0o600); err != nil {
+		return result{}, contract.NewFault(contract.ValidationFailed, "could not write the telemetry config", err.Error())
+	}
+	data["out"] = expanded
+	data["format"] = request.format
+	plain := "Wrote " + request.format + " config to " + expanded + " (owner-only).\nThe password is not printed. Keep the file private and update the scraper.\n"
 	return result{data: data, plain: plain}, nil
 }
 
@@ -348,18 +380,23 @@ func metricsConfigText(format string, data map[string]any) string {
 	}
 	switch format {
 	case "prometheus":
-		add("Prometheus", data["prometheus_config"].(string))
+		add("Prometheus", metricsConfigValue(data, "prometheus_config"))
 	case "alloy":
-		add("Grafana Alloy", data["alloy_config"].(string))
+		add("Grafana Alloy", metricsConfigValue(data, "alloy_config"))
 	case "targets":
-		add("HTTP service discovery", data["targets_json"].(string))
+		add("HTTP service discovery", metricsConfigValue(data, "targets_json"))
 	default:
-		add("Prometheus", data["prometheus_config"].(string))
-		add("Grafana Alloy", data["alloy_config"].(string))
-		add("HTTP service discovery", data["targets_json"].(string))
+		add("Prometheus", metricsConfigValue(data, "prometheus_config"))
+		add("Grafana Alloy", metricsConfigValue(data, "alloy_config"))
+		add("HTTP service discovery", metricsConfigValue(data, "targets_json"))
 	}
 	out.WriteString(ui.Note("The password is a placeholder in ordinary output. Re-run with --format <prometheus|alloy|targets> --out FILE to write an owner-only file with the real credential."))
 	return out.String()
+}
+
+func metricsConfigValue(data map[string]any, key string) string {
+	value, _ := data[key].(string)
+	return value
 }
 
 func (a *app) metricsRotate(cmd *cobra.Command, _ []string) (result, error) {

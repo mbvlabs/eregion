@@ -183,14 +183,7 @@ func revisionStateOf(current platform.Environment) platform.RevisionState {
 
 func (a *app) guidedSource(
 	base platform.SourceBinding,
-) (source platform.SourceBinding, credential []byte, credentialName string, err error) {
-	keep := false
-	defer func() {
-		if !keep {
-			clearBytes(credential)
-			credential = nil
-		}
-	}()
+) (platform.SourceBinding, []byte, string, error) {
 	options := [][2]string{
 		{"Keep or set a Git build recipe", "git"},
 		{"No Git source (deploy explicit artifacts)", "none"},
@@ -217,90 +210,9 @@ func (a *app) guidedSource(
 	}
 	switch kind {
 	case "none":
-		keep = true
 		return platform.SourceBinding{}, nil, "", nil
 	case "git":
-		url, err := askValidated(
-			"HTTPS git repository",
-			"No credentials in the URL; the node checks its allowed hosts",
-			base.URL,
-			validateGitURLShape,
-		)
-		if err != nil {
-			return platform.SourceBinding{}, nil, "", err
-		}
-		ref, err := ui.Input(
-			"Branch or tag",
-			"Empty uses the repository's default branch",
-			base.Ref,
-		)
-		if err != nil {
-			return platform.SourceBinding{}, nil, "", err
-		}
-		name, err := askValidated(
-			"Credential secret name",
-			"Empty for a public repository",
-			base.CredentialSecretName,
-			validateOptionalSecretName,
-		)
-		if err != nil {
-			return platform.SourceBinding{}, nil, "", err
-		}
-		if name != "" {
-			replaceDefault := name != base.CredentialSecretName
-			replace, err := ui.YesNoDefault(
-				"Replace the stored read token?",
-				"The value is written only after the preview and confirmation; only the name enters the revision.",
-				replaceDefault,
-			)
-			if err != nil {
-				return platform.SourceBinding{}, nil, "", err
-			}
-			if replace {
-				token, err := ui.Secret("Repository read token")
-				if err != nil {
-					return platform.SourceBinding{}, nil, "", err
-				}
-				if token == "" {
-					return platform.SourceBinding{}, nil, "", contract.NewFault(
-						contract.InputRequired,
-						"the repository read token is empty",
-						"Enter a token, or answer No to replacing the stored read token.",
-					)
-				}
-				credential = []byte(token)
-				a.registerSecretValue(credential)
-			}
-		}
-		builderDefault := base.Builder
-		builder, err := askValidated(
-			"Buildpacks builder",
-			"Required for Git builds; there is no built-in default",
-			builderDefault,
-			validateOptionalImage,
-		)
-		if err != nil {
-			return platform.SourceBinding{}, nil, "", err
-		}
-		contextPath, err := ui.Input(
-			"Build context path",
-			"Empty builds the repository root",
-			base.ContextPath,
-		)
-		if err != nil {
-			return platform.SourceBinding{}, nil, "", err
-		}
-		source := platform.CloneRevisionState(platform.RevisionState{Source: base}).Source
-		if base.URL == "" {
-			source = platform.SourceBinding{}
-		}
-		source.URL, source.Ref, source.CredentialSecretName = url, ref, name
-		source.ContextPath, source.Builder = contextPath, builder
-		if err := guidedBuildpacks(&source); err != nil {
-			return platform.SourceBinding{}, nil, "", err
-		}
-		keep = true
-		return source, credential, name, nil
+		return a.guidedGitSource(base)
 	default:
 		return platform.SourceBinding{}, nil, "", contract.NewFault(
 			contract.Internal,
@@ -308,6 +220,103 @@ func (a *app) guidedSource(
 			"Report the command and binary version.",
 		)
 	}
+}
+
+func (a *app) guidedGitSource(base platform.SourceBinding) (source platform.SourceBinding, credential []byte, credentialName string, err error) {
+	defer func() {
+		if err != nil {
+			clearBytes(credential)
+			credential = nil
+		}
+	}()
+	url, err := askValidated(
+		"HTTPS git repository",
+		"No credentials in the URL; the node checks its allowed hosts",
+		base.URL,
+		validateGitURLShape,
+	)
+	if err != nil {
+		return platform.SourceBinding{}, nil, "", err
+	}
+	ref, err := ui.Input(
+		"Branch or tag",
+		"Empty uses the repository's default branch",
+		base.Ref,
+	)
+	if err != nil {
+		return platform.SourceBinding{}, nil, "", err
+	}
+	name, err := askValidated(
+		"Credential secret name",
+		"Empty for a public repository",
+		base.CredentialSecretName,
+		validateOptionalSecretName,
+	)
+	if err != nil {
+		return platform.SourceBinding{}, nil, "", err
+	}
+	credential, err = a.guidedGitCredential(base, name)
+	if err != nil {
+		return platform.SourceBinding{}, nil, "", err
+	}
+	builder, err := askValidated(
+		"Buildpacks builder",
+		"Required for Git builds; there is no built-in default",
+		base.Builder,
+		validateOptionalImage,
+	)
+	if err != nil {
+		return platform.SourceBinding{}, nil, "", err
+	}
+	contextPath, err := ui.Input(
+		"Build context path",
+		"Empty builds the repository root",
+		base.ContextPath,
+	)
+	if err != nil {
+		return platform.SourceBinding{}, nil, "", err
+	}
+	source = platform.CloneRevisionState(platform.RevisionState{Source: base}).Source
+	if base.URL == "" {
+		source = platform.SourceBinding{}
+	}
+	source.URL, source.Ref, source.CredentialSecretName = url, ref, name
+	source.ContextPath, source.Builder = contextPath, builder
+	if err := guidedBuildpacks(&source); err != nil {
+		return platform.SourceBinding{}, nil, "", err
+	}
+	return source, credential, name, nil
+}
+
+func (a *app) guidedGitCredential(base platform.SourceBinding, name string) ([]byte, error) {
+	if name == "" {
+		return nil, nil
+	}
+	replace, err := ui.YesNoDefault(
+		"Replace the stored read token?",
+		"The value is written only after the preview and confirmation; only the name enters the revision.",
+		name != base.CredentialSecretName,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if !replace {
+		return nil, nil
+	}
+	token, err := ui.Secret("Repository read token")
+	if err != nil {
+		return nil, err
+	}
+	if token == "" {
+		return nil, contract.NewFault(
+			contract.InputRequired,
+			"the repository read token is empty",
+			"Enter a token, or answer No to replacing the stored read token.",
+		)
+	}
+	credential := []byte(token)
+	a.registerSecretValue(credential)
+	return credential, nil
 }
 
 func guidedRuntime(base platform.RuntimeSpec, node string) (platform.RuntimeSpec, error) {
@@ -380,59 +389,73 @@ func guidedProcesses(base []platform.ProcessSpec) ([]platform.ProcessSpec, error
 		fmt.Fprint(os.Stderr, writeProcessTable(processes))
 	}
 	for index := range processes {
-		process := &processes[index]
-		if process.Kind == "web" || process.Kind == "service" {
-			port, err := askPort(
-				"Container port for "+process.Name,
-				"The port inside the container",
-				strconv.Itoa(process.ContainerPort),
-			)
-			if err != nil {
-				return nil, err
-			}
-			process.ContainerPort = port
-		}
-		line := ""
-		if process.Command != "" {
-			line = formatCommandArgv(append([]string{process.Command}, process.Args...))
-		}
-		for {
-			input, inputErr := ui.Input(
-				"Command for "+process.Name,
-				"Executable and quoted arguments; empty for a web process",
-				line,
-			)
-			if inputErr != nil {
-				return nil, inputErr
-			}
-			line = input
-			command, args, err := splitCommandLine(line)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, ui.Warn(err.Error()))
-				continue
-			}
-			if process.Kind != "web" && command == "" {
-				fmt.Fprintln(os.Stderr, ui.Warn("A worker or service process needs a command."))
-				continue
-			}
-			process.Command, process.Args = command, args
-			break
-		}
-		replicas, err := askReplicas(
-			"Replicas for "+processLabel(*process),
-			strconv.Itoa(process.Replicas),
-		)
-		if err != nil {
+		if err := editGuidedProcess(&processes[index]); err != nil {
 			return nil, err
 		}
-		process.Replicas = replicas
 	}
 	extras, err := readAdditionalProcesses(processes)
 	if err != nil {
 		return nil, err
 	}
-	processes = append(processes, extras...)
-	return removeProcesses(processes)
+	result := make([]platform.ProcessSpec, 0, len(processes)+len(extras))
+	result = append(result, processes...)
+	result = append(result, extras...)
+	return removeProcesses(result)
+}
+
+func editGuidedProcess(process *platform.ProcessSpec) error {
+	if process.Kind == "web" || process.Kind == "service" {
+		port, err := askPort(
+			"Container port for "+process.Name,
+			"The port inside the container",
+			strconv.Itoa(process.ContainerPort),
+		)
+		if err != nil {
+			return err
+		}
+		process.ContainerPort = port
+	}
+	line := ""
+	if process.Command != "" {
+		line = formatCommandArgv(append([]string{process.Command}, process.Args...))
+	}
+	if err := editGuidedCommand(process, line); err != nil {
+		return err
+	}
+	replicas, err := askReplicas(
+		"Replicas for "+processLabel(*process),
+		strconv.Itoa(process.Replicas),
+	)
+	if err != nil {
+		return err
+	}
+	process.Replicas = replicas
+	return nil
+}
+
+func editGuidedCommand(process *platform.ProcessSpec, line string) error {
+	for {
+		input, inputErr := ui.Input(
+			"Command for "+process.Name,
+			"Executable and quoted arguments; empty for a web process",
+			line,
+		)
+		if inputErr != nil {
+			return inputErr
+		}
+		line = input
+		command, args, err := splitCommandLine(line)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, ui.Warn(err.Error()))
+			continue
+		}
+		if process.Kind != "web" && command == "" {
+			fmt.Fprintln(os.Stderr, ui.Warn("A worker or service process needs a command."))
+			continue
+		}
+		process.Command, process.Args = command, args
+		return nil
+	}
 }
 
 func removeProcesses(processes []platform.ProcessSpec) ([]platform.ProcessSpec, error) {

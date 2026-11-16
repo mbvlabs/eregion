@@ -97,7 +97,7 @@ func (s *Store) load() (State, error) {
 	if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
 		return st, contract.NewFault(contract.PreconditionFailed, "the node's two-factor state is not root-only", "Set "+s.Path+" to a regular 0600 file owned by root.")
 	}
-	raw, err := os.ReadFile(s.Path) //nolint:gosec // G304: the fixed root-only gate path.
+	raw, err := os.ReadFile(s.Path)
 	if err != nil {
 		return st, err
 	}
@@ -108,7 +108,7 @@ func (s *Store) load() (State, error) {
 }
 
 func (s *Store) save(st State) error {
-	raw, err := json.MarshalIndent(st, "", "  ")
+	raw, err := json.MarshalIndent(st, "", "  ") // #nosec G117 -- TOTP state must persist its secret; the atomic destination below is owner-only (0600), never an API response.
 	if err != nil {
 		return err
 	}
@@ -155,11 +155,11 @@ func (s *Store) withMutationLock(change func() error) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return contract.NewFault(contract.Unavailable, "could not create the two-factor state directory", err.Error())
 	}
-	lock, err := os.OpenFile(s.lockPath(), os.O_CREATE|os.O_RDWR, 0o600) //nolint:gosec // fixed root-only state path beside the 0600 state file.
+	lock, err := os.OpenFile(s.lockPath(), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return contract.NewFault(contract.Unavailable, "could not open the two-factor state lock", err.Error())
 	}
-	defer lock.Close()
+	defer func() { _ = lock.Close() }()
 	if err := lock.Chmod(0o600); err != nil {
 		return contract.NewFault(contract.Unavailable, "could not protect the two-factor state lock", err.Error())
 	}

@@ -95,7 +95,7 @@ func (s *usersStep) checkScript() string {
 }
 
 func (s *usersStep) Check(ctx context.Context, _ engine.Runtime) (engine.CheckResult, error) {
-	output, err := checkOutput(ctx, engine.Runtime{}, s.exec, s.checkScript())
+	output, err := checkOutput(ctx, s.exec, s.checkScript())
 	if err != nil {
 		return engine.CheckResult{}, err
 	}

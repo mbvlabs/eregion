@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
-	"sort"
 	"strings"
 	"time"
 
@@ -42,7 +41,7 @@ type ResourceVolumeStep struct {
 
 func buildResourceVolumeStep(exec engine.Execution, raw json.RawMessage) (engine.Step, error) {
 	var payload ResourceVolumePayload
-	if err := decodePayload(exec, raw, &payload); err != nil {
+	if err := decodePayload(raw, &payload); err != nil {
 		return nil, err
 	}
 	if payload.Step != exec.Step {
@@ -112,8 +111,9 @@ func (s *ResourceVolumeStep) Check(ctx context.Context, _ engine.Runtime) (engin
 func (s *ResourceVolumeStep) Apply(ctx context.Context, _ engine.Runtime, report engine.Reporter) (engine.ApplyResult, error) {
 	runCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	args := []string{"docker", "volume", "create"}
 	labels := s.labels()
+	args := make([]string, 0, 3+2*len(labels)+1)
+	args = append(args, "docker", "volume", "create")
 	keys := sortedEnvKeys(labels)
 	for _, key := range keys {
 		args = append(args, "--label", key+"="+labels[key])
@@ -161,7 +161,7 @@ type ResourceVolumeRemoveStep struct {
 
 func buildResourceVolumeRemoveStep(exec engine.Execution, raw json.RawMessage) (engine.Step, error) {
 	var payload ResourceVolumeRemovePayload
-	if err := decodePayload(exec, raw, &payload); err != nil {
+	if err := decodePayload(raw, &payload); err != nil {
 		return nil, err
 	}
 	if payload.Step != exec.Step {
@@ -278,73 +278,95 @@ type ResourceRunStep struct {
 
 func buildResourceRunStep(exec engine.Execution, raw json.RawMessage) (engine.Step, error) {
 	var payload ResourceRunPayload
-	if err := decodePayload(exec, raw, &payload); err != nil {
+	if err := decodePayload(raw, &payload); err != nil {
 		return nil, err
 	}
 	if payload.Step != exec.Step {
 		return nil, fmt.Errorf("step ID %q does not match the payload step %q", exec.Step, payload.Step)
 	}
-	if !containerNamePattern.MatchString(payload.Name) {
-		return nil, errors.New("invalid resource container name")
-	}
-	if !ResourceImageIDValid(payload.ImageID) {
-		return nil, errors.New("a resource container must use an immutable image ID")
-	}
-	if !ResourceNetworkValid(payload.Network) {
-		return nil, errors.New("invalid environment network")
-	}
-	if err := ValidateResourceName(payload.Alias); err != nil {
+	if err := validateResourceRunPayload(&payload); err != nil {
 		return nil, err
 	}
-	if err := ValidateName(payload.App); err != nil {
-		return nil, err
+	return &ResourceRunStep{exec: exec, payload: payload}, nil
+}
+
+func validateResourceRunPayload(payload *ResourceRunPayload) error {
+	if err := validateResourceRunIdentifiers(payload); err != nil {
+		return err
 	}
-	if err := ValidateName(payload.Environment); err != nil {
-		return nil, err
-	}
-	if err := ValidateResourceName(payload.Resource); err != nil {
-		return nil, err
-	}
-	if err := ResourceID(payload.ResourceID).Validate(); err != nil {
-		return nil, err
-	}
-	if err := validateEnv(payload.Env, "resource environment"); err != nil {
-		return nil, err
-	}
-	for _, key := range payload.SecretKeys {
-		if !envKeyPattern.MatchString(key) {
-			return nil, errors.New("invalid secret environment key")
-		}
-		if _, plain := payload.Env[key]; plain {
-			return nil, errors.New("a key cannot be both plain configuration and a secret reference")
-		}
-	}
-	if len(payload.SecretKeys) > 64 {
-		return nil, errors.New("too many secret environment keys")
+	if err := validateResourceRunEnv(payload); err != nil {
+		return err
 	}
 	if payload.ConfigHash == "" || len(payload.ConfigHash) > 128 {
-		return nil, errors.New("invalid resource config hash")
+		return errors.New("invalid resource config hash")
 	}
 	if payload.Restart == "" {
 		payload.Restart = "unless-stopped"
 	}
 	if payload.Restart != "unless-stopped" {
-		return nil, errors.New("resource containers must restart unless-stopped")
+		return errors.New("resource containers must restart unless-stopped")
 	}
+	return validateResourceRunMounts(payload)
+}
+
+func validateResourceRunIdentifiers(payload *ResourceRunPayload) error {
+	if !containerNamePattern.MatchString(payload.Name) {
+		return errors.New("invalid resource container name")
+	}
+	if !ResourceImageIDValid(payload.ImageID) {
+		return errors.New("a resource container must use an immutable image ID")
+	}
+	if !ResourceNetworkValid(payload.Network) {
+		return errors.New("invalid environment network")
+	}
+	if err := ValidateResourceName(payload.Alias); err != nil {
+		return err
+	}
+	if err := ValidateName(payload.App); err != nil {
+		return err
+	}
+	if err := ValidateName(payload.Environment); err != nil {
+		return err
+	}
+	if err := ValidateResourceName(payload.Resource); err != nil {
+		return err
+	}
+	return ResourceID(payload.ResourceID).Validate()
+}
+
+func validateResourceRunEnv(payload *ResourceRunPayload) error {
+	if err := validateEnv(payload.Env, "resource environment"); err != nil {
+		return err
+	}
+	if len(payload.SecretKeys) > 64 {
+		return errors.New("too many secret environment keys")
+	}
+	for _, key := range payload.SecretKeys {
+		if !envKeyPattern.MatchString(key) {
+			return errors.New("invalid secret environment key")
+		}
+		if _, plain := payload.Env[key]; plain {
+			return errors.New("a key cannot be both plain configuration and a secret reference")
+		}
+	}
+	return nil
+}
+
+func validateResourceRunMounts(payload *ResourceRunPayload) error {
 	seenDestinations := map[string]bool{}
 	for _, mount := range payload.Mounts {
 		if !ResourceVolumeNameValid(mount.Name) {
-			return nil, errors.New("invalid resource volume name")
+			return errors.New("invalid resource volume name")
 		}
 		if _, err := cleanResourceDestination(mount.Destination); err != nil {
-			return nil, err
+			return err
 		}
 		if seenDestinations[mount.Destination] {
-			return nil, errors.New("two resource mounts use the same destination")
+			return errors.New("two resource mounts use the same destination")
 		}
 		seenDestinations[mount.Destination] = true
 	}
-	return &ResourceRunStep{exec: exec, payload: payload}, nil
+	return nil
 }
 
 func (s *ResourceRunStep) ID() string { return s.payload.Step }
@@ -440,7 +462,7 @@ func (s *ResourceRunStep) Apply(ctx context.Context, rt engine.Runtime, report e
 
 	args, env, err := s.runArgs(rt)
 	if err != nil {
-		return engine.ApplyResult{}, fmt.Errorf("%w: %s", engine.ErrPermanent, err)
+		return engine.ApplyResult{}, fmt.Errorf("%w: %w", engine.ErrPermanent, err)
 	}
 	runCtx, runCancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer runCancel()
@@ -520,7 +542,7 @@ type ResourceHealthStep struct {
 
 func buildResourceHealthStep(exec engine.Execution, raw json.RawMessage) (engine.Step, error) {
 	var payload ResourceHealthPayload
-	if err := decodePayload(exec, raw, &payload); err != nil {
+	if err := decodePayload(raw, &payload); err != nil {
 		return nil, err
 	}
 	if payload.Step != exec.Step {
@@ -648,7 +670,7 @@ type ResourceDestroyStep struct {
 
 func buildResourceDestroyStep(exec engine.Execution, raw json.RawMessage) (engine.Step, error) {
 	var payload ResourceDestroyPayload
-	if err := decodePayload(exec, raw, &payload); err != nil {
+	if err := decodePayload(raw, &payload); err != nil {
 		return nil, err
 	}
 	if payload.Step != exec.Step {
@@ -736,12 +758,6 @@ func redactedResourceDetail(rt engine.Runtime, text string) string {
 		detail = detail[:500]
 	}
 	return detail
-}
-
-func sortedResourceVolumes(volumes []ResourceVolume) []ResourceVolume {
-	out := append([]ResourceVolume(nil), volumes...)
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	return out
 }
 
 var _ engine.Step = (*ResourceVolumeStep)(nil)

@@ -18,11 +18,7 @@ import (
 // inventory cannot be read or no node qualifies, the name is typed instead.
 func (a *app) askNode(cmd *cobra.Command, title, description, def, role, capability, sameAs, same string) (string, error) {
 	typed := func() (string, error) {
-		validate := platform.ValidateName
-		if sameAs != "" {
-			validate = validateOptionalName
-		}
-		return askValidated(title, description, def, validate)
+		return askTypedNode(title, description, def, sameAs)
 	}
 	raw, err := a.platformReadInventoryWith(cmd, "nodes", nil)
 	if err != nil {
@@ -33,6 +29,26 @@ func (a *app) askNode(cmd *cobra.Command, title, description, def, role, capabil
 	if err != nil {
 		return typed()
 	}
+	options := nodePickOptions(nodes, role, capability, sameAs, same)
+	if len(options) == 0 || (sameAs != "" && len(options) == 1) {
+		if sameAs != "" {
+			return "", nil
+		}
+		fmt.Fprintln(os.Stderr, ui.Warn("No registered node has the "+nodeRequirement(role, capability)+"."))
+		return typed()
+	}
+	return ui.ChooseDefault(title, description, options, def)
+}
+
+func askTypedNode(title, description, def, sameAs string) (string, error) {
+	validate := platform.ValidateName
+	if sameAs != "" {
+		validate = validateOptionalName
+	}
+	return askValidated(title, description, def, validate)
+}
+
+func nodePickOptions(nodes []platform.Node, role, capability, sameAs, same string) [][2]string {
 	var options [][2]string
 	if sameAs != "" {
 		options = append(options, [2]string{sameAs, ""})
@@ -47,16 +63,13 @@ func (a *app) askNode(cmd *cobra.Command, title, description, def, role, capabil
 		}
 		options = append(options, [2]string{label, node.Name})
 	}
-	if len(options) == 0 || (sameAs != "" && len(options) == 1) {
-		if sameAs != "" {
-			return "", nil
-		}
-		need := role
-		if capability != "" {
-			need += " role and " + capability + " capability"
-		}
-		fmt.Fprintln(os.Stderr, ui.Warn("No registered node has the "+strings.TrimSpace(need)+"."))
-		return typed()
+	return options
+}
+
+func nodeRequirement(role, capability string) string {
+	need := role
+	if capability != "" {
+		need += " role and " + capability + " capability"
 	}
-	return ui.ChooseDefault(title, description, options, def)
+	return strings.TrimSpace(need)
 }

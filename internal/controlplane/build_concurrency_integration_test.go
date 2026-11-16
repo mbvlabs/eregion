@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/api"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/platform"
@@ -21,6 +22,13 @@ func TestIntegrationBuildConcurrencySettingAndAdmission(t *testing.T) {
 	}
 	app := api.NewAppService(service, nil, nil)
 	operator := contract.Actor{Kind: "operator", Subject: "integration-operator"}
+	assertBuildConcurrencySetting(t, ctx, app, operator)
+	assertBuildConcurrencyAdmission(t, ctx, service, app, operator)
+	assertBuildConcurrencyWriters(t, ctx, pool, service, app, operator)
+}
+
+func assertBuildConcurrencySetting(t *testing.T, ctx context.Context, app api.AppService, operator contract.Actor) {
+	t.Helper()
 	view, err := app.GetBuildConcurrency(ctx, operator)
 	if err != nil || view.Node != "main" || view.Effective != 1 {
 		t.Fatalf("default setting: %+v, %v", view, err)
@@ -48,6 +56,16 @@ func TestIntegrationBuildConcurrencySettingAndAdmission(t *testing.T) {
 	if err != nil || set.Previous != 1 || set.Effective != 2 {
 		t.Fatalf("set: %+v, %v", set, err)
 	}
+}
+
+func assertBuildConcurrencyAdmission(
+	t *testing.T,
+	ctx context.Context,
+	service *Service,
+	app api.AppService,
+	operator contract.Actor,
+) {
+	t.Helper()
 	first, err := service.acquireBuildSlot(ctx, "main", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -108,7 +126,17 @@ func TestIntegrationBuildConcurrencySettingAndAdmission(t *testing.T) {
 		t.Fatalf("released occupancy did not admit: %v", err)
 	}
 	release()
+}
 
+func assertBuildConcurrencyWriters(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	service *Service,
+	app api.AppService,
+	operator contract.Actor,
+) {
+	t.Helper()
 	// Simultaneous writers are row-serialized: each observes the committed
 	// value left by its predecessor, regardless of which wins last.
 	results := make(chan api.BuildConcurrencyResult, 2)
@@ -130,10 +158,10 @@ func TestIntegrationBuildConcurrencySettingAndAdmission(t *testing.T) {
 		}
 	}
 	a, b := <-results, <-results
-	if !((a.Previous == 1 && b.Previous == a.Effective) || (b.Previous == 1 && a.Previous == b.Effective)) {
+	if (a.Previous != 1 || b.Previous != a.Effective) && (b.Previous != 1 || a.Previous != b.Effective) {
 		t.Fatalf("writers did not serialize: %+v / %+v", a, b)
 	}
-	view, err = app.GetBuildConcurrency(ctx, operator)
+	view, err := app.GetBuildConcurrency(ctx, operator)
 	if err != nil || (view.Effective != a.Effective && view.Effective != b.Effective) {
 		t.Fatalf("final capacity: %+v, %v", view, err)
 	}

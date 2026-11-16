@@ -381,25 +381,7 @@ func (m *Model) observeReleaseFallback(event contract.Event) {
 // nothing.
 func (m *Model) ServingLine() string {
 	if m.Serving.Observed {
-		image := m.Serving.Image
-		if image == "" {
-			image = "image not reported"
-		}
-		release := m.Serving.ReleaseID
-		if release == "" {
-			release = "release ID not reported by events"
-		}
-		line := "serving release: " + release + " · image " + image
-		if m.Serving.Health != "" {
-			line += " · health " + m.Serving.Health
-		}
-		if m.Serving.Source == string(TargetRollback) {
-			line += " (previous release restored)"
-		}
-		if m.Serving.Container != "" {
-			line += " · container " + m.Serving.Container
-		}
-		return line
+		return m.observedServingLine()
 	}
 	if m.Kind == "" {
 		return "serving release: unknown · no observation yet"
@@ -408,6 +390,28 @@ func (m *Model) ServingLine() string {
 		return "serving release: not applicable to " + m.Kind
 	}
 	return "serving release: unknown · no serving-container event was emitted"
+}
+
+func (m *Model) observedServingLine() string {
+	image := m.Serving.Image
+	if image == "" {
+		image = "image not reported"
+	}
+	release := m.Serving.ReleaseID
+	if release == "" {
+		release = "release ID not reported by events"
+	}
+	line := "serving release: " + release + " · image " + image
+	if m.Serving.Health != "" {
+		line += " · health " + m.Serving.Health
+	}
+	if m.Serving.Source == string(TargetRollback) {
+		line += " (previous release restored)"
+	}
+	if m.Serving.Container != "" {
+		line += " · container " + m.Serving.Container
+	}
+	return line
 }
 
 // CleanupLine states whether container cleanup happened. The worker

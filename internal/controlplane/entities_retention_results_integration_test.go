@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/platform"
@@ -20,6 +21,14 @@ func TestIntegrationEntitiesRetentionAndResults(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
+	checkRetentionSettings(t, ctx, store)
+	checkRetentionRunLifecycle(t, store)
+	checkRetentionResults(t, store)
+	checkRetentionPlatformReuse(t, pool, store)
+}
+
+func checkRetentionSettings(t *testing.T, ctx context.Context, store *entities.Store) {
+	t.Helper()
 	if _, found, err := store.Retention().GetServerSettings(ctx); err != nil || found {
 		t.Fatalf("empty settings found=%v err=%v", found, err)
 	}
@@ -44,7 +53,11 @@ func TestIntegrationEntitiesRetentionAndResults(t *testing.T) {
 	if pending, err := store.Retention().GCPending(ctx); err != nil || !pending {
 		t.Fatalf("gc pending=%v err=%v", pending, err)
 	}
+}
 
+func checkRetentionRunLifecycle(t *testing.T, store *entities.Store) {
+	t.Helper()
+	ctx := context.Background()
 	op := insertDefinitionOperation(t, store, "platform.retention.prune", "node/foundation", "retention-run-1", json.RawMessage(`{"node":"foundation"}`))
 	runID := "run_foundation_1"
 	started := time.Now().UTC().Add(-time.Minute)
@@ -82,9 +95,11 @@ func TestIntegrationEntitiesRetentionAndResults(t *testing.T) {
 	if err != nil || !found || success == nil || success.Before(started) {
 		t.Fatalf("last success=%v found=%v err=%v", success, found, err)
 	}
+}
 
-	// Result projections: a candidate diagnostic, a failed warning stage, and
-	// the failed-step fallback all read through the typed views.
+func checkRetentionResults(t *testing.T, store *entities.Store) {
+	t.Helper()
+	ctx := context.Background()
 	resultOp := insertDefinitionOperation(t, store, "platform.deploy", "env/results/staging", "results-op", json.RawMessage(`{"app":"results","environment":"staging"}`))
 	if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
 		op, found, err := tx.Operations().Lock(ctx, resultOp)
@@ -102,10 +117,8 @@ func TestIntegrationEntitiesRetentionAndResults(t *testing.T) {
 		if err := tx.Steps().Insert(ctx, resultOp, "platform-health-1", "inputs-health", 0, "exec-health"); err != nil {
 			return err
 		}
-		if _, err := tx.Steps().Fail(ctx, resultOp, "platform-health-1", contract.Unavailable, "health failed"); err != nil {
-			return err
-		}
-		return nil
+		_, err = tx.Steps().Fail(ctx, resultOp, "platform-health-1", contract.Unavailable, "health failed")
+		return err
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -132,8 +145,11 @@ func TestIntegrationEntitiesRetentionAndResults(t *testing.T) {
 	if stage, err := store.Results().FailedStage(ctx, fallbackOp, 1); err != nil || stage != "platform-cleanup-1" {
 		t.Fatalf("fallback stage=%q err=%v", stage, err)
 	}
+}
 
-	// Existing platform retention rows are reused, not duplicated.
+func checkRetentionPlatformReuse(t *testing.T, pool *pgxpool.Pool, store *entities.Store) {
+	t.Helper()
+	ctx := context.Background()
 	fixture := newPlatformFixture(t, pool, "retention-reuse")
 	if _, err := store.Platform().Environments().RetentionRows(ctx, fixture.node); err != nil {
 		t.Fatal(err)

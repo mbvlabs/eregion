@@ -187,18 +187,20 @@ func TestIntegrationAtomicSubmissionAndDeduplication(t *testing.T) {
 	pool, _ := testPool(t, true)
 	run := testRuntime(t, pool, 0)
 	ctx := context.Background()
+	assertAtomicSubmissionRollback(t, ctx, pool, run)
+	id := assertConcurrentSubmissionDedup(t, ctx, pool, run)
+	assertSubmissionDedupAndAuthorization(t, ctx, run, id)
+}
+
+func assertAtomicSubmissionRollback(t *testing.T, ctx context.Context, pool *pgxpool.Pool, run *Runtime) {
+	t.Helper()
 	run.Service.beforeSubmissionCommit = func() error {
 		return errors.New("injected failure after River insertion")
 	}
 	if _, err := run.Service.Submit(ctx, submission("atomic", `{}`)); err == nil {
 		t.Fatal("injected failure succeeded")
 	}
-	for _, table := range []string{"eregion_operations", "eregion_operation_events", "river_job"} {
-		var count int
-		if err := pool.QueryRow(ctx, "SELECT count(*) FROM "+table).Scan(&count); err != nil || count != 0 {
-			t.Fatalf("partial commit in %s: %d %v", table, count, err)
-		}
-	}
+	assertEmptySubmissionTables(t, ctx, pool)
 	run.Service.beforeSubmissionCommit = nil
 	// A deferred constraint fails only at COMMIT, after the accepted event was
 	// appended. The domain row, River job, and event must still roll back together.
@@ -214,12 +216,7 @@ func TestIntegrationAtomicSubmissionAndDeduplication(t *testing.T) {
 	if _, err := run.Service.Submit(ctx, submission("commit-failure", `{}`)); err == nil {
 		t.Fatal("deferred commit failure succeeded")
 	}
-	for _, table := range []string{"eregion_operations", "eregion_operation_events", "river_job"} {
-		var count int
-		if err := pool.QueryRow(ctx, "SELECT count(*) FROM "+table).Scan(&count); err != nil || count != 0 {
-			t.Fatalf("partial commit in %s: %d %v", table, count, err)
-		}
-	}
+	assertEmptySubmissionTables(t, ctx, pool)
 	for _, statement := range []string{
 		`DROP TRIGGER test_fail_after_job ON river_job`,
 		`DROP FUNCTION test_fail_after_job()`,
@@ -229,6 +226,20 @@ func TestIntegrationAtomicSubmissionAndDeduplication(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+}
+
+func assertEmptySubmissionTables(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
+	t.Helper()
+	for _, table := range []string{"eregion_operations", "eregion_operation_events", "river_job"} {
+		var count int
+		if err := pool.QueryRow(ctx, "SELECT count(*) FROM "+table).Scan(&count); err != nil || count != 0 {
+			t.Fatalf("partial commit in %s: %d %v", table, count, err)
+		}
+	}
+}
+
+func assertConcurrentSubmissionDedup(t *testing.T, ctx context.Context, pool *pgxpool.Pool, run *Runtime) contract.OperationID {
+	t.Helper()
 	var wait sync.WaitGroup
 	ids := make(chan contract.OperationID, 12)
 	for range 12 {
@@ -258,6 +269,11 @@ func TestIntegrationAtomicSubmissionAndDeduplication(t *testing.T) {
 	if err != nil || op.ID != id {
 		t.Fatalf("equivalent normalized input did not deduplicate: %v", err)
 	}
+	return id
+}
+
+func assertSubmissionDedupAndAuthorization(t *testing.T, ctx context.Context, run *Runtime, id contract.OperationID) {
+	t.Helper()
 	if _, err := run.Service.Submit(ctx, submission("same-key", `{"steps":4}`)); contract.Classify(err).Code != contract.Conflict {
 		t.Fatalf("changed input reused key: %v", err)
 	}
@@ -307,9 +323,23 @@ func TestIntegrationAPIWorkersAndReplay(t *testing.T) {
 	if op.Attempt != 2 {
 		t.Fatalf("retry attempt not durable: %+v", op)
 	}
-	cursor := contract.Cursor{OperationID: submitted.ID}
+	assertAPIReplayPagination(t, ctx, client, contract.Cursor{OperationID: submitted.ID}, op.LastSequence, 6)
+	if _, err := client.Events(ctx, contract.Cursor{OperationID: op.ID, After: op.LastSequence + 1}, 2); contract.Classify(err).Code != contract.PreconditionFailed {
+		t.Fatal("future cursor accepted")
+	}
+}
+
+func assertAPIReplayPagination(
+	t *testing.T,
+	ctx context.Context,
+	client *api.Client,
+	cursor contract.Cursor,
+	lastSequence uint64,
+	wantProgress int,
+) {
+	t.Helper()
 	progress := 0
-	for cursor.After < op.LastSequence {
+	for cursor.After < lastSequence {
 		raw, err := client.Events(ctx, cursor, 2)
 		if err != nil {
 			t.Fatal(err)
@@ -334,11 +364,8 @@ func TestIntegrationAPIWorkersAndReplay(t *testing.T) {
 			t.Fatal("incorrect resume cursor")
 		}
 	}
-	if progress != 6 {
+	if progress != wantProgress {
 		t.Fatalf("duplicate/lost diagnostic steps: %d", progress)
-	}
-	if _, err := client.Events(ctx, contract.Cursor{OperationID: op.ID, After: op.LastSequence + 1}, 2); contract.Classify(err).Code != contract.PreconditionFailed {
-		t.Fatal("future cursor accepted")
 	}
 }
 
@@ -1005,6 +1032,8 @@ func TestIntegrationShutdownMidStepRecoversOnce(t *testing.T) {
 // insertTestProviderCredential seeds the secret-free provider metadata a typed
 // admission transaction resolves zones from. Provider HTTP remains the test's
 // configured transport; no plaintext credential is stored here.
+//
+//nolint:unparam // shared with DNS tests that all configure the same fixture zone.
 func insertTestProviderCredential(t *testing.T, pool *pgxpool.Pool, zoneID, zoneName string) {
 	t.Helper()
 	ctx := context.Background()

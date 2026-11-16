@@ -14,8 +14,8 @@ import (
 // commands that need it in practice, but the fallback keeps one binary.
 func (a *app) tunnelSpecs() []spec { return nil }
 
-func wireGuardDial(wg *host.WorkspaceWireGuard) (func(context.Context, string, string) (net.Conn, error), error) {
-	return inProcessWireGuardDial(wg)
+func wireGuardDial(ctx context.Context, wg *host.WorkspaceWireGuard) (func(context.Context, string, string) (net.Conn, error), error) {
+	return inProcessWireGuardDial(ctx, wg)
 }
 
 func closeWireGuardRoute(route *host.WorkspaceSSH) { closeInProcessWireGuardRoute(route) }

@@ -99,96 +99,33 @@ func commitRolledBackPath(cfg Config, operationID string) string {
 // and no SSH-key replacement has no access changes and applies without a
 // commit window.
 func AccessChanges(cfg Config, credentials Credentials) ([]AccessChange, error) {
-	var changes []AccessChange
-	for _, risk := range cfg.AccessRisks() {
-		changes = append(changes, AccessChange{Kind: "policy", Detail: risk})
-	}
 	role, err := cfg.RoleConfig()
 	if err != nil {
 		return nil, err
+	}
+	changes := make([]AccessChange, 0, len(cfg.AccessRisks())+4)
+	for _, risk := range cfg.AccessRisks() {
+		changes = append(changes, AccessChange{Kind: "policy", Detail: risk})
 	}
 	// A configured key file always changes SSH access, even when the same keys
 	// are already installed: the step owns the whole file.
 	if cfg.NodeAuthorizedKeysFile != "" {
 		changes = append(changes, AccessChange{Kind: "ssh", Path: cfg.NodeAuthorizedKeysFile, Detail: "node authorized_keys may be replaced"})
 	}
-	compare := func(kind, path string, desired []byte, hasDesired bool) error {
-		raw, mode, exists, err := fileState(path)
-		if err != nil {
-			return err
-		}
-		if !exists {
-			return nil
-		}
-		if !hasDesired {
-			changes = append(changes, AccessChange{Kind: kind, Path: path, Detail: "existing access material would be replaced by credentials that are not available yet"})
-			return nil
-		}
-		if !bytesEqual(raw, desired) || (kind == "credential" && mode != 0o600) {
-			changes = append(changes, AccessChange{Kind: kind, Path: path, Detail: "existing content differs from the requested intent"})
-		}
-		return nil
-	}
+	compare := accessComparer{changes: &changes}
 	if role.ControlPlane {
-		if err := compare("service", filepath.Join(cfg.Layout.SystemdDir, "eregion-api.service"), apiServiceUnit(cfg), true); err != nil {
+		if err := addControlPlaneAccessChanges(cfg, credentials, compare); err != nil {
 			return nil, err
-		}
-		if err := compare("service", filepath.Join(cfg.Layout.SystemdDir, "eregion-worker.service"), workerServiceUnit(cfg), true); err != nil {
-			return nil, err
-		}
-		// The token store is initialized only when absent and is otherwise
-		// preserved. Minting or revoking a token is not an access change, so it
-		// must not arm a commit-confirm window or present as credential drift.
-		env := (&credentialsStep{cfg: cfg, credentials: credentials}).env()
-		if err := compare("credential", filepath.Join(cfg.Layout.ConfigDir, "control-plane.env"), env, true); err != nil {
-			return nil, err
-		}
-		if cfg.APITLSCert != "" {
-			cert, certErr := os.ReadFile(cfg.APITLSCert) //nolint:gosec // G304: operator-provided TLS material.
-			if err := compare("tls", filepath.Join(cfg.Layout.ConfigDir, "tls", "server.crt"), cert, certErr == nil); err != nil {
-				return nil, err
-			}
-			key, keyErr := os.ReadFile(cfg.APITLSKey) //nolint:gosec // G304: operator-provided TLS material.
-			if err := compare("tls", filepath.Join(cfg.Layout.ConfigDir, "tls", "server.key"), key, keyErr == nil); err != nil {
-				return nil, err
-			}
-		}
-		source, sourceErr := cfg.EffectiveBinaryPath()
-		if sourceErr != nil {
-			return nil, sourceErr
-		}
-		if differs, err := binaryDiffers(filepath.Join(cfg.Layout.BinDir, "eregion"), source); err != nil {
-			return nil, err
-		} else if differs {
-			changes = append(changes, AccessChange{Kind: "binary", Path: filepath.Join(cfg.Layout.BinDir, "eregion"), Detail: "installed executable differs from the supplied source"})
 		}
 	}
 	if role.Registry {
-		registry := &registryStep{cfg: cfg}
-		if err := compare("registry", filepath.Join(cfg.Layout.SystemdDir, "eregion-registry.service"), registry.unit(), true); err != nil {
-			return nil, err
-		}
-		if err := compare("registry", filepath.Join(cfg.Layout.ConfigDir, "registry", "config.yml"), registry.config(), true); err != nil {
+		if err := addRegistryAccessChanges(cfg, compare); err != nil {
 			return nil, err
 		}
 	}
 	if role.NodeAgent || role.ControlPlane {
-		node := &nodeConfigStep{cfg: cfg}
-		desired, err := node.config()
-		if err != nil {
+		if err := addNodeAccessChanges(cfg, compare); err != nil {
 			return nil, err
-		}
-		if err := compare("node-identity", node.configPath(), desired, true); err != nil {
-			return nil, err
-		}
-		source, sourceErr := cfg.EffectiveBinaryPath()
-		if sourceErr != nil {
-			return nil, sourceErr
-		}
-		if differs, err := binaryDiffers(filepath.Join(cfg.Layout.BinDir, "eregion"), source); err != nil {
-			return nil, err
-		} else if differs {
-			changes = append(changes, AccessChange{Kind: "binary", Path: filepath.Join(cfg.Layout.BinDir, "eregion"), Detail: "installed executable differs from the supplied source"})
 		}
 	}
 	sort.Slice(changes, func(i, j int) bool {
@@ -198,6 +135,91 @@ func AccessChanges(cfg Config, credentials Credentials) ([]AccessChange, error) 
 		return changes[i].Kind < changes[j].Kind
 	})
 	return changes, nil
+}
+
+type accessComparer struct {
+	changes *[]AccessChange
+}
+
+func (c accessComparer) compare(kind, path string, desired []byte, hasDesired bool) error {
+	raw, mode, exists, err := fileState(path)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+	if !hasDesired {
+		*c.changes = append(*c.changes, AccessChange{Kind: kind, Path: path, Detail: "existing access material would be replaced by credentials that are not available yet"})
+		return nil
+	}
+	if !bytesEqual(raw, desired) || (kind == "credential" && mode != 0o600) {
+		*c.changes = append(*c.changes, AccessChange{Kind: kind, Path: path, Detail: "existing content differs from the requested intent"})
+	}
+	return nil
+}
+
+func addControlPlaneAccessChanges(cfg Config, credentials Credentials, compare accessComparer) error {
+	if err := compare.compare("service", filepath.Join(cfg.Layout.SystemdDir, "eregion-api.service"), apiServiceUnit(cfg), true); err != nil {
+		return err
+	}
+	if err := compare.compare("service", filepath.Join(cfg.Layout.SystemdDir, "eregion-worker.service"), workerServiceUnit(cfg), true); err != nil {
+		return err
+	}
+	// The token store is initialized only when absent and is otherwise
+	// preserved. Minting or revoking a token is not an access change, so it
+	// must not arm a commit-confirm window or present as credential drift.
+	env := (&credentialsStep{cfg: cfg, credentials: credentials}).env()
+	if err := compare.compare("credential", filepath.Join(cfg.Layout.ConfigDir, "control-plane.env"), env, true); err != nil {
+		return err
+	}
+	if cfg.APITLSCert != "" {
+		cert, certErr := os.ReadFile(cfg.APITLSCert)
+		if err := compare.compare("tls", filepath.Join(cfg.Layout.ConfigDir, "tls", "server.crt"), cert, certErr == nil); err != nil {
+			return err
+		}
+		key, keyErr := os.ReadFile(cfg.APITLSKey)
+		if err := compare.compare("tls", filepath.Join(cfg.Layout.ConfigDir, "tls", "server.key"), key, keyErr == nil); err != nil {
+			return err
+		}
+	}
+	return addInstalledBinaryChange(cfg, compare.changes)
+}
+
+func addRegistryAccessChanges(cfg Config, compare accessComparer) error {
+	registry := &registryStep{cfg: cfg}
+	if err := compare.compare("registry", filepath.Join(cfg.Layout.SystemdDir, "eregion-registry.service"), registry.unit(), true); err != nil {
+		return err
+	}
+	return compare.compare("registry", filepath.Join(cfg.Layout.ConfigDir, "registry", "config.yml"), registry.config(), true)
+}
+
+func addNodeAccessChanges(cfg Config, compare accessComparer) error {
+	node := &nodeConfigStep{cfg: cfg}
+	desired, err := node.config()
+	if err != nil {
+		return err
+	}
+	if err := compare.compare("node-identity", node.configPath(), desired, true); err != nil {
+		return err
+	}
+	return addInstalledBinaryChange(cfg, compare.changes)
+}
+
+func addInstalledBinaryChange(cfg Config, changes *[]AccessChange) error {
+	source, err := cfg.EffectiveBinaryPath()
+	if err != nil {
+		return err
+	}
+	target := filepath.Join(cfg.Layout.BinDir, "eregion")
+	differs, err := binaryDiffers(target, source)
+	if err != nil {
+		return err
+	}
+	if differs {
+		*changes = append(*changes, AccessChange{Kind: "binary", Path: target, Detail: "installed executable differs from the supplied source"})
+	}
+	return nil
 }
 
 func binaryDiffers(dest, source string) (bool, error) {
@@ -272,7 +294,7 @@ func commitServices(cfg Config) []commitUnit {
 
 // armCommit writes the rollback snapshot and starts the detached watchdog
 // before any access-changing step runs.
-func (r *Runner) armCommit(operationID string, changes []AccessChange) (CommitState, error) {
+func (r *Runner) armCommit(ctx context.Context, operationID string, changes []AccessChange) (CommitState, error) {
 	dir := commitPath(r.Config, operationID)
 	if err := ensureDir(dir, 0o700); err != nil {
 		return CommitState{}, err
@@ -299,10 +321,10 @@ func (r *Runner) armCommit(operationID string, changes []AccessChange) (CommitSt
 			}
 			sum := sha256.Sum256([]byte(path))
 			entry.Backup = filepath.Join("backup", hex.EncodeToString(sum[:]))
-			if err := os.WriteFile(filepath.Join(dir, entry.Backup), raw, os.FileMode(mode)); err != nil {
+			if err := os.WriteFile(filepath.Join(dir, entry.Backup), raw, mode); err != nil {
 				return CommitState{}, err
 			}
-			if err := os.Chmod(filepath.Join(dir, entry.Backup), os.FileMode(mode)&0o777); err != nil {
+			if err := os.Chmod(filepath.Join(dir, entry.Backup), mode&0o777); err != nil {
 				return CommitState{}, err
 			}
 		}
@@ -316,17 +338,17 @@ func (r *Runner) armCommit(operationID string, changes []AccessChange) (CommitSt
 		return CommitState{}, err
 	}
 	script := commitScript(dir, manifest)
-	if err := os.WriteFile(filepath.Join(dir, "watchdog.sh"), []byte(script), 0o700); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "watchdog.sh"), []byte(script), 0o700); err != nil { //nolint:gosec // G306: the watchdog must be executable by the detached shell.
 		return CommitState{}, err
 	}
-	if err := r.spawnWatchdog(filepath.Join(dir, "watchdog.sh")); err != nil {
+	if err := r.spawnWatchdog(ctx, filepath.Join(dir, "watchdog.sh")); err != nil {
 		return CommitState{}, err
 	}
 	return CommitState{Path: dir, Deadline: manifest.Deadline, Services: unitNames(manifest.Services)}, nil
 }
 
 func unitNames(units []commitUnit) []string {
-	var names []string
+	names := make([]string, 0, len(units))
 	for _, unit := range units {
 		names = append(names, unit.Name)
 	}
@@ -351,7 +373,7 @@ func commitScript(dir string, manifest commitManifest) string {
 	out.WriteString("while :; do\n")
 	out.WriteString("  if [ -f " + confirmed + " ] || [ -f " + rolledBack + " ]; then exit 0; fi\n")
 	out.WriteString("  now=$(date +%s)\n")
-	out.WriteString(fmt.Sprintf("  if [ \"$now\" -ge %d ]; then\n", manifest.Deadline.Unix()))
+	_, _ = fmt.Fprintf(&out, "  if [ \"$now\" -ge %d ]; then\n", manifest.Deadline.Unix())
 	// Re-check the markers after observing the deadline: a confirmation or an
 	// explicit rollback may have raced the last poll iteration.
 	out.WriteString("    if [ -f " + confirmed + " ] || [ -f " + rolledBack + " ]; then exit 0; fi\n")
@@ -365,9 +387,9 @@ func commitScript(dir string, manifest commitManifest) string {
 			backup := shellQuote(filepath.Join(dir, file.Backup))
 			out.WriteString("    mkdir -p " + shellQuote(filepath.Dir(file.Path)) + "\n")
 			out.WriteString("    if ! cp -a " + backup + " " + target + "; then printf 'restore failed at %s\\n' \"$now\" > " + failed + "; rmdir " + rollingBack + " 2>/dev/null || true; exit 1; fi\n")
-			out.WriteString(fmt.Sprintf("    chmod %04o %s 2>/dev/null || true\n", file.Mode&0o777, target))
+			_, _ = fmt.Fprintf(&out, "    chmod %04o %s 2>/dev/null || true\n", file.Mode&0o777, target)
 			if file.UID >= 0 && file.GID >= 0 {
-				out.WriteString(fmt.Sprintf("    chown %d:%d %s 2>/dev/null || true\n", file.UID, file.GID, target))
+				_, _ = fmt.Fprintf(&out, "    chown %d:%d %s 2>/dev/null || true\n", file.UID, file.GID, target)
 			}
 		} else {
 			out.WriteString("    rm -f " + target + "\n")
@@ -394,7 +416,7 @@ func commitScript(dir string, manifest commitManifest) string {
 // reboot, so an expired, unconfirmed snapshot must be restored here rather than
 // left to overwrite a newer configuration later. A future window from another
 // operation blocks mutation: two rollback windows must never overlap.
-func (r *Runner) reconcileCommits(projectedOperation string) error {
+func (r *Runner) reconcileCommits(ctx context.Context, projectedOperation string) error {
 	entries, err := os.ReadDir(commitRoot(r.Config))
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -407,38 +429,41 @@ func (r *Runner) reconcileCommits(projectedOperation string) error {
 		if !entry.IsDir() {
 			continue
 		}
-		operationID := entry.Name()
-		raw, _, exists, err := fileState(commitManifestPath(r.Config, operationID))
-		if err != nil {
+		if err := r.reconcileCommitEntry(ctx, entry.Name(), projectedOperation, now); err != nil {
 			return err
 		}
-		if !exists {
-			continue
+	}
+	return nil
+}
+
+func (r *Runner) reconcileCommitEntry(ctx context.Context, operationID, projectedOperation string, now time.Time) error {
+	raw, _, exists, err := fileState(commitManifestPath(r.Config, operationID))
+	if err != nil || !exists {
+		return err
+	}
+	var manifest commitManifest
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		return contract.NewFault(contract.PreconditionFailed, "a rollback snapshot is invalid", "Inspect the bootstrap commit directory before applying again.")
+	}
+	_, _, hasConfirmed, err := fileState(commitConfirmedPath(r.Config, operationID))
+	if err != nil {
+		return err
+	}
+	_, _, hasRolledBack, err := fileState(commitRolledBackPath(r.Config, operationID))
+	if err != nil {
+		return err
+	}
+	if hasConfirmed || hasRolledBack {
+		return nil
+	}
+	if !now.Before(manifest.Deadline) {
+		if err := r.rollbackCommit(ctx, operationID); err != nil {
+			return contract.NewFault(contract.PreconditionFailed, "an expired access change could not be rolled back", "Inspect the commit snapshot and restore it manually before applying again.")
 		}
-		var manifest commitManifest
-		if err := json.Unmarshal(raw, &manifest); err != nil {
-			return contract.NewFault(contract.PreconditionFailed, "a rollback snapshot is invalid", "Inspect the bootstrap commit directory before applying again.")
-		}
-		_, _, hasConfirmed, err := fileState(commitConfirmedPath(r.Config, operationID))
-		if err != nil {
-			return err
-		}
-		_, _, hasRolledBack, err := fileState(commitRolledBackPath(r.Config, operationID))
-		if err != nil {
-			return err
-		}
-		if hasConfirmed || hasRolledBack {
-			continue
-		}
-		if !now.Before(manifest.Deadline) {
-			if err := r.rollbackCommit(operationID); err != nil {
-				return contract.NewFault(contract.PreconditionFailed, "an expired access change could not be rolled back", "Inspect the commit snapshot and restore it manually before applying again.")
-			}
-			continue
-		}
-		if operationID != projectedOperation {
-			return contract.NewFault(contract.ConfirmationRequired, "another access-changing apply still has an open rollback window", "Confirm or wait for operation "+operationID+" before starting a new convergence; a stale watchdog must not overwrite newer configuration.")
-		}
+		return nil
+	}
+	if operationID != projectedOperation {
+		return contract.NewFault(contract.ConfirmationRequired, "another access-changing apply still has an open rollback window", "Confirm or wait for operation "+operationID+" before starting a new convergence; a stale watchdog must not overwrite newer configuration.")
 	}
 	return nil
 }
@@ -472,6 +497,10 @@ func (r *Runner) Confirm(ctx context.Context, operationID string) (ConfirmReport
 		}
 		return ConfirmReport{}, contract.NewFault(contract.Conflict, "this bootstrap operation has no pending rollback window", "Access-changing apply returns the operation ID and deadline; a normal apply is already committed.")
 	}
+	return r.confirmCommit(ctx, operationID)
+}
+
+func (r *Runner) confirmCommit(ctx context.Context, operationID string) (ConfirmReport, error) {
 	dir := commitPath(r.Config, operationID)
 	raw, _, exists, err := fileState(commitManifestPath(r.Config, operationID))
 	if err != nil {
@@ -494,7 +523,7 @@ func (r *Runner) Confirm(ctx context.Context, operationID string) (ConfirmReport
 		// The detached watchdog may not have survived a reboot or a PID-namespace
 		// tear-down. Reconcile the snapshot now rather than confirming a state
 		// that is no longer live.
-		if err := r.rollbackCommit(operationID); err != nil {
+		if err := r.rollbackCommit(ctx, operationID); err != nil {
 			return ConfirmReport{}, contract.NewFault(contract.PreconditionFailed, "the rollback deadline has passed and the snapshot could not be restored", "Inspect the host and the commit snapshot manually; do not assume the new state is live.")
 		}
 		return ConfirmReport{}, contract.NewFault(contract.PreconditionFailed, "the rollback deadline has passed", "The previous access state was restored. Inspect the host and run node bootstrap plan again; do not assume the new state is live.")
@@ -524,19 +553,16 @@ type ConfirmReport struct {
 // rollbackCommit restores the snapshot. The detached watchdog runs the same
 // logic through its generated shell script; tests call this directly to prove
 // the revert path without waiting for a wall-clock deadline.
-func (r *Runner) rollbackCommit(operationID string) error {
+func (r *Runner) rollbackCommit(ctx context.Context, operationID string) error {
+	// Restoration must outlive a canceled apply: the original rollback path
+	// used context.Background for the same reason.
+	ctx = context.WithoutCancel(ctx)
 	dir := commitPath(r.Config, operationID)
 	confirmedPath := commitConfirmedPath(r.Config, operationID)
 	rolledBackPath := commitRolledBackPath(r.Config, operationID)
-	for _, marker := range []string{confirmedPath, rolledBackPath} {
-		if _, _, exists, err := fileState(marker); err != nil {
-			return err
-		} else if exists {
-			// A confirmed operation must never be reverted by a late caller; a
-			// second rollback is already done. This is the disarm path for an
-			// old watchdog after a newer configuration was confirmed.
-			return nil
-		}
+	done, err := rollbackFinished(confirmedPath, rolledBackPath)
+	if err != nil || done {
+		return err
 	}
 	raw, _, exists, err := fileState(commitManifestPath(r.Config, operationID))
 	if err != nil {
@@ -549,74 +575,32 @@ func (r *Runner) rollbackCommit(operationID string) error {
 	if err := json.Unmarshal(raw, &manifest); err != nil {
 		return err
 	}
-	// Serialize with a detached watchdog using the same atomic directory claim.
-	lock := filepath.Join(dir, "rollback.lock")
-	if err := os.Mkdir(lock, 0o700); err != nil {
-		if os.IsExist(err) {
-			return nil // Another rollback owns this snapshot.
+	performed := false
+	err = withRollbackLock(dir, func() error {
+		// Re-check after taking the claim: a confirmation may have arrived while
+		// this process was reading the manifest.
+		done, err := rollbackFinished(confirmedPath, rolledBackPath)
+		if err != nil || done {
+			return err
 		}
+		if err := r.restoreCommitFiles(dir, manifest.Files); err != nil {
+			return err
+		}
+		if err := r.restartCommitServices(ctx, manifest.Services); err != nil {
+			return err
+		}
+		if err := os.WriteFile(rolledBackPath, []byte(time.Now().UTC().Format(time.RFC3339)+"\n"), 0o600); err != nil {
+			return err
+		}
+		performed = true
+		return nil
+	})
+	if err != nil || !performed {
 		return err
 	}
-	removeLock := func() { _ = os.Remove(lock) }
-	// Re-check after taking the claim: a confirmation may have arrived while
-	// this process was reading the manifest.
-	for _, marker := range []string{confirmedPath, rolledBackPath} {
-		if _, _, exists, err := fileState(marker); err != nil {
-			removeLock()
-			return err
-		} else if exists {
-			removeLock()
-			return nil
-		}
-	}
-	for _, file := range manifest.Files {
-		if file.Exists {
-			source := filepath.Join(dir, file.Backup)
-			if err := os.MkdirAll(filepath.Dir(file.Path), 0o750); err != nil {
-				removeLock()
-				return err
-			}
-			raw, _, _, err := fileState(source)
-			if err != nil {
-				removeLock()
-				return err
-			}
-			if err := writeFile(file.Path, raw, os.FileMode(file.Mode)&0o777, "root", "root"); err != nil {
-				removeLock()
-				return err
-			}
-			if os.Geteuid() == 0 && file.UID >= 0 && file.GID >= 0 {
-				if err := os.Chown(file.Path, file.UID, file.GID); err != nil {
-					removeLock()
-					return err
-				}
-			}
-		} else if err := os.Remove(file.Path); err != nil && !os.IsNotExist(err) {
-			removeLock()
-			return err
-		}
-	}
-	if r.Exec != nil {
-		if err := r.Exec.Run(context.Background(), "host-commit-rollback", "systemctl daemon-reload 2>/dev/null || true", nil, nil); err != nil {
-			removeLock()
-			return err
-		}
-		for _, unit := range manifest.Services {
-			script := "systemctl try-restart " + shellQuote(unit.Name) + " 2>/dev/null || true"
-			if !unit.Exists {
-				script = "systemctl disable --now " + shellQuote(unit.Name) + " 2>/dev/null || true"
-			}
-			_ = r.Exec.Run(context.Background(), "host-commit-rollback-"+unit.Name, script, nil, nil)
-		}
-	}
-	if err := os.WriteFile(rolledBackPath, []byte(time.Now().UTC().Format(time.RFC3339)+"\n"), 0o600); err != nil {
-		removeLock()
-		return err
-	}
-	removeLock()
-	// Clear the pending window so a subsequent plan starts cleanly. This is
-	// also the boot reconciliation path when the detached watchdog did not
-	// survive a reboot.
+	// Clear the pending window after releasing the rollback claim, exactly as
+	// the detached watchdog does. This is also the boot reconciliation path
+	// when the detached watchdog did not survive a reboot.
 	_ = engineWithStateLock(r.Config, func(state *State) error {
 		if state.OperationID == operationID && state.CommitID == operationID {
 			state.CommitID = ""
@@ -624,6 +608,85 @@ func (r *Runner) rollbackCommit(operationID string) error {
 		}
 		return nil
 	})
+	return nil
+}
+
+func rollbackFinished(confirmedPath, rolledBackPath string) (bool, error) {
+	for _, marker := range []string{confirmedPath, rolledBackPath} {
+		if _, _, exists, err := fileState(marker); err != nil {
+			return false, err
+		} else if exists {
+			// A confirmed operation must never be reverted by a late caller; a
+			// second rollback is already done. This is the disarm path for an
+			// old watchdog after a newer configuration was confirmed.
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// withRollbackLock serializes rollback with a detached watchdog using the same
+// atomic directory claim. An existing lock means another rollback owns the
+// snapshot, which is already a successful outcome for this caller.
+func withRollbackLock(dir string, rollback func() error) error {
+	lock := filepath.Join(dir, "rollback.lock")
+	if err := os.Mkdir(lock, 0o700); err != nil {
+		if os.IsExist(err) {
+			return nil
+		}
+		return err
+	}
+	defer func() { _ = os.Remove(lock) }()
+	return rollback()
+}
+
+func (r *Runner) restoreCommitFiles(dir string, files []commitFile) error {
+	for _, file := range files {
+		if err := r.restoreCommitFile(dir, file); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *Runner) restoreCommitFile(dir string, file commitFile) error {
+	if !file.Exists {
+		if err := os.Remove(file.Path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+	source := filepath.Join(dir, file.Backup)
+	if err := os.MkdirAll(filepath.Dir(file.Path), 0o750); err != nil {
+		return err
+	}
+	raw, _, _, err := fileState(source)
+	if err != nil {
+		return err
+	}
+	if err := writeFile(file.Path, raw, os.FileMode(file.Mode)&0o777, "root", "root"); err != nil {
+		return err
+	}
+	if os.Geteuid() == 0 && file.UID >= 0 && file.GID >= 0 {
+		return os.Chown(file.Path, file.UID, file.GID)
+	}
+	return nil
+}
+
+func (r *Runner) restartCommitServices(ctx context.Context, units []commitUnit) error {
+	if r.Exec == nil {
+		return nil
+	}
+	if err := r.Exec.Run(ctx, "host-commit-rollback", "systemctl daemon-reload 2>/dev/null || true", nil, nil); err != nil {
+		return err
+	}
+	for _, unit := range units {
+		script := "systemctl try-restart " + shellQuote(unit.Name) + " 2>/dev/null || true"
+		if !unit.Exists {
+			script = "systemctl disable --now " + shellQuote(unit.Name) + " 2>/dev/null || true"
+		}
+		_ = r.Exec.Run(ctx, "host-commit-rollback-"+unit.Name, script, nil, nil)
+	}
 	return nil
 }
 

@@ -40,41 +40,49 @@ func Serve(config Config, stdin io.Reader, stdout io.Writer) error {
 			}
 			return err
 		}
-		switch frame.Type {
-		case node.FrameHello:
-			if frame.Version != node.ProtocolVersion {
-				// Fail closed: the handshake is refused before any request is
-				// read, and the node never guesses a protocol version.
-				_ = node.WriteFrame(writer, node.Frame{Type: node.FrameError, Error: "unsupported protocol version"})
-				_ = writer.Flush()
-				return fmt.Errorf("unsupported protocol version %d", frame.Version)
-			}
-			if err := node.WriteFrame(writer, node.Frame{Type: node.FrameHello, Version: node.ProtocolVersion, Node: config.Node}); err != nil {
-				return err
-			}
-			if err := writer.Flush(); err != nil {
-				return err
-			}
-		case node.FrameRequest:
-			if frame.Request == nil {
-				if err := writeError(writer, "request frame has no request"); err != nil {
-					return err
-				}
-				continue
-			}
-			response := Handle(config, steps, *frame.Request)
-			if err := node.WriteFrame(writer, node.Frame{Type: node.FrameResponse, Response: &response}); err != nil {
-				return err
-			}
-			if err := writer.Flush(); err != nil {
-				return err
-			}
-		default:
-			if err := writeError(writer, "unsupported frame type "+frame.Type); err != nil {
-				return err
-			}
+		if err := serveFrame(config, steps, writer, frame); err != nil {
+			return err
 		}
 	}
+}
+
+// serveFrame answers one protocol frame.
+func serveFrame(config Config, steps *node.StepRegistry, writer *bufio.Writer, frame node.Frame) error {
+	switch frame.Type {
+	case node.FrameHello:
+		return serveHello(writer, config, frame)
+	case node.FrameRequest:
+		return serveRequest(config, steps, writer, frame)
+	default:
+		return writeError(writer, "unsupported frame type "+frame.Type)
+	}
+}
+
+// serveHello accepts exactly the protocol version this node implements.
+func serveHello(writer *bufio.Writer, config Config, frame node.Frame) error {
+	if frame.Version != node.ProtocolVersion {
+		// Fail closed: the handshake is refused before any request is
+		// read, and the node never guesses a protocol version.
+		_ = node.WriteFrame(writer, node.Frame{Type: node.FrameError, Error: "unsupported protocol version"})
+		_ = writer.Flush()
+		return fmt.Errorf("unsupported protocol version %d", frame.Version)
+	}
+	if err := node.WriteFrame(writer, node.Frame{Type: node.FrameHello, Version: node.ProtocolVersion, Node: config.Node}); err != nil {
+		return err
+	}
+	return writer.Flush()
+}
+
+// serveRequest answers one request frame.
+func serveRequest(config Config, steps *node.StepRegistry, writer *bufio.Writer, frame node.Frame) error {
+	if frame.Request == nil {
+		return writeError(writer, "request frame has no request")
+	}
+	response := Handle(config, steps, *frame.Request)
+	if err := node.WriteFrame(writer, node.Frame{Type: node.FrameResponse, Response: &response}); err != nil {
+		return err
+	}
+	return writer.Flush()
 }
 
 func writeError(writer *bufio.Writer, reason string) error {
@@ -107,14 +115,13 @@ func handle(config Config, steps *node.StepRegistry, request node.Request) node.
 	if err := request.Execution.Validate(); err != nil {
 		return node.Response{Status: engine.StatusFailed, ErrorCode: string(contract.ValidationFailed), Detail: err.Error()}
 	}
-	switch request.Method {
-	case node.MethodStatus:
+	if request.Method == node.MethodStatus {
 		return statusResponse(config, request)
-	case node.MethodRun:
-		return runResponse(config, steps, request)
-	default:
-		return node.Response{Status: engine.StatusFailed, ErrorCode: string(contract.ValidationFailed), Detail: "unknown node method " + string(request.Method)}
 	}
+	if request.Method == node.MethodRun {
+		return runResponse(config, steps, request)
+	}
+	return node.Response{Status: engine.StatusFailed, ErrorCode: string(contract.ValidationFailed), Detail: "unknown node method " + string(request.Method)}
 }
 
 // observeResponse answers a read-only Docker ownership observation. A node
@@ -188,6 +195,8 @@ func explainsTaskOutcome(status engine.Status) bool {
 	switch status {
 	case engine.StatusStale, engine.StatusAbsent, engine.StatusFailed:
 		return true
+	case engine.StatusRunning, engine.StatusDeferred, engine.StatusCompleted:
+		return false
 	default:
 		return false
 	}
@@ -209,7 +218,7 @@ func taskLogTail(config Config, request node.Request, detail int) (string, error
 	if limit <= 0 {
 		return "", nil
 	}
-	file, err := os.Open(taskLogPath(config, request)) //nolint:gosec // G304: the node's own log path.
+	file, err := os.Open(taskLogPath(config, request))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return "", nil
@@ -296,6 +305,9 @@ func runResponse(config Config, steps *node.StepRegistry, request node.Request) 
 		// A deferral is an exited pre-Check/Apply waiter. It is safe to resume
 		// under a new task; the control plane decides when to stop backing off.
 		// The new task, not the deferred observation, owns the next execution.
+	case engine.StatusAbsent, engine.StatusStale, engine.StatusFailed:
+		// No live owner exists for these observations, so a new task is
+		// allowed to start the effect.
 	}
 	if err := SpawnTask(config, request); err != nil {
 		return node.Response{Status: engine.StatusFailed, ExecutionID: request.Execution.ExecutionID(), ErrorCode: string(contract.Internal), Detail: err.Error()}
@@ -337,7 +349,7 @@ func SpawnTask(config Config, request node.Request) error {
 		_ = writeEnd.Close()
 		return err
 	}
-	logFile, err := os.OpenFile(taskLogPath(config, request), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600) //nolint:gosec // G304: the node's own log directory.
+	logFile, err := os.OpenFile(taskLogPath(config, request), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		_ = readEnd.Close()
 		_ = writeEnd.Close()
@@ -351,7 +363,7 @@ func SpawnTask(config Config, request node.Request) error {
 		return err
 	}
 	taskCommand := config.taskCommand()
-	command := exec.Command(taskCommand[0], taskCommand[1:]...)
+	command := exec.CommandContext(context.Background(), taskCommand[0], taskCommand[1:]...) //nolint:gosec // G204: the node operator's configured task command, never request data.
 	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	command.ExtraFiles = []*os.File{readEnd}
 	command.Stdout = logFile

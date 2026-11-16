@@ -63,51 +63,74 @@ func serveOperationFollow(ctx context.Context, app api.AppService, request rpc.R
 		if observation.Snapshot != nil {
 			return writeFollowFrame(out, rpc.FollowPayload{Kind: "snapshot", OperationID: params.OperationID, Snapshot: observation.Snapshot, Cursor: observation.Cursor})
 		}
-		events := observation.Events
-		for len(events) > 0 {
-			// Find the largest prefix that fits without dropping or truncating
-			// any durable event. Each fragment carries its own ending cursor.
-			lo, hi := 0, len(events)
-			for lo < hi {
-				mid := (lo + hi + 1) / 2
-				frame := rpc.FollowPayload{Kind: "events", OperationID: params.OperationID, Events: events[:mid], Cursor: contract.Cursor{OperationID: params.OperationID, After: events[mid-1].Sequence}}
-				raw, e := rpc.MarshalEvent(rpc.EventBody{Kind: "operation_follow", Follow: &frame})
-				if e != nil {
-					return e
-				}
-				if len(raw) <= rpc.MaxFollowFrameBytes {
-					lo = mid
-				} else {
-					hi = mid - 1
-				}
-			}
-			if lo == 0 {
-				return followFrameSizeError()
-			}
-			frame := rpc.FollowPayload{Kind: "events", OperationID: params.OperationID, Events: events[:lo], Cursor: contract.Cursor{OperationID: params.OperationID, After: events[lo-1].Sequence}}
-			if err := writeFollowFrame(out, frame); err != nil {
-				return err
-			}
-			events = events[lo:]
-		}
-		return nil
+		return writeFollowEvents(out, params.OperationID, observation.Events)
 	})
 	if err == nil {
-		data, marshalErr := json.Marshal(result)
-		if marshalErr != nil {
-			err = marshalErr
-		} else if line, marshalErr := rpc.MarshalResult(rpc.Result{OK: true, Data: data}); marshalErr != nil || len(line) > rpc.MaxFollowFrameBytes {
-			err = followFrameSizeError()
-		} else {
-			if n, writeErr := out.Write(line); writeErr != nil {
-				return contract.ExitCode(writeErr)
-			} else if n != len(line) {
-				return contract.ExitCode(io.ErrShortWrite)
-			}
-			return 0
+		code, written, resultErr := writeFollowResult(out, result)
+		if written {
+			return code
 		}
+		err = resultErr
 	}
 	return writeRPCResult(out, nil, err)
+}
+
+// writeFollowEvents splits the durable event page into the largest frames that
+// fit without dropping or truncating any event. Each fragment carries its own
+// ending cursor.
+func writeFollowEvents(out io.Writer, operationID contract.OperationID, events []contract.Event) error {
+	for len(events) > 0 {
+		size, err := followEventPrefixSize(operationID, events)
+		if err != nil {
+			return err
+		}
+		if size == 0 {
+			return followFrameSizeError()
+		}
+		frame := rpc.FollowPayload{Kind: "events", OperationID: operationID, Events: events[:size], Cursor: contract.Cursor{OperationID: operationID, After: events[size-1].Sequence}}
+		if err := writeFollowFrame(out, frame); err != nil {
+			return err
+		}
+		events = events[size:]
+	}
+	return nil
+}
+
+func followEventPrefixSize(operationID contract.OperationID, events []contract.Event) (int, error) {
+	lo, hi := 0, len(events)
+	for lo < hi {
+		mid := (lo + hi + 1) / 2
+		frame := rpc.FollowPayload{Kind: "events", OperationID: operationID, Events: events[:mid], Cursor: contract.Cursor{OperationID: operationID, After: events[mid-1].Sequence}}
+		raw, err := rpc.MarshalEvent(rpc.EventBody{Kind: "operation_follow", Follow: &frame})
+		if err != nil {
+			return 0, err
+		}
+		if len(raw) <= rpc.MaxFollowFrameBytes {
+			lo = mid
+		} else {
+			hi = mid - 1
+		}
+	}
+	return lo, nil
+}
+
+func writeFollowResult(out io.Writer, result api.OperationFollowResult) (int, bool, error) {
+	data, err := json.Marshal(result)
+	if err != nil {
+		return 0, false, err
+	}
+	line, err := rpc.MarshalResult(rpc.Result{OK: true, Data: data})
+	if err != nil || len(line) > rpc.MaxFollowFrameBytes {
+		return 0, false, followFrameSizeError()
+	}
+	n, err := out.Write(line)
+	if err != nil {
+		return contract.ExitCode(err), true, nil
+	}
+	if n != len(line) {
+		return contract.ExitCode(io.ErrShortWrite), true, nil
+	}
+	return 0, true, nil
 }
 
 func writeFollowFrame(out io.Writer, payload rpc.FollowPayload) error {
@@ -172,88 +195,117 @@ func (n *nodeClient) FollowSession(ctx context.Context, cursor contract.Cursor, 
 	return result, nil
 }
 
+type followEnvelope struct {
+	Schema string          `json:"schema"`
+	Type   string          `json:"type"`
+	Event  *rpc.EventBody  `json:"event,omitempty"`
+	OK     *bool           `json:"ok,omitempty"`
+	Data   json.RawMessage `json:"data,omitempty"`
+	Error  *contract.Fault `json:"error,omitempty"`
+}
+
 func readFollowSession(input io.Reader, id contract.OperationID, emit func(viewer.SessionObservation) error) (viewer.SessionResult, error) {
 	reader := bufio.NewReaderSize(input, 64*1024)
 	for {
 		line, err := readFollowLine(reader)
 		if err != nil {
-			var fault *contract.Fault
-			if errors.As(err, &fault) {
-				return viewer.SessionResult{}, fault
-			}
-			return viewer.SessionResult{}, contract.NewFault(contract.Unavailable, "operation follow ended without a result", "Reconnect from the last processed event.")
+			return viewer.SessionResult{}, followReadError(err)
 		}
-		var envelope struct {
-			Schema string          `json:"schema"`
-			Type   string          `json:"type"`
-			Event  *rpc.EventBody  `json:"event,omitempty"`
-			OK     *bool           `json:"ok,omitempty"`
-			Data   json.RawMessage `json:"data,omitempty"`
-			Error  *contract.Fault `json:"error,omitempty"`
-		}
-		decoder := json.NewDecoder(bytes.NewReader(line))
-		decoder.DisallowUnknownFields()
-		if decoder.Decode(&envelope) != nil || decoder.Decode(new(any)) != io.EOF || envelope.Schema != rpc.Schema {
-			return viewer.SessionResult{}, followStreamProtocolError()
+		envelope, err := decodeFollowEnvelope(line)
+		if err != nil {
+			return viewer.SessionResult{}, err
 		}
 		switch envelope.Type {
 		case "event":
-			if envelope.OK != nil || len(envelope.Data) != 0 || envelope.Error != nil || envelope.Event == nil ||
-				envelope.Event.Kind != "operation_follow" || envelope.Event.Follow == nil ||
-				envelope.Event.Step != "" || envelope.Event.Message != "" || envelope.Event.Log != nil {
-				return viewer.SessionResult{}, followStreamProtocolError()
-			}
-			frame := envelope.Event.Follow
-			if frame.OperationID != id || frame.Cursor.OperationID != id {
-				return viewer.SessionResult{}, followStreamProtocolError()
-			}
-			switch frame.Kind {
-			case "snapshot":
-				if frame.Snapshot == nil || frame.Events != nil {
-					return viewer.SessionResult{}, followStreamProtocolError()
-				}
-			case "events":
-				if frame.Snapshot != nil || len(frame.Events) == 0 {
-					return viewer.SessionResult{}, followStreamProtocolError()
-				}
-			default:
-				return viewer.SessionResult{}, followStreamProtocolError()
-			}
-			if err := emit(viewer.SessionObservation{Snapshot: frame.Snapshot, Events: frame.Events, Cursor: frame.Cursor}); err != nil {
+			if err := emitFollowEvent(envelope, id, emit); err != nil {
 				return viewer.SessionResult{}, err
 			}
 		case "result":
-			if envelope.Event != nil || envelope.OK == nil {
-				return viewer.SessionResult{}, followStreamProtocolError()
-			}
-			if !*envelope.OK {
-				if envelope.Error == nil || !contract.KnownCode(envelope.Error.Code) || len(envelope.Data) != 0 {
-					return viewer.SessionResult{}, followStreamProtocolError()
-				}
-				// A failed RPC exits nonzero, so the transport may close the
-				// pipe with the remote exit error rather than io.EOF.
-				if _, err := reader.ReadByte(); err == nil {
-					return viewer.SessionResult{}, followStreamProtocolError()
-				}
-				return viewer.SessionResult{}, envelope.Error
-			}
-			if envelope.Error != nil || len(envelope.Data) == 0 {
-				return viewer.SessionResult{}, followStreamProtocolError()
-			}
-			var result api.OperationFollowResult
-			dec := json.NewDecoder(bytes.NewReader(envelope.Data))
-			dec.DisallowUnknownFields()
-			if dec.Decode(&result) != nil || dec.Decode(new(any)) != io.EOF {
-				return viewer.SessionResult{}, followStreamProtocolError()
-			}
-			if _, err := reader.ReadByte(); !errors.Is(err, io.EOF) {
-				return viewer.SessionResult{}, followStreamProtocolError()
-			}
-			return viewer.SessionResult{Operation: result.Operation, Cursor: result.Cursor}, nil
+			return readFollowResult(reader, envelope)
 		default:
 			return viewer.SessionResult{}, followStreamProtocolError()
 		}
 	}
+}
+
+func followReadError(err error) error {
+	var fault *contract.Fault
+	if errors.As(err, &fault) {
+		return fault
+	}
+	return contract.NewFault(contract.Unavailable, "operation follow ended without a result", "Reconnect from the last processed event.")
+}
+
+func decodeFollowEnvelope(line []byte) (followEnvelope, error) {
+	var envelope followEnvelope
+	decoder := json.NewDecoder(bytes.NewReader(line))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&envelope) != nil || decoder.Decode(new(any)) != io.EOF || envelope.Schema != rpc.Schema {
+		return envelope, followStreamProtocolError()
+	}
+	return envelope, nil
+}
+
+func emitFollowEvent(envelope followEnvelope, id contract.OperationID, emit func(viewer.SessionObservation) error) error {
+	if envelope.OK != nil || len(envelope.Data) != 0 || envelope.Error != nil || envelope.Event == nil ||
+		envelope.Event.Kind != "operation_follow" || envelope.Event.Follow == nil ||
+		envelope.Event.Step != "" || envelope.Event.Message != "" || envelope.Event.Log != nil {
+		return followStreamProtocolError()
+	}
+	frame := envelope.Event.Follow
+	if frame.OperationID != id || frame.Cursor.OperationID != id {
+		return followStreamProtocolError()
+	}
+	if err := validateFollowFrame(frame); err != nil {
+		return err
+	}
+	return emit(viewer.SessionObservation{Snapshot: frame.Snapshot, Events: frame.Events, Cursor: frame.Cursor})
+}
+
+func validateFollowFrame(frame *rpc.FollowPayload) error {
+	switch frame.Kind {
+	case "snapshot":
+		if frame.Snapshot == nil || frame.Events != nil {
+			return followStreamProtocolError()
+		}
+	case "events":
+		if frame.Snapshot != nil || len(frame.Events) == 0 {
+			return followStreamProtocolError()
+		}
+	default:
+		return followStreamProtocolError()
+	}
+	return nil
+}
+
+func readFollowResult(reader *bufio.Reader, envelope followEnvelope) (viewer.SessionResult, error) {
+	if envelope.Event != nil || envelope.OK == nil {
+		return viewer.SessionResult{}, followStreamProtocolError()
+	}
+	if !*envelope.OK {
+		if envelope.Error == nil || !contract.KnownCode(envelope.Error.Code) || len(envelope.Data) != 0 {
+			return viewer.SessionResult{}, followStreamProtocolError()
+		}
+		// A failed RPC exits nonzero, so the transport may close the
+		// pipe with the remote exit error rather than io.EOF.
+		if _, err := reader.ReadByte(); err == nil {
+			return viewer.SessionResult{}, followStreamProtocolError()
+		}
+		return viewer.SessionResult{}, envelope.Error
+	}
+	if envelope.Error != nil || len(envelope.Data) == 0 {
+		return viewer.SessionResult{}, followStreamProtocolError()
+	}
+	var result api.OperationFollowResult
+	dec := json.NewDecoder(bytes.NewReader(envelope.Data))
+	dec.DisallowUnknownFields()
+	if dec.Decode(&result) != nil || dec.Decode(new(any)) != io.EOF {
+		return viewer.SessionResult{}, followStreamProtocolError()
+	}
+	if _, err := reader.ReadByte(); !errors.Is(err, io.EOF) {
+		return viewer.SessionResult{}, followStreamProtocolError()
+	}
+	return viewer.SessionResult{Operation: result.Operation, Cursor: result.Cursor}, nil
 }
 
 func readFollowLine(reader *bufio.Reader) ([]byte, error) {

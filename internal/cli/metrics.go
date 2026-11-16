@@ -211,67 +211,95 @@ func nodeExporterHTTPClient() *http.Client {
 func nodeMetricsText(snapshot telemetry.NodeSnapshot) string {
 	var out strings.Builder
 	out.WriteString(ui.Header("Node metrics "+snapshot.Node, 72))
-	field := func(name, value string) {
-		fmt.Fprintf(&out, "\n  %s %s", ui.Dim(fmt.Sprintf("%-10s", name)), value)
-	}
+	writeNodeMetricsHost(&out, snapshot)
+	writeNodeMetricsCPU(&out, snapshot)
+	writeNodeMetricsMemory(&out, snapshot)
+	writeNodeMetricsLoadAndUptime(&out, snapshot)
+	writeNodeMetricsFilesystems(&out, snapshot)
+	writeNodeMetricsIssues(&out, snapshot)
+	out.WriteString("\n\n")
+	out.WriteString(ui.Note("This is one current snapshot; no samples are stored and there is no history or PromQL endpoint."))
+	return out.String()
+}
+
+func writeMetricField(out *strings.Builder, name, value string) {
+	fmt.Fprintf(out, "\n  %s %s", ui.Dim(fmt.Sprintf("%-10s", name)), value)
+}
+
+func writeNodeMetricsHost(out *strings.Builder, snapshot telemetry.NodeSnapshot) {
 	if snapshot.Hostname != "" {
-		field("host", snapshot.Hostname)
+		writeMetricField(out, "host", snapshot.Hostname)
 	}
 	platform := strings.TrimSpace(strings.Join([]string{snapshot.OS, snapshot.Kernel, snapshot.Machine}, " "))
 	if platform != "" {
-		field("platform", platform)
+		writeMetricField(out, "platform", platform)
 	}
 	version := snapshot.ExporterVersion
 	if version == "" {
 		version = "version unknown"
 	}
-	field("exporter", version+" · "+snapshot.Scrape.Endpoint)
-	field("access", "loopback exporter · no public listener · read by this operator command over SSH")
-	field("sample", sampleText(snapshot))
+	writeMetricField(out, "exporter", version+" · "+snapshot.Scrape.Endpoint)
+	writeMetricField(out, "access", "loopback exporter · no public listener · read by this operator command over SSH")
+	writeMetricField(out, "sample", sampleText(snapshot))
+}
+
+func writeNodeMetricsCPU(out *strings.Builder, snapshot telemetry.NodeSnapshot) {
 	if snapshot.CPU == nil {
-		field("cpu", "unavailable: "+issueReason(snapshot, "cpu"))
-	} else if snapshot.CPU.UtilizationPercent == nil {
-		field("cpu", "unavailable")
-	} else {
-		field("cpu", fmt.Sprintf("%.1f%% of %d logical CPUs over %.1fs of counters", *snapshot.CPU.UtilizationPercent, snapshot.CPU.LogicalCPUs, snapshot.CPU.WindowSeconds))
+		writeMetricField(out, "cpu", "unavailable: "+issueReason(snapshot, "cpu"))
+		return
 	}
+	if snapshot.CPU.UtilizationPercent == nil {
+		writeMetricField(out, "cpu", "unavailable")
+		return
+	}
+	writeMetricField(out, "cpu", fmt.Sprintf("%.1f%% of %d logical CPUs over %.1fs of counters", *snapshot.CPU.UtilizationPercent, snapshot.CPU.LogicalCPUs, snapshot.CPU.WindowSeconds))
+}
+
+func writeNodeMetricsMemory(out *strings.Builder, snapshot telemetry.NodeSnapshot) {
 	if snapshot.Memory == nil {
-		field("memory", "unavailable: "+issueReason(snapshot, "memory"))
-	} else {
-		field("memory", fmt.Sprintf("%s used of %s (%.1f%%)", humanBytes(snapshot.Memory.UsedBytes), humanBytes(snapshot.Memory.TotalBytes), snapshot.Memory.UsedPercent))
+		writeMetricField(out, "memory", "unavailable: "+issueReason(snapshot, "memory"))
+		return
 	}
+	writeMetricField(out, "memory", fmt.Sprintf("%s used of %s (%.1f%%)", humanBytes(snapshot.Memory.UsedBytes), humanBytes(snapshot.Memory.TotalBytes), snapshot.Memory.UsedPercent))
+}
+
+func writeNodeMetricsLoadAndUptime(out *strings.Builder, snapshot telemetry.NodeSnapshot) {
 	if snapshot.Load == nil {
-		field("load", "unavailable: "+issueReason(snapshot, "load"))
+		writeMetricField(out, "load", "unavailable: "+issueReason(snapshot, "load"))
 	} else {
-		field("load", fmt.Sprintf("%.2f %.2f %.2f", snapshot.Load.Load1, snapshot.Load.Load5, snapshot.Load.Load15))
+		writeMetricField(out, "load", fmt.Sprintf("%.2f %.2f %.2f", snapshot.Load.Load1, snapshot.Load.Load5, snapshot.Load.Load15))
 	}
 	if snapshot.UptimeSeconds == nil {
-		field("uptime", "unavailable: "+issueReason(snapshot, "uptime"))
-	} else {
-		field("uptime", uptimeText(int64(*snapshot.UptimeSeconds)))
+		writeMetricField(out, "uptime", "unavailable: "+issueReason(snapshot, "uptime"))
+		return
 	}
+	writeMetricField(out, "uptime", uptimeText(int64(*snapshot.UptimeSeconds)))
+}
+
+func writeNodeMetricsFilesystems(out *strings.Builder, snapshot telemetry.NodeSnapshot) {
 	if len(snapshot.Filesystems) == 0 {
-		field("filesystem", "unavailable: "+issueReason(snapshot, "filesystem"))
-	} else {
-		for _, filesystem := range snapshot.Filesystems {
-			field("filesystem", fmt.Sprintf("%s (%s) %s free of %s (%.0f%% free)", filesystem.Mountpoint, filesystem.Filesystem, humanBytes(filesystem.AvailableBytes), humanBytes(filesystem.TotalBytes), 100-filesystem.UsedPercent))
-		}
+		writeMetricField(out, "filesystem", "unavailable: "+issueReason(snapshot, "filesystem"))
+		return
 	}
-	if snapshot.Freshness.State != telemetry.FreshnessFresh || len(snapshot.Issues) > 0 {
-		out.WriteString("\n")
-		if snapshot.Freshness.State == telemetry.FreshnessStale {
-			field("freshness", "stale: the newest exporter timestamp is older than the freshness threshold")
-		}
-		if snapshot.Freshness.State == telemetry.FreshnessUnknown {
-			field("freshness", "unknown: node_time_seconds is missing")
-		}
-		for _, issue := range snapshot.Issues {
-			fmt.Fprintf(&out, "\n  %s %s", ui.Dim(fmt.Sprintf("%-10s", "missing")), issue.Field+": "+issue.Reason)
-		}
+	for _, filesystem := range snapshot.Filesystems {
+		writeMetricField(out, "filesystem", fmt.Sprintf("%s (%s) %s free of %s (%.0f%% free)", filesystem.Mountpoint, filesystem.Filesystem, humanBytes(filesystem.AvailableBytes), humanBytes(filesystem.TotalBytes), 100-filesystem.UsedPercent))
 	}
-	out.WriteString("\n\n")
-	out.WriteString(ui.Note("This is one current snapshot; no samples are stored and there is no history or PromQL endpoint."))
-	return out.String()
+}
+
+func writeNodeMetricsIssues(out *strings.Builder, snapshot telemetry.NodeSnapshot) {
+	if snapshot.Freshness.State == telemetry.FreshnessFresh && len(snapshot.Issues) == 0 {
+		return
+	}
+	out.WriteString("\n")
+	if snapshot.Freshness.State == telemetry.FreshnessStale {
+		writeMetricField(out, "freshness", "stale: the newest exporter timestamp is older than the freshness threshold")
+	}
+	if snapshot.Freshness.State == telemetry.FreshnessUnknown {
+		writeMetricField(out, "freshness", "unknown: node_time_seconds is missing")
+	}
+	for _, issue := range snapshot.Issues {
+		fmt.Fprintf(out, "\n  %s %s", ui.Dim(fmt.Sprintf("%-10s", "missing")), issue.Field+": "+issue.Reason)
+	}
 }
 
 func sampleText(snapshot telemetry.NodeSnapshot) string {

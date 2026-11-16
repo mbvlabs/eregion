@@ -37,6 +37,22 @@ func dispatchHostMethod(ctx context.Context, request rpc.Request, progress io.Wr
 	if registry == nil {
 		registry = &secrets.Registry{}
 	}
+	cfg, cfgErr := loadHostDispatchConfig(registry)
+	switch request.Method {
+	case methodHostPlan, methodHostApply:
+		return dispatchHostPlanApply(ctx, request, progress, registry, cfg, cfgErr)
+	case methodHostDoctor:
+		return dispatchHostDoctor(ctx, request, registry, cfg, cfgErr)
+	case methodHostStatus:
+		return dispatchHostStatus(ctx, request, registry, cfg, cfgErr)
+	case methodRetentionInventory:
+		return dispatchRetentionInventory(ctx, request, cfg)
+	default:
+		return nil, contract.NewFault(contract.Usage, "unknown host method "+request.Method, "Use host.plan, host.apply, host.doctor, host.status, or retention.inventory.")
+	}
+}
+
+func loadHostDispatchConfig(registry *secrets.Registry) (host.Config, error) {
 	envErr := host.LoadServiceEnv(host.ServiceEnvPath)
 	dsn := ""
 	if envErr == nil {
@@ -54,81 +70,101 @@ func dispatchHostMethod(ctx context.Context, request rpc.Request, progress io.Wr
 	if cfg.DatabaseURL == "" {
 		cfg.DatabaseURL = dsn
 	}
+	return cfg, cfgErr
+}
 
-	switch request.Method {
-	case methodHostPlan, methodHostApply:
-		if cfgErr != nil {
-			return nil, cfgErr
-		}
-		runner, err := host.NewRunner(cfg, registry)
-		if err != nil {
-			return nil, err
-		}
-		runner.Reporter = hostProgress(progress, registry)
-		if request.Method == methodHostPlan || request.DryRun {
-			return runner.Plan(ctx)
-		}
-		confirm := strings.TrimSpace(request.Confirm)
-		if confirm == "" {
-			plan, err := runner.Plan(ctx)
-			if err != nil {
-				return nil, err
-			}
-			if !plan.Supported {
-				return nil, contract.NewFault(contract.PreconditionFailed, "the node platform is not supported", "Use Debian 13 or Ubuntu 26.04 on amd64 or arm64.")
-			}
-			confirm = plan.Confirmation.Token
-		}
-		return runner.Apply(ctx, confirm, false)
-	case methodHostDoctor:
-		var params rpcDoctorParams
-		if err := decodeRPCParams(request.Params, &params); err != nil {
-			return nil, err
-		}
-		var drift host.Plan
-		var driftErr error
-		if cfgErr == nil {
-			if runner, err := host.NewRunner(cfg, registry); err == nil {
-				drift, driftErr = runner.Plan(ctx)
-			} else {
-				driftErr = err
-			}
-		}
-		facts := host.GatherFacts(ctx, cfg, cfgErr, drift, driftErr, request.ClientVersion, request.ClientCommit, registry)
-		facts.Init = params.Init
-		return doctor.BuildReport(doctor.Run(doctor.Checks(), facts)), nil
-	case methodHostStatus:
-		facts := host.GatherFacts(ctx, cfg, cfgErr, host.Plan{}, nil, request.ClientVersion, request.ClientCommit, registry)
-		status := host.StatusFromFacts(facts)
-		if cfg.DatabaseURL != "" {
-			workspace, err := host.ReadWorkspaceStatus(ctx, cfg.DatabaseURL)
-			if err != nil {
-				status.WorkspaceError = registry.Redact(contract.Classify(err).Message)
-			} else {
-				status.Workspace = workspace
-			}
-		} else {
-			status.WorkspaceError = "the node has no control database URL"
-		}
-		return status, nil
-	case methodRetentionInventory:
-		if err := decodeRPCParams(request.Params, &struct{}{}); err != nil {
-			return nil, err
-		}
-		layout := host.DefaultLayout()
-		if cfg.Layout.DataDir != "" {
-			layout = cfg.Layout
-		}
-		inventory, err := platform.ObserveRetentionInventory(ctx, platform.RetentionInventoryPaths{
-			DataDir: layout.DataDir, RegistryDir: layout.RegistryDir,
-		}, nil)
-		if err != nil {
-			return nil, err
-		}
-		return inventory, nil
-	default:
-		return nil, contract.NewFault(contract.Usage, "unknown host method "+request.Method, "Use host.plan, host.apply, host.doctor, host.status, or retention.inventory.")
+func dispatchHostPlanApply(
+	ctx context.Context,
+	request rpc.Request,
+	progress io.Writer,
+	registry *secrets.Registry,
+	cfg host.Config,
+	cfgErr error,
+) (any, error) {
+	if cfgErr != nil {
+		return nil, cfgErr
 	}
+	runner, err := host.NewRunner(cfg, registry)
+	if err != nil {
+		return nil, err
+	}
+	runner.Reporter = hostProgress(progress, registry)
+	if request.Method == methodHostPlan || request.DryRun {
+		return runner.Plan(ctx)
+	}
+	confirm := strings.TrimSpace(request.Confirm)
+	if confirm == "" {
+		plan, err := runner.Plan(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if !plan.Supported {
+			return nil, contract.NewFault(contract.PreconditionFailed, "the node platform is not supported", "Use Debian 13 or Ubuntu 26.04 on amd64 or arm64.")
+		}
+		confirm = plan.Confirmation.Token
+	}
+	return runner.Apply(ctx, confirm, false)
+}
+
+func dispatchHostDoctor(
+	ctx context.Context,
+	request rpc.Request,
+	registry *secrets.Registry,
+	cfg host.Config,
+	cfgErr error,
+) (any, error) {
+	var params rpcDoctorParams
+	if err := decodeRPCParams(request.Params, &params); err != nil {
+		return nil, err
+	}
+	drift, driftErr := hostDriftPlan(ctx, cfg, cfgErr, registry)
+	facts := host.GatherFacts(ctx, cfg, cfgErr, drift, driftErr, request.ClientVersion, request.ClientCommit, registry)
+	facts.Init = params.Init
+	return doctor.BuildReport(doctor.Run(doctor.Checks(), facts)), nil
+}
+
+func hostDriftPlan(ctx context.Context, cfg host.Config, cfgErr error, registry *secrets.Registry) (host.Plan, error) {
+	if cfgErr != nil {
+		return host.Plan{}, nil
+	}
+	runner, err := host.NewRunner(cfg, registry)
+	if err != nil {
+		return host.Plan{}, err
+	}
+	return runner.Plan(ctx)
+}
+
+func dispatchHostStatus(ctx context.Context, request rpc.Request, registry *secrets.Registry, cfg host.Config, cfgErr error) (any, error) {
+	facts := host.GatherFacts(ctx, cfg, cfgErr, host.Plan{}, nil, request.ClientVersion, request.ClientCommit, registry)
+	status := host.StatusFromFacts(facts)
+	if cfg.DatabaseURL == "" {
+		status.WorkspaceError = "the node has no control database URL"
+		return status, nil
+	}
+	workspace, err := host.ReadWorkspaceStatus(ctx, cfg.DatabaseURL)
+	if err != nil {
+		status.WorkspaceError = registry.Redact(contract.Classify(err).Message)
+	} else {
+		status.Workspace = workspace
+	}
+	return status, nil
+}
+
+func dispatchRetentionInventory(ctx context.Context, request rpc.Request, cfg host.Config) (any, error) {
+	if err := decodeRPCParams(request.Params, &struct{}{}); err != nil {
+		return nil, err
+	}
+	layout := host.DefaultLayout()
+	if cfg.Layout.DataDir != "" {
+		layout = cfg.Layout
+	}
+	inventory, err := platform.ObserveRetentionInventory(ctx, platform.RetentionInventoryPaths{
+		DataDir: layout.DataDir, RegistryDir: layout.RegistryDir,
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+	return inventory, nil
 }
 
 func observeLocalRetentionInventory(ctx context.Context) (retention.Inventory, string, error) {

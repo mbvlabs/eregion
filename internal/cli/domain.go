@@ -187,7 +187,11 @@ func (a *app) domainChange(cmd *cobra.Command, kind string, input platform.Domai
 	if err != nil {
 		return result{}, err
 	}
-	input = *normalized.Input.(*platform.DomainInput)
+	typed, ok := normalized.Input.(*platform.DomainInput)
+	if !ok {
+		return result{}, fmt.Errorf("normalized domain input has type %T", normalized.Input)
+	}
+	input = *typed
 	client, err := a.client(cmd)
 	if err != nil {
 		return result{}, err
@@ -207,38 +211,7 @@ func (a *app) domainChange(cmd *cobra.Command, kind string, input platform.Domai
 		}
 	}
 	if dryRun {
-		preview, _, err := submitDomain(cmd, client, kind, target.String(), rawInput, "", true)
-		if err != nil {
-			return result{}, err
-		}
-		if kind == platform.KindDomainRemove {
-			raw, ok := preview.data.(json.RawMessage)
-			if !ok {
-				return result{}, invalidNodeData("domain preview")
-			}
-			preview.data, preview.plain = platformWithConfirmation(raw, input.Domain)
-		} else {
-			records := domainRecords(input.Domain, input.Addresses)
-			raw, ok := preview.data.(json.RawMessage)
-			if !ok {
-				return result{}, invalidNodeData("domain preview")
-			}
-			data, err := domainAddPreview(raw, input.Domain, records)
-			if err != nil {
-				return result{}, err
-			}
-			var envelope struct {
-				DNSRecords []domainRecord `json:"dns_records"`
-			}
-			if err := json.Unmarshal(data, &envelope); err != nil {
-				return result{}, contract.NewFault(contract.Internal, "could not read the domain preview records", "Report the command and binary version.")
-			}
-			preview.plain += "\n" + strings.Join(domainRecordLines(domainChangeData{
-				Domain: input.Domain, DNSRecords: envelope.DNSRecords,
-			}), "\n")
-			preview.data = data
-		}
-		return preview, nil
+		return domainDryRunResult(cmd, client, kind, target, input, rawInput)
 	}
 	key, _ := cmd.Flags().GetString("idempotency-key")
 	if key == "" {
@@ -254,48 +227,97 @@ func (a *app) domainChange(cmd *cobra.Command, kind string, input platform.Domai
 
 	detach, _ := cmd.Flags().GetBool("detach")
 	if detach {
-		data := domainChangeData{
-			Domain: input.Domain, App: input.App, Environment: input.Environment,
-			Primary: input.Primary, OperationID: op.ID,
-			DNSMode: input.DNSMode, DNSZone: input.DNSZone, DNSOrigins: input.DNSOrigins, DNSProxied: input.DNSProxied,
-			DNSRecords: domainRecords(input.Domain, input.Addresses),
-		}
-		plain := "Accepted " + kind + " for " + input.Domain + "\noperation: " + string(op.ID) + "\nnext: eregion operations follow " + string(op.ID)
-		if kind == platform.KindDomainAdd {
-			if binding, err := a.domainBinding(cmd, input.App, input.Environment, input.Domain); err == nil {
-				applyManagedDNSBinding(&data, binding)
-			}
-			plain += "\n" + strings.Join(domainRecordLines(domainChangeData{
-				Domain: input.Domain, DNSRecords: data.DNSRecords,
-			}), "\n")
-		}
-		return result{data: data, plain: plain}, nil
+		return a.domainDetachedResult(cmd, kind, input, op), nil
 	}
 	if follow {
-		// Show the record before the worker starts so it can be created while
-		// the operation runs. NDJSON carries only the event protocol.
-		if ndjson {
-			_, followErr := a.followOperation(cmd, client, op.ID)
-			if followErr != nil {
-				return result{streamed: true}, followErr
-			}
-			return result{streamed: true}, nil
-		}
-		recordData := domainChangeData{Domain: input.Domain, DNSRecords: domainRecords(input.Domain, input.Addresses)}
-		if binding, err := a.domainBinding(cmd, input.App, input.Environment, input.Domain); err == nil {
-			applyManagedDNSBinding(&recordData, binding)
-		}
-		fmt.Fprintln(config.out, strings.Join(domainRecordLines(recordData), "\n"))
-		_, followErr := a.followOperation(cmd, client, op.ID)
-		if followErr != nil {
-			return result{streamed: true}, followErr
-		}
-		fmt.Fprintln(config.out, a.domainStateText(cmd, input))
-		return result{streamed: true}, nil
+		return a.domainFollowResult(cmd, client, input, op, config, ndjson)
 	}
 
 	data, plain := a.domainChangeResult(cmd, kind, input, op)
 	return result{data: data, plain: plain}, nil
+}
+
+func domainDryRunResult(
+	cmd *cobra.Command,
+	client Backend,
+	kind string,
+	target platform.Target,
+	input platform.DomainInput,
+	rawInput json.RawMessage,
+) (result, error) {
+	preview, _, err := submitDomain(cmd, client, kind, target.String(), rawInput, "", true)
+	if err != nil {
+		return result{}, err
+	}
+	raw, ok := preview.data.(json.RawMessage)
+	if !ok {
+		return result{}, invalidNodeData("domain preview")
+	}
+	if kind == platform.KindDomainRemove {
+		preview.data, preview.plain = platformWithConfirmation(raw, input.Domain)
+		return preview, nil
+	}
+	records := domainRecords(input.Domain, input.Addresses)
+	data, err := domainAddPreview(raw, input.Domain, records)
+	if err != nil {
+		return result{}, err
+	}
+	var envelope struct {
+		DNSRecords []domainRecord `json:"dns_records"`
+	}
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return result{}, contract.NewFault(contract.Internal, "could not read the domain preview records", "Report the command and binary version.")
+	}
+	preview.plain += "\n" + strings.Join(domainRecordLines(domainChangeData{
+		Domain: input.Domain, DNSRecords: envelope.DNSRecords,
+	}), "\n")
+	preview.data = data
+	return preview, nil
+}
+
+func (a *app) domainDetachedResult(cmd *cobra.Command, kind string, input platform.DomainInput, op contract.Operation) result {
+	data := domainChangeData{
+		Domain: input.Domain, App: input.App, Environment: input.Environment,
+		Primary: input.Primary, OperationID: op.ID,
+		DNSMode: input.DNSMode, DNSZone: input.DNSZone, DNSOrigins: input.DNSOrigins, DNSProxied: input.DNSProxied,
+		DNSRecords: domainRecords(input.Domain, input.Addresses),
+	}
+	plain := "Accepted " + kind + " for " + input.Domain + "\noperation: " + string(op.ID) + "\nnext: eregion operations follow " + string(op.ID)
+	if kind == platform.KindDomainAdd {
+		if binding, err := a.domainBinding(cmd, input.App, input.Environment, input.Domain); err == nil {
+			applyManagedDNSBinding(&data, binding)
+		}
+		plain += "\n" + strings.Join(domainRecordLines(domainChangeData{
+			Domain: input.Domain, DNSRecords: data.DNSRecords,
+		}), "\n")
+	}
+	return result{data: data, plain: plain}
+}
+
+func (a *app) domainFollowResult(
+	cmd *cobra.Command,
+	client Backend,
+	input platform.DomainInput,
+	op contract.Operation,
+	config *followIO,
+	ndjson bool,
+) (result, error) {
+	// Show the record before the worker starts so it can be created while
+	// the operation runs. NDJSON carries only the event protocol.
+	if ndjson {
+		_, err := a.followOperation(cmd, client, op.ID)
+		return result{streamed: true}, err
+	}
+	recordData := domainChangeData{Domain: input.Domain, DNSRecords: domainRecords(input.Domain, input.Addresses)}
+	if binding, err := a.domainBinding(cmd, input.App, input.Environment, input.Domain); err == nil {
+		applyManagedDNSBinding(&recordData, binding)
+	}
+	_, _ = fmt.Fprintln(config.out, strings.Join(domainRecordLines(recordData), "\n"))
+	if _, err := a.followOperation(cmd, client, op.ID); err != nil {
+		return result{streamed: true}, err
+	}
+	_, _ = fmt.Fprintln(config.out, a.domainStateText(cmd, input))
+	return result{streamed: true}, nil
 }
 
 // domainAddPreview nests the dry-run preview and the DNS records. Its result is

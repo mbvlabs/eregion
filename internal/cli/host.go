@@ -344,14 +344,14 @@ func (a *app) ssh(cmd *cobra.Command, args []string) (result, error) {
 	}
 
 	width, height := 80, 24
-	if w, h, err := term.GetSize(int(os.Stdout.Fd())); err == nil { //nolint:gosec // G115: file descriptors fit in int.
+	if w, h, err := term.GetSize(int(os.Stdout.Fd())); err == nil {
 		width, height = w, h
 	}
 	modes := ssh.TerminalModes{ssh.ECHO: 1, ssh.TTY_OP_ISPEED: 14400, ssh.TTY_OP_OSPEED: 14400}
 	if err := session.RequestPty("xterm-256color", height, width, modes); err != nil {
 		return result{}, contract.NewFault(contract.PreconditionFailed, "the node refused a PTY", err.Error())
 	}
-	fd := int(os.Stdin.Fd()) //nolint:gosec // G115: file descriptors fit in int.
+	fd := int(os.Stdin.Fd())
 	oldState, err := term.MakeRaw(fd)
 	if err != nil {
 		return result{}, contract.NewFault(contract.PreconditionFailed, "could not put the terminal in raw mode", "Run eregion ssh from a terminal.")
@@ -434,5 +434,5 @@ func (s *sudoPasswordWatch) Write(b []byte) (int, error) {
 	return s.w.Write(b)
 }
 
-func stdinIsTerminal() bool  { return term.IsTerminal(int(os.Stdin.Fd())) }  //nolint:gosec // G115: file descriptors fit in int.
-func stdoutIsTerminal() bool { return term.IsTerminal(int(os.Stdout.Fd())) } //nolint:gosec // G115: file descriptors fit in int.
+func stdinIsTerminal() bool  { return term.IsTerminal(int(os.Stdin.Fd())) }
+func stdoutIsTerminal() bool { return term.IsTerminal(int(os.Stdout.Fd())) }

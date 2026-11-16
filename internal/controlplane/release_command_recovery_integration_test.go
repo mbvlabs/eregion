@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
 	"github.com/mbvlabs/eregion/internal/node"
@@ -40,38 +41,50 @@ func (t *releaseRecoveryTransport) Call(_ context.Context, request node.Request,
 	case node.MethodRun:
 		t.runCalls++
 		return node.Response{}, errors.New("recovery dispatched a second command")
+	case node.MethodObserve, node.MethodInventory:
+		return node.Response{}, errors.New("unexpected recovery method")
 	default:
 		return node.Response{}, errors.New("unexpected recovery method")
 	}
 }
 
-// TestIntegrationReleaseCommandRecovery proves a terminal owner's running
-// command effect is resolved from durable step state and node status before any
-// new ownership is allowed.
-func TestIntegrationReleaseCommandRecovery(t *testing.T) {
+// releaseCommandRecoveryCase is one durable step/node-status combination.
+type releaseCommandRecoveryCase struct {
+	name         string
+	stepState    string
+	status       engine.Status
+	statusHash   string
+	statusErr    error
+	queryFault   bool
+	deleteStep   bool
+	wantDecision releaseCommandDecision
+	wantError    bool
+	wantRow      string
+	wantStatus   int
+}
+
+// releaseCommandRecoveryFixture seeds the operation, release, deployment, run
+// and running command step shared by every recovery case.
+type releaseCommandRecoveryFixture struct {
+	pool       *pgxpool.Pool
+	ctx        context.Context
+	original   contract.OperationID
+	current    contract.OperationID
+	releaseID  platform.ReleaseID
+	digest     string
+	run        releaseCommandRun
+	inputsHash string
+}
+
+func newReleaseCommandRecoveryFixture(t *testing.T) releaseCommandRecoveryFixture {
+	t.Helper()
 	pool, _ := testPool(t, true)
 	ctx := context.Background()
-
-	appID, err := platform.NewAppID()
-	if err != nil {
-		t.Fatal(err)
-	}
-	envID, err := platform.NewEnvironmentID()
-	if err != nil {
-		t.Fatal(err)
-	}
-	releaseID, err := platform.NewReleaseID()
-	if err != nil {
-		t.Fatal(err)
-	}
-	original, err := contract.NewOperationID()
-	if err != nil {
-		t.Fatal(err)
-	}
-	current, err := contract.NewOperationID()
-	if err != nil {
-		t.Fatal(err)
-	}
+	appID := mustNewAppID(t)
+	envID := mustNewEnvironmentID(t)
+	releaseID := mustNewReleaseID(t)
+	original := mustNewOperationID(t)
+	current := mustNewOperationID(t)
 	revisionID := platform.RevisionID("erv_" + "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 	if err := insertFixtureNode(ctx, pool, "main", []string{"application"}, []string{"docker"}, ""); err != nil {
 		t.Fatal(err)
@@ -108,21 +121,122 @@ func TestIntegrationReleaseCommandRecovery(t *testing.T) {
 		engine.Execution{OperationID: original, Attempt: 1, Step: deploymentCommandStep}.ExecutionID()); err != nil {
 		t.Fatal(err)
 	}
-	run := releaseCommandRun{State: "running", OperationID: original}
+	return releaseCommandRecoveryFixture{
+		pool: pool, ctx: ctx, original: original, current: current, releaseID: releaseID,
+		digest: digest, run: releaseCommandRun{State: "running", OperationID: original}, inputsHash: inputsHash,
+	}
+}
 
-	tests := []struct {
-		name         string
-		stepState    string
-		status       engine.Status
-		statusHash   string
-		statusErr    error
-		queryFault   bool
-		deleteStep   bool
-		wantDecision releaseCommandDecision
-		wantError    bool
-		wantRow      string
-		wantStatus   int
-	}{
+func mustNewAppID(t *testing.T) platform.AppID {
+	t.Helper()
+	id, err := platform.NewAppID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func mustNewEnvironmentID(t *testing.T) platform.EnvironmentID {
+	t.Helper()
+	id, err := platform.NewEnvironmentID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func mustNewReleaseID(t *testing.T) platform.ReleaseID {
+	t.Helper()
+	id, err := platform.NewReleaseID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func mustNewOperationID(t *testing.T) contract.OperationID {
+	t.Helper()
+	id, err := contract.NewOperationID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+// runReleaseCommandRecoveryCase resets one case's durable rows, performs the
+// recovery, and asserts the decision, transport calls, row ownership and
+// resulting action.
+func runReleaseCommandRecoveryCase(t *testing.T, fixture releaseCommandRecoveryFixture, test releaseCommandRecoveryCase) {
+	t.Helper()
+	ctx := fixture.ctx
+	if _, err := fixture.pool.Exec(ctx, `UPDATE eregion_platform_release_command_runs SET state='running',operation_id=$1,error_code='',error='',completed_at=NULL WHERE release_id=$2 AND command_digest=$3`,
+		fixture.original, fixture.releaseID, fixture.digest); err != nil {
+		t.Fatal(err)
+	}
+	if test.deleteStep {
+		if _, err := fixture.pool.Exec(ctx, `DELETE FROM eregion_operation_steps WHERE operation_id=$1 AND step=$2`, fixture.original, deploymentCommandStep); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		if _, err := fixture.pool.Exec(ctx, `UPDATE eregion_operation_steps SET state=$3,inputs_hash=$4 WHERE operation_id=$1 AND step=$2`,
+			fixture.original, deploymentCommandStep, test.stepState, fixture.inputsHash); err != nil {
+			t.Fatal(err)
+		}
+	}
+	statusHash := test.statusHash
+	if statusHash == "" {
+		statusHash = fixture.inputsHash
+	}
+	fake := &releaseRecoveryTransport{status: test.status, inputsHash: statusHash, statusErr: test.statusErr, queryFault: test.queryFault}
+	service := &Service{entities: newTestEntities(t, fixture.pool), resolver: NewNodeResolver(newTestEntities(t, fixture.pool).Nodes(), ResolverConfig{}, func() node.Transport { return fake })}
+	worker := &platformWorker{service: service}
+	decision, err := worker.recoverReleaseCommandRun(ctx, fixture.releaseID, fixture.digest, fixture.run, fixture.current)
+	if test.wantError {
+		if err == nil {
+			t.Fatal("recovery accepted an unknown or running effect")
+		}
+	} else if err != nil {
+		t.Fatalf("recovery failed: %v", err)
+	}
+	if decision != test.wantDecision && !test.wantError {
+		t.Fatalf("recovery decision = %v, want %v", decision, test.wantDecision)
+	}
+	if fake.runCalls != 0 {
+		t.Fatalf("recovery dispatched %d commands", fake.runCalls)
+	}
+	if fake.statusCalls != test.wantStatus {
+		t.Fatalf("status calls = %d, want %d", fake.statusCalls, test.wantStatus)
+	}
+	row, err := service.releaseCommandRun(ctx, fixture.releaseID, fixture.digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != test.wantRow || row.OperationID != fixture.original {
+		t.Fatalf("row = %+v, want state %s owned by the original operation", row, test.wantRow)
+	}
+	assertReleaseCommandRowAction(t, row, fixture.current, test.wantRow)
+}
+
+func assertReleaseCommandRowAction(t *testing.T, row releaseCommandRun, current contract.OperationID, wantRow string) {
+	t.Helper()
+	switch wantRow {
+	case "succeeded":
+		if got := releaseCommandAction(row, platform.ActionDeploy, current); got != releaseCommandSkip {
+			t.Fatalf("recovered success action = %v, want skip", got)
+		}
+	case "failed":
+		if got := releaseCommandAction(row, platform.ActionDeploy, current); got != releaseCommandRunNow {
+			t.Fatalf("recovered failure action = %v, want a new run", got)
+		}
+	}
+}
+
+// TestIntegrationReleaseCommandRecovery proves a terminal owner's running
+// command effect is resolved from durable step state and node status before any
+// new ownership is allowed.
+func TestIntegrationReleaseCommandRecovery(t *testing.T) {
+	fixture := newReleaseCommandRecoveryFixture(t)
+	tests := []releaseCommandRecoveryCase{
 		{name: "completed effect recovers success", stepState: "running", status: engine.StatusCompleted, wantDecision: releaseCommandSkip, wantRow: "succeeded", wantStatus: 1},
 		{name: "failed effect allows a new run", stepState: "running", status: engine.StatusFailed, wantDecision: releaseCommandRunNow, wantRow: "failed", wantStatus: 1},
 		{name: "still running keeps ownership", stepState: "running", status: engine.StatusRunning, wantError: true, wantRow: "running", wantStatus: 1},
@@ -139,61 +253,7 @@ func TestIntegrationReleaseCommandRecovery(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if _, err := pool.Exec(ctx, `UPDATE eregion_platform_release_command_runs SET state='running',operation_id=$1,error_code='',error='',completed_at=NULL WHERE release_id=$2 AND command_digest=$3`,
-				original, releaseID, digest); err != nil {
-				t.Fatal(err)
-			}
-			if test.deleteStep {
-				if _, err := pool.Exec(ctx, `DELETE FROM eregion_operation_steps WHERE operation_id=$1 AND step=$2`, original, deploymentCommandStep); err != nil {
-					t.Fatal(err)
-				}
-			} else {
-				if _, err := pool.Exec(ctx, `UPDATE eregion_operation_steps SET state=$3,inputs_hash=$4 WHERE operation_id=$1 AND step=$2`,
-					original, deploymentCommandStep, test.stepState, inputsHash); err != nil {
-					t.Fatal(err)
-				}
-			}
-			statusHash := test.statusHash
-			if statusHash == "" {
-				statusHash = inputsHash
-			}
-			fake := &releaseRecoveryTransport{status: test.status, inputsHash: statusHash, statusErr: test.statusErr, queryFault: test.queryFault}
-			service := &Service{entities: newTestEntities(t, pool), resolver: NewNodeResolver(newTestEntities(t, pool).Nodes(), ResolverConfig{}, func() node.Transport { return fake })}
-			worker := &platformWorker{service: service}
-			decision, err := worker.recoverReleaseCommandRun(ctx, releaseID, digest, run, current)
-			if test.wantError {
-				if err == nil {
-					t.Fatal("recovery accepted an unknown or running effect")
-				}
-			} else if err != nil {
-				t.Fatalf("recovery failed: %v", err)
-			}
-			if decision != test.wantDecision && !test.wantError {
-				t.Fatalf("recovery decision = %v, want %v", decision, test.wantDecision)
-			}
-			if fake.runCalls != 0 {
-				t.Fatalf("recovery dispatched %d commands", fake.runCalls)
-			}
-			if fake.statusCalls != test.wantStatus {
-				t.Fatalf("status calls = %d, want %d", fake.statusCalls, test.wantStatus)
-			}
-			row, err := service.releaseCommandRun(ctx, releaseID, digest)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if row.State != test.wantRow || row.OperationID != original {
-				t.Fatalf("row = %+v, want state %s owned by the original operation", row, test.wantRow)
-			}
-			switch test.wantRow {
-			case "succeeded":
-				if got := releaseCommandAction(row, platform.ActionDeploy, current); got != releaseCommandSkip {
-					t.Fatalf("recovered success action = %v, want skip", got)
-				}
-			case "failed":
-				if got := releaseCommandAction(row, platform.ActionDeploy, current); got != releaseCommandRunNow {
-					t.Fatalf("recovered failure action = %v, want a new run", got)
-				}
-			}
+			runReleaseCommandRecoveryCase(t, fixture, test)
 		})
 	}
 }

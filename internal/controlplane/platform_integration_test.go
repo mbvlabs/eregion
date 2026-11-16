@@ -24,7 +24,19 @@ func platformSubmissionAs(actor contract.Actor, kind, target, key string, input 
 
 func platformSubmitAs(t *testing.T, s *Service, actor contract.Actor, kind, target, key string, input any) contract.Operation {
 	t.Helper()
-	op, err := s.Submit(context.Background(), platformSubmissionAs(actor, kind, target, key, input))
+	return platformSubmitAsContext(context.Background(), t, s, actor, kind, target, key, input)
+}
+
+func platformSubmitAsContext(
+	ctx context.Context,
+	t *testing.T,
+	s *Service,
+	actor contract.Actor,
+	kind, target, key string,
+	input any,
+) contract.Operation {
+	t.Helper()
+	op, err := s.Submit(ctx, platformSubmissionAs(actor, kind, target, key, input))
 	if err != nil {
 		t.Fatalf("submit %s as %s: %v (%v)", kind, actor.Subject, err, errors.Unwrap(err))
 	}
@@ -33,7 +45,18 @@ func platformSubmitAs(t *testing.T, s *Service, actor contract.Actor, kind, targ
 
 func platformSubmit(t *testing.T, s *Service, kind, target, key string, input any) contract.Operation {
 	t.Helper()
-	op, err := s.Submit(context.Background(), platformSubmission(kind, target, key, input))
+	return platformSubmitContext(context.Background(), t, s, kind, target, key, input)
+}
+
+func platformSubmitContext(
+	ctx context.Context,
+	t *testing.T,
+	s *Service,
+	kind, target, key string,
+	input any,
+) contract.Operation {
+	t.Helper()
+	op, err := s.Submit(ctx, platformSubmission(kind, target, key, input))
 	if err != nil {
 		t.Fatalf("submit %s: %v (%v)", kind, err, errors.Unwrap(err))
 	}
@@ -42,9 +65,20 @@ func platformSubmit(t *testing.T, s *Service, kind, target, key string, input an
 
 func platformAwait(t *testing.T, s *Service, op contract.Operation, want contract.State) contract.Operation {
 	t.Helper()
+	return platformAwaitContext(context.Background(), t, s, op, want)
+}
+
+func platformAwaitContext(
+	ctx context.Context,
+	t *testing.T,
+	s *Service,
+	op contract.Operation,
+	want contract.State,
+) contract.Operation {
+	t.Helper()
 	deadline := time.Now().Add(60 * time.Second)
 	for {
-		current, err := s.Get(context.Background(), testActor, op.ID)
+		current, err := s.Get(ctx, testActor, op.ID)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -53,14 +87,14 @@ func platformAwait(t *testing.T, s *Service, op contract.Operation, want contrac
 			break
 		}
 		if time.Now().After(deadline) {
-			page, _ := s.Events(context.Background(), testActor, contract.Cursor{OperationID: op.ID}, 200)
+			page, _ := s.Events(ctx, testActor, contract.Cursor{OperationID: op.ID}, 200)
 			raw, _ := json.Marshal(page)
 			t.Fatalf("%s did not become %s within 60s; last=%+v events=%s", op.Kind, want, op, raw)
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
 	if op.State != want {
-		page, _ := s.Events(context.Background(), testActor, contract.Cursor{OperationID: op.ID}, 200)
+		page, _ := s.Events(ctx, testActor, contract.Cursor{OperationID: op.ID}, 200)
 		raw, _ := json.Marshal(page)
 		t.Fatalf("%s: got %s, want %s; events=%s", op.Kind, op.State, want, raw)
 	}

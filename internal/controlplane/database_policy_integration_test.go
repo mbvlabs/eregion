@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/api"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/entities"
@@ -298,24 +299,35 @@ func TestIntegrationDatabasePolicyCorruptResourceFailsClosed(t *testing.T) {
 	}
 }
 
+type databasePolicyGitFixture struct {
+	pool         *pgxpool.Pool
+	service      *Service
+	ctx          context.Context
+	op           contract.Operation
+	envID        platform.EnvironmentID
+	releaseID    platform.ReleaseID
+	deploymentID platform.DeploymentID
+}
+
 func TestIntegrationDatabasePolicyGitDeploymentAndStoredSecretIntegrity(t *testing.T) {
+	f := newDatabasePolicyGitFixture(t)
+	assertReleaseCommandAndCleanup(t, f)
+	seedDatabasePolicyVault(t, f)
+	assertIntegrationAuditIdentities(t, f)
+	assertDeploymentSecretSnapshotIntegrity(t, f)
+}
+
+func newDatabasePolicyGitFixture(t *testing.T) databasePolicyGitFixture {
+	t.Helper()
 	pool, _ := testPool(t, true)
 	s := testRuntime(t, pool, 0).Service
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	submit := func(kind, target, key string, input any) contract.Operation {
-		t.Helper()
-		op, err := s.Submit(ctx, platformSubmission(kind, target, key, input))
-		if err != nil {
-			t.Fatalf("%s: %v", key, err)
-		}
-		return op
-	}
-	submit(platform.KindNodeRegister, "platform", "node", map[string]any{
+	t.Cleanup(cancel)
+	platformSubmitContext(ctx, t, s, platform.KindNodeRegister, "platform", "node", map[string]any{
 		"name": "local", "roles": []string{platform.RoleApplication, platform.RoleBuilder},
 		"capabilities": []string{platform.CapabilityDocker, platform.CapabilityBuildpacks},
 	})
-	submit(platform.KindAppCreate, "platform", "app", map[string]any{
+	platformSubmitContext(ctx, t, s, platform.KindAppCreate, "platform", "app", map[string]any{
 		"name": "deploypolicy", "environments": []map[string]any{{
 			"name": "production", "node": "local", "container_port": 8080,
 			"domain": "deploypolicy.example.com",
@@ -326,7 +338,7 @@ func TestIntegrationDatabasePolicyGitDeploymentAndStoredSecretIntegrity(t *testi
 	s.resolveGitRef = func(context.Context, string, string, []byte) (string, error) {
 		return "0123456789abcdef0123456789abcdef01234567", nil
 	}
-	op := submit(platform.KindDeploy, "env/deploypolicy/production", "deploy", map[string]any{})
+	op := platformSubmitContext(ctx, t, s, platform.KindDeploy, "env/deploypolicy/production", "deploy", map[string]any{})
 	var envID platform.EnvironmentID
 	var releaseID platform.ReleaseID
 	var deploymentID platform.DeploymentID
@@ -352,42 +364,53 @@ func TestIntegrationDatabasePolicyGitDeploymentAndStoredSecretIntegrity(t *testi
 	if err != nil || !ok {
 		t.Fatalf("git admission defaults: ok=%v err=%v", ok, err)
 	}
+	return databasePolicyGitFixture{
+		pool: pool, service: s, ctx: ctx, op: op,
+		envID: envID, releaseID: releaseID, deploymentID: deploymentID,
+	}
+}
 
+func assertReleaseCommandAndCleanup(t *testing.T, f databasePolicyGitFixture) {
+	t.Helper()
 	// Exercise internal services against the real release and operation, not
 	// rows made solely to satisfy the command/cleanup foreign keys.
+	var ok bool
 	digest := platform.ReleaseCommandDigest(platform.CommandSpec{Argv: []string{"bin/migrate"}, TimeoutSeconds: 120})
-	if err := s.startReleaseCommandRun(ctx, releaseID, digest, op.ID); err != nil {
+	if err := f.service.startReleaseCommandRun(f.ctx, f.releaseID, digest, f.op.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := pool.QueryRow(ctx, `SELECT state='running' AND error_code='' AND error=''
+	if err := f.pool.QueryRow(f.ctx, `SELECT state='running' AND error_code='' AND error=''
 		AND started_at IS NOT NULL AND completed_at IS NULL
 		FROM eregion_platform_release_command_runs WHERE release_id=$1 AND command_digest=$2`,
-		releaseID, digest).Scan(&ok); err != nil || !ok {
+		f.releaseID, digest).Scan(&ok); err != nil || !ok {
 		t.Fatalf("release command initial row: ok=%v err=%v", ok, err)
 	}
-	if err := s.finishReleaseCommandRun(ctx, releaseID, digest, op.ID, nil); err != nil {
+	if err := f.service.finishReleaseCommandRun(f.ctx, f.releaseID, digest, f.op.ID, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := pool.QueryRow(ctx, `SELECT state='succeeded' AND error_code='' AND error=''
+	if err := f.pool.QueryRow(f.ctx, `SELECT state='succeeded' AND error_code='' AND error=''
 		AND completed_at>=started_at FROM eregion_platform_release_command_runs
-		WHERE release_id=$1 AND command_digest=$2`, releaseID, digest).Scan(&ok); err != nil || !ok {
+		WHERE release_id=$1 AND command_digest=$2`, f.releaseID, digest).Scan(&ok); err != nil || !ok {
 		t.Fatalf("release command completion: ok=%v err=%v", ok, err)
 	}
-	if err := s.recordContainerCleanup(ctx, "eregion-policy-old", envID, "local", deploymentID, "previous",
+	if err := f.service.recordContainerCleanup(f.ctx, "eregion-policy-old", f.envID, "local", f.deploymentID, "previous",
 		contract.NewFault(contract.PreconditionFailed, "cleanup failed", "retry")); err != nil {
 		t.Fatal(err)
 	}
-	if err := pool.QueryRow(ctx, `SELECT attempts=1 AND last_error<>'' AND created_at IS NOT NULL
+	if err := f.pool.QueryRow(f.ctx, `SELECT attempts=1 AND last_error<>'' AND created_at IS NOT NULL
 		AND next_attempt_at>created_at AND deployment_id=$1 AND reason='previous'
-		FROM eregion_platform_container_cleanup WHERE container_name='eregion-policy-old'`, deploymentID).Scan(&ok); err != nil || !ok {
+		FROM eregion_platform_container_cleanup WHERE container_name='eregion-policy-old'`, f.deploymentID).Scan(&ok); err != nil || !ok {
 		t.Fatalf("cleanup initial row: ok=%v err=%v", ok, err)
 	}
+}
 
+func seedDatabasePolicyVault(t *testing.T, f databasePolicyGitFixture) {
+	t.Helper()
 	ring, err := vault.GenerateKeyRing()
 	if err != nil {
 		t.Fatal(err)
 	}
-	store := newTestEntities(t, pool)
+	store := newTestEntities(t, f.pool)
 	v, err := vault.NewService(store.Secrets(), store.Secrets(), ring, store.Providers())
 	if err != nil {
 		t.Fatal(err)
@@ -396,13 +419,14 @@ func TestIntegrationDatabasePolicyGitDeploymentAndStoredSecretIntegrity(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
-		_, err := v.Store().Set(ctx, tx.Secrets(), ns, []byte("integration-secret-value"), 0, testActor)
+	if err := store.WithinTx(f.ctx, func(tx *entities.StoreTx) error {
+		_, err := v.Store().Set(f.ctx, tx.Secrets(), ns, []byte("integration-secret-value"), 0, testActor)
 		return err
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := pool.QueryRow(ctx, `SELECT s.latest_revision=1 AND s.state='active' AND s.archived_at IS NULL
+	var ok bool
+	if err := f.pool.QueryRow(f.ctx, `SELECT s.latest_revision=1 AND s.state='active' AND s.archived_at IS NULL
 		AND s.created_by_kind=$1 AND s.created_by_subject=$2 AND s.updated_by_kind=$1 AND s.updated_by_subject=$2
 		AND s.created_at IS NOT NULL AND s.updated_at>=s.created_at AND r.revision=1
 		AND r.key_id<>'' AND length(r.ciphertext)>0 AND length(r.ciphertext_sha256)=64
@@ -417,14 +441,14 @@ func TestIntegrationDatabasePolicyGitDeploymentAndStoredSecretIntegrity(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
-		_, err := v.Store().SetProviderCredential(ctx, tx.Providers(), scope, "example.com",
+	if err := store.WithinTx(f.ctx, func(tx *entities.StoreTx) error {
+		_, err := v.Store().SetProviderCredential(f.ctx, tx.Providers(), scope, "example.com",
 			[]byte("integration-provider-value"), 0, testActor)
 		return err
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := pool.QueryRow(ctx, `SELECT p.latest_revision=1 AND p.zone_name='example.com'
+	if err := f.pool.QueryRow(f.ctx, `SELECT p.latest_revision=1 AND p.zone_name='example.com'
 		AND p.created_by_kind=$1 AND p.updated_by_subject=$2 AND p.created_at IS NOT NULL
 		AND p.updated_at>=p.created_at AND r.revision=1 AND r.key_id<>'' AND length(r.ciphertext)>0
 		AND length(r.ciphertext_sha256)=64 AND length(r.revision_hash)=64
@@ -433,32 +457,41 @@ func TestIntegrationDatabasePolicyGitDeploymentAndStoredSecretIntegrity(t *testi
 		WHERE p.provider='cloudflare' AND p.zone_id=$3`, testActor.Kind, testActor.Subject, scope.ZoneID).Scan(&ok); err != nil || !ok {
 		t.Fatalf("provider credential metadata: ok=%v err=%v", ok, err)
 	}
-	audit := newTestEntities(t, pool).Audit()
+}
+
+func assertIntegrationAuditIdentities(t *testing.T, f databasePolicyGitFixture) {
+	t.Helper()
+	var ok bool
+	audit := newTestEntities(t, f.pool).Audit()
 	for _, action := range []string{"policy.first", "policy.second"} {
-		if err := audit.Record(ctx, integrations.AuditEntry{At: time.Now().UTC(), Actor: testActor.Subject,
+		if err := audit.Record(f.ctx, integrations.AuditEntry{At: time.Now().UTC(), Actor: testActor.Subject,
 			Action: action, Target: "deploypolicy/production", Outcome: "succeeded"}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := pool.QueryRow(ctx, `SELECT count(*)=2 AND min(id)=1 AND max(id)=2
+	if err := f.pool.QueryRow(f.ctx, `SELECT count(*)=2 AND min(id)=1 AND max(id)=2
 		AND bool_and(recorded_at IS NOT NULL AND entry->>'outcome'='succeeded')
 		FROM eregion_integration_audit`).Scan(&ok); err != nil || !ok {
 		t.Fatalf("integration audit identities: ok=%v err=%v", ok, err)
 	}
+}
+
+func assertDeploymentSecretSnapshotIntegrity(t *testing.T, f databasePolicyGitFixture) {
+	t.Helper()
 	// A snapshot identity is populated from an actual encrypted vault revision.
-	if _, err := pool.Exec(ctx, `UPDATE eregion_platform_deployments
+	if _, err := f.pool.Exec(f.ctx, `UPDATE eregion_platform_deployments
 		SET secret_revisions=(SELECT jsonb_build_object('API_KEY',jsonb_build_object(
 			'revision',revision,'hash',revision_hash,'key_id',key_id,'created_at',created_at))
 			FROM eregion_secret_revisions WHERE app='deploypolicy' AND environment='production' AND name='API_KEY' AND revision=1)
-		WHERE id=$1`, deploymentID); err != nil {
+		WHERE id=$1`, f.deploymentID); err != nil {
 		t.Fatal(err)
 	}
 	query := platform.InventoryQuery{Collection: "deployments", App: "deploypolicy", Environment: "production", Limit: 10}
-	if _, err := s.Inventory(ctx, testActor, query); err != nil {
+	if _, err := f.service.Inventory(f.ctx, testActor, query); err != nil {
 		t.Fatalf("vault-produced identity rejected: %v", err)
 	}
 	var original []byte
-	if err := pool.QueryRow(ctx, `SELECT secret_revisions FROM eregion_platform_deployments WHERE id=$1`, deploymentID).Scan(&original); err != nil {
+	if err := f.pool.QueryRow(f.ctx, `SELECT secret_revisions FROM eregion_platform_deployments WHERE id=$1`, f.deploymentID).Scan(&original); err != nil {
 		t.Fatal(err)
 	}
 	for _, tc := range []struct{ name, expression string }{
@@ -469,22 +502,33 @@ func TestIntegrationDatabasePolicyGitDeploymentAndStoredSecretIntegrity(t *testi
 		{"null-map", `'null'::jsonb`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := pool.Exec(ctx, `UPDATE eregion_platform_deployments SET secret_revisions=`+tc.expression+` WHERE id=$1`, deploymentID); err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(func() {
-				if _, err := pool.Exec(ctx, `UPDATE eregion_platform_deployments SET secret_revisions=$2 WHERE id=$1`, deploymentID, original); err != nil {
-					t.Errorf("restore snapshot: %v", err)
-				}
-			})
-			_, err := s.Inventory(ctx, testActor, query)
-			if err == nil || contract.Classify(err).Code != contract.Unavailable {
-				t.Fatalf("corrupt snapshot must fail closed: %v", err)
-			}
+			assertCorruptSecretSnapshotFailsClosed(t, f, query, original, tc.expression)
 		})
 	}
-	if _, err := s.Inventory(ctx, testActor, query); err != nil {
+	if _, err := f.service.Inventory(f.ctx, testActor, query); err != nil {
 		t.Fatalf("restored snapshot: %v", err)
+	}
+}
+
+func assertCorruptSecretSnapshotFailsClosed(
+	t *testing.T,
+	f databasePolicyGitFixture,
+	query platform.InventoryQuery,
+	original []byte,
+	expression string,
+) {
+	t.Helper()
+	if _, err := f.pool.Exec(f.ctx, `UPDATE eregion_platform_deployments SET secret_revisions=`+expression+` WHERE id=$1`, f.deploymentID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := f.pool.Exec(f.ctx, `UPDATE eregion_platform_deployments SET secret_revisions=$2 WHERE id=$1`, f.deploymentID, original); err != nil {
+			t.Errorf("restore snapshot: %v", err)
+		}
+	})
+	_, err := f.service.Inventory(f.ctx, testActor, query)
+	if err == nil || contract.Classify(err).Code != contract.Unavailable {
+		t.Fatalf("corrupt snapshot must fail closed: %v", err)
 	}
 }
 
@@ -576,67 +620,83 @@ func TestIntegrationDatabasePolicyHTTPResourceAdmission(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	counts := func() [3]int {
-		t.Helper()
-		var c [3]int
-		if err := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM eregion_operations),
-			(SELECT count(*) FROM river_job), (SELECT count(*) FROM eregion_platform_resources)`).
-			Scan(&c[0], &c[1], &c[2]); err != nil {
-			t.Fatal(err)
-		}
-		return c
-	}
-	for _, tc := range []struct {
-		name, input string
-		valid       bool
-	}{
+	for _, tc := range []httpResourceAdmissionCase{
 		{"invalid-health", `{"image":"redis:7","health":{"type":"invented","command":["true"]}}`, false},
 		{"valid", `{"image":"redis:7","health":{"type":"exec","command":["true"]}}`, true},
 		{"invalid-update", `{"image":"redis:7","health":{"type":"invented","command":["true"]}}`, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			before := counts()
-			snapshot := func() string {
-				t.Helper()
-				var raw string
-				if err := pool.QueryRow(ctx, `SELECT coalesce((SELECT to_jsonb(r)::text
-					FROM eregion_platform_resources r WHERE r.name='cache'),'')`).Scan(&raw); err != nil {
-					t.Fatal(err)
-				}
-				return raw
-			}
-			beforeResource := snapshot()
-			raw, err := client.SubmitAction(ctx, platform.KindResourceApply, target, json.RawMessage(tc.input), "http-"+tc.name, false)
-			if !tc.valid {
-				if err == nil || contract.Classify(err).Code != contract.ValidationFailed {
-					t.Fatalf("HTTP invalid health: %v", err)
-				}
-				if after := counts(); before != after {
-					t.Fatalf("invalid HTTP admission committed: before=%v after=%v", before, after)
-				}
-				if after := snapshot(); beforeResource != after {
-					t.Fatalf("invalid HTTP admission changed existing resource: before=%s after=%s", beforeResource, after)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("authorized HTTP admission: %v", err)
-			}
-			var op contract.Operation
-			if err := json.Unmarshal(raw, &op); err != nil || op.State != contract.Queued {
-				t.Fatalf("HTTP response=%s err=%v", raw, err)
-			}
-			after := counts()
-			if after != [3]int{before[0] + 1, before[1] + 1, before[2] + 1} {
-				t.Fatalf("valid HTTP admission counts before=%v after=%v", before, after)
-			}
-			var ok bool
-			if err := pool.QueryRow(ctx, `SELECT state='pending' AND health_state='unknown' AND volumes='[]'::jsonb
-				AND image_id='' AND error_code='' AND operation_id=$1 FROM eregion_platform_resources WHERE name='cache'`,
-				op.ID).Scan(&ok); err != nil || !ok {
-				t.Fatalf("HTTP resource defaults: ok=%v err=%v", ok, err)
-			}
+			runHTTPResourceAdmissionCase(t, ctx, pool, client, target, tc)
 		})
+	}
+}
+
+type httpResourceAdmissionCase struct {
+	name, input string
+	valid       bool
+}
+
+func databasePolicyCounts(t *testing.T, ctx context.Context, pool *pgxpool.Pool) [3]int {
+	t.Helper()
+	var c [3]int
+	if err := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM eregion_operations),
+		(SELECT count(*) FROM river_job), (SELECT count(*) FROM eregion_platform_resources)`).
+		Scan(&c[0], &c[1], &c[2]); err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+func databasePolicyResourceSnapshot(t *testing.T, ctx context.Context, pool *pgxpool.Pool, name string) string {
+	t.Helper()
+	var raw string
+	if err := pool.QueryRow(ctx, `SELECT coalesce((SELECT to_jsonb(r)::text
+		FROM eregion_platform_resources r WHERE r.name=$1),'')`, name).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+func runHTTPResourceAdmissionCase(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	client *api.Client,
+	target string,
+	tc httpResourceAdmissionCase,
+) {
+	t.Helper()
+	before := databasePolicyCounts(t, ctx, pool)
+	beforeResource := databasePolicyResourceSnapshot(t, ctx, pool, "cache")
+	raw, err := client.SubmitAction(ctx, platform.KindResourceApply, target, json.RawMessage(tc.input), "http-"+tc.name, false)
+	if !tc.valid {
+		if err == nil || contract.Classify(err).Code != contract.ValidationFailed {
+			t.Fatalf("HTTP invalid health: %v", err)
+		}
+		if after := databasePolicyCounts(t, ctx, pool); before != after {
+			t.Fatalf("invalid HTTP admission committed: before=%v after=%v", before, after)
+		}
+		if after := databasePolicyResourceSnapshot(t, ctx, pool, "cache"); beforeResource != after {
+			t.Fatalf("invalid HTTP admission changed existing resource: before=%s after=%s", beforeResource, after)
+		}
+		return
+	}
+	if err != nil {
+		t.Fatalf("authorized HTTP admission: %v", err)
+	}
+	var op contract.Operation
+	if err := json.Unmarshal(raw, &op); err != nil || op.State != contract.Queued {
+		t.Fatalf("HTTP response=%s err=%v", raw, err)
+	}
+	after := databasePolicyCounts(t, ctx, pool)
+	if after != [3]int{before[0] + 1, before[1] + 1, before[2] + 1} {
+		t.Fatalf("valid HTTP admission counts before=%v after=%v", before, after)
+	}
+	var ok bool
+	if err := pool.QueryRow(ctx, `SELECT state='pending' AND health_state='unknown' AND volumes='[]'::jsonb
+		AND image_id='' AND error_code='' AND operation_id=$1 FROM eregion_platform_resources WHERE name='cache'`,
+		op.ID).Scan(&ok); err != nil || !ok {
+		t.Fatalf("HTTP resource defaults: ok=%v err=%v", ok, err)
 	}
 }
 

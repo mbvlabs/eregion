@@ -460,7 +460,7 @@ func webhookPartialFault(appName, environment string, operationID contract.Opera
 }
 
 func runGH(ctx context.Context, stdin []byte, args ...string) ([]byte, error) {
-	command := exec.CommandContext(ctx, "gh", args...) //nolint:gosec // G204: fixed executable; values are constants or validated command inputs.
+	command := exec.CommandContext(ctx, "gh", args...)
 	command.Env = append(os.Environ(),
 		"GH_PROMPT_DISABLED=1",
 		"GH_NO_UPDATE_NOTIFIER=1",

@@ -283,28 +283,100 @@ const (
 func Plan(in Input) []Item {
 	now := in.Now
 	serverPolicy := normalizedPolicy(in.ServerPolicy)
-	inFlightReleases := stringSet(in.InFlight.Releases)
-	inFlightDeployments := stringSet(in.InFlight.Deployments)
-	inFlightContainers := stringSet(in.InFlight.Containers)
-	// A pending or running deployment in the history is an in-flight candidate
-	// even when the caller did not separately repeat it in InFlight. Protecting
-	// its release here keeps both the release and its artifacts out of the plan.
+	inFlightReleases, inFlightDeployments, inFlightContainers := planInFlight(in)
+	environments, environmentByKey := planEnvironments(in.Environments)
+	releases := planReleases(in.Releases)
+	releasesByEnvironment := groupReleases(releases)
+	localImages := indexLocalImages(in.LocalImages)
+
+	items, plannedReleaseIDs, protectedReleaseIDs := planReleaseRows(
+		now,
+		environments,
+		releasesByEnvironment,
+		in.Deployments,
+		inFlightReleases,
+	)
+	artifactMetadata := planArtifactMetadata(releases, serverPolicy, environmentByKey, localImages)
+	protection, protectedImageDigests, retainedReleaseIDs := planRegistryProtection(
+		releases,
+		plannedReleaseIDs,
+		protectedReleaseIDs,
+		environmentByKey,
+		localImages,
+	)
+	registryIndex := indexRegistryArtifacts(in.Registry)
+	skipReasons, skipAll := registrySkipReasons(
+		releases,
+		plannedReleaseIDs,
+		protectedReleaseIDs,
+		environmentByKey,
+		registryIndex,
+		localImages,
+	)
+	if in.RegistryUnsafeReason != "" {
+		skipReasons, skipAll = map[string]string{"*": in.RegistryUnsafeReason}, true
+	}
+	items = append(items, planRegistryArtifacts(
+		registryIndex,
+		protection,
+		artifactMetadata,
+		skipReasons,
+		skipAll,
+		now,
+	)...)
+	items = append(items, planBuildpackCache(serverPolicy, in.Cache)...)
+	items = append(items, planContainers(
+		environmentByKey,
+		in.Containers,
+		inFlightReleases,
+		inFlightDeployments,
+		inFlightContainers,
+	)...)
+	imageItems := planReleaseImages(
+		releases,
+		plannedReleaseIDs,
+		protectedReleaseIDs,
+		in.Containers,
+		in.LocalImages,
+		in.Images,
+	)
+	items = append(items, imageItems...)
+	items = append(items, planDanglingImages(
+		in.Images,
+		protectedImageDigests,
+		retainedReleaseIDs,
+		plannedImageReferences(imageItems),
+		in.Containers,
+	)...)
+	return items
+}
+
+// A pending or running deployment in the history is an in-flight candidate
+// even when the caller did not separately repeat it in InFlight. Protecting
+// its release here keeps both the release and its artifacts out of the plan.
+func planInFlight(in Input) (map[string]bool, map[string]bool, map[string]bool) {
+	releases := stringSet(in.InFlight.Releases)
+	deployments := stringSet(in.InFlight.Deployments)
+	containers := stringSet(in.InFlight.Containers)
 	for _, deployment := range in.Deployments {
 		if deployment.State == "pending" || deployment.State == "running" {
-			inFlightDeployments[deployment.ID] = true
+			deployments[deployment.ID] = true
 		}
-		if !inFlightDeployments[deployment.ID] {
+		if !deployments[deployment.ID] {
 			continue
 		}
 		if deployment.Release != "" {
-			inFlightReleases[deployment.Release] = true
+			releases[deployment.Release] = true
 		}
 		if deployment.PreviousRelease != "" {
-			inFlightReleases[deployment.PreviousRelease] = true
+			releases[deployment.PreviousRelease] = true
 		}
 	}
+	return releases, deployments, containers
+}
 
-	environments := append([]Environment(nil), in.Environments...)
+func planEnvironments(values []Environment) ([]Environment, map[environmentKey]Environment) {
+	environments := append([]Environment(nil), values...)
 	sort.SliceStable(environments, func(i, j int) bool {
 		if environments[i].App != environments[j].App {
 			return environments[i].App < environments[j].App
@@ -318,8 +390,11 @@ func Plan(in Input) []Item {
 			environmentByKey[key] = environment
 		}
 	}
+	return environments, environmentByKey
+}
 
-	releases := append([]Release(nil), in.Releases...)
+func planReleases(values []Release) []Release {
+	releases := append([]Release(nil), values...)
 	sort.SliceStable(releases, func(i, j int) bool {
 		if releases[i].App != releases[j].App {
 			return releases[i].App < releases[j].App
@@ -332,13 +407,25 @@ func Plan(in Input) []Item {
 		}
 		return releases[i].ID < releases[j].ID
 	})
+	return releases
+}
+
+func groupReleases(releases []Release) map[environmentKey][]Release {
 	releasesByEnvironment := map[environmentKey][]Release{}
 	for _, release := range releases {
 		key := environmentKey{app: release.App, environment: release.Environment}
 		releasesByEnvironment[key] = append(releasesByEnvironment[key], release)
 	}
-	localImages := indexLocalImages(in.LocalImages)
+	return releasesByEnvironment
+}
 
+func planReleaseRows(
+	now time.Time,
+	environments []Environment,
+	releasesByEnvironment map[environmentKey][]Release,
+	deployments []Deployment,
+	inFlightReleases map[string]bool,
+) ([]Item, map[string]bool, map[string]bool) {
 	protectedReleaseIDs := map[string]bool{}
 	for releaseID := range inFlightReleases {
 		protectedReleaseIDs[releaseID] = true
@@ -353,85 +440,126 @@ func Plan(in Input) []Item {
 			continue
 		}
 		seenEnvironments[key] = true
+		items = append(items, planEnvironmentReleases(
+			now,
+			environment,
+			releasesByEnvironment[key],
+			deployments,
+			inFlightReleases,
+			plannedReleaseIDs,
+			protectedReleaseIDs,
+		)...)
+	}
+	return items, plannedReleaseIDs, protectedReleaseIDs
+}
 
-		policy := normalizedPolicy(environment.Policy)
-		rollbackTarget := RollbackTarget(
-			environment.App,
-			environment.Name,
-			environment.ServingRelease,
-			in.Deployments,
-		)
-		if environment.ServingRelease != "" {
-			protectedReleaseIDs[environment.ServingRelease] = true
-		}
-		if rollbackTarget != "" {
-			protectedReleaseIDs[rollbackTarget] = true
-		}
-		releaseCutoff := daysBefore(now, policy.KeepNewerThanDays)
+func planEnvironmentReleases(
+	now time.Time,
+	environment Environment,
+	environmentReleases []Release,
+	deployments []Deployment,
+	inFlightReleases map[string]bool,
+	plannedReleaseIDs, protectedReleaseIDs map[string]bool,
+) []Item {
+	policy := normalizedPolicy(environment.Policy)
+	rollbackTarget := RollbackTarget(
+		environment.App,
+		environment.Name,
+		environment.ServingRelease,
+		deployments,
+	)
+	if environment.ServingRelease != "" {
+		protectedReleaseIDs[environment.ServingRelease] = true
+	}
+	if rollbackTarget != "" {
+		protectedReleaseIDs[rollbackTarget] = true
+	}
+	releaseCutoff := daysBefore(now, policy.KeepNewerThanDays)
 
-		environmentReleases := releasesByEnvironment[key]
-		// Find the keep set from newest to oldest; the output below walks the
-		// same slice from oldest to newest for a stable removal order.
-		sort.SliceStable(environmentReleases, func(i, j int) bool {
-			if !environmentReleases[i].CreatedAt.Equal(environmentReleases[j].CreatedAt) {
-				return environmentReleases[i].CreatedAt.After(environmentReleases[j].CreatedAt)
-			}
-			return environmentReleases[i].ID > environmentReleases[j].ID
-		})
-		kept := map[string]bool{}
-		for index, release := range environmentReleases {
-			if index < policy.KeepReleases ||
-				release.CreatedAt.After(releaseCutoff) ||
-				release.ID == environment.ServingRelease ||
-				release.ID == rollbackTarget ||
-				inFlightReleases[release.ID] {
-				kept[release.ID] = true
-			}
+	// Find the keep set from newest to oldest; the output below walks the
+	// same slice from oldest to newest for a stable removal order.
+	sort.SliceStable(environmentReleases, func(i, j int) bool {
+		if !environmentReleases[i].CreatedAt.Equal(environmentReleases[j].CreatedAt) {
+			return environmentReleases[i].CreatedAt.After(environmentReleases[j].CreatedAt)
 		}
-		for index := len(environmentReleases) - 1; index >= 0; index-- {
-			release := environmentReleases[index]
-			if release.PrunedAt != nil || kept[release.ID] || inFlightReleases[release.ID] {
-				continue
-			}
-			plannedReleaseIDs[release.ID] = true
-			items = append(items, Item{
-				Kind:        ItemRelease,
-				App:         release.App,
-				Environment: release.Environment,
-				Reference:   release.ID,
-				Reason: fmt.Sprintf(
-					"outside the newest %d releases and older than the %d-day keep window",
-					policy.KeepReleases,
-					policy.KeepNewerThanDays,
-				),
-			})
+		return environmentReleases[i].ID > environmentReleases[j].ID
+	})
+	kept := map[string]bool{}
+	for index, release := range environmentReleases {
+		if releaseKept(release, index, policy, releaseCutoff, environment.ServingRelease, rollbackTarget, inFlightReleases) {
+			kept[release.ID] = true
 		}
 	}
+	items := []Item{}
+	for index := len(environmentReleases) - 1; index >= 0; index-- {
+		release := environmentReleases[index]
+		if release.PrunedAt != nil || kept[release.ID] || inFlightReleases[release.ID] {
+			continue
+		}
+		plannedReleaseIDs[release.ID] = true
+		items = append(items, Item{
+			Kind:        ItemRelease,
+			App:         release.App,
+			Environment: release.Environment,
+			Reference:   release.ID,
+			Reason: fmt.Sprintf(
+				"outside the newest %d releases and older than the %d-day keep window",
+				policy.KeepReleases,
+				policy.KeepNewerThanDays,
+			),
+		})
+	}
+	return items
+}
 
-	// Artifact ownership and grace come from every release row, including rows
-	// pruned by an earlier run. A pruned release's environment override still
-	// governs artifacts that remain in the registry.
+func releaseKept(
+	release Release,
+	index int,
+	policy Policy,
+	releaseCutoff time.Time,
+	serving, rollbackTarget string,
+	inFlightReleases map[string]bool,
+) bool {
+	return index < policy.KeepReleases ||
+		release.CreatedAt.After(releaseCutoff) ||
+		release.ID == serving ||
+		release.ID == rollbackTarget ||
+		inFlightReleases[release.ID]
+}
+
+// Artifact ownership and grace come from every release row, including rows
+// pruned by an earlier run. A pruned release's environment override still
+// governs artifacts that remain in the registry.
+func planArtifactMetadata(
+	releases []Release,
+	serverPolicy Policy,
+	environments map[environmentKey]Environment,
+	localImages localImageIndex,
+) artifactMetadataIndex {
 	artifactMetadata := newArtifactMetadataIndex(serverPolicy)
 	for _, release := range releases {
 		policy := serverPolicy
-		if environment, known := environmentByKey[environmentKey{app: release.App, environment: release.Environment}]; known {
+		if environment, known := environments[environmentKey{app: release.App, environment: release.Environment}]; known {
 			policy = normalizedPolicy(environment.Policy)
 		}
 		artifactMetadata.recordRelease(release, policy, localImages)
 	}
+	return artifactMetadata
+}
 
-	// A retained release protects every artifact and image it still needs,
-	// including a digest or tag shared with a release that is being pruned.
+// A retained release protects every artifact and image it still needs,
+// including a digest or tag shared with a release that is being pruned.
+func planRegistryProtection(
+	releases []Release,
+	planned, protected map[string]bool,
+	environments map[environmentKey]Environment,
+	localImages localImageIndex,
+) (registryProtection, map[string]bool, map[string]bool) {
 	protection := newRegistryProtection()
 	protectedImageDigests := map[string]bool{}
 	retainedReleaseIDs := map[string]bool{}
 	for _, release := range releases {
-		if !registryReleaseRetained(
-			release,
-			plannedReleaseIDs,
-			protectedReleaseIDs,
-			environmentByKey,
-		) {
+		if !registryReleaseRetained(release, planned, protected, environments) {
 			continue
 		}
 		retainedReleaseIDs[release.ID] = true
@@ -447,64 +575,17 @@ func Plan(in Input) []Item {
 			protectedImageDigests[runtimeID] = true
 		}
 	}
+	return protection, protectedImageDigests, retainedReleaseIDs
+}
 
-	registryIndex := indexRegistryArtifacts(in.Registry)
-	skipReasons, skipAll := registrySkipReasons(
-		releases,
-		plannedReleaseIDs,
-		protectedReleaseIDs,
-		environmentByKey,
-		registryIndex,
-		localImages,
-	)
-	if in.RegistryUnsafeReason != "" {
-		skipReasons, skipAll = map[string]string{"*": in.RegistryUnsafeReason}, true
-	}
-	items = append(
-		items,
-		planRegistryArtifacts(
-			registryIndex,
-			protection,
-			artifactMetadata,
-			skipReasons,
-			skipAll,
-			now,
-		)...)
-	items = append(items, planBuildpackCache(serverPolicy, in.Cache)...)
-	items = append(
-		items,
-		planContainers(
-			environmentByKey,
-			in.Containers,
-			inFlightReleases,
-			inFlightDeployments,
-			inFlightContainers,
-		)...)
-	imageItems := planReleaseImages(
-		releases,
-		plannedReleaseIDs,
-		protectedReleaseIDs,
-		in.Containers,
-		in.LocalImages,
-		in.Images,
-	)
-	plannedImageIDs := map[string]bool{}
-	for _, item := range imageItems {
+func plannedImageReferences(items []Item) map[string]bool {
+	planned := map[string]bool{}
+	for _, item := range items {
 		if item.Kind == ItemImage {
-			plannedImageIDs[item.Reference] = true
+			planned[item.Reference] = true
 		}
 	}
-	items = append(items, imageItems...)
-	items = append(
-		items,
-		planDanglingImages(
-			in.Images,
-			protectedImageDigests,
-			retainedReleaseIDs,
-			plannedImageIDs,
-			in.Containers,
-		)...)
-	return items
+	return planned
 }
 
 // TotalBytes returns the bytes every item reclaims. Negative byte counts are
@@ -651,21 +732,7 @@ func planBuildpackCache(policy Policy, cache CacheInventory) []Item {
 			},
 		}
 	}
-	entries := make([]CacheEntry, 0, len(cache.Entries))
-	var entryBytes int64
-	seen := map[string]bool{}
-	for _, entry := range cache.Entries {
-		path := strings.TrimSpace(entry.Path)
-		if path == "" || seen[path] {
-			continue
-		}
-		seen[path] = true
-		if entry.Bytes < 0 {
-			entry.Bytes = 0
-		}
-		entries = append(entries, entry)
-		entryBytes += entry.Bytes
-	}
+	entries, entryBytes := normalizeCacheEntries(cache.Entries)
 	cacheBytes := cache.Bytes
 	if cacheBytes < entryBytes {
 		cacheBytes = entryBytes
@@ -678,20 +745,7 @@ func planBuildpackCache(policy Policy, cache CacheInventory) []Item {
 		return nil
 	}
 
-	sort.SliceStable(entries, func(i, j int) bool {
-		switch {
-		case entries[i].LastUsedAt.IsZero() && entries[j].LastUsedAt.IsZero():
-		case entries[i].LastUsedAt.IsZero():
-			return false
-		case entries[j].LastUsedAt.IsZero():
-			return true
-		default:
-			if !entries[i].LastUsedAt.Equal(entries[j].LastUsedAt) {
-				return entries[i].LastUsedAt.Before(entries[j].LastUsedAt)
-			}
-		}
-		return entries[i].Path < entries[j].Path
-	})
+	sort.SliceStable(entries, func(i, j int) bool { return cacheEntryLess(entries[i], entries[j]) })
 
 	items := []Item{}
 	for index, entry := range entries {
@@ -713,20 +767,52 @@ func planBuildpackCache(policy Policy, cache CacheInventory) []Item {
 		if usedBytes < 0 {
 			usedBytes = 0
 		}
-		cacheWithinLimit := cacheBytes <= policy.BuildpackCacheMaxBytes
-		diskWithinLimit := cache.DiskTotalBytes <= 0 ||
-			float64(
-				usedBytes,
-			) <= float64(
-				cache.DiskTotalBytes,
-			)*float64(
-				policy.BuildpackCacheMaxPercent,
-			)/100
-		if cacheWithinLimit && (diskWithinLimit || cacheBytes == 0 || index == len(entries)-1) {
+		if cacheRemovalComplete(policy, cache, cacheBytes, usedBytes, index, len(entries)) {
 			break
 		}
 	}
 	return items
+}
+
+func normalizeCacheEntries(values []CacheEntry) ([]CacheEntry, int64) {
+	entries := make([]CacheEntry, 0, len(values))
+	var entryBytes int64
+	seen := map[string]bool{}
+	for _, entry := range values {
+		path := strings.TrimSpace(entry.Path)
+		if path == "" || seen[path] {
+			continue
+		}
+		seen[path] = true
+		if entry.Bytes < 0 {
+			entry.Bytes = 0
+		}
+		entries = append(entries, entry)
+		entryBytes += entry.Bytes
+	}
+	return entries, entryBytes
+}
+
+func cacheEntryLess(left, right CacheEntry) bool {
+	switch {
+	case left.LastUsedAt.IsZero() && right.LastUsedAt.IsZero():
+	case left.LastUsedAt.IsZero():
+		return false
+	case right.LastUsedAt.IsZero():
+		return true
+	default:
+		if !left.LastUsedAt.Equal(right.LastUsedAt) {
+			return left.LastUsedAt.Before(right.LastUsedAt)
+		}
+	}
+	return left.Path < right.Path
+}
+
+func cacheRemovalComplete(policy Policy, cache CacheInventory, cacheBytes, usedBytes int64, index, total int) bool {
+	cacheWithinLimit := cacheBytes <= policy.BuildpackCacheMaxBytes
+	diskWithinLimit := cache.DiskTotalBytes <= 0 ||
+		float64(usedBytes) <= float64(cache.DiskTotalBytes)*float64(policy.BuildpackCacheMaxPercent)/100
+	return cacheWithinLimit && (diskWithinLimit || cacheBytes == 0 || index == total-1)
 }
 
 func planContainers(
@@ -747,48 +833,58 @@ func planContainers(
 
 	items := []Item{}
 	for _, container := range sorted {
-		// Only an eregion-owned container is a removal candidate. Every
-		// container still protects its image through planReleaseImages and
-		// planDanglingImages.
-		if !container.Owned && strings.TrimSpace(container.App) == "" {
-			continue
+		if item, ok := planContainer(container, environmentByKey, inFlightReleases, inFlightDeployments, inFlightContainers); ok {
+			items = append(items, item)
 		}
-		// Resources are environment-owned dependencies managed by the resource
-		// lifecycle. Their containers are never deployment candidates.
-		if container.Kind == "resource" {
-			continue
-		}
-		if inFlightReleases[container.Release] ||
-			inFlightDeployments[container.Deployment] ||
-			inFlightContainers[container.Name] ||
-			inFlightContainers[container.ID] {
-			continue
-		}
-		key := environmentKey{app: container.App, environment: container.Environment}
-		environment, known := environmentByKey[key]
-		if known {
-			if environment.ServingRelease != "" && container.Release == environment.ServingRelease {
-				continue
-			}
-			if environment.ServingDeployment != "" &&
-				container.Deployment == environment.ServingDeployment {
-				continue
-			}
-		}
-		reason := "container is neither a serving release nor an active candidate"
-		if !known {
-			reason = "container labels do not match a known environment"
-		}
-		items = append(items, Item{
-			Kind:        ItemContainer,
-			App:         container.App,
-			Environment: container.Environment,
-			Reference:   containerReference(container),
-			Bytes:       container.Bytes,
-			Reason:      reason,
-		})
 	}
 	return items
+}
+
+func planContainer(
+	container Container,
+	environmentByKey map[environmentKey]Environment,
+	inFlightReleases, inFlightDeployments, inFlightContainers map[string]bool,
+) (Item, bool) {
+	// Only an eregion-owned container is a removal candidate. Every
+	// container still protects its image through planReleaseImages and
+	// planDanglingImages.
+	if !container.Owned && strings.TrimSpace(container.App) == "" {
+		return Item{}, false
+	}
+	// Resources are environment-owned dependencies managed by the resource
+	// lifecycle. Their containers are never deployment candidates.
+	if container.Kind == "resource" {
+		return Item{}, false
+	}
+	if inFlightReleases[container.Release] ||
+		inFlightDeployments[container.Deployment] ||
+		inFlightContainers[container.Name] ||
+		inFlightContainers[container.ID] {
+		return Item{}, false
+	}
+	key := environmentKey{app: container.App, environment: container.Environment}
+	environment, known := environmentByKey[key]
+	if known {
+		if environment.ServingRelease != "" && container.Release == environment.ServingRelease {
+			return Item{}, false
+		}
+		if environment.ServingDeployment != "" &&
+			container.Deployment == environment.ServingDeployment {
+			return Item{}, false
+		}
+	}
+	reason := "container is neither a serving release nor an active candidate"
+	if !known {
+		reason = "container labels do not match a known environment"
+	}
+	return Item{
+		Kind:        ItemContainer,
+		App:         container.App,
+		Environment: container.Environment,
+		Reference:   containerReference(container),
+		Bytes:       container.Bytes,
+		Reason:      reason,
+	}, true
 }
 
 func containerReference(container Container) string {
@@ -854,6 +950,37 @@ func planReleaseImages(
 	dangling []Image,
 ) []Item {
 	localIndex := indexLocalImages(localImages)
+	retainedImages := retainedReleaseImages(releases, planned, protected, localIndex)
+	containerImages := containerImageOwners(containers)
+	imageTags := localImageRepoTags(localImages)
+	presentImages := presentImageIDs(localImages, dangling)
+
+	plannedImages := map[string]bool{}
+	items := []Item{}
+	for _, release := range releases {
+		isPlanned := planned[release.ID]
+		isPruned := release.PrunedAt != nil && !protected[release.ID]
+		if !isPlanned && !isPruned {
+			continue
+		}
+		item, ok := planReleaseImage(
+			release,
+			isPlanned,
+			localIndex,
+			retainedImages,
+			containerImages,
+			presentImages,
+			plannedImages,
+			imageTags,
+		)
+		if ok {
+			items = append(items, item)
+		}
+	}
+	return items
+}
+
+func retainedReleaseImages(releases []Release, planned, protected map[string]bool, localIndex localImageIndex) map[string]string {
 	retainedImages := map[string]string{}
 	for _, release := range releases {
 		if planned[release.ID] {
@@ -869,8 +996,10 @@ func planReleaseImages(
 			}
 		}
 	}
-	containerImages := containerImageOwners(containers)
-	imageTags := localImageRepoTags(localImages)
+	return retainedImages
+}
+
+func presentImageIDs(localImages []LocalImageRef, dangling []Image) map[string]bool {
 	presentImages := map[string]bool{}
 	for _, image := range localImages {
 		if imageID := normalizeDigest(image.ID); imageID != "" {
@@ -882,79 +1011,68 @@ func planReleaseImages(
 			presentImages[imageID] = true
 		}
 	}
+	return presentImages
+}
 
-	plannedImages := map[string]bool{}
-	items := []Item{}
-	for _, release := range releases {
-		isPlanned := planned[release.ID]
-		isPruned := release.PrunedAt != nil && !protected[release.ID]
-		if !isPlanned && !isPruned {
-			continue
+func planReleaseImage(
+	release Release,
+	isPlanned bool,
+	localIndex localImageIndex,
+	retainedImages, containerImages map[string]string,
+	presentImages, plannedImages map[string]bool,
+	imageTags map[string][]string,
+) (Item, bool) {
+	imageIDs, mappingReason := releaseRuntimeImageIDs(release, localIndex)
+	if len(imageIDs) == 0 {
+		if !isPlanned {
+			return Item{}, false
 		}
-		imageIDs, mappingReason := releaseRuntimeImageIDs(release, localIndex)
-		if len(imageIDs) == 0 {
-			if isPlanned {
-				items = append(items, Item{
-					Kind:        ItemImageSkipped,
-					App:         release.App,
-					Environment: release.Environment,
-					Release:     release.ID,
-					Reference:   release.ID,
-					Reason:      mappingReason + "; no image is removed without a proven runtime mapping",
-				})
-			}
-			continue
-		}
-		if len(imageIDs) > 1 {
-			if isPlanned {
-				items = append(items, Item{
-					Kind:        ItemImageSkipped,
-					App:         release.App,
-					Environment: release.Environment,
-					Release:     release.ID,
-					Reference:   release.ID,
-					Reason:      "multiple local images carry the canonical manifest; removal is ambiguous and every plausible runtime image is protected",
-				})
-			}
-			continue
-		}
-		imageID := imageIDs[0]
-		if owner, shared := retainedImages[imageID]; shared {
-			if isPlanned {
-				items = append(items, Item{
-					Kind: ItemImageSkipped, App: release.App, Environment: release.Environment,
-					Release: release.ID, Reference: release.ID,
-					Reason: "image " + imageID + " is still used by retained release " + owner,
-				})
-			}
-			continue
-		}
-		if container, shared := containerImages[imageID]; shared {
-			if isPlanned {
-				items = append(items, Item{
-					Kind: ItemImageSkipped, App: release.App, Environment: release.Environment,
-					Release: release.ID, Reference: release.ID,
-					Reason: "used by container " + container,
-				})
-			}
-			continue
-		}
-		if !isPlanned && !presentImages[imageID] {
-			// The earlier run's image is already gone. The release row stays
-			// pruned; a later run has nothing to remove.
-			continue
-		}
-		if plannedImages[imageID] {
-			continue
-		}
-		plannedImages[imageID] = true
-		items = append(items, Item{
-			Kind: ItemImage, App: release.App, Environment: release.Environment,
-			Release: release.ID, Reference: imageID, Tags: imageTags[imageID],
-			Reason: "release image is not used by a retained release or container",
-		})
+		return releaseImageSkipped(release, mappingReason+"; no image is removed without a proven runtime mapping"), true
 	}
-	return items
+	if len(imageIDs) > 1 {
+		if !isPlanned {
+			return Item{}, false
+		}
+		return releaseImageSkipped(release, "multiple local images carry the canonical manifest; removal is ambiguous and every plausible runtime image is protected"), true
+	}
+	imageID := imageIDs[0]
+	if owner, shared := retainedImages[imageID]; shared {
+		if !isPlanned {
+			return Item{}, false
+		}
+		return releaseImageSkipped(release, "image "+imageID+" is still used by retained release "+owner), true
+	}
+	if container, shared := containerImages[imageID]; shared {
+		if !isPlanned {
+			return Item{}, false
+		}
+		return releaseImageSkipped(release, "used by container "+container), true
+	}
+	if !isPlanned && !presentImages[imageID] {
+		// The earlier run's image is already gone. The release row stays
+		// pruned; a later run has nothing to remove.
+		return Item{}, false
+	}
+	if plannedImages[imageID] {
+		return Item{}, false
+	}
+	plannedImages[imageID] = true
+	return Item{
+		Kind: ItemImage, App: release.App, Environment: release.Environment,
+		Release: release.ID, Reference: imageID, Tags: imageTags[imageID],
+		Reason: "release image is not used by a retained release or container",
+	}, true
+}
+
+func releaseImageSkipped(release Release, reason string) Item {
+	return Item{
+		Kind:        ItemImageSkipped,
+		App:         release.App,
+		Environment: release.Environment,
+		Release:     release.ID,
+		Reference:   release.ID,
+		Reason:      reason,
+	}
 }
 
 // containerImageOwners maps every container's immutable image ID to one stable

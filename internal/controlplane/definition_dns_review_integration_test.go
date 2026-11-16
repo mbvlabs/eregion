@@ -15,101 +15,91 @@ import (
 	"github.com/riverqueue/river"
 )
 
-func definitionPendingDNSChild(t *testing.T) (*pgxpool.Pool, *Service, contract.Operation, contract.OperationID, *definitionDNSProviderFixture) {
+func definitionPendingDNSChild(t *testing.T) (*pgxpool.Pool, *Service, contract.Operation, contract.OperationID) {
 	t.Helper()
-	pool, s, app, provider := definitionDNSFixture(t, false, http.StatusInternalServerError)
+	pool, s, app, _ := definitionDNSFixture(t, false, http.StatusInternalServerError)
 	ctx := context.Background()
 	parent := planAndSubmitDefinitionDNS(t, app, "review-pending")
-	claimed, _, ok, err := s.claimPlatform(ctx, parent, 1)
-	if err != nil || !ok {
-		t.Fatalf("claim=%v err=%v", ok, err)
+	claimed := claimDefinitionParent(ctx, t, s, parent)
+	child := admitDefinitionChild(ctx, t, pool, s, parent, claimed, platform.KindDomainAdd)
+	if err := runPlatformAttempt(ctx, s, child, 1); contract.Classify(err).Code != contract.Unavailable {
+		t.Fatalf("pending write: %v", err)
 	}
-	worker := &platformWorker{service: s}
-	for i := 0; i < 12; i++ {
-		err := worker.runDefinitionApply(ctx, claimed, 1)
-		var snooze *river.JobSnoozeError
-		if err != nil && !errors.As(err, &snooze) {
-			t.Fatal(err)
-		}
-		var id, kind *string
-		if err := pool.QueryRow(ctx, `SELECT (SELECT s.child_operation_id FROM eregion_definition_steps s JOIN eregion_operations c ON c.id=s.child_operation_id WHERE s.parent_operation_id=$1 AND c.state='queued' ORDER BY s.ordinal LIMIT 1), (SELECT s.kind FROM eregion_definition_steps s JOIN eregion_operations c ON c.id=s.child_operation_id WHERE s.parent_operation_id=$1 AND c.state='queued' ORDER BY s.ordinal LIMIT 1)`, parent).Scan(&id, &kind); err != nil {
-			t.Fatal(err)
-		}
-		if id == nil || kind == nil {
-			continue
-		}
-		if *kind == platform.KindDomainAdd {
-			child := contract.OperationID(*id)
-			if err := runPlatformAttempt(ctx, s, child, 1); contract.Classify(err).Code != contract.Unavailable {
-				t.Fatalf("pending write: %v", err)
-			}
-			return pool, s, claimed, child, provider
-		}
-		if err := runPlatformAttempt(ctx, s, contract.OperationID(*id), 1); err != nil {
-			t.Fatal(err)
-		}
-	}
-	t.Fatal("DNS child not admitted")
-	return pool, s, contract.Operation{}, "", nil
+	return pool, s, claimed, child
 }
 
 func TestIntegrationDefinitionDNSMalformedJournalRetainsReservation(t *testing.T) {
 	for _, scenario := range []string{"missing-plans", "missing-plans-result", "missing-link", "missing-cleanup-link"} {
 		t.Run(scenario, func(t *testing.T) {
-			pool, s, parent, child, _ := definitionPendingDNSChild(t)
-			ctx := context.Background()
-			if _, err := pool.Exec(ctx, `UPDATE eregion_definition_steps SET dns_plan=NULL,dns_cleanup=NULL WHERE child_operation_id=$1`, child); err != nil {
-				t.Fatal(err)
-			}
-			if scenario == "missing-plans-result" {
-				if _, err := pool.Exec(ctx, `UPDATE eregion_definition_steps SET dns_progress=jsonb_set(dns_progress,'{0,result}','[]'::jsonb) WHERE child_operation_id=$1`, child); err != nil {
-					t.Fatal(err)
-				}
-			}
-			if err := s.failPlatformOperation(ctx, child, 1, contract.Conflict, "fixture failure"); contract.Classify(err).Code != contract.Conflict {
-				t.Fatalf("generic failure bypassed unresolved journal: %v", err)
-			}
-			if err := s.cancelPlatform(ctx, child, 1, "fixture cancellation"); contract.Classify(err).Code != contract.Conflict {
-				t.Fatalf("generic cancellation bypassed unresolved journal: %v", err)
-			}
-			if _, err := pool.Exec(ctx, `UPDATE eregion_operations SET state='failed',error_code='unavailable' WHERE id=$1`, child); err != nil {
-				t.Fatal(err)
-			}
-			if scenario == "missing-cleanup-link" {
-				if _, err := pool.Exec(ctx, `UPDATE eregion_definition_steps SET dns_progress='[]'::jsonb,dns_cleanup='{"changes":[]}'::jsonb WHERE child_operation_id=$1`, child); err != nil {
-					t.Fatal(err)
-				}
-				if _, err := pool.Exec(ctx, `UPDATE eregion_platform_domain_dns SET state='cleanup_pending' WHERE last_operation_id=$1`, child); err != nil {
-					t.Fatal(err)
-				}
-			}
-			if scenario == "missing-link" || scenario == "missing-cleanup-link" {
-				if _, err := pool.Exec(ctx, `UPDATE eregion_definition_steps SET child_operation_id=NULL WHERE child_operation_id=$1`, child); err != nil {
-					t.Fatal(err)
-				}
-			}
-			err := s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
-				return guardDefinitionChildrenTerminalTx(ctx, tx, parent.ID)
-			})
-			if contract.Classify(err).Code != contract.Conflict {
-				t.Fatalf("parent terminal guard accepted broken journal: %v", err)
-			}
-			if _, err := pool.Exec(ctx, `UPDATE eregion_operations SET state='failed',error_code='unavailable' WHERE id=$1`, parent.ID); err != nil {
-				t.Fatal(err)
-			}
-			if err := s.reconcileTerminalDefinitionRuns(ctx); err != nil {
-				t.Fatal(err)
-			}
-			var reserved bool
-			if err := pool.QueryRow(ctx, `SELECT finished_at IS NULL FROM eregion_definition_runs WHERE operation_id=$1`, parent.ID).Scan(&reserved); err != nil || !reserved {
-				t.Fatalf("terminal-run repair dropped reservation=%v err=%v", reserved, err)
-			}
+			testDefinitionDNSMalformedJournalScenario(t, scenario)
 		})
 	}
 }
 
+func testDefinitionDNSMalformedJournalScenario(t *testing.T, scenario string) {
+	t.Helper()
+	pool, s, parent, child := definitionPendingDNSChild(t)
+	ctx := context.Background()
+	prepareDefinitionDNSMalformedJournal(t, ctx, pool, s, scenario, child)
+	err := s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		return guardDefinitionChildrenTerminalTx(ctx, tx, parent.ID)
+	})
+	if contract.Classify(err).Code != contract.Conflict {
+		t.Fatalf("parent terminal guard accepted broken journal: %v", err)
+	}
+	assertDefinitionDNSMalformedJournalRetained(t, ctx, pool, s, parent.ID)
+}
+
+func prepareDefinitionDNSMalformedJournal(t *testing.T, ctx context.Context, pool *pgxpool.Pool, s *Service, scenario string, child contract.OperationID) {
+	t.Helper()
+	if _, err := pool.Exec(ctx, `UPDATE eregion_definition_steps SET dns_plan=NULL,dns_cleanup=NULL WHERE child_operation_id=$1`, child); err != nil {
+		t.Fatal(err)
+	}
+	if scenario == "missing-plans-result" {
+		if _, err := pool.Exec(ctx, `UPDATE eregion_definition_steps SET dns_progress=jsonb_set(dns_progress,'{0,result}','[]'::jsonb) WHERE child_operation_id=$1`, child); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.failPlatformOperation(ctx, child, 1, contract.Conflict, "fixture failure"); contract.Classify(err).Code != contract.Conflict {
+		t.Fatalf("generic failure bypassed unresolved journal: %v", err)
+	}
+	if err := s.cancelPlatform(ctx, child, 1, "fixture cancellation"); contract.Classify(err).Code != contract.Conflict {
+		t.Fatalf("generic cancellation bypassed unresolved journal: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE eregion_operations SET state='failed',error_code='unavailable' WHERE id=$1`, child); err != nil {
+		t.Fatal(err)
+	}
+	if scenario == "missing-cleanup-link" {
+		if _, err := pool.Exec(ctx, `UPDATE eregion_definition_steps SET dns_progress='[]'::jsonb,dns_cleanup='{"changes":[]}'::jsonb WHERE child_operation_id=$1`, child); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE eregion_platform_domain_dns SET state='cleanup_pending' WHERE last_operation_id=$1`, child); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if scenario == "missing-link" || scenario == "missing-cleanup-link" {
+		if _, err := pool.Exec(ctx, `UPDATE eregion_definition_steps SET child_operation_id=NULL WHERE child_operation_id=$1`, child); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func assertDefinitionDNSMalformedJournalRetained(t *testing.T, ctx context.Context, pool *pgxpool.Pool, s *Service, parent contract.OperationID) {
+	t.Helper()
+	if _, err := pool.Exec(ctx, `UPDATE eregion_operations SET state='failed',error_code='unavailable' WHERE id=$1`, parent); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.reconcileTerminalDefinitionRuns(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var reserved bool
+	if err := pool.QueryRow(ctx, `SELECT finished_at IS NULL FROM eregion_definition_runs WHERE operation_id=$1`, parent).Scan(&reserved); err != nil || !reserved {
+		t.Fatalf("terminal-run repair dropped reservation=%v err=%v", reserved, err)
+	}
+}
+
 func TestIntegrationDefinitionDNSMislinkedTerminalChildRetainsReservation(t *testing.T) {
-	pool, s, parent, child, _ := definitionPendingDNSChild(t)
+	pool, s, parent, child := definitionPendingDNSChild(t)
 	ctx := context.Background()
 	var unrelated contract.OperationID
 	if err := pool.QueryRow(ctx, `SELECT id FROM eregion_operations WHERE kind=$1 AND state='succeeded' ORDER BY id LIMIT 1`, platform.KindNodeRegister).Scan(&unrelated); err != nil {
@@ -141,7 +131,7 @@ func TestIntegrationDefinitionDNSMislinkedTerminalChildRetainsReservation(t *tes
 }
 
 func TestIntegrationDefinitionDNSRepeatedRecoveryClaimsAreBounded(t *testing.T) {
-	pool, s, parent, child, _ := definitionPendingDNSChild(t)
+	pool, s, parent, child := definitionPendingDNSChild(t)
 	ctx := context.Background()
 	if _, err := s.RequestCancel(ctx, definitionIntegrationActor, parent.ID); err != nil {
 		t.Fatal(err)
@@ -212,33 +202,9 @@ func TestIntegrationDefinitionDNSCleanupDefinitive403(t *testing.T) {
 		t.Fatal(err)
 	}
 	parent := planAndSubmitDefinitionDNS(t, app, "reject-cleanup")
-	claimed, _, ok, err := s.claimPlatform(ctx, parent, 1)
-	if err != nil || !ok {
-		t.Fatalf("claim=%v err=%v", ok, err)
-	}
+	claimed := claimDefinitionParent(ctx, t, s, parent)
 	worker := &platformWorker{service: s}
-	var child string
-	for i := 0; i < 12 && child == ""; i++ {
-		err := worker.runDefinitionApply(ctx, claimed, 1)
-		var snooze *river.JobSnoozeError
-		if err != nil && !errors.As(err, &snooze) {
-			t.Fatal(err)
-		}
-		var id, kind *string
-		if err := pool.QueryRow(ctx, `SELECT (SELECT s.child_operation_id FROM eregion_definition_steps s JOIN eregion_operations c ON c.id=s.child_operation_id WHERE s.parent_operation_id=$1 AND c.state='queued' ORDER BY s.ordinal LIMIT 1), (SELECT s.kind FROM eregion_definition_steps s JOIN eregion_operations c ON c.id=s.child_operation_id WHERE s.parent_operation_id=$1 AND c.state='queued' ORDER BY s.ordinal LIMIT 1)`, parent).Scan(&id, &kind); err != nil {
-			t.Fatal(err)
-		}
-		if id != nil && kind != nil {
-			if *kind == platform.KindDomainRemove {
-				child = *id
-			} else if err := runPlatformAttempt(ctx, s, contract.OperationID(*id), 1); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-	if child == "" {
-		t.Fatal("cleanup child not admitted")
-	}
+	child := string(admitDefinitionChild(ctx, t, pool, s, parent, claimed, platform.KindDomainRemove))
 	provider.mu.Lock()
 	provider.status = http.StatusForbidden
 	provider.mu.Unlock()
@@ -253,7 +219,7 @@ func TestIntegrationDefinitionDNSCleanupDefinitive403(t *testing.T) {
 	if _, err := pool.Exec(ctx, `UPDATE eregion_platform_domain_dns SET cleanup_error=$2 WHERE last_operation_id=$1`, child, "definitive cleanup rejection: "+strings.Repeat("0", 64)+" Cloudflare provider: authorization (HTTP 403)"); err != nil {
 		t.Fatal(err)
 	}
-	err = s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+	err := s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
 		return guardDefinitionDNSTerminalTx(ctx, tx, &contract.Operation{ID: contract.OperationID(child), Kind: platform.KindDomainRemove, State: state})
 	})
 	if err == nil {
@@ -294,33 +260,9 @@ func TestIntegrationDefinitionDNSCleanupRecoveredFailureRetainsDiagnostic(t *tes
 		t.Fatal(err)
 	}
 	parent := planAndSubmitDefinitionDNS(t, app, "prior-cleanup")
-	claimed, _, ok, err := s.claimPlatform(ctx, parent, 1)
-	if err != nil || !ok {
-		t.Fatalf("claim=%v err=%v", ok, err)
-	}
+	claimed := claimDefinitionParent(ctx, t, s, parent)
 	worker := &platformWorker{service: s}
-	var child string
-	for i := 0; i < 12 && child == ""; i++ {
-		err := worker.runDefinitionApply(ctx, claimed, 1)
-		var snooze *river.JobSnoozeError
-		if err != nil && !errors.As(err, &snooze) {
-			t.Fatal(err)
-		}
-		var id, kind *string
-		if err := pool.QueryRow(ctx, `SELECT (SELECT s.child_operation_id FROM eregion_definition_steps s JOIN eregion_operations c ON c.id=s.child_operation_id WHERE s.parent_operation_id=$1 AND c.state='queued' ORDER BY s.ordinal LIMIT 1), (SELECT s.kind FROM eregion_definition_steps s JOIN eregion_operations c ON c.id=s.child_operation_id WHERE s.parent_operation_id=$1 AND c.state='queued' ORDER BY s.ordinal LIMIT 1)`, parent).Scan(&id, &kind); err != nil {
-			t.Fatal(err)
-		}
-		if id != nil && kind != nil {
-			if *kind == platform.KindDomainRemove {
-				child = *id
-			} else if err := runPlatformAttempt(ctx, s, contract.OperationID(*id), 1); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-	if child == "" {
-		t.Fatal("cleanup child not admitted")
-	}
+	child := string(admitDefinitionChild(ctx, t, pool, s, parent, claimed, platform.KindDomainRemove))
 	provider.mu.Lock()
 	provider.status = http.StatusInternalServerError
 	provider.mu.Unlock()

@@ -45,6 +45,8 @@ func (p *Plain) Observe(observation Observation) error {
 			}
 		}
 		p.lastObservation = observation.Observation
+	case ObservationSucceeded, ObservationClosed:
+		// These observations do not produce an append-only line.
 	}
 	return nil
 }
@@ -59,6 +61,8 @@ func (p *Plain) clean() Cleaner {
 func (p *Plain) observationLine(observation Observation) string {
 	age := FormatDuration(observation.Age)
 	switch observation.Observation {
+	case Connecting:
+		return ""
 	case Reconnecting:
 		return p.clean()("reconnecting: last known " + stateWord(observation.State) + " " + age + " ago")
 	case Stale:
@@ -126,26 +130,38 @@ func (p *Plain) line(text string) error {
 // resume command; it never claims the operation was cancelled.
 func (p *Plain) Finish(summary Summary, err error, resume string, now time.Time) error {
 	if summary.Detached || errors.Is(err, context.Canceled) {
-		line := "detached from " + string(summary.OperationID) + " after " + fmt.Sprintf("%d", summary.Events) + " events"
-		if summary.State != "" {
-			line += " · last known " + stateWord(summary.State)
-		}
-		if resume != "" {
-			line += "\nresume: " + resume
-		}
-		return p.line(p.clean()(line))
+		return p.finishDetached(summary, resume)
 	}
 	if err != nil {
-		message := p.clean()(err.Error())
-		if summary.OperationID != "" {
-			message += "\noperation: " + string(summary.OperationID)
-		}
-		if resume != "" {
-			message += "\nresume: " + resume
-		}
-		_, _ = io.WriteString(p.Err, "error: "+message+"\n")
-		return nil
+		return p.finishError(summary, err, resume)
 	}
+	return p.finishSuccess(summary, now)
+}
+
+func (p *Plain) finishDetached(summary Summary, resume string) error {
+	line := "detached from " + string(summary.OperationID) + " after " + fmt.Sprintf("%d", summary.Events) + " events"
+	if summary.State != "" {
+		line += " · last known " + stateWord(summary.State)
+	}
+	if resume != "" {
+		line += "\nresume: " + resume
+	}
+	return p.line(p.clean()(line))
+}
+
+func (p *Plain) finishError(summary Summary, err error, resume string) error {
+	message := p.clean()(err.Error())
+	if summary.OperationID != "" {
+		message += "\noperation: " + string(summary.OperationID)
+	}
+	if resume != "" {
+		message += "\nresume: " + resume
+	}
+	_, _ = io.WriteString(p.Err, "error: "+message+"\n")
+	return nil
+}
+
+func (p *Plain) finishSuccess(summary Summary, now time.Time) error {
 	elapsed := ""
 	if duration, ok := summaryElapsed(summary, now); ok {
 		elapsed = " · elapsed " + FormatDuration(duration)
@@ -167,29 +183,36 @@ func (p *Plain) Finish(summary Summary, err error, resume string, now time.Time)
 			line += " · " + summary.Cleanup.Detail
 		}
 	}
-	if result := summary.Operation.LatestResult; result != nil {
-		if result.Stage != "" {
-			line += "\nstage: " + result.Stage
-		}
-		if result.Message != "" {
-			line += "\nresult: " + result.Message
-		}
-		excerpt, availability, omitted := result.Excerpt, result.Evidence, result.ExcerptOmitted
-		if evidence := summary.Operation.Evidence; evidence != nil {
-			excerpt, availability, omitted = evidence.Excerpt, evidence.Availability, evidence.ExcerptOmitted
-		}
-		if excerpt != "" {
-			line += "\nexcerpt: " + excerpt
-		} else if omitted != "" {
-			line += "\nexcerpt omitted: " + omitted
-		}
-		line += "\nevidence: " + availability
-		line += "\nhistory: " + string(result.History.OperationID) + " after " + fmt.Sprintf("%d", result.History.After)
-	}
+	line = appendResultLines(line, summary)
 	if summary.Operation.EvidenceReadError != "" {
 		line += "\nevidence read: " + summary.Operation.EvidenceReadError
 	}
 	return p.line(p.clean()(line))
+}
+
+func appendResultLines(line string, summary Summary) string {
+	result := summary.Operation.LatestResult
+	if result == nil {
+		return line
+	}
+	if result.Stage != "" {
+		line += "\nstage: " + result.Stage
+	}
+	if result.Message != "" {
+		line += "\nresult: " + result.Message
+	}
+	excerpt, availability, omitted := result.Excerpt, result.Evidence, result.ExcerptOmitted
+	if evidence := summary.Operation.Evidence; evidence != nil {
+		excerpt, availability, omitted = evidence.Excerpt, evidence.Availability, evidence.ExcerptOmitted
+	}
+	if excerpt != "" {
+		line += "\nexcerpt: " + excerpt
+	} else if omitted != "" {
+		line += "\nexcerpt omitted: " + omitted
+	}
+	line += "\nevidence: " + availability
+	line += "\nhistory: " + string(result.History.OperationID) + " after " + fmt.Sprintf("%d", result.History.After)
+	return line
 }
 
 func summaryElapsed(summary Summary, now time.Time) (time.Duration, bool) {

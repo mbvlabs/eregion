@@ -91,12 +91,7 @@ func (s *Server) dispatch(r *http.Request) (any, int, error) {
 	// Only this route gets the tighter 4s child budget; an earlier parent
 	// deadline is inherited rather than extended.
 	if r.Method == http.MethodGet && r.URL.Path == "/readyz" {
-		readyCtx, readyCancel := context.WithTimeout(r.Context(), readinessTimeout)
-		defer readyCancel()
-		if err := s.ready(readyCtx); err != nil {
-			return nil, 0, contract.NewFault(contract.Unavailable, "control plane is not ready", "Check database connectivity, migration versions, and binary compatibility.")
-		}
-		return map[string]bool{"ready": true}, http.StatusOK, nil
+		return s.readiness(r)
 	}
 	scope := "operations:read"
 	if r.Method == http.MethodPost {
@@ -112,106 +107,149 @@ func (s *Server) dispatch(r *http.Request) (any, int, error) {
 	if err != nil {
 		return nil, 0, err
 	}
-	if r.Method == http.MethodPost && r.URL.Path == "/v1/operations" {
-		if !strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
-			return nil, 0, contract.NewFault(contract.ValidationFailed, "JSON content type required", "Use Content-Type: application/json.")
-		}
-		raw, err := io.ReadAll(io.LimitReader(r.Body, maxPlatformRequestBytes+1))
-		if err != nil || len(raw) > maxPlatformRequestBytes {
-			return nil, 0, contract.NewFault(contract.ValidationFailed, "request body is unreadable or too large", "Limit JSON requests to 64 KiB of action input plus envelope overhead.")
-		}
-		var request testRequest
-		decoder := json.NewDecoder(strings.NewReader(string(raw)))
-		decoder.DisallowUnknownFields()
-		if err := decoder.Decode(&request); err != nil || decoder.Decode(new(any)) != io.EOF {
-			return nil, 0, contract.NewFault(contract.ValidationFailed, "invalid operation request", "Provide kind, target, input, and optional dry_run; identity comes from authentication.")
-		}
-		if strings.HasPrefix(request.Kind, "platform.") {
-			return s.submitPlatformAction(r, raw)
-		}
-		if request.Kind != operations.TestKind || request.Target != operations.TestTarget {
-			return nil, 0, contract.NewFault(contract.ValidationFailed, "unsupported operation kind or target", "Use diagnostic.test on control-plane.")
-		}
-		if len(r.Header.Values("Idempotency-Key")) > 1 {
-			return nil, 0, contract.NewFault(contract.InputRequired, "exactly one Idempotency-Key header is required", "Reuse one stable key for retries of this submission.")
-		}
-		key := r.Header.Get("Idempotency-Key")
-		data, err := NewAppService(s.service, nil, s.ready).SubmitDiagnostic(r.Context(), actor, request.Input, key, request.DryRun)
-		status := http.StatusAccepted
-		if request.DryRun {
-			status = http.StatusOK
-		}
-		return data, status, err
-	}
-	if r.Method == http.MethodGet && r.URL.Path == "/v1/platform" {
+	switch {
+	case r.Method == http.MethodPost && r.URL.Path == "/v1/operations":
+		return s.dispatchOperationSubmit(r, actor)
+	case r.Method == http.MethodGet && r.URL.Path == "/v1/platform":
 		return s.platformInventory(r)
+	default:
+		parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/"), "/")
+		if len(parts) >= 3 && parts[0] == "v1" && parts[1] == "operations" {
+			return s.dispatchOperationRoute(r, actor, parts)
+		}
+		return nil, 0, apiNotFound()
 	}
-	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/"), "/")
-	if len(parts) >= 3 && parts[0] == "v1" && parts[1] == "operations" {
-		id := contract.OperationID(parts[2])
-		if err := id.Validate(); err != nil {
-			return nil, 0, err
+}
+
+func (s *Server) readiness(r *http.Request) (any, int, error) {
+	readyCtx, readyCancel := context.WithTimeout(r.Context(), readinessTimeout)
+	defer readyCancel()
+	if err := s.ready(readyCtx); err != nil {
+		return nil, 0, contract.NewFault(contract.Unavailable, "control plane is not ready", "Check database connectivity, migration versions, and binary compatibility.")
+	}
+	return map[string]bool{"ready": true}, http.StatusOK, nil
+}
+
+func (s *Server) dispatchOperationSubmit(r *http.Request, actor contract.Actor) (any, int, error) {
+	if !strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+		return nil, 0, contract.NewFault(contract.ValidationFailed, "JSON content type required", "Use Content-Type: application/json.")
+	}
+	raw, err := io.ReadAll(io.LimitReader(r.Body, maxPlatformRequestBytes+1))
+	if err != nil || len(raw) > maxPlatformRequestBytes {
+		return nil, 0, contract.NewFault(contract.ValidationFailed, "request body is unreadable or too large", "Limit JSON requests to 64 KiB of action input plus envelope overhead.")
+	}
+	var request testRequest
+	decoder := json.NewDecoder(strings.NewReader(string(raw)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil || decoder.Decode(new(any)) != io.EOF {
+		return nil, 0, contract.NewFault(contract.ValidationFailed, "invalid operation request", "Provide kind, target, input, and optional dry_run; identity comes from authentication.")
+	}
+	if strings.HasPrefix(request.Kind, "platform.") {
+		return s.submitPlatformAction(r, raw)
+	}
+	if request.Kind != operations.TestKind || request.Target != operations.TestTarget {
+		return nil, 0, contract.NewFault(contract.ValidationFailed, "unsupported operation kind or target", "Use diagnostic.test on control-plane.")
+	}
+	if len(r.Header.Values("Idempotency-Key")) > 1 {
+		return nil, 0, contract.NewFault(contract.InputRequired, "exactly one Idempotency-Key header is required", "Reuse one stable key for retries of this submission.")
+	}
+	key := r.Header.Get("Idempotency-Key")
+	data, err := NewAppService(s.service, nil, s.ready).SubmitDiagnostic(r.Context(), actor, request.Input, key, request.DryRun)
+	status := http.StatusAccepted
+	if request.DryRun {
+		status = http.StatusOK
+	}
+	return data, status, err
+}
+
+func (s *Server) dispatchOperationRoute(r *http.Request, actor contract.Actor, parts []string) (any, int, error) {
+	id := contract.OperationID(parts[2])
+	if err := id.Validate(); err != nil {
+		return nil, 0, err
+	}
+	app := NewAppService(s.service, nil, s.ready)
+	switch {
+	case r.Method == http.MethodGet && len(parts) == 3:
+		return s.getOperation(r, app, actor, id)
+	case r.Method == http.MethodGet && len(parts) == 4 && parts[3] == "events":
+		return s.getOperationEvents(r, app, actor, id)
+	case r.Method == http.MethodPost && len(parts) == 4 && parts[3] == "cancel":
+		return s.cancelOperation(r, app, actor, id)
+	default:
+		return nil, 0, apiNotFound()
+	}
+}
+
+func (s *Server) getOperation(r *http.Request, app AppService, actor contract.Actor, id contract.OperationID) (any, int, error) {
+	op, err := app.GetOperation(r.Context(), actor, id)
+	if err != nil {
+		return op, http.StatusOK, err
+	}
+	if err := s.authorizeExistingOperation(r, op); err != nil {
+		return nil, 0, err
+	}
+	return op, http.StatusOK, nil
+}
+
+func (s *Server) getOperationEvents(r *http.Request, app AppService, actor contract.Actor, id contract.OperationID) (any, int, error) {
+	existing, err := app.GetOperation(r.Context(), actor, id)
+	if err != nil {
+		return nil, 0, err
+	}
+	if err := s.authorizeExistingOperation(r, existing); err != nil {
+		return nil, 0, err
+	}
+	after, limit, err := parseEventQuery(r)
+	if err != nil {
+		return nil, 0, err
+	}
+	page, err := app.OperationEvents(r.Context(), actor, contract.Cursor{OperationID: id, After: after}, limit)
+	return page, http.StatusOK, err
+}
+
+func (s *Server) cancelOperation(r *http.Request, app AppService, actor contract.Actor, id contract.OperationID) (any, int, error) {
+	existing, err := app.GetOperation(r.Context(), actor, id)
+	if err != nil {
+		return nil, 0, err
+	}
+	if err := s.authorizeExistingOperation(r, existing); err != nil {
+		return nil, 0, err
+	}
+	op, err := s.service.RequestCancel(r.Context(), actor, id)
+	return op, http.StatusAccepted, err
+}
+
+func parseEventQuery(r *http.Request) (uint64, int, error) {
+	after := uint64(0)
+	limit := 100
+	query, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		return 0, 0, contract.NewFault(contract.ValidationFailed, "invalid event query encoding", "Use decimal after and limit parameters.")
+	}
+	for name, values := range query {
+		if (name != "after" && name != "limit") || len(values) != 1 {
+			return 0, 0, contract.NewFault(contract.ValidationFailed, "invalid event query", "Use one after cursor and one limit parameter.")
 		}
-		app := NewAppService(s.service, nil, s.ready)
-		if r.Method == http.MethodGet && len(parts) == 3 {
-			op, err := app.GetOperation(r.Context(), actor, id)
-			if err != nil {
-				return op, http.StatusOK, err
+		if name == "after" {
+			after, err = strconv.ParseUint(values[0], 10, 64)
+			if err == nil && strconv.FormatUint(after, 10) != values[0] {
+				err = strconv.ErrSyntax
 			}
-			if err := s.authorizeExistingOperation(r, op); err != nil {
-				return nil, 0, err
-			}
-			return op, http.StatusOK, nil
+		} else {
+			limit, err = strconv.Atoi(values[0])
 		}
-		if r.Method == http.MethodGet && len(parts) == 4 && parts[3] == "events" {
-			existing, err := app.GetOperation(r.Context(), actor, id)
-			if err != nil {
-				return nil, 0, err
-			}
-			if err := s.authorizeExistingOperation(r, existing); err != nil {
-				return nil, 0, err
-			}
-			after := uint64(0)
-			limit := 100
-			query, queryErr := url.ParseQuery(r.URL.RawQuery)
-			if queryErr != nil {
-				return nil, 0, contract.NewFault(contract.ValidationFailed, "invalid event query encoding", "Use decimal after and limit parameters.")
-			}
-			for name, values := range query {
-				if (name != "after" && name != "limit") || len(values) != 1 {
-					return nil, 0, contract.NewFault(contract.ValidationFailed, "invalid event query", "Use one after cursor and one limit parameter.")
-				}
-				if name == "after" {
-					after, err = strconv.ParseUint(values[0], 10, 64)
-					if err == nil && strconv.FormatUint(after, 10) != values[0] {
-						err = strconv.ErrSyntax
-					}
-				} else {
-					limit, err = strconv.Atoi(values[0])
-				}
-				if err != nil {
-					return nil, 0, contract.NewFault(contract.ValidationFailed, "invalid event cursor or limit", "Use an unsigned decimal after cursor and limit 1–200.")
-				}
-			}
-			if limit < 1 || limit > 200 {
-				return nil, 0, contract.NewFault(contract.ValidationFailed, "event limit out of range", "Use an event limit from 1 to 200.")
-			}
-			page, err := app.OperationEvents(r.Context(), actor, contract.Cursor{OperationID: id, After: after}, limit)
-			return page, http.StatusOK, err
-		}
-		if r.Method == http.MethodPost && len(parts) == 4 && parts[3] == "cancel" {
-			existing, err := app.GetOperation(r.Context(), actor, id)
-			if err != nil {
-				return nil, 0, err
-			}
-			if err := s.authorizeExistingOperation(r, existing); err != nil {
-				return nil, 0, err
-			}
-			op, err := s.service.RequestCancel(r.Context(), actor, id)
-			return op, http.StatusAccepted, err
+		if err != nil {
+			return 0, 0, contract.NewFault(contract.ValidationFailed, "invalid event cursor or limit", "Use an unsigned decimal after cursor and limit 1–200.")
 		}
 	}
-	return nil, 0, contract.NewFault(contract.NotFound, "API endpoint not found", "Use a documented method and /v1 endpoint.")
+	if limit < 1 || limit > 200 {
+		return 0, 0, contract.NewFault(contract.ValidationFailed, "event limit out of range", "Use an event limit from 1 to 200.")
+	}
+	return after, limit, nil
+}
+
+func apiNotFound() *contract.FaultError {
+	return contract.NewFault(contract.NotFound, "API endpoint not found", "Use a documented method and /v1 endpoint.")
 }
 
 func httpStatus(code contract.Code) int {
@@ -230,6 +268,8 @@ func httpStatus(code contract.Code) int {
 		return http.StatusPreconditionFailed
 	case contract.Unavailable, contract.Cancelled:
 		return http.StatusServiceUnavailable
+	case contract.MissingTool, contract.DoctorFailed, contract.NodeVersionMismatch, contract.RemoteUnreachable, contract.Internal:
+		return http.StatusInternalServerError
 	default:
 		return http.StatusInternalServerError
 	}

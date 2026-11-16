@@ -74,72 +74,85 @@ func (d *Dispatcher) Call(ctx context.Context, request Request, onEvent func(Eve
 			onEvent(Event{Kind: event.Kind, Step: event.Step, ExecutionID: request.Execution.ExecutionID(), Message: registry.RedactPreservingLength(event.Message)})
 		}
 	}
-	switch request.Method {
-	case MethodStatus:
+	if request.Method == MethodStatus {
 		status, err := requestEngine.Status(ctx, request.Execution)
 		if err != nil {
 			return Response{}, err
 		}
 		return ResponseFromStatus(status), nil
-	case MethodRun:
-		if d.hooks.BeforeRun != nil {
-			if err := d.hooks.BeforeRun(ctx, request.Execution); err != nil {
-				return Response{Status: engine.StatusFailed, ExecutionID: request.Execution.ExecutionID(), Retryable: true, Detail: registry.Redact(err.Error())}, nil
-			}
+	}
+	if request.Method == MethodRun {
+		return d.run(ctx, requestEngine, request, registry, report)
+	}
+	return Response{}, fmt.Errorf("unknown node method %q", request.Method)
+}
+
+// run executes one run request against the request-scoped engine.
+func (d *Dispatcher) run(ctx context.Context, requestEngine engine.Engine, request Request, registry *secrets.Registry, report engine.Reporter) (Response, error) {
+	if d.hooks.BeforeRun != nil {
+		if err := d.hooks.BeforeRun(ctx, request.Execution); err != nil {
+			return Response{Status: engine.StatusFailed, ExecutionID: request.Execution.ExecutionID(), Retryable: true, Detail: registry.Redact(err.Error())}, nil
 		}
-		step, err := d.steps.Build(request.Execution, request.Payload)
-		if err != nil {
-			return Response{Status: engine.StatusFailed, ExecutionID: request.Execution.ExecutionID(), ErrorCode: string(contract.PreconditionFailed), Detail: registry.Redact(err.Error())}, nil
-		}
-		status, err := requestEngine.Run(ctx, step, request.Execution, report)
-		if err != nil {
-			if errors.Is(err, engine.ErrLockHeld) {
-				// The observed task identity is the journal's owner, never the
-				// request attempt that merely asked to join it. A deferral is a
-				// separate nonterminal observation from a live running task.
-				statusName := status.Status
-				if statusName == "" {
-					statusName = engine.StatusRunning
-				}
-				return Response{
-					Status:         statusName,
-					ExecutionID:    status.ExecutionID,
-					Attempt:        status.Attempt,
-					AppliedAttempt: status.AppliedAttempt,
-					InputsHash:     status.InputsHash,
-					Phase:          status.Phase,
-					PhaseStartedAt: status.PhaseStartedAt,
-					WaitMS:         maxWaitMS(status.WaitMS),
-					Retryable:      true,
-					Detail:         registry.Redact(status.Detail),
-				}, nil
-			}
-			executionID, attempt := status.ExecutionID, status.Attempt
-			if executionID == "" {
-				executionID = request.Execution.ExecutionID()
-			}
-			if attempt == 0 {
-				attempt = request.Execution.Attempt
-			}
-			return Response{
-				Status:         engine.StatusFailed,
-				ExecutionID:    executionID,
-				Attempt:        attempt,
-				AppliedAttempt: status.AppliedAttempt,
-				InputsHash:     status.InputsHash,
-				Phase:          status.Phase,
-				PhaseStartedAt: status.PhaseStartedAt,
-				WaitMS:         maxWaitMS(status.WaitMS),
-				Retryable:      !permanent(err),
-				InputsMismatch: errors.Is(err, engine.ErrInputsMismatch),
-				ErrorCode:      string(errorCode(err)),
-				Detail:         registry.Redact(err.Error()),
-				Result:         status.Result,
-			}, nil
-		}
-		return ResponseFromStatus(status), nil
-	default:
-		return Response{}, fmt.Errorf("unknown node method %q", request.Method)
+	}
+	step, err := d.steps.Build(request.Execution, request.Payload)
+	if err != nil {
+		return Response{Status: engine.StatusFailed, ExecutionID: request.Execution.ExecutionID(), ErrorCode: string(contract.PreconditionFailed), Detail: registry.Redact(err.Error())}, nil
+	}
+	status, err := requestEngine.Run(ctx, step, request.Execution, report)
+	if err != nil {
+		return runFailureResponse(request, status, err, registry), nil
+	}
+	return ResponseFromStatus(status), nil
+}
+
+// runFailureResponse maps an engine run error to a domain response. A lock
+// contention is a live or deferred observation, never a failed task.
+func runFailureResponse(request Request, status engine.TaskStatus, err error, registry *secrets.Registry) Response {
+	if errors.Is(err, engine.ErrLockHeld) {
+		return lockHeldResponse(status, registry)
+	}
+	executionID, attempt := status.ExecutionID, status.Attempt
+	if executionID == "" {
+		executionID = request.Execution.ExecutionID()
+	}
+	if attempt == 0 {
+		attempt = request.Execution.Attempt
+	}
+	return Response{
+		Status:         engine.StatusFailed,
+		ExecutionID:    executionID,
+		Attempt:        attempt,
+		AppliedAttempt: status.AppliedAttempt,
+		InputsHash:     status.InputsHash,
+		Phase:          status.Phase,
+		PhaseStartedAt: status.PhaseStartedAt,
+		WaitMS:         maxWaitMS(status.WaitMS),
+		Retryable:      !permanent(err),
+		InputsMismatch: errors.Is(err, engine.ErrInputsMismatch),
+		ErrorCode:      string(errorCode(err)),
+		Detail:         registry.Redact(err.Error()),
+		Result:         status.Result,
+	}
+}
+
+// lockHeldResponse reports the observed owner rather than the request attempt
+// that merely asked to join it.
+func lockHeldResponse(status engine.TaskStatus, registry *secrets.Registry) Response {
+	statusName := status.Status
+	if statusName == "" {
+		statusName = engine.StatusRunning
+	}
+	return Response{
+		Status:         statusName,
+		ExecutionID:    status.ExecutionID,
+		Attempt:        status.Attempt,
+		AppliedAttempt: status.AppliedAttempt,
+		InputsHash:     status.InputsHash,
+		Phase:          status.Phase,
+		PhaseStartedAt: status.PhaseStartedAt,
+		WaitMS:         maxWaitMS(status.WaitMS),
+		Retryable:      true,
+		Detail:         registry.Redact(status.Detail),
 	}
 }
 

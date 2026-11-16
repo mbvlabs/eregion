@@ -139,7 +139,7 @@ func readAuthFileWith(path string, beforeStat func()) (map[[32]byte]Principal, a
 		// repaired file.
 		return nil, authFileStamp{}, contract.NewFault(contract.ValidationFailed, "could not open API credential file", "Set EREGION_AUTH_FILE to a private regular JSON file.")
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	stat, err := file.Stat()
 	if err != nil || !stat.Mode().IsRegular() || stat.Mode().Perm()&0077 != 0 {
 		return nil, stampFor(stat), contract.NewFault(contract.ValidationFailed, "API credential file permissions are unsafe", "Use a regular file readable only by its owner (0600 or 0400).")
@@ -188,48 +188,60 @@ func indexPrincipals(principals []Principal) (map[[32]byte]Principal, error) {
 	}
 	index := make(map[[32]byte]Principal, len(principals))
 	for _, principal := range principals {
-		if err := principal.Actor.Validate(); err != nil {
+		key, err := principalKey(principal)
+		if err != nil {
 			return nil, err
 		}
-		digest, err := hex.DecodeString(principal.TokenSHA256)
-		if err != nil || len(digest) != sha256.Size || principal.TokenSHA256 != strings.ToLower(principal.TokenSHA256) || len(principal.Scopes) == 0 {
-			return nil, contract.NewFault(contract.ValidationFailed, "invalid API credential hash or scopes", "Use a lowercase SHA-256 hash of a random token and explicit supported scopes.")
-		}
-		var key [32]byte
-		copy(key[:], digest)
 		if _, exists := index[key]; exists {
 			return nil, contract.NewFault(contract.ValidationFailed, "duplicate API credential hash", "Each token must resolve to exactly one principal.")
 		}
-		if principal.Name != "" && !tokenNamePattern.MatchString(principal.Name) {
-			return nil, contract.NewFault(contract.ValidationFailed, "invalid API credential name", "Use 2–64 lowercase letters, digits, dots, underscores, or hyphens.")
-		}
-		if principal.TokenPrefix != "" && len(principal.TokenPrefix) > 16 {
-			return nil, contract.NewFault(contract.ValidationFailed, "invalid API credential prefix", "Store at most the first 16 characters for listing.")
-		}
-		if principal.CreatedAt != nil && principal.CreatedAt.IsZero() {
-			return nil, contract.NewFault(contract.ValidationFailed, "invalid API credential creation time", "Omit created_at or use an RFC 3339 time.")
-		}
-		if principal.ExpiresAt != nil {
-			if principal.ExpiresAt.IsZero() {
-				return nil, contract.NewFault(contract.ValidationFailed, "invalid API credential expiry", "Omit expires_at or use an RFC 3339 time.")
-			}
-			if principal.CreatedAt != nil && !principal.ExpiresAt.After(*principal.CreatedAt) {
-				return nil, contract.NewFault(contract.ValidationFailed, "invalid API credential expiry", "Expiry must be after creation.")
-			}
-		}
-		for _, scope := range principal.Scopes {
-			if !slices.Contains(knownScopes, scope) {
-				return nil, contract.NewFault(contract.ValidationFailed, "unknown API scope", "Use operations:submit, operations:read, operations:cancel, or system:read.")
-			}
-		}
-		principal.Scopes = slices.Clone(principal.Scopes)
-		if err := validateGrants(principal.ActionGrants); err != nil {
+		if err := validatePrincipal(principal); err != nil {
 			return nil, err
 		}
+		principal.Scopes = slices.Clone(principal.Scopes)
 		principal.ActionGrants = slices.Clone(principal.ActionGrants)
 		index[key] = principal
 	}
 	return index, nil
+}
+
+func principalKey(principal Principal) ([32]byte, error) {
+	if err := principal.Actor.Validate(); err != nil {
+		return [32]byte{}, err
+	}
+	digest, err := hex.DecodeString(principal.TokenSHA256)
+	if err != nil || len(digest) != sha256.Size || principal.TokenSHA256 != strings.ToLower(principal.TokenSHA256) || len(principal.Scopes) == 0 {
+		return [32]byte{}, contract.NewFault(contract.ValidationFailed, "invalid API credential hash or scopes", "Use a lowercase SHA-256 hash of a random token and explicit supported scopes.")
+	}
+	var key [32]byte
+	copy(key[:], digest)
+	return key, nil
+}
+
+func validatePrincipal(principal Principal) error {
+	if principal.Name != "" && !tokenNamePattern.MatchString(principal.Name) {
+		return contract.NewFault(contract.ValidationFailed, "invalid API credential name", "Use 2–64 lowercase letters, digits, dots, underscores, or hyphens.")
+	}
+	if principal.TokenPrefix != "" && len(principal.TokenPrefix) > 16 {
+		return contract.NewFault(contract.ValidationFailed, "invalid API credential prefix", "Store at most the first 16 characters for listing.")
+	}
+	if principal.CreatedAt != nil && principal.CreatedAt.IsZero() {
+		return contract.NewFault(contract.ValidationFailed, "invalid API credential creation time", "Omit created_at or use an RFC 3339 time.")
+	}
+	if principal.ExpiresAt != nil {
+		if principal.ExpiresAt.IsZero() {
+			return contract.NewFault(contract.ValidationFailed, "invalid API credential expiry", "Omit expires_at or use an RFC 3339 time.")
+		}
+		if principal.CreatedAt != nil && !principal.ExpiresAt.After(*principal.CreatedAt) {
+			return contract.NewFault(contract.ValidationFailed, "invalid API credential expiry", "Expiry must be after creation.")
+		}
+	}
+	for _, scope := range principal.Scopes {
+		if !slices.Contains(knownScopes, scope) {
+			return contract.NewFault(contract.ValidationFailed, "unknown API scope", "Use operations:submit, operations:read, operations:cancel, or system:read.")
+		}
+	}
+	return validateGrants(principal.ActionGrants)
 }
 
 // currentSnapshot returns the snapshot for this request, reloading it first

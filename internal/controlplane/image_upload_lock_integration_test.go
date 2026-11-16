@@ -125,7 +125,7 @@ func TestIntegrationImageUploadLeaseRefusesStaleDeleteRecreateBeforePayload(t *t
 		if _, err := fixture.pool.Exec(ctx, `DELETE FROM eregion_platform_apps WHERE name='live'`); err != nil {
 			return err
 		}
-		return insertFixtureApp(ctx, fixture.pool, string(recreated), "live", "live")
+		return insertFixtureApp(ctx, fixture.pool, recreated, "live", "live")
 	})
 	if lease != nil {
 		lease.Release()
@@ -194,13 +194,24 @@ func TestIntegrationCrossHostUploadIdentityCannotAuthorizeAnotherHost(t *testing
 	identityB := identityA
 	identityB.HostKeyFingerprint = "SHA256:" + strings.Repeat("B", 43)
 	identityB.StateDir = t.TempDir()
+	assertCrossHostIdentityConflicts(t, fixture, identityB, serviceA.registryEndpoint)
+	serviceB := &Service{entities: newTestEntities(t, fixture.pool), registryHostIdentity: &identityB, registryEndpoint: serviceA.registryEndpoint}
+	assertCrossHostDeletionRefused(t, fixture, serviceB, lockPathA)
+}
+
+func assertCrossHostIdentityConflicts(t *testing.T, fixture *deploymentRetryFixture, identityB RegistryHostIdentity, endpoint string) {
+	t.Helper()
 	if _, err := VerifyWorkspaceRegistryHost(fixture.ctx, fixture.service.entities.Workspace(), identityB); err == nil || contract.Classify(err).Code != contract.Conflict {
 		t.Fatalf("B with A's name and a different fingerprint = %v, want conflict", err)
 	}
-	serviceB := &Service{entities: newTestEntities(t, fixture.pool), registryHostIdentity: &identityB, registryEndpoint: serviceA.registryEndpoint}
+	serviceB := &Service{entities: newTestEntities(t, fixture.pool), registryHostIdentity: &identityB, registryEndpoint: endpoint}
 	if _, err := serviceB.verifyLocalRegistryHost(fixture.ctx); err == nil || contract.Classify(err).Code != contract.Conflict {
 		t.Fatalf("B local verification = %v, want conflict", err)
 	}
+}
+
+func assertCrossHostDeletionRefused(t *testing.T, fixture *deploymentRetryFixture, serviceB *Service, lockPathA string) {
+	t.Helper()
 	if !hostLockContended(t, fixture.ctx, lockPathA) {
 		t.Fatal("A upload lease did not hold the A host lock")
 	}
@@ -221,17 +232,7 @@ func TestIntegrationCrossHostUploadIdentityCannotAuthorizeAnotherHost(t *testing
 	}
 	appOp := "op_" + strings.Repeat("a", 32)
 	envOp := "op_" + strings.Repeat("b", 32)
-	for _, row := range []struct{ id, kind, target string }{
-		{appOp, platform.KindAppDelete, "app/live"},
-		{envOp, platform.KindEnvironmentDelete, "env/live/production"},
-	} {
-		if _, err := fixture.pool.Exec(fixture.ctx, `INSERT INTO eregion_operations
-            (id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state,attempt,completed_steps,last_sequence,created_at,updated_at,error_code)
-            VALUES($1,$2,$3,'operator','cross-host',$1,'sha256:hash','{}','running',1,0,0,clock_timestamp(),clock_timestamp(),'')`,
-			row.id, row.kind, row.target); err != nil {
-			t.Fatal(err)
-		}
-	}
+	insertCrossHostDeleteOperations(t, fixture, appOp, envOp)
 	workerB := &platformWorker{service: serviceB}
 	// deleteApplication/deleteEnvironment settle a terminal guard refusal
 	// durably and return nil to their worker caller. The operation row is the
@@ -243,18 +244,7 @@ func TestIntegrationCrossHostUploadIdentityCannotAuthorizeAnotherHost(t *testing
 	if err := workerB.deleteEnvironment(fixture.ctx, contract.OperationID(envOp), 1, "live", "production"); err != nil {
 		t.Fatalf("B environment delete worker returned an unclassified error: %v", err)
 	}
-	for _, row := range []struct{ id, kind string }{
-		{appOp, platform.KindAppDelete},
-		{envOp, platform.KindEnvironmentDelete},
-	} {
-		var state, code string
-		if err := fixture.pool.QueryRow(fixture.ctx, `SELECT state,error_code FROM eregion_operations WHERE id=$1`, row.id).Scan(&state, &code); err != nil {
-			t.Fatal(err)
-		}
-		if state != string(contract.Failed) || code != string(contract.Conflict) {
-			t.Fatalf("%s operation state/code = %s/%s, want failed/conflict", row.kind, state, code)
-		}
-	}
+	assertCrossHostDeleteOperationsRefused(t, fixture, appOp, envOp)
 	var cleanupRows int
 	if err := fixture.pool.QueryRow(fixture.ctx, `SELECT count(*) FROM eregion_platform_container_cleanup c
         JOIN eregion_platform_environments e ON e.id=c.environment_id
@@ -279,6 +269,37 @@ func TestIntegrationCrossHostUploadIdentityCannotAuthorizeAnotherHost(t *testing
 		Actor: testActor, IdempotencyKey: "cross-host-repo", Input: raw,
 	}); err == nil {
 		t.Fatal("B claimed A's unique app repository")
+	}
+}
+
+func insertCrossHostDeleteOperations(t *testing.T, fixture *deploymentRetryFixture, appOp, envOp string) {
+	t.Helper()
+	for _, row := range []struct{ id, kind, target string }{
+		{appOp, platform.KindAppDelete, "app/live"},
+		{envOp, platform.KindEnvironmentDelete, "env/live/production"},
+	} {
+		if _, err := fixture.pool.Exec(fixture.ctx, `INSERT INTO eregion_operations
+            (id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state,attempt,completed_steps,last_sequence,created_at,updated_at,error_code)
+            VALUES($1,$2,$3,'operator','cross-host',$1,'sha256:hash','{}','running',1,0,0,clock_timestamp(),clock_timestamp(),'')`,
+			row.id, row.kind, row.target); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func assertCrossHostDeleteOperationsRefused(t *testing.T, fixture *deploymentRetryFixture, appOp, envOp string) {
+	t.Helper()
+	for _, row := range []struct{ id, kind string }{
+		{appOp, platform.KindAppDelete},
+		{envOp, platform.KindEnvironmentDelete},
+	} {
+		var state, code string
+		if err := fixture.pool.QueryRow(fixture.ctx, `SELECT state,error_code FROM eregion_operations WHERE id=$1`, row.id).Scan(&state, &code); err != nil {
+			t.Fatal(err)
+		}
+		if state != string(contract.Failed) || code != string(contract.Conflict) {
+			t.Fatalf("%s operation state/code = %s/%s, want failed/conflict", row.kind, state, code)
+		}
 	}
 }
 

@@ -140,8 +140,11 @@ func (r *NodeResolver) TransportFor(ctx context.Context, nodeName string) (node.
 			"Finish node enrollment.", nil)
 	case platform.EnrollmentEnrolled:
 		if rec.Transport == "ssh" {
-			return r.cached(rec, false)
+			return r.cached(ctx, rec, false)
 		}
+	case platform.EnrollmentRegistered:
+		// A registered node has not completed enrollment; fall through to the
+		// worker's own transport when it authenticates as that node.
 	}
 	return r.fallbackFor(rec.Name)
 }
@@ -149,8 +152,8 @@ func (r *NodeResolver) TransportFor(ctx context.Context, nodeName string) (node.
 // Direct returns an uncached transport over the node's direct SSH address,
 // ignoring any tunnel. Enrollment and tunnel repair use it, so a broken tunnel
 // cannot lock the control plane out of the node. The caller closes it.
-func (r *NodeResolver) Direct(rec entities.NodeConnection) (node.Transport, func(), error) {
-	return r.build(rec, true)
+func (r *NodeResolver) Direct(ctx context.Context, rec entities.NodeConnection) (node.Transport, func(), error) {
+	return r.build(ctx, rec, true)
 }
 
 // fallbackFor returns the worker's own transport when it authenticates as the
@@ -180,7 +183,7 @@ func (r *NodeResolver) fallbackFor(name string) (node.Transport, error) {
 
 // cached returns the shared transport of an enrolled node, rebuilding it when
 // the node record's connection facts changed.
-func (r *NodeResolver) cached(rec entities.NodeConnection, direct bool) (node.Transport, error) {
+func (r *NodeResolver) cached(ctx context.Context, rec entities.NodeConnection, direct bool) (node.Transport, error) {
 	key := connectionKey(rec, r.usesTunnel(rec, direct))
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -191,7 +194,7 @@ func (r *NodeResolver) cached(rec entities.NodeConnection, direct bool) (node.Tr
 		entry.closer()
 		delete(r.cache, rec.Name)
 	}
-	built, closer, err := r.build(rec, direct)
+	built, closer, err := r.build(ctx, rec, direct)
 	if err != nil {
 		return nil, err
 	}
@@ -211,7 +214,7 @@ func (r *NodeResolver) usesTunnel(rec entities.NodeConnection, direct bool) bool
 		r.config.WireGuardKeyDir != "" && rec.WGAddress != "" && rec.WGPublicKey != "" && rec.WGEndpoint != ""
 }
 
-func (r *NodeResolver) build(rec entities.NodeConnection, direct bool) (node.Transport, func(), error) {
+func (r *NodeResolver) build(ctx context.Context, rec entities.NodeConnection, direct bool) (node.Transport, func(), error) {
 	noop := func() {}
 	if r.config.SSHIdentityFile == "" {
 		return nil, noop, contract.NewFault(contract.PreconditionFailed, "the control plane has no SSH identity for enrolled nodes", "Set EREGION_NODE_SSH_IDENTITY to the control plane's SSH key, which is authorized on every node.")
@@ -241,7 +244,7 @@ func (r *NodeResolver) build(rec entities.NodeConnection, direct bool) (node.Tra
 			port = strconv.Itoa(rec.WGSSHPort)
 		}
 		address = net.JoinHostPort(rec.WGAddress, port)
-		dialer, err := r.tunnel(rec)
+		dialer, err := r.tunnel(ctx, rec)
 		if err != nil {
 			return nil, noop, err
 		}
@@ -261,7 +264,7 @@ func (r *NodeResolver) build(rec entities.NodeConnection, direct bool) (node.Tra
 
 // tunnel builds the userspace WireGuard dialer for one node with the control
 // plane's per-node key.
-func (r *NodeResolver) tunnel(rec entities.NodeConnection) (*transport.WireGuardDialer, error) {
+func (r *NodeResolver) tunnel(ctx context.Context, rec entities.NodeConnection) (*transport.WireGuardDialer, error) {
 	key, err := transport.ReadWireGuardKey(r.controlKeyPath(rec.Name))
 	if err != nil {
 		return nil, contract.NewFault(contract.PreconditionFailed, "the control plane WireGuard key for the node is unreadable", err.Error())
@@ -285,7 +288,7 @@ func (r *NodeResolver) tunnel(rec entities.NodeConnection) (*transport.WireGuard
 	if lockDir == "" {
 		lockDir = os.TempDir()
 	}
-	dialer, err := transport.NewWireGuardDialer(transport.WireGuardConfig{
+	dialer, err := transport.NewWireGuardDialer(ctx, transport.WireGuardConfig{
 		PrivateKey: key, Address: local, NodeAddress: nodeAddress, PeerPublicKey: peer,
 		Endpoint: rec.WGEndpoint, LockDir: lockDir, Logf: r.config.Logf,
 	})
@@ -322,7 +325,7 @@ func (r *NodeResolver) ControlPublicKey(nodeName string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) //nolint:gosec // G304: a node-named file in the operator's private key directory.
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		if os.IsExist(err) {
 			return r.ControlPublicKey(nodeName)

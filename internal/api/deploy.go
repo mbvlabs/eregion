@@ -226,6 +226,8 @@ func writeCIDeployFault(w http.ResponseWriter, err error) {
 		status = http.StatusConflict
 	case contract.Unavailable, contract.Cancelled:
 		status = http.StatusServiceUnavailable
+	case contract.InvalidOutputMode, contract.MissingTool, contract.DoctorFailed, contract.NodeVersionMismatch, contract.RemoteUnreachable, contract.Internal:
+		status = http.StatusInternalServerError
 	}
 	writeCIDeploy(w, status, ciDeployResponse{Error: fault.Message, Hint: fault.Hint, Code: string(fault.Code)})
 }

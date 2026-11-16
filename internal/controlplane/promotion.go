@@ -104,8 +104,6 @@ func (s *Service) promotionPlanTx(
 		ctx,
 		tx,
 		target.Node,
-		platform.RoleApplication,
-		platform.CapabilityDocker,
 	); err != nil {
 		return promotionPlan{}, err
 	}

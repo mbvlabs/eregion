@@ -88,6 +88,8 @@ func (g glyphs) stage(status viewer.StageStatus) string {
 			return "[>]"
 		case viewer.StageFailed:
 			return "[!]"
+		case viewer.StageStopped:
+			return "[-]"
 		default:
 			return "[-]"
 		}
@@ -99,6 +101,8 @@ func (g glyphs) stage(status viewer.StageStatus) string {
 		return "◐"
 	case viewer.StageFailed:
 		return "■"
+	case viewer.StageStopped:
+		return "·"
 	default:
 		return "·"
 	}
@@ -115,11 +119,15 @@ func (g glyphs) observation(state viewer.ObservationState) string {
 			return "?"
 		case viewer.Closed:
 			return "#"
+		case viewer.Connecting:
+			return "..."
 		default:
 			return "..."
 		}
 	}
 	switch state {
+	case viewer.Connecting:
+		return "◌"
 	case viewer.Live:
 		return "●"
 	case viewer.Stale:
@@ -152,16 +160,11 @@ func badgeText(state contract.State, observation viewer.ObservationState, ascii 
 	switch observation {
 	case viewer.Stale, viewer.Reconnecting:
 		return g.observation(observation) + " LAST KNOWN: " + strings.ToUpper(string(state))
+	case viewer.Connecting, viewer.Live, viewer.Closed:
+		return label
 	default:
 		return label
 	}
-}
-
-func titleCase(text string) string {
-	if text == "" {
-		return text
-	}
-	return strings.ToUpper(text[:1]) + text[1:]
 }
 
 func attemptText(attempt uint32, previous uint32, changed bool) string {

@@ -11,6 +11,7 @@ import (
 
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/entities"
+	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/mbvlabs/eregion/internal/vault"
 )
@@ -72,7 +73,7 @@ func (s *Service) prepareResourceApply(ctx context.Context, tx *entities.StoreTx
 	if err != nil {
 		return err
 	}
-	if err := s.checkPlacementByTx(ctx, tx, env.Node, platform.RoleApplication, platform.CapabilityDocker); err != nil {
+	if err := s.checkPlacementByTx(ctx, tx, env.Node); err != nil {
 		return err
 	}
 	if err := ensureNoActiveParentDeleteTx(ctx, tx, id, input.App, input.Environment); err != nil {
@@ -83,40 +84,8 @@ func (s *Service) prepareResourceApply(ctx context.Context, tx *entities.StoreTx
 		return err
 	}
 	if len(input.SecretEnv) > 0 {
-		if s.vault == nil {
-			return contract.NewFault(contract.Unavailable, "secret storage is not configured", "Configure the vault before applying a resource with secret references.")
-		}
-		names := make([]string, 0, len(input.SecretEnv))
-		seen := make(map[string]bool, len(input.SecretEnv))
-		for _, name := range input.SecretEnv {
-			if !seen[name] {
-				seen[name] = true
-				names = append(names, name)
-			}
-		}
-		sort.Strings(names)
-		var missing []string
-		for _, name := range names {
-			namespace, err := vault.NewNamespace(input.App, input.Environment, name)
-			if err != nil {
-				return err
-			}
-			metadata, err := s.vault.Store().GetForUpdateTx(ctx, tx.Secrets(), namespace)
-			if err != nil {
-				if contract.Classify(err).Code == contract.NotFound {
-					missing = append(missing, name)
-					continue
-				}
-				return err
-			}
-			if metadata.State != vault.StateActive {
-				missing = append(missing, name)
-			}
-		}
-		if len(missing) > 0 {
-			fault := contract.NewFault(contract.PreconditionFailed, "resource requires active secrets: "+strings.Join(missing, ", "), "Set the missing or archived secrets in this environment, then apply the resource again.")
-			fault.Details = map[string]any{"reason": "missing_secret_values", "names": missing}
-			return fault
+		if err := s.validateResourceSecrets(ctx, tx, input); err != nil {
+			return err
 		}
 	}
 	existing, found, err := resourceByNameTxOptional(ctx, tx, input.App, input.Environment, input.Name)
@@ -124,18 +93,7 @@ func (s *Service) prepareResourceApply(ctx context.Context, tx *entities.StoreTx
 		return err
 	}
 	if found {
-		if existing.Node != env.Node {
-			return contract.NewFault(contract.PreconditionFailed, "resource is bound to node "+existing.Node, "A resource with persistent volumes is never moved implicitly. Destroy it on "+existing.Node+" first; data volumes stay there, and a new resource identity must be declared for another node.")
-		}
-		if existing.State == platform.ResourceProvisioning || existing.State == platform.ResourceDestroying {
-			return contract.NewFault(contract.Conflict, "resource is already changing", "Wait for the active resource operation to finish or cancel it explicitly.")
-		}
-		if _, err := tx.Resources().ResetForApply(ctx, entities.ResourceReset{
-			ID: existing.ID, Node: env.Node, Spec: input.ResourceSpec, Image: input.Image, OperationID: id,
-		}); err != nil {
-			return unavailable(err)
-		}
-		return nil
+		return resetResourceForApply(ctx, tx, id, input, env, existing)
 	}
 	resourceID, err := platform.NewResourceID()
 	if err != nil {
@@ -146,6 +104,60 @@ func (s *Service) prepareResourceApply(ctx context.Context, tx *entities.StoreTx
 		Name: input.Name, Node: env.Node, Spec: input.ResourceSpec, Image: input.Image, OperationID: id,
 	}); err != nil {
 		return platformWriteError(err, "resource name already exists in this environment")
+	}
+	return nil
+}
+
+func (s *Service) validateResourceSecrets(ctx context.Context, tx *entities.StoreTx, input *platform.ResourceApplyInput) error {
+	if s.vault == nil {
+		return contract.NewFault(contract.Unavailable, "secret storage is not configured", "Configure the vault before applying a resource with secret references.")
+	}
+	names := make([]string, 0, len(input.SecretEnv))
+	seen := make(map[string]bool, len(input.SecretEnv))
+	for _, name := range input.SecretEnv {
+		if !seen[name] {
+			seen[name] = true
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	var missing []string
+	for _, name := range names {
+		namespace, err := vault.NewNamespace(input.App, input.Environment, name)
+		if err != nil {
+			return err
+		}
+		metadata, err := s.vault.Store().GetForUpdateTx(ctx, tx.Secrets(), namespace)
+		if err != nil {
+			if contract.Classify(err).Code == contract.NotFound {
+				missing = append(missing, name)
+				continue
+			}
+			return err
+		}
+		if metadata.State != vault.StateActive {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	fault := contract.NewFault(contract.PreconditionFailed, "resource requires active secrets: "+strings.Join(missing, ", "), "Set the missing or archived secrets in this environment, then apply the resource again.")
+	fault.Details = map[string]any{"reason": "missing_secret_values", "names": missing}
+	return fault
+}
+
+func resetResourceForApply(ctx context.Context, tx *entities.StoreTx, id contract.OperationID, input *platform.ResourceApplyInput, env platform.Environment, existing platform.Resource) error {
+	if existing.Node != env.Node {
+		return contract.NewFault(contract.PreconditionFailed, "resource is bound to node "+existing.Node, "A resource with persistent volumes is never moved implicitly. Destroy it on "+existing.Node+" first; data volumes stay there, and a new resource identity must be declared for another node.")
+	}
+	if existing.State == platform.ResourceProvisioning || existing.State == platform.ResourceDestroying {
+		return contract.NewFault(contract.Conflict, "resource is already changing", "Wait for the active resource operation to finish or cancel it explicitly.")
+	}
+	if _, err := tx.Resources().ResetForApply(ctx, entities.ResourceReset{
+		ID: existing.ID, Node: env.Node, Spec: input.ResourceSpec, Image: input.Image, OperationID: id,
+	}); err != nil {
+		return unavailable(err)
 	}
 	return nil
 }
@@ -350,7 +362,7 @@ func liveDeletionResources(ctx context.Context, resources *entities.ResourceStor
 }
 
 // ensureNoLiveResourcesTx rechecks the preview predicate under admission locks.
-func (s *Service) ensureNoLiveResourcesTx(ctx context.Context, tx *entities.StoreTx, app, environment string, appID string, envID string) error {
+func (s *Service) ensureNoLiveResourcesTx(ctx context.Context, tx *entities.StoreTx, appID string, envID string) error {
 	blockers, err := liveDeletionResources(ctx, tx.Resources(), platform.AppID(appID), platform.EnvironmentID(envID))
 	if err != nil {
 		return err
@@ -390,61 +402,29 @@ func (w *platformWorker) runResourceApply(ctx context.Context, id contract.Opera
 	return w.settle(ctx, id, attempt, err)
 }
 
-func (w *platformWorker) applyResource(ctx context.Context, id contract.OperationID, attempt uint32, input *platform.ResourceApplyInput) error {
-	resource, err := w.service.resourceByName(ctx, input.App, input.Environment, input.Name)
-	if err != nil {
-		return err
-	}
-	if resource.OperationID != id {
-		return contract.NewFault(contract.PreconditionFailed, "resource operation was superseded", "Refresh resource inventory and retry from its current operation.")
-	}
-	env, err := w.service.environment(ctx, input.App, input.Environment)
-	if err != nil {
-		return err
-	}
-	if env.ID == "" {
-		return contract.NewFault(contract.NotFound, "environment not found", "Create the environment before applying a resource.")
-	}
-	if err := w.service.checkCancelled(ctx, id); err != nil {
-		return err
-	}
-	plan, err := platform.PlanResource(env.ID, resource.Node, resource.ID, env.App, env.Name, resource.Name, resource.Spec)
-	if err != nil {
-		return err
-	}
-	secretValues, secretFingerprint, err := w.service.resolveResourceSecrets(ctx, env, resource.Spec)
-	if err != nil {
-		return err
-	}
-	secretKeys := platform.SortedResourceSecretEnvKeys(secretValues)
-	tr, err := w.service.resolver.TransportFor(ctx, resource.Node)
-	if err != nil {
-		return err
-	}
-
+func (w *platformWorker) prepareResourceImage(ctx context.Context, tr node.Transport, id contract.OperationID, attempt uint32, plan platform.ResourcePlan) (string, string, error) {
 	networkStep := platform.ResourceNetworkStepID(plan)
 	if _, err := w.runStepOn(ctx, tr, id, attempt, networkStep, platform.ArgvPayload{
 		Step: networkStep,
 		Argv: []string{"docker", "network", "create", "--driver", "bridge",
-			"--label", "io.eregion.app=" + env.App,
-			"--label", "io.eregion.environment=" + env.Name, plan.Network},
+			"--label", "io.eregion.app=" + plan.App,
+			"--label", "io.eregion.environment=" + plan.Environment, plan.Network},
 		CheckArgv:      []string{"docker", "network", "inspect", "--format", "{{.Name}}", plan.Network},
 		TimeoutSeconds: 30,
 	}, nil); err != nil {
-		return err
+		return "", "", err
 	}
 	if err := w.service.checkCancelled(ctx, id); err != nil {
-		return err
+		return "", "", err
 	}
-
 	pullStep := platform.ResourcePullStepID(plan)
 	if _, err := w.runStepOn(ctx, tr, id, attempt, pullStep, platform.ArgvPayload{
 		Step: pullStep, Argv: []string{"docker", "pull", plan.Spec.Image}, TimeoutSeconds: 600,
 	}, nil); err != nil {
-		return err
+		return "", "", err
 	}
 	if err := w.service.checkCancelled(ctx, id); err != nil {
-		return err
+		return "", "", err
 	}
 	imageStep := platform.ResourceImageStepID(plan)
 	imageRaw, err := w.runStepOn(ctx, tr, id, attempt, imageStep, platform.ArgvPayload{
@@ -453,16 +433,92 @@ func (w *platformWorker) applyResource(ctx context.Context, id contract.Operatio
 		TimeoutSeconds: 30,
 	}, nil)
 	if err != nil {
-		return err
+		return "", "", err
 	}
 	if err := w.service.checkCancelled(ctx, id); err != nil {
-		return err
+		return "", "", err
 	}
 	imageID, repoDigests, err := platform.ParseResourceImageInspect(stepStdout(imageRaw))
 	if err != nil {
-		return contract.NewFault(contract.PreconditionFailed, "the resource image has no immutable identity", err.Error())
+		return "", "", contract.NewFault(contract.PreconditionFailed, "the resource image has no immutable identity", err.Error())
 	}
-	imageDigest := platform.ResourceImageDigest(plan.Spec.Image, repoDigests)
+	return imageID, platform.ResourceImageDigest(plan.Spec.Image, repoDigests), nil
+}
+
+func (w *platformWorker) createResourceVolumes(ctx context.Context, tr node.Transport, id contract.OperationID, attempt uint32, plan platform.ResourcePlan, env platform.Environment, resource platform.Resource) error {
+	for index, volume := range plan.Volumes {
+		step := platform.ResourceVolumeStepID(plan, index)
+		if _, err := w.runStepOn(ctx, tr, id, attempt, step, platform.ResourceVolumePayload{
+			Step: step, Volume: volume.Name, App: env.App, Environment: env.Name,
+			Resource: resource.Name, ResourceID: string(resource.ID),
+		}, nil); err != nil {
+			return err
+		}
+		if err := w.service.checkCancelled(ctx, id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type resourceApplyRun struct {
+	resource          platform.Resource
+	env               platform.Environment
+	plan              platform.ResourcePlan
+	tr                node.Transport
+	secretValues      map[string]string
+	secretFingerprint string
+}
+
+func (w *platformWorker) prepareResourceApplyRun(ctx context.Context, id contract.OperationID, input *platform.ResourceApplyInput) (*resourceApplyRun, error) {
+	resource, err := w.service.resourceByName(ctx, input.App, input.Environment, input.Name)
+	if err != nil {
+		return nil, err
+	}
+	if resource.OperationID != id {
+		return nil, contract.NewFault(contract.PreconditionFailed, "resource operation was superseded", "Refresh resource inventory and retry from its current operation.")
+	}
+	env, err := w.service.environment(ctx, input.App, input.Environment)
+	if err != nil {
+		return nil, err
+	}
+	if env.ID == "" {
+		return nil, contract.NewFault(contract.NotFound, "environment not found", "Create the environment before applying a resource.")
+	}
+	if err := w.service.checkCancelled(ctx, id); err != nil {
+		return nil, err
+	}
+	plan, err := platform.PlanResource(env.ID, resource.Node, resource.ID, env.App, env.Name, resource.Name, resource.Spec)
+	if err != nil {
+		return nil, err
+	}
+	secretValues, secretFingerprint, err := w.service.resolveResourceSecrets(ctx, env, resource.Spec)
+	if err != nil {
+		return nil, err
+	}
+	tr, err := w.service.resolver.TransportFor(ctx, resource.Node)
+	if err != nil {
+		return nil, err
+	}
+	return &resourceApplyRun{
+		resource: resource, env: env, plan: plan, tr: tr,
+		secretValues: secretValues, secretFingerprint: secretFingerprint,
+	}, nil
+}
+
+func (w *platformWorker) applyResource(ctx context.Context, id contract.OperationID, attempt uint32, input *platform.ResourceApplyInput) error {
+	run, err := w.prepareResourceApplyRun(ctx, id, input)
+	if err != nil {
+		return err
+	}
+	resource, env, plan, tr := run.resource, run.env, run.plan, run.tr
+	secretValues, secretFingerprint := run.secretValues, run.secretFingerprint
+	secretKeys := platform.SortedResourceSecretEnvKeys(secretValues)
+
+	imageID, imageDigest, err := w.prepareResourceImage(ctx, tr, id, attempt, plan)
+	if err != nil {
+		return err
+	}
 
 	// Record every volume identity before Docker creates any of them. A crash
 	// between the create steps and the final resource update must not leave
@@ -476,17 +532,8 @@ func (w *platformWorker) applyResource(ctx context.Context, id contract.Operatio
 	if err := w.service.checkCancelled(ctx, id); err != nil {
 		return err
 	}
-	for index, volume := range plan.Volumes {
-		step := platform.ResourceVolumeStepID(plan, index)
-		if _, err := w.runStepOn(ctx, tr, id, attempt, step, platform.ResourceVolumePayload{
-			Step: step, Volume: volume.Name, App: env.App, Environment: env.Name,
-			Resource: resource.Name, ResourceID: string(resource.ID),
-		}, nil); err != nil {
-			return err
-		}
-		if err := w.service.checkCancelled(ctx, id); err != nil {
-			return err
-		}
+	if err := w.createResourceVolumes(ctx, tr, id, attempt, plan, env, resource); err != nil {
+		return err
 	}
 
 	configHash := platform.ResourceContainerConfigHash(plan, imageID, secretFingerprint, secretKeys)
@@ -550,6 +597,29 @@ func (w *platformWorker) runResourceDestroy(ctx context.Context, id contract.Ope
 	return w.settle(ctx, id, attempt, err)
 }
 
+func (w *platformWorker) deleteResourceVolumes(ctx context.Context, tr node.Transport, id contract.OperationID, attempt uint32, deleteData bool, plan platform.ResourcePlan, env platform.Environment, resource platform.Resource) ([]platform.ResourceVolumeStatus, error) {
+	if !deleteData {
+		return []platform.ResourceVolumeStatus{}, nil
+	}
+	if err := w.service.checkCancelled(ctx, id); err != nil {
+		return nil, err
+	}
+	deleteVolumes := platform.ResourceVolumesForDestroy(resource.Volumes, plan)
+	for index, volume := range deleteVolumes {
+		removeStep := platform.ResourceVolumeRemoveStepID(plan, index)
+		if _, err := w.runStepOn(ctx, tr, id, attempt, removeStep, platform.ResourceVolumeRemovePayload{
+			Step: removeStep, Volume: volume.Name, App: env.App, Environment: env.Name,
+			Resource: resource.Name, ResourceID: string(resource.ID),
+		}, nil); err != nil {
+			return nil, err
+		}
+		if err := w.service.checkCancelled(ctx, id); err != nil {
+			return nil, err
+		}
+	}
+	return deleteVolumes, nil
+}
+
 func (w *platformWorker) destroyResource(ctx context.Context, id contract.OperationID, attempt uint32, input *platform.ResourceDestroyInput) error {
 	resource, err := w.service.resourceByName(ctx, input.App, input.Environment, input.Name)
 	if err != nil {
@@ -587,51 +657,40 @@ func (w *platformWorker) destroyResource(ctx context.Context, id contract.Operat
 		return err
 	}
 	ownedVolumes := platform.MergeResourceVolumes(resource.Volumes, nil)
-	deleteVolumes := []platform.ResourceVolumeStatus{}
-	if input.DeleteData {
-		if err := w.service.checkCancelled(ctx, id); err != nil {
-			return err
-		}
-		deleteVolumes = platform.ResourceVolumesForDestroy(resource.Volumes, plan)
-		for index, volume := range deleteVolumes {
-			removeStep := platform.ResourceVolumeRemoveStepID(plan, index)
-			if _, err := w.runStepOn(ctx, tr, id, attempt, removeStep, platform.ResourceVolumeRemovePayload{
-				Step: removeStep, Volume: volume.Name, App: env.App, Environment: env.Name,
-				Resource: resource.Name, ResourceID: string(resource.ID),
-			}, nil); err != nil {
-				return err
-			}
-			if err := w.service.checkCancelled(ctx, id); err != nil {
-				return err
-			}
-		}
+	deleteVolumes, err := w.deleteResourceVolumes(ctx, tr, id, attempt, input.DeleteData, plan, env, resource)
+	if err != nil {
+		return err
 	}
 	if err := w.service.checkCancelled(ctx, id); err != nil {
 		return err
 	}
 	return w.service.finishResourceOperation(ctx, id, attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
-		detail := "Container removed; named volumes were retained."
-		destroyVolumes := ownedVolumes
-		if input.DeleteData {
-			destroyVolumes = []platform.ResourceVolumeStatus{}
-			if len(deleteVolumes) == 0 {
-				detail = "Container removed; no owned named volumes were recorded to delete."
-			} else {
-				detail = "Container and named volumes removed; resource data was deleted."
-			}
+		return finishDestroyedResource(ctx, tx, op, resource, id, input.DeleteData, ownedVolumes, deleteVolumes)
+	})
+}
+
+func finishDestroyedResource(ctx context.Context, tx *entities.StoreTx, op *contract.Operation, resource platform.Resource, id contract.OperationID, deleteData bool, ownedVolumes, deleteVolumes []platform.ResourceVolumeStatus) error {
+	detail := "Container removed; named volumes were retained."
+	destroyVolumes := ownedVolumes
+	if deleteData {
+		destroyVolumes = []platform.ResourceVolumeStatus{}
+		if len(deleteVolumes) == 0 {
+			detail = "Container removed; no owned named volumes were recorded to delete."
+		} else {
+			detail = "Container and named volumes removed; resource data was deleted."
 		}
-		rows, err := tx.Resources().MarkDestroyed(ctx, entities.ResourceDestroyed{
-			ID: resource.ID, OperationID: id, Volumes: destroyVolumes, Detail: detail,
-		})
-		if err != nil {
-			return unavailable(err)
-		}
-		if rows == 0 {
-			return contract.NewFault(contract.PreconditionFailed, "resource changed while it was being destroyed", "Refresh resource inventory before retrying.")
-		}
-		return appendEvent(ctx, tx, op, contract.Event{
-			Kind: "log", Stage: "resource", Message: "Resource " + resource.Name + ": " + detail,
-		})
+	}
+	rows, err := tx.Resources().MarkDestroyed(ctx, entities.ResourceDestroyed{
+		ID: resource.ID, OperationID: id, Volumes: destroyVolumes, Detail: detail,
+	})
+	if err != nil {
+		return unavailable(err)
+	}
+	if rows == 0 {
+		return contract.NewFault(contract.PreconditionFailed, "resource changed while it was being destroyed", "Refresh resource inventory before retrying.")
+	}
+	return appendEvent(ctx, tx, op, contract.Event{
+		Kind: "log", Stage: "resource", Message: "Resource " + resource.Name + ": " + detail,
 	})
 }
 

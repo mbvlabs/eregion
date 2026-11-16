@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -296,30 +297,10 @@ func (a *app) startRuntime(cmd *cobra.Command, concurrency int, readinessRuntime
 	}
 	// A process without workers never dispatches node work, so it builds no
 	// node transport and holds no WireGuard key.
-	var nodeTransport node.Transport
-	closeTransport := func() {}
-	if concurrency > 0 {
-		nodeTransport, closeTransport, err = a.nodeTransport(a.logger(cmd))
-		if err != nil {
-			pool.Close()
-			return nil, nil, extensionRuntime{}, nil, err
-		}
-		// The local transport is the default. Build it here so the shared
-		// per-node resolver sees the same authenticated transport the worker
-		// uses; controlplane.New is given this instance and does not replace it.
-		if nodeTransport == nil {
-			localName := strings.TrimSpace(os.Getenv("EREGION_NODE_NAME"))
-			if localName == "" {
-				pool.Close()
-				return nil, nil, extensionRuntime{}, nil, contract.NewFault(contract.ValidationFailed, "the worker needs EREGION_NODE_NAME", "Set EREGION_NODE_NAME to this node's registered name before starting the worker.")
-			}
-			local, localErr := node.NewLocal(node.DefaultStateDir(), localName, &secrets.Registry{})
-			if localErr != nil {
-				pool.Close()
-				return nil, nil, extensionRuntime{}, nil, contract.NewFault(contract.ValidationFailed, "could not initialise the local node transport", "Check EREGION_NODE_STATE_DIR permissions and that every worker on this host uses the same directory.")
-			}
-			nodeTransport = local
-		}
+	nodeTransport, closeTransport, err := a.workerTransport(ctx, cmd, concurrency)
+	if err != nil {
+		pool.Close()
+		return nil, nil, extensionRuntime{}, nil, err
 	}
 	store, err := entities.NewStore(pool)
 	if err != nil {
@@ -349,15 +330,11 @@ func (a *app) startRuntime(cmd *cobra.Command, concurrency int, readinessRuntime
 		pool.Close()
 		return nil, nil, extensionRuntime{}, nil, endpointErr
 	}
-	var registryHostIdentity *controlplane.RegistryHostIdentity
-	if concurrency > 0 {
-		identity, identityErr := host.LocalRegistryIdentity()
-		if identityErr != nil {
-			closeTransport()
-			pool.Close()
-			return nil, nil, extensionRuntime{}, nil, identityErr
-		}
-		registryHostIdentity = &identity
+	registryHostIdentity, err := workerRegistryHostIdentity(concurrency)
+	if err != nil {
+		closeTransport()
+		pool.Close()
+		return nil, nil, extensionRuntime{}, nil, err
 	}
 	run, err := controlplane.New(store, logger, controlplane.WorkerConfig{
 		Concurrency: concurrency, Transport: nodeTransport, SecretResolver: secretResolver,
@@ -389,16 +366,56 @@ func (a *app) startRuntime(cmd *cobra.Command, concurrency int, readinessRuntime
 	return pool, run, parts, func() { run.Close(); closeTransport() }, nil
 }
 
+// workerTransport builds the worker's node transport. A process without
+// workers builds none, so it holds no WireGuard key.
+func (a *app) workerTransport(ctx context.Context, cmd *cobra.Command, concurrency int) (node.Transport, func(), error) {
+	if concurrency <= 0 {
+		return nil, func() {}, nil
+	}
+	transport, closeTransport, err := a.nodeTransport(ctx, a.logger(cmd))
+	if err != nil {
+		return nil, nil, err
+	}
+	if transport != nil {
+		return transport, closeTransport, nil
+	}
+	// The local transport is the default. Build it here so the shared per-node
+	// resolver sees the same authenticated transport the worker uses;
+	// controlplane.New is given this instance and does not replace it.
+	localName := strings.TrimSpace(os.Getenv("EREGION_NODE_NAME"))
+	if localName == "" {
+		closeTransport()
+		return nil, nil, contract.NewFault(contract.ValidationFailed, "the worker needs EREGION_NODE_NAME", "Set EREGION_NODE_NAME to this node's registered name before starting the worker.")
+	}
+	local, err := node.NewLocal(node.DefaultStateDir(), localName, &secrets.Registry{})
+	if err != nil {
+		closeTransport()
+		return nil, nil, contract.NewFault(contract.ValidationFailed, "could not initialise the local node transport", "Check EREGION_NODE_STATE_DIR permissions and that every worker on this host uses the same directory.")
+	}
+	return local, closeTransport, nil
+}
+
+func workerRegistryHostIdentity(concurrency int) (*controlplane.RegistryHostIdentity, error) {
+	if concurrency <= 0 {
+		return nil, nil
+	}
+	identity, err := host.LocalRegistryIdentity()
+	if err != nil {
+		return nil, err
+	}
+	return &identity, nil
+}
+
 // nodeTransport builds the transport a worker dispatches node work through.
 // The local transport is the default; EREGION_NODE_TRANSPORT=ssh selects the
 // pinned SSH transport. The choice never changes the worker, the operation
 // contract, or the database model.
-func (a *app) nodeTransport(logger *slog.Logger) (node.Transport, func(), error) {
+func (a *app) nodeTransport(ctx context.Context, logger *slog.Logger) (node.Transport, func(), error) {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("EREGION_NODE_TRANSPORT"))) {
 	case "", "local":
 		return nil, func() {}, nil
 	case "ssh":
-		return a.sshTransport(logger)
+		return a.sshTransport(ctx, logger)
 	default:
 		return nil, nil, contract.NewFault(contract.ValidationFailed, "unknown node transport", "Set EREGION_NODE_TRANSPORT to local or ssh.")
 	}
@@ -427,7 +444,7 @@ func (a *app) fleetResolverConfig(logger *slog.Logger) controlplane.ResolverConf
 // EREGION_NODE_WG_PRIVATE_KEY_FILE is set, the SSH connection runs inside a
 // userspace WireGuard tunnel and EREGION_NODE_SSH_ADDRESS is the node's
 // tunnel address.
-func (a *app) sshTransport(logger *slog.Logger) (node.Transport, func(), error) {
+func (a *app) sshTransport(ctx context.Context, logger *slog.Logger) (node.Transport, func(), error) {
 	address := os.Getenv("EREGION_NODE_SSH_ADDRESS")
 	user := os.Getenv("EREGION_NODE_SSH_USER")
 	identity := os.Getenv("EREGION_NODE_SSH_IDENTITY")
@@ -449,7 +466,7 @@ func (a *app) sshTransport(logger *slog.Logger) (node.Transport, func(), error) 
 	}
 	closer := func() {}
 	if os.Getenv("EREGION_NODE_WG_PRIVATE_KEY_FILE") != "" {
-		dialer, err := a.wireGuardDialer(address, logger)
+		dialer, err := a.wireGuardDialer(ctx, address, logger)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -467,7 +484,7 @@ func (a *app) sshTransport(logger *slog.Logger) (node.Transport, func(), error) 
 // wireGuardDialer builds the userspace WireGuard dialer from the environment.
 // The private key comes only from a strict-mode file and is registered for
 // redaction before anything else can print it.
-func (a *app) wireGuardDialer(sshAddress string, logger *slog.Logger) (*transport.WireGuardDialer, error) {
+func (a *app) wireGuardDialer(ctx context.Context, sshAddress string, logger *slog.Logger) (*transport.WireGuardDialer, error) {
 	key, err := transport.ReadWireGuardKey(os.Getenv("EREGION_NODE_WG_PRIVATE_KEY_FILE"))
 	if err != nil {
 		return nil, contract.NewFault(contract.ValidationFailed, "the WireGuard private key could not be read", err.Error())
@@ -519,7 +536,7 @@ func (a *app) wireGuardDialer(sshAddress string, logger *slog.Logger) (*transpor
 	if lockDir == "" {
 		lockDir = os.TempDir()
 	}
-	dialer, err := transport.NewWireGuardDialer(transport.WireGuardConfig{
+	dialer, err := transport.NewWireGuardDialer(ctx, transport.WireGuardConfig{
 		PrivateKey:    key,
 		Address:       local,
 		NodeAddress:   nodeAddress,
@@ -572,13 +589,9 @@ func (a *app) serve(cmd *cobra.Command, _ []string) (res result, serveErr error)
 	if err := validateListener(address, cert, key); err != nil {
 		return result{}, err
 	}
-	var tlsConfig *tls.Config
-	if cert != "" {
-		pair, err := tls.LoadX509KeyPair(cert, key)
-		if err != nil {
-			return result{}, contract.NewFault(contract.ValidationFailed, "could not load API TLS certificate/key", "Check --tls-cert and --tls-key; private material is not printed.")
-		}
-		tlsConfig = &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{pair}}
+	tlsConfig, err := serveTLSConfig(cert, key)
+	if err != nil {
+		return result{}, err
 	}
 	authFile := os.Getenv("EREGION_AUTH_FILE")
 	if authFile == "" {
@@ -608,17 +621,18 @@ func (a *app) serve(cmd *cobra.Command, _ []string) (res result, serveErr error)
 	if withWorkers {
 		defer run.Metrics.Start(processmetrics.WorkerAddress, a.logger(cmd))()
 	}
-	listener, err := net.Listen("tcp", address)
+	listener, err := new(net.ListenConfig).Listen(cmd.Context(), "tcp", address)
 	if err != nil {
 		return result{}, contract.NewFault(contract.Unavailable, "could not bind API listener", "Check --listen and whether the port is available.")
 	}
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 	if withWorkers {
-		if err := run.Jobs.Start(cmd.Context()); err != nil {
+		stop, err := startServeWorkers(cmd, run)
+		if err != nil {
 			return result{}, err
 		}
 		defer func() {
-			if err := stopWorkers(run); serveErr == nil {
+			if err := stop(); serveErr == nil {
 				serveErr = err
 			}
 		}()
@@ -637,9 +651,34 @@ func (a *app) serve(cmd *cobra.Command, _ []string) (res result, serveErr error)
 	}
 	server := &http.Server{Handler: api.Instrument(handler, apiMetrics), TLSConfig: tlsConfig, ErrorLog: slog.NewLogLogger(logger.Handler(), slog.LevelWarn), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: time.Minute, MaxHeaderBytes: 8192}
 	logger.Info("API listener bound", "address", listener.Addr().String(), "workers", withWorkers)
+	if err := serveHTTP(cmd.Context(), server, listener, cert != ""); err != nil {
+		return result{}, err
+	}
+	return result{data: map[string]bool{"stopped": true}, plain: fmt.Sprintf("API stopped (%s).", listener.Addr())}, nil
+}
+
+func serveTLSConfig(cert, key string) (*tls.Config, error) {
+	if cert == "" {
+		return nil, nil
+	}
+	pair, err := tls.LoadX509KeyPair(cert, key)
+	if err != nil {
+		return nil, contract.NewFault(contract.ValidationFailed, "could not load API TLS certificate/key", "Check --tls-cert and --tls-key; private material is not printed.")
+	}
+	return &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{pair}}, nil
+}
+
+func startServeWorkers(cmd *cobra.Command, run *controlplane.Runtime) (func() error, error) {
+	if err := run.Jobs.Start(cmd.Context()); err != nil {
+		return nil, err
+	}
+	return func() error { return stopWorkers(run) }, nil
+}
+
+func serveHTTP(ctx context.Context, server *http.Server, listener net.Listener, tls bool) error {
 	done := make(chan error, 1)
 	go func() {
-		if cert != "" {
+		if tls {
 			done <- server.ServeTLS(listener, "", "")
 		} else {
 			done <- server.Serve(listener)
@@ -647,18 +686,18 @@ func (a *app) serve(cmd *cobra.Command, _ []string) (res result, serveErr error)
 	}()
 	select {
 	case err := <-done:
-		if err != http.ErrServerClosed {
-			return result{}, contract.NewFault(contract.Unavailable, "API listener stopped unexpectedly", "Check listener/TLS configuration and restart the service.")
+		if !errors.Is(err, http.ErrServerClosed) {
+			return contract.NewFault(contract.Unavailable, "API listener stopped unexpectedly", "Check listener/TLS configuration and restart the service.")
 		}
-	case <-cmd.Context().Done():
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 		defer cancel()
-		if err := server.Shutdown(ctx); err != nil {
+		if err := server.Shutdown(shutdownCtx); err != nil {
 			_ = server.Close()
-			return result{}, err
+			return err
 		}
 	}
-	return result{data: map[string]bool{"stopped": true}, plain: fmt.Sprintf("API stopped (%s).", listener.Addr())}, nil
+	return nil
 }
 
 func validateListener(address, cert, key string) error {

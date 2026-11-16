@@ -193,74 +193,22 @@ func ValidateNodeName(name string) error {
 // require the host filesystem to be writable; Plan uses the same validation so
 // an unsupported mode is visible before apply.
 func (c Config) Validate() error {
-	if err := engine.ValidateNodeName(c.Node); err != nil {
-		return contract.NewFault(contract.ValidationFailed, "invalid node name", "Use 1–64 lowercase letters, digits, hyphens, or underscores.")
-	}
-	role, err := ConfigForRole(c.Role)
+	role, err := c.validateIdentity()
 	if err != nil {
-		return contract.NewFault(contract.ValidationFailed, err.Error(), "Use --role main, application, builder, or telemetry.")
-	}
-	if err := c.Layout.Validate(); err != nil {
-		return contract.NewFault(contract.ValidationFailed, err.Error(), "Use absolute, non-root host paths.")
-	}
-	if c.Workspace != "" && !role.ControlPlane {
-		return contract.NewFault(contract.ValidationFailed, "a workspace identity belongs to the main control-plane node", "Omit --workspace on application, builder, or telemetry roles.")
-	}
-	if c.Workspace != "" {
-		if err := ValidateWorkspaceName(c.Workspace); err != nil {
-			return err
-		}
+		return err
 	}
 	if role.ControlPlane {
-		if strings.TrimSpace(c.DatabaseURL) == "" {
-			return contract.NewFault(contract.InputRequired, "the external database URL is required for the main role", "Set EREGION_DATABASE_URL or --database-url-file to a private file; the URL is never accepted as a command argument.")
-		}
-		if err := validateListen(c.APIListen, "API"); err != nil {
+		if err := c.validateControlPlane(); err != nil {
 			return err
-		}
-		host, _, _ := net.SplitHostPort(c.APIListen)
-		ip := net.ParseIP(host)
-		loopback := ip != nil && ip.IsLoopback()
-		if !loopback && (c.APITLSCert == "" || c.APITLSKey == "") {
-			return contract.NewFault(contract.ValidationFailed, "a non-loopback API listener requires TLS", "Supply --api-tls-cert and --api-tls-key, or keep the API on a loopback address behind a reverse proxy.")
-		}
-		if (c.APITLSCert == "") != (c.APITLSKey == "") {
-			return contract.NewFault(contract.ValidationFailed, "API TLS requires both a certificate and a key", "Supply --api-tls-cert and --api-tls-key together.")
-		}
-		if c.Hostname != "" {
-			if err := ValidateHostname(c.Hostname); err != nil {
-				return contract.NewFault(contract.ValidationFailed, "invalid hostname "+c.Hostname, err.Error())
-			}
-		}
-		if c.AdminUser != "" {
-			if err := ValidateAccountName(c.AdminUser); err != nil {
-				return contract.NewFault(contract.ValidationFailed, "invalid admin user", err.Error())
-			}
-			if c.AdminUser == "root" {
-				return contract.NewFault(contract.ValidationFailed, "the admin user must not be root", "Use a separate unprivileged operator account.")
-			}
-		}
-		if c.WorkerConcurrency < 1 || c.WorkerConcurrency > 16 {
-			return contract.NewFault(contract.ValidationFailed, "worker concurrency out of range", "Use --worker-concurrency 1–16.")
-		}
-		if c.CommitConfirmSeconds != 0 && (c.CommitConfirmSeconds < 30 || c.CommitConfirmSeconds > 900) {
-			return contract.NewFault(contract.ValidationFailed, "commit-confirm window out of range", "Use --commit-confirm-seconds 30–900.")
 		}
 	}
 	if role.Registry {
-		if err := validateListen(c.RegistryListen, "registry"); err != nil {
+		if err := c.validateRegistry(); err != nil {
 			return err
 		}
-		host, _, _ := net.SplitHostPort(c.RegistryListen)
-		ip := net.ParseIP(host)
-		if ip == nil || !ip.IsLoopback() {
-			return contract.NewFault(contract.ValidationFailed, "the registry must listen on a loopback address", "This increment installs a local registry without TLS or registry authentication; expose it through an authenticated proxy before changing the bind address.")
-		}
 	}
-	if role.NodeAgent {
-		if c.Layout.NodeUser == "" || c.Layout.NodeGroup == "" {
-			return contract.NewFault(contract.ValidationFailed, "node roles require a node account and group", "Use the default eregion-node execution identity.")
-		}
+	if role.NodeAgent && (c.Layout.NodeUser == "" || c.Layout.NodeGroup == "") {
+		return contract.NewFault(contract.ValidationFailed, "node roles require a node account and group", "Use the default eregion-node execution identity.")
 	}
 	if role.ControlPlane {
 		if _, err := c.EffectiveBinaryPath(); err != nil {
@@ -273,13 +221,83 @@ func (c Config) Validate() error {
 	return nil
 }
 
-func apiExternallyReachable(cfg Config) bool {
-	host, _, err := net.SplitHostPort(cfg.APIListen)
-	if err != nil {
-		return false
+func (c Config) validateIdentity() (RoleConfig, error) {
+	if err := engine.ValidateNodeName(c.Node); err != nil {
+		return RoleConfig{}, contract.NewFault(contract.ValidationFailed, "invalid node name", "Use 1–64 lowercase letters, digits, hyphens, or underscores.")
 	}
+	role, err := ConfigForRole(c.Role)
+	if err != nil {
+		return RoleConfig{}, contract.NewFault(contract.ValidationFailed, err.Error(), "Use --role main, application, builder, or telemetry.")
+	}
+	if err := c.Layout.Validate(); err != nil {
+		return RoleConfig{}, contract.NewFault(contract.ValidationFailed, err.Error(), "Use absolute, non-root host paths.")
+	}
+	if c.Workspace != "" && !role.ControlPlane {
+		return RoleConfig{}, contract.NewFault(contract.ValidationFailed, "a workspace identity belongs to the main control-plane node", "Omit --workspace on application, builder, or telemetry roles.")
+	}
+	if c.Workspace != "" {
+		if err := ValidateWorkspaceName(c.Workspace); err != nil {
+			return RoleConfig{}, err
+		}
+	}
+	return role, nil
+}
+
+func (c Config) validateControlPlane() error {
+	if strings.TrimSpace(c.DatabaseURL) == "" {
+		return contract.NewFault(contract.InputRequired, "the external database URL is required for the main role", "Set EREGION_DATABASE_URL or --database-url-file to a private file; the URL is never accepted as a command argument.")
+	}
+	if err := validateListen(c.APIListen, "API"); err != nil {
+		return err
+	}
+	host, _, _ := net.SplitHostPort(c.APIListen)
 	ip := net.ParseIP(host)
-	return ip == nil || !ip.IsLoopback()
+	if loopback := ip != nil && ip.IsLoopback(); !loopback && (c.APITLSCert == "" || c.APITLSKey == "") {
+		return contract.NewFault(contract.ValidationFailed, "a non-loopback API listener requires TLS", "Supply --api-tls-cert and --api-tls-key, or keep the API on a loopback address behind a reverse proxy.")
+	}
+	if (c.APITLSCert == "") != (c.APITLSKey == "") {
+		return contract.NewFault(contract.ValidationFailed, "API TLS requires both a certificate and a key", "Supply --api-tls-cert and --api-tls-key together.")
+	}
+	if err := c.validateControlPlaneIdentity(); err != nil {
+		return err
+	}
+	if c.WorkerConcurrency < 1 || c.WorkerConcurrency > 16 {
+		return contract.NewFault(contract.ValidationFailed, "worker concurrency out of range", "Use --worker-concurrency 1–16.")
+	}
+	if c.CommitConfirmSeconds != 0 && (c.CommitConfirmSeconds < 30 || c.CommitConfirmSeconds > 900) {
+		return contract.NewFault(contract.ValidationFailed, "commit-confirm window out of range", "Use --commit-confirm-seconds 30–900.")
+	}
+	return nil
+}
+
+func (c Config) validateControlPlaneIdentity() error {
+	if c.Hostname != "" {
+		if err := ValidateHostname(c.Hostname); err != nil {
+			return contract.NewFault(contract.ValidationFailed, "invalid hostname "+c.Hostname, err.Error())
+		}
+	}
+	if c.AdminUser == "" {
+		return nil
+	}
+	if err := ValidateAccountName(c.AdminUser); err != nil {
+		return contract.NewFault(contract.ValidationFailed, "invalid admin user", err.Error())
+	}
+	if c.AdminUser == "root" {
+		return contract.NewFault(contract.ValidationFailed, "the admin user must not be root", "Use a separate unprivileged operator account.")
+	}
+	return nil
+}
+
+func (c Config) validateRegistry() error {
+	if err := validateListen(c.RegistryListen, "registry"); err != nil {
+		return err
+	}
+	host, _, _ := net.SplitHostPort(c.RegistryListen)
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return contract.NewFault(contract.ValidationFailed, "the registry must listen on a loopback address", "This increment installs a local registry without TLS or registry authentication; expose it through an authenticated proxy before changing the bind address.")
+	}
+	return nil
 }
 
 func validateListen(address, name string) error {
@@ -391,11 +409,11 @@ func (c Config) ConfigHash() (string, error) {
 }
 
 func fileSHA256(path string) (string, error) {
-	file, err := os.Open(path) //nolint:gosec // G304: operator-provided binary or configuration path.
+	file, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	hash := sha256.New()
 	if _, err := io.Copy(hash, file); err != nil {
 		return "", err

@@ -154,49 +154,69 @@ func AuthVaultAuthorizer(auth *Auth) VaultAuthorizer {
 
 func dispatchVault(r *http.Request, service VaultService, authorize VaultAuthorizer) (int, any, error) {
 	path := r.URL.Path
-	if path == "/v1/secrets" {
-		switch r.Method {
-		case http.MethodPost:
-			access, err := authorize(r, VaultWriteScope)
-			if err != nil {
-				return 0, nil, err
-			}
-			return setSecret(r, service, access)
-		case http.MethodGet:
-			access, err := authorize(r, VaultReadScope)
-			if err != nil {
-				return 0, nil, err
-			}
-			return listSecrets(r, service, access)
-		default:
-			return 0, nil, vaultNotFound()
-		}
+	switch path {
+	case "/v1/secrets":
+		return dispatchVaultCollection(r, service, authorize)
+	case "/v1/secrets/archive":
+		return dispatchVaultArchive(r, service, authorize)
 	}
-	if path == "/v1/secrets/archive" {
-		if r.Method != http.MethodPost {
-			return 0, nil, vaultNotFound()
-		}
+	parts, ok := vaultPathParts(path)
+	if !ok {
+		return 0, nil, vaultNotFound()
+	}
+	return dispatchVaultNamespace(r, service, authorize, parts)
+}
+
+func dispatchVaultCollection(r *http.Request, service VaultService, authorize VaultAuthorizer) (int, any, error) {
+	switch r.Method {
+	case http.MethodPost:
 		access, err := authorize(r, VaultWriteScope)
 		if err != nil {
 			return 0, nil, err
 		}
-		return archiveSecret(r, service, access)
+		return setSecret(r, service, access)
+	case http.MethodGet:
+		access, err := authorize(r, VaultReadScope)
+		if err != nil {
+			return 0, nil, err
+		}
+		return listSecrets(r, service, access)
+	default:
+		return 0, nil, vaultNotFound()
 	}
+}
+
+func dispatchVaultArchive(r *http.Request, service VaultService, authorize VaultAuthorizer) (int, any, error) {
+	if r.Method != http.MethodPost {
+		return 0, nil, vaultNotFound()
+	}
+	access, err := authorize(r, VaultWriteScope)
+	if err != nil {
+		return 0, nil, err
+	}
+	return archiveSecret(r, service, access)
+}
+
+func vaultPathParts(path string) ([]string, bool) {
 	const prefix = "/v1/secrets/"
 	if !strings.HasPrefix(path, prefix) || strings.HasSuffix(path, "/") {
-		return 0, nil, vaultNotFound()
+		return nil, false
 	}
 	parts := strings.Split(strings.TrimPrefix(path, prefix), "/")
 	for i := range parts {
 		decoded, err := url.PathUnescape(parts[i])
 		if err != nil || decoded == "" || strings.Contains(decoded, "/") {
-			return 0, nil, vaultNotFound()
+			return nil, false
 		}
 		parts[i] = decoded
 	}
 	if len(parts) != 3 && len(parts) != 4 {
-		return 0, nil, vaultNotFound()
+		return nil, false
 	}
+	return parts, true
+}
+
+func dispatchVaultNamespace(r *http.Request, service VaultService, authorize VaultAuthorizer, parts []string) (int, any, error) {
 	namespace, err := vault.NewNamespace(parts[0], parts[1], parts[2])
 	if err != nil {
 		return 0, nil, err
@@ -383,6 +403,8 @@ func vaultHTTPStatus(code contract.Code) int {
 		return http.StatusPreconditionFailed
 	case contract.Unavailable, contract.Cancelled:
 		return http.StatusServiceUnavailable
+	case contract.MissingTool, contract.DoctorFailed, contract.NodeVersionMismatch, contract.RemoteUnreachable, contract.Internal:
+		return http.StatusInternalServerError
 	default:
 		return http.StatusInternalServerError
 	}

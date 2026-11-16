@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"net"
 	"regexp"
 	"sort"
@@ -407,7 +408,8 @@ func sameRoutes(left, right []string) bool {
 }
 
 func storeUnavailable(err error) error {
-	if fault, ok := err.(*contract.Fault); ok {
+	var fault *contract.FaultError
+	if errors.As(err, &fault) && fault != nil {
 		return fault
 	}
 	return contract.NewFault(contract.Unavailable, "access grant store is unavailable", "Do not treat this as an access decision; repair the store and retry the same operation.")

@@ -13,9 +13,13 @@ import (
 	"github.com/mbvlabs/eregion/internal/platform"
 )
 
-func readActionPayload(t *testing.T, pool *pgxpool.Pool, s *Service, op contract.Operation, dst any) string {
+func readActionPayload(t *testing.T, s *Service, op contract.Operation, dst any) string {
 	t.Helper()
-	ctx := context.Background()
+	return readActionPayloadContext(context.Background(), t, s, op, dst)
+}
+
+func readActionPayloadContext(ctx context.Context, t *testing.T, s *Service, op contract.Operation, dst any) string {
+	t.Helper()
 	var raw json.RawMessage
 	err := s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
 		var err error
@@ -75,7 +79,7 @@ func TestIntegrationActionPayloadRevisionAndUnavailable(t *testing.T) {
 	}
 	empty := platformSubmit(t, s, platform.KindAppCreate, "platform", "payload-empty", map[string]any{"name": "emptyapp"})
 	var emptyResult revisionPayload
-	readActionPayload(t, pool, s, empty, &emptyResult)
+	readActionPayload(t, s, empty, &emptyResult)
 	if emptyResult.AppName != "emptyapp" || emptyResult.CurrentApp == nil ||
 		emptyResult.CurrentApp.ObservedAt.IsZero() || len(emptyResult.Revisions) != 0 {
 		t.Fatalf("app without environments: %+v", emptyResult)
@@ -107,16 +111,23 @@ func TestIntegrationActionPayloadNodeDomainResource(t *testing.T) {
 	platformSubmit(t, s, platform.KindAppCreate, "platform", "families-app", map[string]any{
 		"name": "payload", "environments": []map[string]any{{"name": "production", "node": "local"}},
 	})
+	assertActionPayloadNodeFacts(t, ctx, pool, s, nodeOp)
+	assertActionPayloadDomain(t, ctx, pool, s)
+	assertActionPayloadResource(t, ctx, pool, s)
+}
+
+func assertActionPayloadNodeFacts(t *testing.T, ctx context.Context, pool *pgxpool.Pool, s *Service, nodeOp contract.Operation) {
+	t.Helper()
 	var n nodePayload
-	readActionPayload(t, pool, s, nodeOp, &n)
+	readActionPayloadContext(ctx, t, s, nodeOp, &n)
 	if n.Name != "local" || len(n.DeclaredRoles) != 1 || n.CurrentObservation == nil ||
 		n.CurrentObservation.EnrollmentState != string(platform.EnrollmentRegistered) ||
 		n.CurrentObservation.IdentityFingerprint != "" || n.CurrentObservation.ObservedAt.IsZero() {
 		t.Fatalf("registered node falsely verified or missing facts: %+v", n)
 	}
-	checkOp := platformSubmit(t, s, platform.KindNodeCheck, "node/local", "families-check", map[string]any{})
+	checkOp := platformSubmitContext(ctx, t, s, platform.KindNodeCheck, "node/local", "families-check", map[string]any{})
 	var checked nodePayload
-	readActionPayload(t, pool, s, checkOp, &checked)
+	readActionPayloadContext(ctx, t, s, checkOp, &checked)
 	if checked.Name != "local" || checked.CurrentObservation == nil || checked.CurrentObservation.EnrollmentState != "registered" {
 		t.Fatalf("node check: %+v", checked)
 	}
@@ -125,16 +136,20 @@ func TestIntegrationActionPayloadNodeDomainResource(t *testing.T) {
 		last_check_at=clock_timestamp(),updated_at=clock_timestamp() WHERE name='local'`); err != nil {
 		t.Fatal(err)
 	}
-	readActionPayload(t, pool, s, nodeOp, &n)
+	readActionPayloadContext(ctx, t, s, nodeOp, &n)
 	if n.CurrentObservation.EnrollmentState != "enrolled" || n.CurrentObservation.EnrolledAt == nil ||
 		n.CurrentObservation.IdentityFingerprint != "SHA256:observed" || n.CurrentObservation.LastCheckAt == nil {
 		t.Fatalf("enrolled observation: %+v", n)
 	}
-	domain := platformSubmit(t, s, platform.KindDomainAdd, "env/payload/production", "families-domain", map[string]any{
+}
+
+func assertActionPayloadDomain(t *testing.T, ctx context.Context, pool *pgxpool.Pool, s *Service) {
+	t.Helper()
+	domain := platformSubmitContext(ctx, t, s, platform.KindDomainAdd, "env/payload/production", "families-domain", map[string]any{
 		"domain": "app.example.com",
 	})
 	var d domainPayload
-	readActionPayload(t, pool, s, domain, &d)
+	readActionPayloadContext(ctx, t, s, domain, &d)
 	if d.CurrentObservation == nil || d.CurrentObservation.Generation != nil || d.CurrentObservation.OwnershipMarker != "" {
 		t.Fatalf("manual domain incorrectly has managed DNS facts: %+v", d)
 	}
@@ -150,7 +165,7 @@ func TestIntegrationActionPayloadNodeDomainResource(t *testing.T) {
 		t.Fatal(err)
 	}
 	d = domainPayload{}
-	readActionPayload(t, pool, s, domain, &d)
+	readActionPayloadContext(ctx, t, s, domain, &d)
 	if d.Name != "app.example.com" || d.CurrentObservation == nil || d.CurrentObservation.ID == "" ||
 		d.CurrentObservation.DesiredRevision != 3 || d.CurrentObservation.AppliedRevision != 2 ||
 		d.CurrentObservation.RouteState != "pending" || d.CurrentObservation.Generation == nil ||
@@ -159,7 +174,11 @@ func TestIntegrationActionPayloadNodeDomainResource(t *testing.T) {
 		d.CurrentObservation.ObservedAt.IsZero() {
 		t.Fatalf("domain: %+v", d)
 	}
-	resource := platformSubmit(t, s, platform.KindResourceApply, "resource/payload/production/db", "families-resource", map[string]any{
+}
+
+func assertActionPayloadResource(t *testing.T, ctx context.Context, pool *pgxpool.Pool, s *Service) {
+	t.Helper()
+	resource := platformSubmitContext(ctx, t, s, platform.KindResourceApply, "resource/payload/production/db", "families-resource", map[string]any{
 		"image": "postgres:17", "env": map[string]string{"PASSWORD": "payload-secret"},
 		"mounts": []map[string]any{{"name": "data", "destination": "/private-secret-path"}},
 		"health": map[string]any{"type": "exec", "command": []string{"private-command"}},
@@ -179,7 +198,7 @@ func TestIntegrationActionPayloadNodeDomainResource(t *testing.T) {
 		t.Fatal(err)
 	}
 	var r resourcePayload
-	raw := readActionPayload(t, pool, s, resource, &r)
+	raw := readActionPayloadContext(ctx, t, s, resource, &r)
 	if r.CurrentObservation == nil || r.CurrentObservation.State != "ready" || r.CurrentObservation.ContainerName != "resource-container" ||
 		r.CurrentObservation.NetworkName != "resource-network" || len(r.CurrentObservation.VolumeNames) != 1 ||
 		r.CurrentObservation.VolumeNames[0] != volumeName || r.CurrentObservation.LastOperationID != string(resource.ID) {
@@ -193,11 +212,16 @@ func TestIntegrationActionPayloadNodeDomainResource(t *testing.T) {
 	if _, err := pool.Exec(ctx, `UPDATE eregion_operations SET state='succeeded' WHERE id=$1`, resource.ID); err != nil {
 		t.Fatal(err)
 	}
-	destroy := platformSubmit(t, s, platform.KindResourceDestroy, "resource/payload/production/db", "families-destroy", map[string]any{
+	assertActionPayloadResourceDestroy(t, ctx, pool, s)
+}
+
+func assertActionPayloadResourceDestroy(t *testing.T, ctx context.Context, pool *pgxpool.Pool, s *Service) {
+	t.Helper()
+	destroy := platformSubmitContext(ctx, t, s, platform.KindResourceDestroy, "resource/payload/production/db", "families-destroy", map[string]any{
 		"confirm": "payload/production/db",
 	})
-	r = resourcePayload{}
-	readActionPayload(t, pool, s, destroy, &r)
+	var r resourcePayload
+	readActionPayloadContext(ctx, t, s, destroy, &r)
 	if r.DeleteDataRequested == nil || *r.DeleteDataRequested || r.DataOutcome != "unavailable" || r.CurrentObservation.State != "destroying" {
 		t.Fatalf("premature destroy outcome: %+v", r)
 	}
@@ -205,14 +229,14 @@ func TestIntegrationActionPayloadNodeDomainResource(t *testing.T) {
 		destroyed_at=clock_timestamp(),updated_at=clock_timestamp() WHERE operation_id=$1`, destroy.ID); err != nil {
 		t.Fatal(err)
 	}
-	readActionPayload(t, pool, s, destroy, &r)
+	readActionPayloadContext(ctx, t, s, destroy, &r)
 	if r.DataOutcome != "retained" || len(r.CurrentObservation.VolumeNames) != 1 {
 		t.Fatalf("retained destroy outcome: %+v", r)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE eregion_operations SET state='succeeded' WHERE id=$1`, destroy.ID); err != nil {
 		t.Fatal(err)
 	}
-	deleteData := platformSubmit(t, s, platform.KindResourceDestroy, "resource/payload/production/db", "families-delete-data", map[string]any{
+	deleteData := platformSubmitContext(ctx, t, s, platform.KindResourceDestroy, "resource/payload/production/db", "families-delete-data", map[string]any{
 		"confirm": "payload/production/db", "delete_data": true,
 	})
 	if _, err := pool.Exec(ctx, `UPDATE eregion_platform_resources SET state='destroyed',volumes='[]'::jsonb,
@@ -220,12 +244,12 @@ func TestIntegrationActionPayloadNodeDomainResource(t *testing.T) {
 		t.Fatal(err)
 	}
 	r = resourcePayload{}
-	readActionPayload(t, pool, s, deleteData, &r)
+	readActionPayloadContext(ctx, t, s, deleteData, &r)
 	if r.DeleteDataRequested == nil || !*r.DeleteDataRequested || r.DataOutcome != "delete_completed" || len(r.CurrentObservation.VolumeNames) != 0 {
 		t.Fatalf("delete data outcome: %+v", r)
 	}
 	r = resourcePayload{}
-	readActionPayload(t, pool, s, destroy, &r)
+	readActionPayloadContext(ctx, t, s, destroy, &r)
 	if r.DataOutcome != "unavailable" || r.CurrentObservation.LastOperationID != string(deleteData.ID) {
 		t.Fatalf("later operation misattributed to earlier destroy: %+v", r)
 	}
@@ -235,7 +259,7 @@ func TestIntegrationActionPayloadBuildStopTarget(t *testing.T) {
 	f := newPointerBuildFixture(t)
 	op := platformSubmit(t, f.service, platform.KindBuildStop, "build/"+string(f.build), "payload-stop", map[string]any{})
 	var got buildStopPayload
-	readActionPayload(t, f.pool, f.service, op, &got)
+	readActionPayload(t, f.service, op, &got)
 	if got.TargetBuildID != string(f.build) || got.CurrentObservation == nil ||
 		got.CurrentObservation.ID != string(f.build) || got.CurrentObservation.OperationID != string(f.op.ID) ||
 		got.CurrentObservation.ObservedAt.IsZero() || got.CurrentObservation.State == "" {
@@ -261,7 +285,7 @@ func TestIntegrationActionPayloadDiagnosticAcknowledgements(t *testing.T) {
 		t.Fatal(err)
 	}
 	var got diagnosticPayloadResult
-	readActionPayload(t, pool, run.Service, claimed, &got)
+	readActionPayload(t, run.Service, claimed, &got)
 	if got.RequestedSteps != 2 || got.AcknowledgedSteps != 1 || len(got.Steps) != 1 ||
 		got.Steps[0].State != "completed" || got.Steps[0].ExecutionID == "" || got.Steps[0].CompletedAt == nil {
 		t.Fatalf("diagnostic: %+v", got)
@@ -280,7 +304,7 @@ func TestIntegrationActionPayloadProtectionRetention(t *testing.T) {
 	})
 	op := platformSubmit(t, s, platform.KindEnvironmentProtect, "env/guard/preview", "protection-on", map[string]any{"protected": true})
 	var protect protectionPayload
-	readActionPayload(t, pool, s, op, &protect)
+	readActionPayload(t, s, op, &protect)
 	if !protect.DesiredProtected || protect.CurrentObservation == nil || !protect.CurrentObservation.Protected ||
 		protect.CurrentObservation.ObservedAt.IsZero() {
 		t.Fatalf("protection: %+v", protect)
@@ -290,7 +314,7 @@ func TestIntegrationActionPayloadProtectionRetention(t *testing.T) {
 		t.Fatal(err)
 	}
 	protect = protectionPayload{}
-	readActionPayload(t, pool, s, op, &protect)
+	readActionPayload(t, s, op, &protect)
 	if !protect.DesiredProtected || protect.CurrentObservation.Protected {
 		t.Fatalf("current protection mistaken for requested state: %+v", protect)
 	}
@@ -307,7 +331,7 @@ func TestIntegrationActionPayloadProtectionRetention(t *testing.T) {
 	unprotect := op
 	unprotect.ID = unprotectID
 	protect = protectionPayload{}
-	readActionPayload(t, pool, s, unprotect, &protect)
+	readActionPayload(t, s, unprotect, &protect)
 	if protect.DesiredProtected || protect.CurrentObservation == nil || protect.CurrentObservation.Protected {
 		t.Fatalf("unprotection: %+v", protect)
 	}
@@ -328,7 +352,7 @@ func TestIntegrationActionPayloadProtectionRetention(t *testing.T) {
 	}
 	diag.Kind = platform.KindRetentionPrune
 	var retained retentionPayload
-	raw := readActionPayload(t, pool, s, diag, &retained)
+	raw := readActionPayload(t, s, diag, &retained)
 	if retained.Availability != "available" || retained.PlannedCount != 2 || retained.RemovedCount != 1 ||
 		retained.PlannedSkipCount != 1 || retained.SkippedCount != 1 || retained.CacheBytes == nil ||
 		*retained.CacheBytes != 20 || retained.CacheMeasuredAt == nil || retained.GCGeneration != 2 ||
@@ -357,7 +381,7 @@ func TestIntegrationActionPayloadDeploymentEvidence(t *testing.T) {
 		t.Fatal(err)
 	}
 	var got executionPayload
-	raw := readActionPayload(t, f.pool, f.service, f.op, &got)
+	raw := readActionPayload(t, f.service, f.op, &got)
 	if got.DeploymentID != string(f.dep) || got.BuildID != string(f.build) || got.ReleaseID != string(f.release) ||
 		got.CurrentObservation == nil || got.CurrentObservation.ServingDeploymentID != string(f.dep) ||
 		got.CurrentObservation.CandidateCleanupPending != 1 || len(got.Steps) != 2 ||
@@ -370,6 +394,15 @@ func TestIntegrationActionPayloadFirstDeployAttribution(t *testing.T) {
 	pool, _ := testPool(t, true)
 	s := testRuntime(t, pool, 0).Service
 	ctx := context.Background()
+	create, plain := seedFirstDeployPayload(t, s)
+	initial, noIntent := assertFirstDeployInitial(t, s, create, plain)
+	insertFirstDeploySpoofCandidates(t, ctx, pool, create, initial, noIntent)
+	assertFirstDeploySpoofRejected(t, s, create, plain)
+	assertFirstDeployPinRemoved(t, ctx, pool, s, create)
+}
+
+func seedFirstDeployPayload(t *testing.T, s *Service) (contract.Operation, contract.Operation) {
+	t.Helper()
 	platformSubmit(t, s, platform.KindNodeRegister, "platform", "first-node", map[string]any{
 		"name": "local", "roles": []string{platform.RoleApplication, platform.RoleBuilder},
 		"capabilities": []string{platform.CapabilityDocker, platform.CapabilityBuildpacks},
@@ -384,13 +417,33 @@ func TestIntegrationActionPayloadFirstDeployAttribution(t *testing.T) {
 	plain := platformSubmit(t, s, platform.KindAppCreate, "platform", "first-without", map[string]any{
 		"name": "plainfirst", "environments": []map[string]any{{"name": "production", "node": "local"}},
 	})
+	return create, plain
+}
+
+func assertFirstDeployInitial(
+	t *testing.T,
+	s *Service,
+	create, plain contract.Operation,
+) (revisionPayload, revisionPayload) {
+	t.Helper()
 	var initial, noIntent revisionPayload
-	readActionPayload(t, pool, s, create, &initial)
-	readActionPayload(t, pool, s, plain, &noIntent)
+	readActionPayload(t, s, create, &initial)
+	readActionPayload(t, s, plain, &noIntent)
 	if len(initial.Revisions) != 1 || initial.Revisions[0].FirstDeployOperationID != string(create.FirstDeployOperationID) ||
 		len(noIntent.Revisions) != 1 || noIntent.Revisions[0].FirstDeployOperationID != "" {
 		t.Fatalf("initial first deploys: %+v %+v", initial, noIntent)
 	}
+	return initial, noIntent
+}
+
+func insertFirstDeploySpoofCandidates(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	create contract.Operation,
+	initial, noIntent revisionPayload,
+) {
+	t.Helper()
 	for i, revision := range []actionRevision{initial.Revisions[0], noIntent.Revisions[0]} {
 		for _, candidate := range []struct{ actor, target string }{
 			{"other-actor", "env/" + revision.App + "/" + revision.Environment},
@@ -408,27 +461,39 @@ func TestIntegrationActionPayloadFirstDeployAttribution(t *testing.T) {
 				fake, candidate.target, candidate.actor, "first-deploy:"+revision.ID); err != nil {
 				t.Fatal(err)
 			}
-			if i == 0 {
-				if _, err := pool.Exec(ctx, `INSERT INTO eregion_platform_deployments
-				(id,operation_id,app_id,environment_id,action,release_id,previous_release_id,state,error_code,message,created_at,updated_at,
-				completed_at,revision_id,secret_revisions,previous_deployment_id,instances)
-				SELECT 'dep_' || substr($1,4),$1,app_id,environment_id,action,release_id,previous_release_id,state,error_code,message,
-				created_at,updated_at,completed_at,revision_id,secret_revisions,previous_deployment_id,instances
-				FROM eregion_platform_deployments WHERE operation_id=$2`, fake, create.FirstDeployOperationID); err != nil {
-					t.Fatal(err)
-				}
+			if i != 0 {
+				continue
+			}
+			if _, err := pool.Exec(ctx, `INSERT INTO eregion_platform_deployments
+			(id,operation_id,app_id,environment_id,action,release_id,previous_release_id,state,error_code,message,created_at,updated_at,
+			completed_at,revision_id,secret_revisions,previous_deployment_id,instances)
+			SELECT 'dep_' || substr($1,4),$1,app_id,environment_id,action,release_id,previous_release_id,state,error_code,message,
+			created_at,updated_at,completed_at,revision_id,secret_revisions,previous_deployment_id,instances
+			FROM eregion_platform_deployments WHERE operation_id=$2`, fake, create.FirstDeployOperationID); err != nil {
+				t.Fatal(err)
 			}
 		}
 	}
+	insertFirstDeployWithoutIntent(t, ctx, pool, create, noIntent)
+}
+
+func insertFirstDeployWithoutIntent(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	create contract.Operation,
+	noIntent revisionPayload,
+) {
+	t.Helper()
+	r := noIntent.Revisions[0]
 	withoutIntent, err := contract.NewOperationID()
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := noIntent.Revisions[0]
 	if _, err := pool.Exec(ctx, `INSERT INTO eregion_operations
 		(id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state,attempt,completed_steps,last_sequence,created_at,updated_at,error_code)
 		VALUES ($1,'platform.deploy',$2,$3,$4,$5,'hash','{}','queued',0,0,1,clock_timestamp(),clock_timestamp(),'')`,
-		withoutIntent, "env/"+r.App+"/"+r.Environment, plain.Actor.Kind, plain.Actor.Subject, "first-deploy:"+r.ID); err != nil {
+		withoutIntent, "env/"+r.App+"/"+r.Environment, testActor.Kind, testActor.Subject, "first-deploy:"+r.ID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO eregion_platform_deployments
@@ -438,18 +503,30 @@ func TestIntegrationActionPayloadFirstDeployAttribution(t *testing.T) {
 		FROM eregion_platform_deployments WHERE operation_id=$5`, withoutIntent, r.AppID, r.EnvironmentID, r.ID, create.FirstDeployOperationID); err != nil {
 		t.Fatal(err)
 	}
-	initial, noIntent = revisionPayload{}, revisionPayload{}
-	readActionPayload(t, pool, s, create, &initial)
-	readActionPayload(t, pool, s, plain, &noIntent)
+}
+
+func assertFirstDeploySpoofRejected(
+	t *testing.T,
+	s *Service,
+	create, plain contract.Operation,
+) {
+	t.Helper()
+	var initial, noIntent revisionPayload
+	readActionPayload(t, s, create, &initial)
+	readActionPayload(t, s, plain, &noIntent)
 	if initial.Revisions[0].FirstDeployOperationID != string(create.FirstDeployOperationID) || noIntent.Revisions[0].FirstDeployOperationID != "" {
 		t.Fatalf("caller key spoofed first deploy: %+v %+v", initial, noIntent)
 	}
+}
+
+func assertFirstDeployPinRemoved(t *testing.T, ctx context.Context, pool *pgxpool.Pool, s *Service, create contract.Operation) {
+	t.Helper()
 	// Removing the true pin must not let the unrelated candidate take over.
 	if _, err := pool.Exec(ctx, `UPDATE eregion_platform_deployments SET revision_id=NULL WHERE operation_id=$1`, create.FirstDeployOperationID); err != nil {
 		t.Fatal(err)
 	}
-	initial = revisionPayload{}
-	readActionPayload(t, pool, s, create, &initial)
+	var initial revisionPayload
+	readActionPayloadContext(ctx, t, s, create, &initial)
 	if initial.Revisions[0].FirstDeployOperationID != "" {
 		t.Fatalf("unrelated deployment attributed after real pin disappeared: %+v", initial)
 	}

@@ -95,7 +95,8 @@ func (s *Service) environmentWorkloadNodes(ctx context.Context, envID platform.E
 // inspecting an ownership row across a lock gap.
 func targetLockKey(target string) int64 {
 	sum := sha256.Sum256([]byte(target))
-	return int64(binary.BigEndian.Uint64(sum[:8]))
+	// Preserve the exact 64-bit key bits; advisory locks only compare identity.
+	return int64(binary.BigEndian.Uint64(sum[:8])) //nolint:gosec // G115: intentional two's-complement preservation of a 64-bit advisory key.
 }
 
 func uniqueTargets(targets []string) []string {
@@ -227,40 +228,15 @@ func (w *platformWorker) deleteEnvironment(ctx context.Context, id contract.Oper
 	if err != nil {
 		return w.settle(ctx, id, attempt, err)
 	}
-	if _, err := w.service.verifyLocalRegistryHost(ctx); err != nil {
-		return w.settle(ctx, id, attempt, err)
-	}
-	// Provider cleanup must succeed before any serving workload is removed. A
-	// failed Cloudflare read/delete then leaves the retained app alive and
-	// retryable instead of taking it offline while its route remains.
-	op, _, err := w.service.operationSnapshot(ctx, id)
-	if err != nil {
-		return w.settle(ctx, id, attempt, err)
-	}
-	if err := w.service.cleanupDomainDNSForEnvironments(ctx, op, attempt, []platform.EnvironmentID{env.ID}); err != nil {
-		return w.settle(ctx, id, attempt, err)
-	}
-	if err := w.service.checkDomainDNSBoundary(ctx, id, attempt); err != nil {
+	if err := w.deletePreflight(ctx, id, attempt, []platform.EnvironmentID{env.ID}); err != nil {
 		return w.settle(ctx, id, attempt, err)
 	}
 	nodes, err := w.service.environmentWorkloadNodes(ctx, env.ID, env.Node)
 	if err != nil {
 		return w.settle(ctx, id, attempt, err)
 	}
-	for index, nodeName := range nodes {
-		if err := w.service.checkDomainDNSBoundary(ctx, id, attempt); err != nil {
-			return w.settle(ctx, id, attempt, err)
-		}
-		tr, err := w.service.resolver.TransportFor(ctx, nodeName)
-		if err != nil {
-			return w.settle(ctx, id, attempt, err)
-		}
-		step := fmt.Sprintf("platform-delete-%02d-v1", index+1)
-		if _, err := w.runStepOn(ctx, tr, id, attempt, step, platform.DeletePayload{
-			Step: step, App: env.App, Environment: env.Name,
-		}, nil); err != nil {
-			return w.settle(ctx, id, attempt, err)
-		}
+	if err := w.runDeleteNodeSteps(ctx, id, attempt, nodes, env.App, env.Name); err != nil {
+		return w.settle(ctx, id, attempt, err)
 	}
 	if err := w.service.checkDomainDNSBoundary(ctx, id, attempt); err != nil {
 		return w.settle(ctx, id, attempt, err)
@@ -287,8 +263,7 @@ func (w *platformWorker) deleteEnvironment(ctx context.Context, id contract.Oper
 		if err := deleteEmptyApplicationTx(ctx, tx, env.App); err != nil {
 			return err
 		}
-		var appDeleted bool
-		appDeleted, err = tx.Platform().Apps().MissingByID(ctx, lockedApp.ID)
+		appDeleted, err := tx.Platform().Apps().MissingByID(ctx, lockedApp.ID)
 		if err != nil {
 			return err
 		}
@@ -310,54 +285,19 @@ func (w *platformWorker) deleteApplication(ctx context.Context, id contract.Oper
 	if err != nil {
 		return w.settle(ctx, id, attempt, err)
 	}
-	if _, err := w.service.verifyLocalRegistryHost(ctx); err != nil {
-		return w.settle(ctx, id, attempt, err)
-	}
 	environmentIDs := make([]platform.EnvironmentID, 0, len(environments))
 	for _, env := range environments {
 		environmentIDs = append(environmentIDs, env.ID)
 	}
-	// Clean every managed binding before removing any serving workload. A
-	// provider failure cannot therefore orphan a retained app on dead routes.
-	op, _, err := w.service.operationSnapshot(ctx, id)
+	if err := w.deletePreflight(ctx, id, attempt, environmentIDs); err != nil {
+		return w.settle(ctx, id, attempt, err)
+	}
+	nodes, err := w.deleteWorkloadNodes(ctx, environments)
 	if err != nil {
 		return w.settle(ctx, id, attempt, err)
 	}
-	if err := w.service.cleanupDomainDNSForEnvironments(ctx, op, attempt, environmentIDs); err != nil {
+	if err := w.runDeleteNodeSteps(ctx, id, attempt, nodes, app.Name, ""); err != nil {
 		return w.settle(ctx, id, attempt, err)
-	}
-	if err := w.service.checkDomainDNSBoundary(ctx, id, attempt); err != nil {
-		return w.settle(ctx, id, attempt, err)
-	}
-	byNode := map[string]bool{}
-	for _, env := range environments {
-		nodes, err := w.service.environmentWorkloadNodes(ctx, env.ID, env.Node)
-		if err != nil {
-			return w.settle(ctx, id, attempt, err)
-		}
-		for _, nodeName := range nodes {
-			byNode[nodeName] = true
-		}
-	}
-	nodes := make([]string, 0, len(byNode))
-	for name := range byNode {
-		nodes = append(nodes, name)
-	}
-	sort.Strings(nodes)
-	for index, nodeName := range nodes {
-		if err := w.service.checkDomainDNSBoundary(ctx, id, attempt); err != nil {
-			return w.settle(ctx, id, attempt, err)
-		}
-		tr, err := w.service.resolver.TransportFor(ctx, nodeName)
-		if err != nil {
-			return w.settle(ctx, id, attempt, err)
-		}
-		step := fmt.Sprintf("platform-delete-%02d-v1", index+1)
-		if _, err := w.runStepOn(ctx, tr, id, attempt, step, platform.DeletePayload{
-			Step: step, App: app.Name,
-		}, nil); err != nil {
-			return w.settle(ctx, id, attempt, err)
-		}
 	}
 	if err := w.service.checkDomainDNSBoundary(ctx, id, attempt); err != nil {
 		return w.settle(ctx, id, attempt, err)
@@ -374,30 +314,92 @@ func (w *platformWorker) deleteApplication(ctx context.Context, id contract.Oper
 	}
 	defer hostRelease()
 	if err := w.service.finishDomainOperation(ctx, id, attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
-		lockedApp, err := appByNameForUpdateTx(ctx, tx, app.Name)
+		return w.deleteApplicationTx(ctx, tx, op, app, environments)
+	}); err != nil {
+		return w.settle(ctx, id, attempt, err)
+	}
+	return nil
+}
+
+func (w *platformWorker) deleteApplicationTx(ctx context.Context, tx *entities.StoreTx, op *contract.Operation, app platform.App, environments []platform.Environment) error {
+	lockedApp, err := appByNameForUpdateTx(ctx, tx, app.Name)
+	if err != nil {
+		return err
+	}
+	if lockedApp.ID != app.ID {
+		return pointerIntegrityFault()
+	}
+	for _, env := range environments {
+		if err := deleteEnvironmentRowsTx(ctx, tx, env); err != nil {
+			return err
+		}
+	}
+	if err := deleteApplicationRowsTx(ctx, tx, app); err != nil {
+		return err
+	}
+	if data, err := deletionActionData(lockedApp, environments, true); err == nil {
+		w.service.tryDeletionOutputTx(ctx, tx, op, data)
+	}
+	return appendEvent(ctx, tx, op, contract.Event{
+		Kind: "log", Stage: "delete",
+		Message: "Application " + app.Name + " and every environment were deleted after workload and route cleanup; operation history was kept.",
+	})
+}
+
+// deletePreflight verifies the local registry host, reads the operation, runs
+// provider cleanup for every managed binding and rechecks the DNS boundary
+// before any serving workload is removed.
+func (w *platformWorker) deletePreflight(ctx context.Context, id contract.OperationID, attempt uint32, environmentIDs []platform.EnvironmentID) error {
+	if _, err := w.service.verifyLocalRegistryHost(ctx); err != nil {
+		return err
+	}
+	op, _, err := w.service.operationSnapshot(ctx, id)
+	if err != nil {
+		return err
+	}
+	if err := w.service.cleanupDomainDNSForEnvironments(ctx, op, attempt, environmentIDs); err != nil {
+		return err
+	}
+	if err := w.service.checkDomainDNSBoundary(ctx, id, attempt); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (w *platformWorker) deleteWorkloadNodes(ctx context.Context, environments []platform.Environment) ([]string, error) {
+	byNode := map[string]bool{}
+	for _, env := range environments {
+		nodes, err := w.service.environmentWorkloadNodes(ctx, env.ID, env.Node)
+		if err != nil {
+			return nil, err
+		}
+		for _, nodeName := range nodes {
+			byNode[nodeName] = true
+		}
+	}
+	nodes := make([]string, 0, len(byNode))
+	for name := range byNode {
+		nodes = append(nodes, name)
+	}
+	sort.Strings(nodes)
+	return nodes, nil
+}
+
+func (w *platformWorker) runDeleteNodeSteps(ctx context.Context, id contract.OperationID, attempt uint32, nodes []string, app, environment string) error {
+	for index, nodeName := range nodes {
+		if err := w.service.checkDomainDNSBoundary(ctx, id, attempt); err != nil {
+			return err
+		}
+		tr, err := w.service.resolver.TransportFor(ctx, nodeName)
 		if err != nil {
 			return err
 		}
-		if lockedApp.ID != app.ID {
-			return pointerIntegrityFault()
-		}
-		for _, env := range environments {
-			if err := deleteEnvironmentRowsTx(ctx, tx, env); err != nil {
-				return err
-			}
-		}
-		if err := deleteApplicationRowsTx(ctx, tx, app); err != nil {
+		step := fmt.Sprintf("platform-delete-%02d-v1", index+1)
+		if _, err := w.runStepOn(ctx, tr, id, attempt, step, platform.DeletePayload{
+			Step: step, App: app, Environment: environment,
+		}, nil); err != nil {
 			return err
 		}
-		if data, err := deletionActionData(lockedApp, environments, true); err == nil {
-			w.service.tryDeletionOutputTx(ctx, tx, op, data)
-		}
-		return appendEvent(ctx, tx, op, contract.Event{
-			Kind: "log", Stage: "delete",
-			Message: "Application " + app.Name + " and every environment were deleted after workload and route cleanup; operation history was kept.",
-		})
-	}); err != nil {
-		return w.settle(ctx, id, attempt, err)
 	}
 	return nil
 }
@@ -492,25 +494,6 @@ func deleteApplicationRowsTx(ctx context.Context, tx *entities.StoreTx, app plat
 	}
 	if _, err := tx.Secrets().DeleteForApp(ctx, app.Name); err != nil {
 		return unavailable(err)
-	}
-	return nil
-}
-
-// deleteDomainRows removes the row-6 domain state for the environments being
-// deleted. The caller then uses the one serialized route writer (syncRoutes),
-// so deletion does not introduce a second Caddy write path.
-func (s *Service) deleteDomainRows(ctx context.Context, environmentIDs []platform.EnvironmentID) error {
-	if len(environmentIDs) == 0 {
-		return nil
-	}
-	err := s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
-		return deleteDomainRowsTx(ctx, tx, environmentIDs)
-	})
-	if err != nil {
-		if entities.IsBeginFailure(err) || entities.IsCommitFailure(err) {
-			return unavailable(err)
-		}
-		return err
 	}
 	return nil
 }

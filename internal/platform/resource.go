@@ -135,9 +135,7 @@ type ResourceVolumeStatus struct {
 func PlannedResourceVolumes(plan ResourcePlan) []ResourceVolumeStatus {
 	volumes := make([]ResourceVolumeStatus, 0, len(plan.Volumes))
 	for _, volume := range plan.Volumes {
-		volumes = append(volumes, ResourceVolumeStatus{
-			Name: volume.Name, Destination: volume.Destination, ReadOnly: volume.ReadOnly,
-		})
+		volumes = append(volumes, ResourceVolumeStatus(volume))
 	}
 	return volumes
 }
@@ -265,40 +263,64 @@ func ValidateResourceName(name string) error {
 // declaration. It rejects secret-value fields by strict decoding at the action
 // boundary; this function only ever accepts secret NAMES.
 func NormalizeResourceSpec(spec ResourceSpec) (ResourceSpec, error) {
-	if err := ValidateImage(spec.Image); err != nil {
+	if err := normalizeResourceBase(&spec); err != nil {
 		return spec, err
+	}
+	if err := normalizeResourceMounts(&spec); err != nil {
+		return spec, err
+	}
+	if err := normalizeResourceHealth(&spec); err != nil {
+		return spec, err
+	}
+	if err := validateResourceCommand(spec.Command); err != nil {
+		return spec, err
+	}
+	return spec, nil
+}
+
+func normalizeResourceBase(spec *ResourceSpec) error {
+	if err := ValidateImage(spec.Image); err != nil {
+		return err
 	}
 	spec.Image = strings.TrimSpace(spec.Image)
 	if spec.Port != 0 {
 		if err := validatePort(spec.Port, 1); err != nil {
-			return spec, err
+			return err
 		}
 	}
 	if spec.Env == nil {
 		spec.Env = map[string]string{}
 	}
 	if err := validateEnv(spec.Env, "resource environment"); err != nil {
-		return spec, err
+		return err
 	}
+	return normalizeResourceSecretEnv(spec)
+}
+
+func normalizeResourceSecretEnv(spec *ResourceSpec) error {
 	if spec.SecretEnv == nil {
 		spec.SecretEnv = map[string]string{}
 	}
 	if len(spec.SecretEnv) > 64 {
-		return spec, invalid("resource secret environment", "Use at most 64 secret environment mappings.")
+		return invalid("resource secret environment", "Use at most 64 secret environment mappings.")
 	}
 	for key, name := range spec.SecretEnv {
 		if !envKeyPattern.MatchString(key) {
-			return spec, invalid("resource secret environment key", "Use 1–128 ASCII letters, digits, and underscores; do not start with a digit.")
+			return invalid("resource secret environment key", "Use 1–128 ASCII letters, digits, and underscores; do not start with a digit.")
 		}
 		if _, plain := spec.Env[key]; plain {
-			return spec, invalid("resource secret environment", "A key cannot be both plain configuration and a secret reference.")
+			return invalid("resource secret environment", "A key cannot be both plain configuration and a secret reference.")
 		}
 		if !secretNamePattern.MatchString(name) {
-			return spec, invalid("resource secret name", "Reference an uppercase vault secret name such as DATABASE_PASSWORD.")
+			return invalid("resource secret name", "Reference an uppercase vault secret name such as DATABASE_PASSWORD.")
 		}
 	}
+	return nil
+}
+
+func normalizeResourceMounts(spec *ResourceSpec) error {
 	if len(spec.Mounts) > 16 {
-		return spec, invalid("resource mounts", "Use at most 16 named-volume mounts.")
+		return invalid("resource mounts", "Use at most 16 named-volume mounts.")
 	}
 	seenMounts := map[string]bool{}
 	seenDestinations := map[string]bool{}
@@ -306,60 +328,75 @@ func NormalizeResourceSpec(spec ResourceSpec) (ResourceSpec, error) {
 		mount := &spec.Mounts[index]
 		mount.Name = strings.TrimSpace(mount.Name)
 		if !resourceMountPattern.MatchString(mount.Name) {
-			return spec, invalid("resource mount name", "Use 1–20 lowercase letters, digits and inner hyphens for a mount name.")
+			return invalid("resource mount name", "Use 1–20 lowercase letters, digits and inner hyphens for a mount name.")
 		}
 		if seenMounts[mount.Name] {
-			return spec, invalid("resource mount name", "Use each mount name at most once.")
+			return invalid("resource mount name", "Use each mount name at most once.")
 		}
 		seenMounts[mount.Name] = true
 		destination, err := cleanResourceDestination(mount.Destination)
 		if err != nil {
-			return spec, err
+			return err
 		}
 		if seenDestinations[destination] {
-			return spec, invalid("resource mount destination", "Use each container destination at most once.")
+			return invalid("resource mount destination", "Use each container destination at most once.")
 		}
 		seenDestinations[destination] = true
 		mount.Destination = destination
 	}
+	return nil
+}
+
+func normalizeResourceHealth(spec *ResourceSpec) error {
 	if spec.Health.Type == "" {
 		spec.Health.Type = "exec"
 	}
 	if spec.Health.Type != "exec" {
-		return spec, invalid("resource health type", `Use health.type "exec" with a command that exits 0 when the resource is ready.`)
+		return invalid("resource health type", `Use health.type "exec" with a command that exits 0 when the resource is ready.`)
 	}
-	if len(spec.Health.Command) == 0 || len(spec.Health.Command) > 32 {
-		return spec, invalid("resource health command", "Provide 1–32 argv entries for the exec health check.")
-	}
-	for _, arg := range spec.Health.Command {
-		if arg == "" || len(arg) > 1024 || strings.ContainsAny(arg, "\x00\r\n") {
-			return spec, invalid("resource health command", "Health argv entries must be non-empty, at most 1024 bytes and free of control characters.")
-		}
-	}
-	if strings.HasPrefix(spec.Health.Command[0], "-") {
-		return spec, invalid("resource health command", "The health command cannot start with a dash.")
+	if err := validateResourceHealthCommand(spec.Health.Command); err != nil {
+		return err
 	}
 	if spec.Health.TimeoutSeconds == 0 {
 		spec.Health.TimeoutSeconds = 30
 	}
 	if spec.Health.TimeoutSeconds < 1 || spec.Health.TimeoutSeconds > 300 {
-		return spec, invalid("resource health timeout", "Use a timeout from 1 to 300 seconds.")
+		return invalid("resource health timeout", "Use a timeout from 1 to 300 seconds.")
 	}
 	if spec.Health.IntervalMS == 0 {
 		spec.Health.IntervalMS = 500
 	}
 	if spec.Health.IntervalMS < 100 || spec.Health.IntervalMS > 5000 {
-		return spec, invalid("resource health interval", "Use an interval from 100 to 5000 milliseconds.")
+		return invalid("resource health interval", "Use an interval from 100 to 5000 milliseconds.")
 	}
-	if len(spec.Command) > 32 {
-		return spec, invalid("resource command", "Use at most 32 argv entries.")
+	return nil
+}
+
+func validateResourceHealthCommand(command []string) error {
+	if len(command) == 0 || len(command) > 32 {
+		return invalid("resource health command", "Provide 1–32 argv entries for the exec health check.")
 	}
-	for _, arg := range spec.Command {
-		if len(arg) > 4096 || strings.ContainsAny(arg, "\x00\r\n") {
-			return spec, invalid("resource command", "Command argv entries must be at most 4096 bytes and free of control characters.")
+	for _, arg := range command {
+		if arg == "" || len(arg) > 1024 || strings.ContainsAny(arg, "\x00\r\n") {
+			return invalid("resource health command", "Health argv entries must be non-empty, at most 1024 bytes and free of control characters.")
 		}
 	}
-	return spec, nil
+	if strings.HasPrefix(command[0], "-") {
+		return invalid("resource health command", "The health command cannot start with a dash.")
+	}
+	return nil
+}
+
+func validateResourceCommand(command []string) error {
+	if len(command) > 32 {
+		return invalid("resource command", "Use at most 32 argv entries.")
+	}
+	for _, arg := range command {
+		if len(arg) > 4096 || strings.ContainsAny(arg, "\x00\r\n") {
+			return invalid("resource command", "Command argv entries must be at most 4096 bytes and free of control characters.")
+		}
+	}
+	return nil
 }
 
 func cleanResourceDestination(value string) (string, error) {

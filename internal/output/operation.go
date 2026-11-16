@@ -122,37 +122,17 @@ func redactData(r *secrets.Registry, value any) ([]byte, error) {
 		if v == nil {
 			return json.Marshal(nil)
 		}
-		items := make([]contract.Operation, len(v))
-		for i := range v {
-			items[i] = cleanOperation(r, v[i])
-		}
-		return json.Marshal(items)
+		return json.Marshal(cleanOperationList(r, v))
 	case []contract.Event:
 		if v == nil {
 			return json.Marshal(nil)
 		}
-		events := make([]contract.Event, len(v))
-		for i := range v {
-			events[i] = cleanEvent(r, v[i])
-		}
-		return json.Marshal(events)
+		return json.Marshal(cleanEventList(r, v))
 	case operations.ListPage:
-		items := make([]contract.Operation, len(v.Items))
-		for i := range v.Items {
-			items[i] = cleanOperation(r, v.Items[i])
-		}
-		if v.Items != nil {
-			v.Items = items
-		}
+		v.Items = cleanOperationList(r, v.Items)
 		return json.Marshal(v)
 	case operations.EventPage:
-		events := make([]contract.Event, len(v.Events))
-		for i := range v.Events {
-			events[i] = cleanEvent(r, v.Events[i])
-		}
-		if v.Events != nil {
-			v.Events = events
-		}
+		v.Events = cleanEventList(r, v.Events)
 		return json.Marshal(v)
 	case operations.SubmissionResult:
 		v.Operation = cleanOperation(r, v.Operation)
@@ -163,6 +143,28 @@ func redactData(r *secrets.Registry, value any) ([]byte, error) {
 	default:
 		return r.JSON(value)
 	}
+}
+
+func cleanOperationList(r *secrets.Registry, items []contract.Operation) []contract.Operation {
+	if items == nil {
+		return nil
+	}
+	cleaned := make([]contract.Operation, len(items))
+	for i := range items {
+		cleaned[i] = cleanOperation(r, items[i])
+	}
+	return cleaned
+}
+
+func cleanEventList(r *secrets.Registry, events []contract.Event) []contract.Event {
+	if events == nil {
+		return nil
+	}
+	cleaned := make([]contract.Event, len(events))
+	for i := range events {
+		cleaned[i] = cleanEvent(r, events[i])
+	}
+	return cleaned
 }
 
 func redactFaultDetails(r *secrets.Registry, details map[string]any, companion *contract.FollowFaultDetails) ([]byte, error) {

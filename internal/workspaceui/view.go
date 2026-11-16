@@ -110,14 +110,6 @@ func (m Model) glyphSeparator() string {
 	return " · "
 }
 
-func (m Model) glyphRule(width int) string {
-	character := "─"
-	if m.opts.ASCII {
-		character = "-"
-	}
-	return m.dim().Render(strings.Repeat(character, max(1, width)))
-}
-
 func (m Model) spinnerText() string {
 	if m.opts.ReducedMotion {
 		return m.dim().Render("loading")
@@ -137,6 +129,8 @@ func (m Model) stateLabel() string {
 			label = "authentication required"
 		case contract.Forbidden:
 			label = "not authorized"
+		case contract.Usage, contract.InvalidOutputMode, contract.InputRequired, contract.ValidationFailed, contract.MissingTool, contract.NotFound, contract.PreconditionFailed, contract.DoctorFailed, contract.ConfirmationRequired, contract.Conflict, contract.NodeVersionMismatch, contract.RemoteUnreachable, contract.Unavailable, contract.Cancelled, contract.Internal:
+			// Keep the generic unreachable label.
 		}
 		style := m.riskStyle()
 		if len(tab.items) > 0 {
@@ -153,6 +147,8 @@ func (m Model) stateLabel() string {
 			style = m.warnStyle()
 		}
 		return style.Render(freshness) + m.glyphSeparator() + m.dim().Render(fmt.Sprintf("%d rows", len(tab.items)))
+	case loadIdle:
+		return m.dim().Render("not loaded")
 	default:
 		return m.dim().Render("not loaded")
 	}
@@ -211,19 +207,33 @@ func (m Model) renderBody(width, height int) string {
 	}
 	tab := m.current()
 	items := m.visibleItems()
-	if tab.state == loadFailed && len(tab.items) == 0 {
+	switch {
+	case tab.state == loadFailed && len(tab.items) == 0:
 		return m.renderUnreachable(width, height)
-	}
-	if tab.state == loadLoading && len(tab.items) == 0 {
-		lines := []string{
-			m.spinnerText() + " " + m.boldStyle().Render("Loading "+m.tab.Collection()),
-			m.dim().Render("The workspace keeps the previous view until the API responds."),
-		}
-		return fitLines(strings.Join(lines, "\n"), width, height)
-	}
-	if len(items) == 0 {
+	case tab.state == loadLoading && len(tab.items) == 0:
+		return m.renderLoading(width, height)
+	case len(items) == 0:
 		return m.renderEmpty(width, height)
 	}
+	lines, capacity := m.listHeader(width, height)
+	selected := m.selected[m.tab]
+	start := windowStart(selected, len(items), capacity)
+	lines = m.appendRows(lines, items, selected, start, capacity, height, width)
+	if m.notice != "" && len(lines) < height {
+		lines = append(lines, m.warnStyle().Render(truncate(m.clean(m.notice), width)))
+	}
+	return fitLines(strings.Join(lines, "\n"), width, height)
+}
+
+func (m Model) renderLoading(width, height int) string {
+	lines := []string{
+		m.spinnerText() + " " + m.boldStyle().Render("Loading "+m.tab.Collection()),
+		m.dim().Render("The workspace keeps the previous view until the API responds."),
+	}
+	return fitLines(strings.Join(lines, "\n"), width, height)
+}
+
+func (m Model) listHeader(width, height int) ([]string, int) {
 	lines := make([]string, 0, height)
 	capacity := height
 	if width >= 56 && height >= 8 {
@@ -237,8 +247,10 @@ func (m Model) renderBody(width, height int) string {
 	if m.tab == Fleet && width >= 72 {
 		capacity = max(1, capacity-1)
 	}
-	selected := m.selected[m.tab]
-	start := windowStart(selected, len(items), capacity)
+	return lines, capacity
+}
+
+func (m Model) appendRows(lines []string, items []Item, selected, start, capacity, height, width int) []string {
 	for index := start; index < len(items) && len(lines) < capacity; index++ {
 		lines = append(lines, m.rowLine(items[index], index == selected, width))
 	}
@@ -250,10 +262,7 @@ func (m Model) renderBody(width, height int) string {
 	if len(items) > capacity && len(lines) < height {
 		lines = append(lines, m.dim().Render(fmt.Sprintf("%d–%d of %d · j/k to move", start+1, min(len(items), start+capacity), len(items))))
 	}
-	if m.notice != "" && len(lines) < height {
-		lines = append(lines, m.warnStyle().Render(truncate(m.clean(m.notice), width)))
-	}
-	return fitLines(strings.Join(lines, "\n"), width, height)
+	return lines
 }
 
 func fleetHeader(width int) string {
@@ -368,6 +377,8 @@ func (m Model) renderUnreachable(width, height int) string {
 	case contract.Unauthenticated:
 		title = "Authentication required"
 		detail = "Select a saved workspace with eregion workspace use before opening the workspace."
+	case contract.Usage, contract.InvalidOutputMode, contract.InputRequired, contract.ValidationFailed, contract.MissingTool, contract.NotFound, contract.Forbidden, contract.PreconditionFailed, contract.DoctorFailed, contract.ConfirmationRequired, contract.Conflict, contract.NodeVersionMismatch, contract.RemoteUnreachable, contract.Unavailable, contract.Cancelled, contract.Internal:
+		// Keep the generic unreachable title and detail.
 	}
 	lines := []string{
 		m.riskStyle().Render(title),
@@ -401,6 +412,8 @@ func (m Model) renderEmpty(width, height int) string {
 		case Deployments:
 			title = "No deployments reported"
 			hint = "Press d to deploy a ready release, or o to plan a rollback."
+		case tabCount:
+			// Keep the generic empty-state text.
 		}
 	}
 	lines := append(wrapText(title, width), "", m.dim().Render(truncate(hint, width)))
@@ -610,6 +623,8 @@ func (m Model) renderForm(width, height int) string {
 	case formChecking:
 		lines = append(lines, m.spinnerText()+" "+m.boldStyle().Render("Running the API dry-run preview"))
 		lines = append(lines, m.dim().Render("No operation, domain row, or job is created by a dry run."))
+	case formEdit:
+		lines = append(lines, m.renderFormFields(form, width))
 	default:
 		lines = append(lines, m.renderFormFields(form, width))
 	}
@@ -647,25 +662,7 @@ func (m Model) renderFormFields(form *formState, width int) string {
 
 func (m Model) renderPreview(form *formState, width int) string {
 	lines := []string{m.okStyle().Render("DRY-RUN PREVIEW — nothing has been submitted.")}
-	if form.preview != nil {
-		if form.preview.Summary != "" {
-			lines = append(lines, m.boldStyle().Render(form.preview.Summary))
-		}
-		lines = append(lines, m.dim().Render("kind: "+form.preview.Kind))
-		lines = append(lines, m.dim().Render("target: "+m.clean(form.preview.Target)))
-		if len(form.preview.Steps) > 0 {
-			lines = append(lines, "", m.boldStyle().Render("Planned steps"))
-			for index, step := range form.preview.Steps {
-				lines = append(lines, fmt.Sprintf("  %d. %s", index+1, truncate(m.clean(step), max(8, width-5))))
-			}
-		}
-		if len(form.preview.Warnings) > 0 {
-			lines = append(lines, "", m.warnStyle().Render("Warnings"))
-			for _, warning := range form.preview.Warnings {
-				lines = append(lines, "  "+m.warnStyle().Render(truncate(m.clean(warning), max(8, width-2))))
-			}
-		}
-	}
+	lines = append(lines, m.previewPlanLines(form.preview, width)...)
 	if form.confirmPhrase != "" {
 		lines = append(lines, "", m.warnStyle().Render("Type "+form.confirmPhrase+" to confirm this action."))
 		value := form.confirm.Value()
@@ -685,15 +682,46 @@ func (m Model) renderPreview(form *formState, width int) string {
 	if form.approved != nil && form.approved.ConfirmPhrase != "" {
 		lines = append(lines, m.warnStyle().Render("Typed confirmation is bound to this dry-run plan; editing the form requires a new preview."))
 	}
-	if form.approved != nil {
-		lines = append(lines, "", m.boldStyle().Render("Noninteractive equivalent"))
-		for _, command := range strings.Split(form.approved.Noninteractive(), "\n") {
-			for _, line := range wrapText(command, max(8, width)) {
-				lines = append(lines, m.dim().Render(truncate(line, width)))
-			}
+	lines = append(lines, m.noninteractiveLines(form.approved, width)...)
+	return strings.Join(lines, "\n")
+}
+
+func (m Model) previewPlanLines(preview *Preview, width int) []string {
+	if preview == nil {
+		return nil
+	}
+	lines := make([]string, 0, 4+len(preview.Steps)+len(preview.Warnings))
+	if preview.Summary != "" {
+		lines = append(lines, m.boldStyle().Render(preview.Summary))
+	}
+	lines = append(lines, m.dim().Render("kind: "+preview.Kind))
+	lines = append(lines, m.dim().Render("target: "+m.clean(preview.Target)))
+	if len(preview.Steps) > 0 {
+		lines = append(lines, "", m.boldStyle().Render("Planned steps"))
+		for index, step := range preview.Steps {
+			lines = append(lines, fmt.Sprintf("  %d. %s", index+1, truncate(m.clean(step), max(8, width-5))))
 		}
 	}
-	return strings.Join(lines, "\n")
+	if len(preview.Warnings) > 0 {
+		lines = append(lines, "", m.warnStyle().Render("Warnings"))
+		for _, warning := range preview.Warnings {
+			lines = append(lines, "  "+m.warnStyle().Render(truncate(m.clean(warning), max(8, width-2))))
+		}
+	}
+	return lines
+}
+
+func (m Model) noninteractiveLines(approved *Action, width int) []string {
+	if approved == nil {
+		return nil
+	}
+	lines := []string{"", m.boldStyle().Render("Noninteractive equivalent")}
+	for _, command := range strings.Split(approved.Noninteractive(), "\n") {
+		for _, line := range wrapText(command, max(8, width)) {
+			lines = append(lines, m.dim().Render(truncate(line, width)))
+		}
+	}
+	return lines
 }
 
 func (m Model) renderFormResult(form *formState, width int) string {
@@ -703,13 +731,15 @@ func (m Model) renderFormResult(form *formState, width int) string {
 	operation := form.result.Operation
 	state := string(operation.State)
 	style := m.infoStyle()
-	switch {
-	case operation.State == contract.Succeeded:
+	switch operation.State {
+	case contract.Succeeded:
 		style = m.okStyle()
-	case operation.State == contract.Failed, operation.State == contract.Canceled:
+	case contract.Failed, contract.Canceled:
 		style = m.riskStyle()
-	case operation.State == contract.Running:
+	case contract.Running:
 		style = m.accent()
+	case contract.Queued, contract.Cancelling:
+		// Keep the informational style.
 	}
 	lines := []string{
 		m.okStyle().Render("ACCEPTED — the operation is durable without this interface."),
@@ -720,14 +750,7 @@ func (m Model) renderFormResult(form *formState, width int) string {
 	if operation.ErrorCode != "" {
 		lines = append(lines, m.riskStyle().Render("error: "+string(operation.ErrorCode)))
 	}
-	if form.approved != nil {
-		lines = append(lines, "", m.boldStyle().Render("Noninteractive equivalent"))
-		for _, command := range strings.Split(form.approved.Noninteractive(), "\n") {
-			for _, line := range wrapText(command, max(8, width)) {
-				lines = append(lines, m.dim().Render(truncate(line, width)))
-			}
-		}
-	}
+	lines = append(lines, m.noninteractiveLines(form.approved, width)...)
 	lines = append(lines, "", m.boldStyle().Render("Resume observation"))
 	for _, line := range wrapText("eregion operations follow "+string(operation.ID)+" --interactive", max(8, width)) {
 		lines = append(lines, m.dim().Render(truncate(line, width)))
@@ -750,6 +773,8 @@ func (m Model) formHint(form *formState) string {
 		return "s submit · e edit · esc cancel · ctrl+c detach"
 	case formChecking:
 		return "waiting for the dry-run · esc hides the error hint · ctrl+c detach"
+	case formEdit:
+		return "enter next · tab next · esc cancel · ctrl+c detach"
 	default:
 		return "enter next · tab next · esc cancel · ctrl+c detach"
 	}

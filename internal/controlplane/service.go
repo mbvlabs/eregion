@@ -12,7 +12,6 @@ import (
 	"net"
 	"net/http"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/integrations"
@@ -176,34 +175,9 @@ func (s *Service) registerSecretValues(values map[string]string) {
 	s.redaction.Add(list...)
 }
 
-func (s *Service) buildSourceRoots() []string {
-	if len(s.sourceRoots) > 0 {
-		return s.sourceRoots
-	}
-	return platform.BuildSourceRoots()
-}
-
 var _ operations.Service = (*Service)(nil)
 
 const columns = `id, kind, target, actor_kind, actor_subject, state, attempt, last_sequence, error_code, created_at, updated_at`
-
-func scanOperation(row pgx.Row) (contract.Operation, error) {
-	var op contract.Operation
-	err := row.Scan(
-		&op.ID,
-		&op.Kind,
-		&op.Target,
-		&op.Actor.Kind,
-		&op.Actor.Subject,
-		&op.State,
-		&op.Attempt,
-		&op.LastSequence,
-		&op.ErrorCode,
-		&op.CreatedAt,
-		&op.UpdatedAt,
-	)
-	return op, err
-}
 
 func (s *Service) Submit(
 	ctx context.Context,
@@ -219,21 +193,8 @@ func (s *Service) SubmitWithReceipt(
 	ctx context.Context,
 	sub operations.Submission,
 ) (operations.SubmissionResult, error) {
-	var zero operations.SubmissionResult
-	// This operation may only be admitted by the dedicated trusted boundary;
-	// registering its normalizer later must not make generic submit authorize it.
-	if sub.Kind == platform.KindDefinitionApply {
-		return zero, contract.NewFault(
-			contract.ValidationFailed,
-			"definition apply is not available through generic submission",
-			"Use the trusted operator boundary.",
-		)
-	}
-	if err := sub.Actor.Validate(); err != nil {
-		return zero, err
-	}
-	if err := contract.ValidateIdempotencyKey(sub.IdempotencyKey); err != nil {
-		return zero, err
+	if err := validateGenericSubmission(sub); err != nil {
+		return operations.SubmissionResult{}, err
 	}
 	if platform.IsKind(sub.Kind) {
 		result, err := s.submitPlatformWithReceipt(ctx, sub)
@@ -242,13 +203,43 @@ func (s *Service) SubmitWithReceipt(
 		}
 		return result, err
 	}
-	if sub.Kind != operations.TestKind || sub.Target != operations.TestTarget ||
-		sub.Confirmation != "" {
-		return zero, contract.NewFault(
+	return s.submitDiagnostic(ctx, sub)
+}
+
+func validateGenericSubmission(sub operations.Submission) error {
+	// This operation may only be admitted by the dedicated trusted boundary;
+	// registering its normalizer later must not make generic submit authorize it.
+	if sub.Kind == platform.KindDefinitionApply {
+		return contract.NewFault(
+			contract.ValidationFailed,
+			"definition apply is not available through generic submission",
+			"Use the trusted operator boundary.",
+		)
+	}
+	if err := sub.Actor.Validate(); err != nil {
+		return err
+	}
+	if err := contract.ValidateIdempotencyKey(sub.IdempotencyKey); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateDiagnosticSubmission(sub operations.Submission) error {
+	if sub.Kind != operations.TestKind || sub.Target != operations.TestTarget || sub.Confirmation != "" {
+		return contract.NewFault(
 			contract.ValidationFailed,
 			"unsupported operation or target",
 			"Only diagnostic.test on control-plane is implemented; it needs no confirmation.",
 		)
+	}
+	return nil
+}
+
+func (s *Service) submitDiagnostic(ctx context.Context, sub operations.Submission) (operations.SubmissionResult, error) {
+	var zero operations.SubmissionResult
+	if err := validateDiagnosticSubmission(sub); err != nil {
+		return zero, err
 	}
 	input, err := operations.NormalizeTestInput(sub.Input)
 	if err != nil {
@@ -266,67 +257,15 @@ func (s *Service) SubmitWithReceipt(
 	}
 	var submitted operations.SubmissionResult
 	err = s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
-		inserted, err := tx.Operations().Insert(ctx, entities.OperationInsert{
-			ID: id, Key: key, InputHash: inputHash, Input: canonical,
-		})
-		if err != nil {
-			return txStorageError(err)
-		}
-		if !inserted {
-			identity, found, err := tx.Operations().Identity(ctx, key)
-			if err != nil {
-				return txStorageError(err)
-			}
-			if !found {
-				return unavailable()
-			}
-			if identity.InputHash != inputHash {
-				return idempotencyInputConflict()
-			}
-			op, found, err := tx.Operations().Get(ctx, identity.ID)
-			if err != nil {
-				return txStorageError(err)
-			}
-			if !found {
-				return unavailable()
-			}
-			submitted = operations.SubmissionResult{Operation: op, Replay: true}
-			return nil
-		}
-		jobID, err := tx.Jobs().EnqueueDiagnostic(ctx, id)
-		if err != nil {
-			return txStorageError(err)
-		}
-		if err := tx.Operations().SetJob(ctx, id, jobID); err != nil {
-			return txStorageError(err)
-		}
-		op, found, err := tx.Operations().Get(ctx, id)
-		if err != nil {
-			return txStorageError(err)
-		}
-		if !found {
-			return unavailable()
-		}
-		if err := appendEvent(ctx, tx, &op, contract.Event{
-			Kind:    "state",
-			State:   contract.Queued,
-			Message: "Diagnostic operation accepted durably.",
-		}); err != nil {
-			return err
-		}
-		if s.beforeSubmissionCommit != nil {
-			if err := s.beforeSubmissionCommit(); err != nil {
-				return err
-			}
-		}
-		submitted = operations.SubmissionResult{Operation: op}
-		return nil
+		var txErr error
+		submitted, txErr = s.insertDiagnosticSubmission(ctx, tx, id, key, canonical, inputHash)
+		return txErr
 	})
 	if err != nil {
 		if entities.IsBeginFailure(err) || entities.IsCommitFailure(err) {
 			return zero, unavailable(err)
 		}
-		var fault *contract.Fault
+		var fault *contract.FaultError
 		if errors.As(err, &fault) {
 			return zero, err
 		}
@@ -338,6 +277,74 @@ func (s *Service) SubmitWithReceipt(
 		}
 	}
 	return submitted, nil
+}
+
+func (s *Service) insertDiagnosticSubmission(ctx context.Context, tx *entities.StoreTx, id contract.OperationID, key entities.OperationKey, canonical []byte, inputHash string) (operations.SubmissionResult, error) {
+	inserted, err := tx.Operations().Insert(ctx, entities.OperationInsert{
+		ID: id, Key: key, InputHash: inputHash, Input: canonical,
+	})
+	if err != nil {
+		return operations.SubmissionResult{}, txStorageError(err)
+	}
+	if !inserted {
+		return replayDiagnosticSubmission(ctx, tx, key, inputHash)
+	}
+	op, err := recordDiagnosticSubmission(ctx, tx, id)
+	if err != nil {
+		return operations.SubmissionResult{}, err
+	}
+	if s.beforeSubmissionCommit != nil {
+		if err := s.beforeSubmissionCommit(); err != nil {
+			return operations.SubmissionResult{}, err
+		}
+	}
+	return operations.SubmissionResult{Operation: op}, nil
+}
+
+func replayDiagnosticSubmission(ctx context.Context, tx *entities.StoreTx, key entities.OperationKey, inputHash string) (operations.SubmissionResult, error) {
+	identity, found, err := tx.Operations().Identity(ctx, key)
+	if err != nil {
+		return operations.SubmissionResult{}, txStorageError(err)
+	}
+	if !found {
+		return operations.SubmissionResult{}, unavailable()
+	}
+	if identity.InputHash != inputHash {
+		return operations.SubmissionResult{}, idempotencyInputConflict()
+	}
+	op, found, err := tx.Operations().Get(ctx, identity.ID)
+	if err != nil {
+		return operations.SubmissionResult{}, txStorageError(err)
+	}
+	if !found {
+		return operations.SubmissionResult{}, unavailable()
+	}
+	return operations.SubmissionResult{Operation: op, Replay: true}, nil
+}
+
+func recordDiagnosticSubmission(ctx context.Context, tx *entities.StoreTx, id contract.OperationID) (contract.Operation, error) {
+	jobID, err := tx.Jobs().EnqueueDiagnostic(ctx, id)
+	if err != nil {
+		return contract.Operation{}, txStorageError(err)
+	}
+	if err := tx.Operations().SetJob(ctx, id, jobID); err != nil {
+		return contract.Operation{}, txStorageError(err)
+	}
+	op, found, err := tx.Operations().Get(ctx, id)
+	if err != nil {
+		return contract.Operation{}, txStorageError(err)
+	}
+	if !found {
+		return contract.Operation{}, unavailable()
+	}
+	if err := appendEvent(ctx, tx, &op, contract.Event{
+		Kind:    "state",
+		State:   contract.Queued,
+		Message: "Diagnostic operation accepted durably.",
+	}); err != nil {
+		return contract.Operation{}, err
+	}
+	return op, nil
 }
 
 func (s *Service) Get(
@@ -534,7 +541,7 @@ func txStorageError(err error) error {
 	if err == nil {
 		return nil
 	}
-	var fault *contract.Fault
+	var fault *contract.FaultError
 	if errors.As(err, &fault) {
 		return err
 	}
@@ -591,69 +598,92 @@ func appendEvent(
 ) error {
 	event.OperationID, event.Sequence, event.Attempt = op.ID, op.LastSequence+1, op.Attempt
 	event.At = time.Now().UTC()
-	// All terminalization paths use state events, including domain-specific
-	// workers. Preserve a generic result when no richer result was supplied.
-	if event.Kind == "state" && event.State.Terminal() && event.Result == nil &&
-		op.LatestResult == nil {
-		event.Result = &contract.ActionResult{
-			OperationID: op.ID,
-			Action:      op.Kind,
-			Target:      op.Target,
-			Attempt:     op.Attempt,
-			Status:      event.State,
-			Final:       true,
-			StartedAt:   op.CreatedAt,
-			CompletedAt: event.At,
-			Code:        event.ErrorCode,
-			Evidence:    "not_collected",
-			TimingBasis: "operation_created",
-			Stage:       "action",
-			History:     contract.Cursor{OperationID: op.ID},
-		}
-		if event.Result.StartedAt.After(event.At) {
-			event.Result.StartedAt = event.At
-		}
-		if event.State == contract.Failed {
-			event.Result.Message = event.Message
-			if event.Result.Message == "" {
-				event.Result.Message = "Action failed; inspect retained history."
-			}
-		}
-		if op.PendingResult != nil {
-			event.Result.Data = op.PendingResult.Data
-			event.Result.DataStatus = op.PendingResult.DataStatus
-			if op.PendingResult.Message != "" {
-				event.Result.Message = op.PendingResult.Message
-			}
-		}
-		tryEnrichActionResultTx(ctx, tx, event.Result)
-		tryActionOutputTx(ctx, tx, event.Result)
-		tryActionPayloadTx(ctx, tx, op, event.Result, nil)
-		op.LatestResult = event.Result
-	}
-	if event.Kind == "state" && event.State.Terminal() && event.Result != nil {
-		op.LatestResult = event.Result
-	}
-	if event.Result != nil {
-		result := event.Result
-		if err := result.Validate(); err != nil {
-			return err
-		}
-		if result.OperationID != op.ID || result.Action != op.Kind || result.Target != op.Target ||
-			result.Attempt != op.Attempt ||
-			result.History.After > op.LastSequence ||
-			(result.ExcerptCursor != nil && result.ExcerptCursor.After > op.LastSequence) ||
-			(result.DataCursor != nil && result.DataCursor.After > op.LastSequence) ||
-			(event.Kind == "state" && (result.Status != event.State || !result.Final)) {
-			return contract.NewFault(
-				contract.ValidationFailed,
-				"action result does not match its operation",
-				"Record an outcome for the fenced operation and attempt.",
-			)
-		}
+	ensureTerminalActionResult(ctx, tx, op, &event)
+	if err := validateEventResult(op, event); err != nil {
+		return err
 	}
 	if err := event.Validate(); err != nil {
 		return err
 	}
 	return tx.Operations().AppendEvent(ctx, op, event)
+}
+
+// ensureTerminalActionResult attaches a generic final result to terminal state
+// events only when no richer result was supplied.
+func ensureTerminalActionResult(ctx context.Context, tx *entities.StoreTx, op *contract.Operation, event *contract.Event) {
+	if event.Kind != "state" || !event.State.Terminal() || event.Result != nil || op.LatestResult != nil {
+		if event.Kind == "state" && event.State.Terminal() && event.Result != nil {
+			op.LatestResult = event.Result
+		}
+		return
+	}
+	result := initialTerminalResult(op, event)
+	applyPendingResult(result, op.PendingResult)
+	tryEnrichActionResultTx(ctx, tx, result)
+	tryActionOutputTx(ctx, tx, result)
+	tryActionPayloadTx(ctx, tx, op, result, nil)
+	event.Result = result
+	op.LatestResult = result
+}
+
+func initialTerminalResult(op *contract.Operation, event *contract.Event) *contract.ActionResult {
+	result := &contract.ActionResult{
+		OperationID: op.ID,
+		Action:      op.Kind,
+		Target:      op.Target,
+		Attempt:     op.Attempt,
+		Status:      event.State,
+		Final:       true,
+		StartedAt:   op.CreatedAt,
+		CompletedAt: event.At,
+		Code:        event.ErrorCode,
+		Evidence:    "not_collected",
+		TimingBasis: "operation_created",
+		Stage:       "action",
+		History:     contract.Cursor{OperationID: op.ID},
+	}
+	if result.StartedAt.After(event.At) {
+		result.StartedAt = event.At
+	}
+	if event.State == contract.Failed {
+		result.Message = event.Message
+		if result.Message == "" {
+			result.Message = "Action failed; inspect retained history."
+		}
+	}
+	return result
+}
+
+func applyPendingResult(result, pending *contract.ActionResult) {
+	if pending == nil {
+		return
+	}
+	result.Data = pending.Data
+	result.DataStatus = pending.DataStatus
+	if pending.Message != "" {
+		result.Message = pending.Message
+	}
+}
+
+func validateEventResult(op *contract.Operation, event contract.Event) error {
+	if event.Result == nil {
+		return nil
+	}
+	result := event.Result
+	if err := result.Validate(); err != nil {
+		return err
+	}
+	if result.OperationID != op.ID || result.Action != op.Kind || result.Target != op.Target ||
+		result.Attempt != op.Attempt ||
+		result.History.After > op.LastSequence ||
+		(result.ExcerptCursor != nil && result.ExcerptCursor.After > op.LastSequence) ||
+		(result.DataCursor != nil && result.DataCursor.After > op.LastSequence) ||
+		(event.Kind == "state" && (result.Status != event.State || !result.Final)) {
+		return contract.NewFault(
+			contract.ValidationFailed,
+			"action result does not match its operation",
+			"Record an outcome for the fenced operation and attempt.",
+		)
+	}
+	return nil
 }

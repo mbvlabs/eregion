@@ -16,13 +16,15 @@ import (
 	"github.com/mbvlabs/eregion/internal/platform"
 )
 
+type deleteOrderCase struct {
+	name       string
+	app        string
+	deleteKind string
+	call       func(*testing.T, *platformWorker, contract.Operation, string)
+}
+
 func TestIntegrationDeleteOrderKeepsServingWorkloadsWhenCloudflareCleanupFails(t *testing.T) {
-	for _, test := range []struct {
-		name       string
-		app        string
-		deleteKind string
-		call       func(*testing.T, *platformWorker, contract.Operation, string)
-	}{
+	for _, test := range []deleteOrderCase{
 		{
 			name: "environment", app: "order-env", deleteKind: platform.KindEnvironmentDelete,
 			call: func(t *testing.T, w *platformWorker, op contract.Operation, app string) {
@@ -41,111 +43,145 @@ func TestIntegrationDeleteOrderKeepsServingWorkloadsWhenCloudflareCleanupFails(t
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			pool, _ := testPool(t, true)
-			insertTestProviderCredential(t, pool, "0123456789abcdef0123456789abcdef", "example.com")
-			transport := &scriptedPlatformTransport{}
-			identity := ensureTestRegistryHost(t, pool, t.TempDir())
-			run, err := New(newTestEntities(t, pool), slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
-				Concurrency: 0, TestOnly: true, Transport: transport,
-				NodeStateDir: identity.StateDir, RegistryHostIdentity: &identity,
-				RegistryEndpoint: "127.0.0.1:5000",
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			s := run.Service
-			ctx := context.Background()
-
-			fixture := &domainDNSLedgerFixture{records: map[string]integrations.DNSRecord{}}
-			server := httptest.NewServer(fixture)
-			defer server.Close()
-			store := newTestDNSStore(integrations.DNSZone{ZoneID: "0123456789abcdef0123456789abcdef", ZoneName: "example.com"}).withToken("0123456789abcdef0123456789abcdef", "ledger-token-0123456789")
-			domainActor := contract.Actor{Kind: "operator", Subject: testActor.Subject}
-			domainDNS, err := integrations.NewDomainDNS(integrations.DomainDNSConfig{
-				Zones: store, Credentials: store,
-				BaseURL:    server.URL + "/client/v4",
-				HTTPClient: server.Client(),
-				Authorizer: integrations.NewOperatorDNSAuthorizer(),
-				Audit:      integrations.NewMemoryAudit(),
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			s.domainDNS = domainDNS
-			proxied := true
-
-			platformSubmit(t, s, platform.KindNodeRegister, "platform", "delete-order-node", map[string]any{
-				"name": "local", "roles": []string{platform.RoleApplication}, "capabilities": []string{platform.CapabilityDocker},
-			})
-			platformSubmit(t, s, platform.KindAppCreate, "platform", "delete-order-app", map[string]any{"name": test.app})
-			for _, envName := range []string{"test", "other"} {
-				op := platformSubmit(t, s, platform.KindEnvironmentCreate, "app/"+test.app, "delete-order-env-"+envName, map[string]any{
-					"name": envName, "node": "local",
-				})
-				if _, err := pool.Exec(ctx, `UPDATE eregion_operations SET state='succeeded' WHERE id=$1`, op.ID); err != nil {
-					t.Fatal(err)
-				}
-			}
-			addOp := platformSubmitAs(t, s, domainActor, platform.KindDomainAdd, "env/"+test.app+"/test", "delete-order-domain", map[string]any{
-				"domain": "app.example.com", "dns_mode": "cloudflare", "dns_zone": "example.com",
-				"dns_origins": []string{"8.8.8.8"}, "dns_proxied": proxied,
-			})
-			if _, err := pool.Exec(ctx, `UPDATE eregion_operations SET state='succeeded' WHERE id=$1`, addOp.ID); err != nil {
-				t.Fatal(err)
-			}
-			ledger, err := s.loadDomainDNSLedger(ctx, test.app, "test", "app.example.com")
-			if err != nil || ledger == nil {
-				t.Fatalf("ledger = %+v, %v", ledger, err)
-			}
-			fixture.mu.Lock()
-			fixture.records["owned"] = integrations.DNSRecord{
-				ID: "owned", Name: "app.example.com", Type: "A", Content: "8.8.8.8", TTL: 1,
-				Proxied: true, Comment: ledger.Ownership,
-			}
-			fixture.status = 500
-			fixture.mu.Unlock()
-
-			var deleteOp contract.Operation
-			if test.deleteKind == platform.KindAppDelete {
-				s.humanFactor = func(string) error { return nil }
-				submission := platformSubmissionAs(domainActor, platform.KindAppDelete, "app/"+test.app, "delete-order-app-op", map[string]any{"confirm": test.app})
-				submission.HumanFactor = "test-factor"
-				deleteOp, err = s.Submit(ctx, submission)
-				if err != nil {
-					t.Fatal(err)
-				}
-			} else {
-				deleteOp = platformSubmitAs(t, s, domainActor, platform.KindEnvironmentDelete, "env/"+test.app+"/test", "delete-order-env-op", map[string]any{"confirm": test.app + "/test"})
-			}
-			test.call(t, &platformWorker{service: s}, deleteOp, test.app)
-
-			if got := transport.runCount("platform-delete-01-v1"); got != 0 {
-				t.Fatalf("serving workload node step ran %d time(s) after provider cleanup failed", got)
-			}
-			if test.deleteKind == platform.KindEnvironmentDelete {
-				if _, err := s.environment(ctx, test.app, "test"); err != nil {
-					t.Fatalf("environment was removed after provider failure: %v", err)
-				}
-			} else if _, environments, err := s.applicationEnvironments(ctx, test.app); err != nil || len(environments) != 2 {
-				t.Fatalf("application state was removed after provider failure: envs=%d err=%v", len(environments), err)
-			}
-			fixture.mu.Lock()
-			_, providerRetained := fixture.records["owned"]
-			fixture.mu.Unlock()
-			if !providerRetained {
-				t.Fatal("provider record was mutated while cleanup was failing")
-			}
-			// The provider read fails during all-binding preflight, so no
-			// record was mutated and the ledger keeps its cleanup intent.
-			ledger, err = s.loadDomainDNSLedger(ctx, test.app, "test", "app.example.com")
-			if err != nil || ledger == nil || ledger.State != domainDNSStateCleanupPending || ledger.CleanupError != "" {
-				t.Fatalf("preflight-refused cleanup ledger = %+v, %v", ledger, err)
-			}
-			text := operationEventText(t, s, deleteOp.ID)
-			if !strings.Contains(text, "preflight refused") || !strings.Contains(text, "no workload was removed") {
-				t.Fatalf("preflight failure event is not honest: %s", text)
-			}
+			runDeleteOrderCase(t, test)
 		})
+	}
+}
+
+func runDeleteOrderCase(t *testing.T, test deleteOrderCase) {
+	t.Helper()
+	_, s, transport, fixture, ctx := newDeleteOrderFixture(t, test.app)
+	deleteOp := submitDeleteOrderOperation(t, ctx, s, test)
+	test.call(t, &platformWorker{service: s}, deleteOp, test.app)
+	if got := transport.runCount("platform-delete-01-v1"); got != 0 {
+		t.Fatalf("serving workload node step ran %d time(s) after provider cleanup failed", got)
+	}
+	assertDeleteOrderServingState(t, ctx, s, test)
+	assertDeleteOrderProviderState(t, ctx, s, fixture, test, deleteOp)
+}
+
+func newDeleteOrderFixture(
+	t *testing.T,
+	app string,
+) (*pgxpool.Pool, *Service, *scriptedPlatformTransport, *domainDNSLedgerFixture, context.Context) {
+	t.Helper()
+	pool, _ := testPool(t, true)
+	insertTestProviderCredential(t, pool, "0123456789abcdef0123456789abcdef", "example.com")
+	transport := &scriptedPlatformTransport{}
+	identity := ensureTestRegistryHost(t, pool, t.TempDir())
+	run, err := New(newTestEntities(t, pool), slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
+		Concurrency: 0, TestOnly: true, Transport: transport,
+		NodeStateDir: identity.StateDir, RegistryHostIdentity: &identity,
+		RegistryEndpoint: "127.0.0.1:5000",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := run.Service
+	ctx := context.Background()
+	fixture := &domainDNSLedgerFixture{records: map[string]integrations.DNSRecord{}}
+	server := httptest.NewServer(fixture)
+	t.Cleanup(server.Close)
+	store := newTestDNSStore(integrations.DNSZone{ZoneID: "0123456789abcdef0123456789abcdef", ZoneName: "example.com"}).withToken("0123456789abcdef0123456789abcdef", "ledger-token-0123456789")
+	domainActor := contract.Actor{Kind: "operator", Subject: testActor.Subject}
+	domainDNS, err := integrations.NewDomainDNS(integrations.DomainDNSConfig{
+		Zones: store, Credentials: store,
+		BaseURL:    server.URL + "/client/v4",
+		HTTPClient: server.Client(),
+		Authorizer: integrations.NewOperatorDNSAuthorizer(),
+		Audit:      integrations.NewMemoryAudit(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.domainDNS = domainDNS
+	platformSubmit(t, s, platform.KindNodeRegister, "platform", "delete-order-node", map[string]any{
+		"name": "local", "roles": []string{platform.RoleApplication}, "capabilities": []string{platform.CapabilityDocker},
+	})
+	platformSubmit(t, s, platform.KindAppCreate, "platform", "delete-order-app", map[string]any{"name": app})
+	for _, envName := range []string{"test", "other"} {
+		op := platformSubmit(t, s, platform.KindEnvironmentCreate, "app/"+app, "delete-order-env-"+envName, map[string]any{
+			"name": envName, "node": "local",
+		})
+		if _, err := pool.Exec(ctx, `UPDATE eregion_operations SET state='succeeded' WHERE id=$1`, op.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	addOp := platformSubmitAs(t, s, domainActor, platform.KindDomainAdd, "env/"+app+"/test", "delete-order-domain", map[string]any{
+		"domain": "app.example.com", "dns_mode": "cloudflare", "dns_zone": "example.com",
+		"dns_origins": []string{"8.8.8.8"}, "dns_proxied": true,
+	})
+	if _, err := pool.Exec(ctx, `UPDATE eregion_operations SET state='succeeded' WHERE id=$1`, addOp.ID); err != nil {
+		t.Fatal(err)
+	}
+	ledger, err := s.loadDomainDNSLedger(ctx, app, "test", "app.example.com")
+	if err != nil || ledger == nil {
+		t.Fatalf("ledger = %+v, %v", ledger, err)
+	}
+	fixture.mu.Lock()
+	fixture.records["owned"] = integrations.DNSRecord{
+		ID: "owned", Name: "app.example.com", Type: "A", Content: "8.8.8.8", TTL: 1,
+		Proxied: true, Comment: ledger.Ownership,
+	}
+	fixture.status = 500
+	fixture.mu.Unlock()
+	return pool, s, transport, fixture, ctx
+}
+
+func submitDeleteOrderOperation(t *testing.T, ctx context.Context, s *Service, test deleteOrderCase) contract.Operation {
+	t.Helper()
+	if test.deleteKind != platform.KindAppDelete {
+		return platformSubmitAsContext(ctx, t, s, contract.Actor{Kind: "operator", Subject: testActor.Subject},
+			platform.KindEnvironmentDelete, "env/"+test.app+"/test", "delete-order-env-op", map[string]any{"confirm": test.app + "/test"})
+	}
+	s.humanFactor = func(string) error { return nil }
+	submission := platformSubmissionAs(contract.Actor{Kind: "operator", Subject: testActor.Subject},
+		platform.KindAppDelete, "app/"+test.app, "delete-order-app-op", map[string]any{"confirm": test.app})
+	submission.HumanFactor = "test-factor"
+	deleteOp, err := s.Submit(ctx, submission)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return deleteOp
+}
+
+func assertDeleteOrderServingState(t *testing.T, ctx context.Context, s *Service, test deleteOrderCase) {
+	t.Helper()
+	if test.deleteKind == platform.KindEnvironmentDelete {
+		if _, err := s.environment(ctx, test.app, "test"); err != nil {
+			t.Fatalf("environment was removed after provider failure: %v", err)
+		}
+		return
+	}
+	if _, environments, err := s.applicationEnvironments(ctx, test.app); err != nil || len(environments) != 2 {
+		t.Fatalf("application state was removed after provider failure: envs=%d err=%v", len(environments), err)
+	}
+}
+
+func assertDeleteOrderProviderState(
+	t *testing.T,
+	ctx context.Context,
+	s *Service,
+	fixture *domainDNSLedgerFixture,
+	test deleteOrderCase,
+	deleteOp contract.Operation,
+) {
+	t.Helper()
+	fixture.mu.Lock()
+	_, providerRetained := fixture.records["owned"]
+	fixture.mu.Unlock()
+	if !providerRetained {
+		t.Fatal("provider record was mutated while cleanup was failing")
+	}
+	// The provider read fails during all-binding preflight, so no
+	// record was mutated and the ledger keeps its cleanup intent.
+	ledger, err := s.loadDomainDNSLedger(ctx, test.app, "test", "app.example.com")
+	if err != nil || ledger == nil || ledger.State != domainDNSStateCleanupPending || ledger.CleanupError != "" {
+		t.Fatalf("preflight-refused cleanup ledger = %+v, %v", ledger, err)
+	}
+	text := operationEventText(ctx, t, s, deleteOp.ID)
+	if !strings.Contains(text, "preflight refused") || !strings.Contains(text, "no workload was removed") {
+		t.Fatalf("preflight failure event is not honest: %s", text)
 	}
 }
 
@@ -255,10 +291,10 @@ func providerRecordPresent(f *domainDNSLedgerFixture, name string) bool {
 	return false
 }
 
-func operationEventText(t *testing.T, s *Service, id contract.OperationID) string {
+func operationEventText(ctx context.Context, t *testing.T, s *Service, id contract.OperationID) string {
 	t.Helper()
 	authority := operations.OperatorAuthority(contract.Actor{Kind: "operator", Subject: testActor.Subject})
-	page, err := s.Events(context.Background(), authority, contract.Cursor{OperationID: id}, 200)
+	page, err := s.Events(ctx, authority, contract.Cursor{OperationID: id}, 200)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -295,7 +331,7 @@ func TestIntegrationMultiBindingDNSCleanupPreflightsAll(t *testing.T) {
 	if _, err := s.environment(ctx, "multi-preflight", "test"); err != nil {
 		t.Fatalf("environment was removed after preflight read failure: %v", err)
 	}
-	text := operationEventText(t, s, deleteOp.ID)
+	text := operationEventText(ctx, t, s, deleteOp.ID)
 	if !strings.Contains(text, "preflight refused") || !strings.Contains(text, "no workload was removed") {
 		t.Fatalf("preflight event is not honest: %s", text)
 	}
@@ -325,7 +361,7 @@ func TestIntegrationMultiBindingDNSLaterFailureRetainsLedgerAndWorkloads(t *test
 	if err != nil || b == nil || b.State != domainDNSStateCleanupFailed {
 		t.Fatalf("b ledger = %+v, %v", b, err)
 	}
-	text := operationEventText(t, s, deleteOp.ID)
+	text := operationEventText(ctx, t, s, deleteOp.ID)
 	if !strings.Contains(text, "stopped after 1 of 2") || !strings.Contains(text, "not atomic") || !strings.Contains(text, "retry") {
 		t.Fatalf("partial cleanup event is not honest: %s", text)
 	}
@@ -372,7 +408,7 @@ func TestIntegrationMultiBindingDNSPostDeleteReadFailureRetainsLedger(t *testing
 	if _, err := s.environment(ctx, "multi-read", "test"); err != nil {
 		t.Fatalf("environment was removed after read failure: %v", err)
 	}
-	text := operationEventText(t, s, deleteOp.ID)
+	text := operationEventText(ctx, t, s, deleteOp.ID)
 	if !strings.Contains(text, "not atomic") || !strings.Contains(text, "retry") {
 		t.Fatalf("partial cleanup event is not honest: %s", text)
 	}
@@ -420,7 +456,7 @@ func TestIntegrationMultiBindingDNSCancelRetainsLedgerAndRetries(t *testing.T) {
 	if err != nil || b == nil || b.State != domainDNSStateCleanupPending {
 		t.Fatalf("b ledger after cancellation = %+v, %v", b, err)
 	}
-	text := operationEventText(t, s, deleteOp.ID)
+	text := operationEventText(ctx, t, s, deleteOp.ID)
 	if !strings.Contains(text, "not atomic") || !strings.Contains(text, "retry") {
 		t.Fatalf("partial cleanup event is not honest: %s", text)
 	}

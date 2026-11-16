@@ -230,13 +230,7 @@ func TestIntegrationControlPlaneRecoveryDrill(t *testing.T) {
 	defer cancel()
 
 	sourcePool, sourceDSN := testPool(t, true)
-	sourceFingerprint, sourcePlan := func() (recoveryHistory, MigrationPlan) {
-		plan, err := PlanMigrations(ctx, sourcePool)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return recoveryDrillHistory(t, ctx, sourcePool), plan
-	}()
+	sourceFingerprint, sourcePlan := recoveryDrillFingerprint(t, ctx, sourcePool)
 
 	admin, err := Open(ctx, os.Getenv("EREGION_TEST_DATABASE_URL"))
 	if err != nil {
@@ -287,17 +281,25 @@ func TestIntegrationControlPlaneRecoveryDrill(t *testing.T) {
 	recoveryDrillDrop(t, ctx, admin, created, second)
 
 	// The source must still be ready and unchanged; the drill only read it.
-	afterFingerprint, afterPlan := func() (recoveryHistory, MigrationPlan) {
-		if err := Ready(ctx, sourcePool); err != nil {
-			t.Fatal(err)
-		}
-		plan, err := PlanMigrations(ctx, sourcePool)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return recoveryDrillHistory(t, ctx, sourcePool), plan
-	}()
+	afterFingerprint, afterPlan := readyRecoveryFingerprint(t, ctx, sourcePool)
 	if afterFingerprint != sourceFingerprint || afterPlan != sourcePlan {
 		t.Fatal("the recovery drill changed the source database")
 	}
+}
+
+func recoveryDrillFingerprint(t *testing.T, ctx context.Context, pool *pgxpool.Pool) (recoveryHistory, MigrationPlan) {
+	t.Helper()
+	plan, err := PlanMigrations(ctx, pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return recoveryDrillHistory(t, ctx, pool), plan
+}
+
+func readyRecoveryFingerprint(t *testing.T, ctx context.Context, pool *pgxpool.Pool) (recoveryHistory, MigrationPlan) {
+	t.Helper()
+	if err := Ready(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	return recoveryDrillFingerprint(t, ctx, pool)
 }

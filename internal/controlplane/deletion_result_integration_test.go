@@ -58,17 +58,29 @@ func TestIntegrationDomainRemovalRetainsOriginalBindingResult(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_platform_domains WHERE id=$1`, originalID).Scan(&remaining); err != nil || remaining != 0 {
 		t.Fatalf("binding was not removed: %d, %v", remaining, err)
 	}
+	assertOperationHistoryResult(t, ctx, service, op, completed, observed)
+}
+
+func assertOperationHistoryResult(
+	t *testing.T,
+	ctx context.Context,
+	service *Service,
+	op, completed contract.Operation,
+	observed int,
+) {
+	t.Helper()
 	page, err := service.ListOperations(ctx, definitionIntegrationActor, operations.ListQuery{Limit: 20})
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, item := range page.Items {
-		if item.ID == op.ID {
-			if item.LatestResult == nil || string(item.LatestResult.Data) != string(completed.LatestResult.Data) || observed != 1 {
-				t.Fatalf("list result or action observation differs: %+v, observations=%d", item, observed)
-			}
-			return
+		if item.ID != op.ID {
+			continue
 		}
+		if item.LatestResult == nil || string(item.LatestResult.Data) != string(completed.LatestResult.Data) || observed != 1 {
+			t.Fatalf("list result or action observation differs: %+v, observations=%d", item, observed)
+		}
+		return
 	}
 	t.Fatal("removed binding operation missing from history")
 }

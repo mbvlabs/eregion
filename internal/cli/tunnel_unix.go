@@ -101,9 +101,9 @@ func (a *app) tunnelSpecs() []spec {
 // wireGuardDial is the dial function for a workspace's WireGuard route. Every
 // route with the same tunnel configuration shares one daemon, so concurrent
 // eregion commands never bring up competing devices with one operator key.
-func wireGuardDial(wg *host.WorkspaceWireGuard) (func(context.Context, string, string) (net.Conn, error), error) {
+func wireGuardDial(ctx context.Context, wg *host.WorkspaceWireGuard) (func(context.Context, string, string) (net.Conn, error), error) {
 	if os.Getenv(envTunnel) == "inprocess" {
-		return inProcessWireGuardDial(wg)
+		return inProcessWireGuardDial(ctx, wg)
 	}
 	cfg, err := wireGuardConfig(wg)
 	if err != nil {
@@ -340,7 +340,7 @@ func spawnTunnelDaemon(ctx context.Context, privateKeyFile string, cfg transport
 		return err
 	}
 	logPath := socket + ".log"
-	logFile, err := os.OpenFile(logPath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600) //nolint:gosec // G304: the operator's private log.
+	logFile, err := os.OpenFile(logPath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
 	if err != nil {
 		return err
 	}
@@ -355,7 +355,7 @@ func spawnTunnelDaemon(ctx context.Context, privateKeyFile string, cfg transport
 		return err
 	}
 	defer func() { _ = r.Close() }()
-	cmd := exec.Command(exe, "tunnel", "serve") //nolint:gosec // G204: re-runs this binary.
+	cmd := exec.CommandContext(context.WithoutCancel(ctx), exe, "tunnel", "serve")
 	cmd.Dir = "/"
 	cmd.Env = append(os.Environ(),
 		envTunnelReadyFD+"=3",
@@ -478,7 +478,9 @@ func runTunnelServe(cmd *cobra.Command, _ []string) (result, error) {
 	// died is stale.
 	_ = os.Remove(socket)
 	old := syscall.Umask(0o077)
-	ln, err := net.Listen("unix", socket)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+	ln, err := new(net.ListenConfig).Listen(ctx, "unix", socket)
 	syscall.Umask(old)
 	if err != nil {
 		return fail(contract.NewFault(contract.RemoteUnreachable, fmt.Sprintf("listen on %s: %v", socket, err), ""))
@@ -487,15 +489,13 @@ func runTunnelServe(cmd *cobra.Command, _ []string) (result, error) {
 	_ = os.Chmod(socket, 0o600)
 
 	cfg.Logf = tunnelLogf
-	dialer, err := transport.NewWireGuardDialer(cfg)
+	dialer, err := transport.NewWireGuardDialer(ctx, cfg)
 	if err != nil {
 		_ = ln.Close()
 		return fail(err)
 	}
 	defer func() { _ = dialer.Close() }()
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
-	defer stop()
 	signal.Ignore(syscall.SIGHUP, syscall.SIGPIPE)
 	srv := transport.NewSharedServer(transport.SharedServerConfig{
 		Listener:      ln,
@@ -686,11 +686,11 @@ type tunnelLockHolder struct {
 // tryTunnelLock takes the tunnel singleton lock without waiting. held is
 // false when another process has it. The returned func releases it.
 func tryTunnelLock(path, command string) (release func(), held bool, err error) {
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600) //nolint:gosec // G304: the operator's own lock file.
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		return nil, false, err
 	}
-	fd := int(f.Fd()) //nolint:gosec // G115: file descriptors fit in int.
+	fd := int(f.Fd())
 	if err := syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		_ = f.Close()
 		if errors.Is(err, syscall.EWOULDBLOCK) {

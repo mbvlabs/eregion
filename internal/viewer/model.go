@@ -221,8 +221,21 @@ func (m *Model) Page(events []contract.Event, at time.Time) error {
 
 	ordered := append([]contract.Event(nil), events...)
 	sort.SliceStable(ordered, func(i, j int) bool { return ordered[i].Sequence < ordered[j].Sequence })
-	// Validate the entire page before applying it. Otherwise a gap after a valid
-	// prefix would advance the cursor without emitting that prefix to a caller.
+	if err := m.validatePage(ordered); err != nil {
+		return err
+	}
+	if err := m.applyPage(ordered, at); err != nil {
+		return err
+	}
+	m.Gap = false
+	m.ExpectedSequence = 0
+	m.finishTerminalStages(at)
+	return nil
+}
+
+// validatePage checks the entire page before applying it. Otherwise a gap after
+// a valid prefix would advance the cursor without emitting that prefix.
+func (m *Model) validatePage(ordered []contract.Event) error {
 	next := m.Cursor
 	for _, event := range ordered {
 		if m.OperationID != "" && event.OperationID != m.OperationID {
@@ -241,6 +254,10 @@ func (m *Model) Page(events []contract.Event, at time.Time) error {
 		}
 		next = event.Sequence
 	}
+	return nil
+}
+
+func (m *Model) applyPage(ordered []contract.Event, at time.Time) error {
 	for _, event := range ordered {
 		if event.Sequence <= m.Cursor {
 			continue // duplicate delivery
@@ -263,19 +280,20 @@ func (m *Model) Page(events []contract.Event, at time.Time) error {
 		}
 		m.applyEvent(clean)
 	}
-	m.Gap = false
-	m.ExpectedSequence = 0
-	// A late-joining viewer can receive a terminal snapshot before replaying
-	// the step events that led to it. The snapshot remains authoritative, so
-	// no stage may claim to still be running after the operation finished.
-	if m.State.Terminal() {
-		finishedAt := at
-		if !m.UpdatedAt.IsZero() {
-			finishedAt = m.UpdatedAt
-		}
-		m.finishStages(m.State, finishedAt)
-	}
 	return nil
+}
+
+// finishTerminalStages keeps a late-joining viewer honest: a terminal snapshot
+// is authoritative, so no stage may still claim to be running.
+func (m *Model) finishTerminalStages(at time.Time) {
+	if !m.State.Terminal() {
+		return
+	}
+	finishedAt := at
+	if !m.UpdatedAt.IsZero() {
+		finishedAt = m.UpdatedAt
+	}
+	m.finishStages(m.State, finishedAt)
 }
 
 func (m *Model) cleanEvent(event contract.Event) (contract.Event, error) {
@@ -388,6 +406,8 @@ func (m *Model) applyState(state contract.State, attempt uint32, code contract.C
 	case contract.Canceled:
 		m.CancelRequested = true
 		m.CancelAcknowledged = true
+	case contract.Queued, contract.Succeeded, contract.Failed:
+		// No additional cancellation flags.
 	}
 	if state.Terminal() {
 		m.finishStages(state, at)
@@ -453,6 +473,8 @@ func (m *Model) finishStages(state contract.State, at time.Time) {
 			m.Stages[i].Status = StageFailed
 		case contract.Canceled:
 			m.Stages[i].Status = StageStopped
+		case contract.Queued, contract.Running, contract.Cancelling:
+			// Running stages keep their observed status.
 		}
 		m.Stages[i].LastSeen = at
 	}
@@ -630,6 +652,8 @@ func (m *Model) StageCounts() (completed, active, failed int) {
 			active++
 		case StageFailed:
 			failed++
+		case StageStopped:
+			// Stopped stages are neither completed, active, nor failed.
 		}
 	}
 	return completed, active, failed
@@ -665,7 +689,7 @@ func formatDuration(d time.Duration) string {
 func FormatDuration(d time.Duration) string { return formatDuration(d) }
 
 // ErrGap converts a reducer error into a machine-readable fault.
-func ErrGap(err error) *contract.Fault {
+func ErrGap(err error) *contract.FaultError {
 	var gap *GapError
 	if errors.As(err, &gap) {
 		return contract.NewFault(contract.PreconditionFailed, "operation event history has a gap", "Refetch from the last event cursor; do not skip missing observations.")

@@ -51,19 +51,19 @@ func RunTask(config Config) error {
 		return err
 	}
 	report := func(event engine.Event) {
-		fmt.Fprintf(os.Stdout, "%s %s %s\n", event.Kind, event.Step, registry.Redact(event.Message))
+		_, _ = fmt.Fprintf(os.Stdout, "%s %s %s\n", event.Kind, event.Step, registry.Redact(event.Message))
 	}
 	status, err := nodeEngine.Run(context.Background(), step, request.Execution, report)
 	// The journal is compacted after every task so it stays bounded on a node
 	// that never restarts.
 	if _, compactErr := engine.Compact(context.Background(), config.StateDir, engine.DefaultRetention()); compactErr != nil {
-		fmt.Fprintf(os.Stderr, "eregion node-agent: journal compaction failed: %v\n", compactErr)
+		_, _ = fmt.Fprintf(os.Stderr, "eregion node-agent: journal compaction failed: %v\n", compactErr)
 	}
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "node task failed: %s\n", registry.Redact(err.Error()))
+		_, _ = fmt.Fprintf(os.Stderr, "node task failed: %s\n", registry.Redact(err.Error()))
 		return err
 	}
-	fmt.Fprintf(os.Stdout, "completed %s applied_attempt=%d\n", status.ExecutionID, status.AppliedAttempt)
+	_, _ = fmt.Fprintf(os.Stdout, "completed %s applied_attempt=%d\n", status.ExecutionID, status.AppliedAttempt)
 	return nil
 }
 
@@ -80,5 +80,9 @@ func Identity(config Config) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return node.Fingerprint(key.Public().(ed25519.PublicKey)), nil
+	public, ok := key.Public().(ed25519.PublicKey)
+	if !ok {
+		return "", errors.New("the node identity key is not an ed25519 key")
+	}
+	return node.Fingerprint(public), nil
 }

@@ -35,7 +35,7 @@ func (s ShellExec) Run(ctx context.Context, stepID, script string, env map[strin
 func (s ShellExec) Output(ctx context.Context, script string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	command := exec.CommandContext(ctx, "/bin/bash", "-c", script) //nolint:gosec // G204: fixed interpreter and scripts from Go source.
+	command := exec.CommandContext(ctx, "/bin/bash", "-c", script)
 	command.Env = []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LANG=C.UTF-8", "LC_ALL=C.UTF-8", "HOME=/root", "DEBIAN_FRONTEND=noninteractive"}
 	var output bytes.Buffer
 	command.Stdout = &output

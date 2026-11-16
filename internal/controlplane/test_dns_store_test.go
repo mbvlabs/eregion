@@ -13,17 +13,16 @@ import (
 // integration tests. Production resolves PostgreSQL through
 // CloudflareCredentialStore.
 type testDNSStore struct {
-	mu         sync.Mutex
-	zones      []integrations.DNSZone
-	tokens     map[string]string
-	zoneReads  int
-	tokenReads int
+	mu     sync.Mutex
+	zones  []integrations.DNSZone
+	tokens map[string]string
 }
 
 func newTestDNSStore(zones ...integrations.DNSZone) *testDNSStore {
 	return &testDNSStore{zones: append([]integrations.DNSZone(nil), zones...), tokens: map[string]string{}}
 }
 
+//nolint:unparam // shared with definition DNS tests that all use the fixture zone.
 func (s *testDNSStore) withToken(zoneID, token string) *testDNSStore {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -34,7 +33,6 @@ func (s *testDNSStore) withToken(zoneID, token string) *testDNSStore {
 func (s *testDNSStore) DNSZone(_ context.Context, zoneID, zoneName string) (integrations.DNSZone, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.zoneReads++
 	zoneID = strings.ToLower(strings.TrimSpace(zoneID))
 	zoneName = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(zoneName), "."))
 	for _, zone := range s.zones {
@@ -58,7 +56,6 @@ func (s *testDNSStore) DNSZones(context.Context) ([]integrations.DNSZone, error)
 func (s *testDNSStore) DNSCredential(_ context.Context, provider, zoneID string) ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.tokenReads++
 	if provider != integrations.DNSProviderCloudflare {
 		return nil, contract.NewFault(contract.ValidationFailed, "unsupported DNS provider", "Only Cloudflare DNS is supported.")
 	}
@@ -67,10 +64,4 @@ func (s *testDNSStore) DNSCredential(_ context.Context, provider, zoneID string)
 		return nil, contract.NewFault(contract.NotFound, "provider credential was not found", "Configure it with eregion dns configure --provider cloudflare, then retry.")
 	}
 	return []byte(token), nil
-}
-
-func (s *testDNSStore) counts() (int, int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.zoneReads, s.tokenReads
 }

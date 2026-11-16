@@ -11,6 +11,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/vault"
@@ -50,9 +51,30 @@ func (f *providerSetupFixture) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	})
 }
 
+type providerCredentialFixture struct {
+	pool    *pgxpool.Pool
+	secrets *vault.Service
+	setup   *CloudflareSetup
+	server  *providerSetupFixture
+	ring    *vault.KeyRing
+	actor   contract.Actor
+	zoneID  string
+	scope   vault.ProviderScope
+}
+
 func TestIntegrationProviderCredentialValidationAtomicityAndRotation(t *testing.T) {
-	pool, _ := testPool(t, true)
+	f := newProviderCredentialFixture(t)
 	ctx := context.Background()
+	assertProviderInitialConfigure(t, ctx, f)
+	assertProviderStaleAndInvalid(t, ctx, f)
+	assertProviderAuditRollback(t, ctx, f)
+	assertProviderRotation(t, ctx, f)
+	assertProviderSetupNoMutations(t, f)
+}
+
+func newProviderCredentialFixture(t *testing.T) providerCredentialFixture {
+	t.Helper()
+	pool, _ := testPool(t, true)
 	ring, err := vault.GenerateKeyRing()
 	if err != nil {
 		t.Fatal(err)
@@ -62,140 +84,151 @@ func TestIntegrationProviderCredentialValidationAtomicityAndRotation(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	fixture := newProviderSetupFixture()
-	server := httptest.NewServer(fixture)
-	defer server.Close()
+	handler := newProviderSetupFixture()
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
 	setup := NewCloudflareSetup(secrets, store, server.URL+"/client/v4", server.Client())
-	actor := contract.Actor{Kind: "operator", Subject: "first-operator"}
 	const zoneID = "0123456789abcdef0123456789abcdef"
-	preview, err := setup.PreviewCloudflareCredential(ctx, actor, zoneID, "example.com", []byte("cf-token-one-0123456789"))
+	scope, _ := vault.NewProviderScope(vault.ProviderCloudflare, zoneID)
+	return providerCredentialFixture{
+		pool: pool, secrets: secrets, setup: setup, server: handler, ring: ring,
+		actor: contract.Actor{Kind: "operator", Subject: "first-operator"}, zoneID: zoneID, scope: scope,
+	}
+}
+
+func assertProviderInitialConfigure(t *testing.T, ctx context.Context, f providerCredentialFixture) {
+	t.Helper()
+	preview, err := f.setup.PreviewCloudflareCredential(ctx, f.actor, f.zoneID, "example.com", []byte("cf-token-one-0123456789"))
 	if err != nil || preview.CurrentRevision != 0 || preview.NextRevision != 1 || !preview.ReadValidated {
 		t.Fatalf("initial preview = %+v, %v", preview, err)
 	}
-	first, err := setup.ConfigureCloudflareCredential(ctx, actor, zoneID, "example.com", preview.CurrentRevision, []byte("cf-token-one-0123456789"))
-	if err != nil || first.LatestRevision != 1 || first.CreatedBy.Subject != actor.Subject {
+	first, err := f.setup.ConfigureCloudflareCredential(ctx, f.actor, f.zoneID, "example.com", preview.CurrentRevision, []byte("cf-token-one-0123456789"))
+	if err != nil || first.LatestRevision != 1 || first.CreatedBy.Subject != f.actor.Subject {
 		t.Fatalf("initial configure = %+v, %v", first, err)
 	}
 	var ciphertext []byte
-	if err := pool.QueryRow(ctx, `SELECT ciphertext FROM eregion_provider_credential_revisions WHERE provider='cloudflare' AND zone_id=$1 AND revision=1`, zoneID).Scan(&ciphertext); err != nil {
+	if err := f.pool.QueryRow(ctx, `SELECT ciphertext FROM eregion_provider_credential_revisions WHERE provider='cloudflare' AND zone_id=$1 AND revision=1`, f.zoneID).Scan(&ciphertext); err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(string(ciphertext), "cf-token-one") {
 		t.Fatal("provider token was stored in plaintext")
 	}
-	scope, _ := vault.NewProviderScope(vault.ProviderCloudflare, zoneID)
-	metadata, token, err := secrets.ResolveProviderCredential(ctx, scope)
+	metadata, token, err := f.secrets.ResolveProviderCredential(ctx, f.scope)
 	if err != nil || string(token) != "cf-token-one-0123456789" || metadata.LatestRevision != 1 {
 		t.Fatalf("resolved provider credential = %+v, %q, %v", metadata, token, err)
 	}
 	clearProviderToken(token)
+}
 
+func assertProviderStaleAndInvalid(t *testing.T, ctx context.Context, f providerCredentialFixture) {
+	t.Helper()
 	// A stale replacement is a conflict and leaves revision 1 active.
-	if _, err := setup.ConfigureCloudflareCredential(ctx, contract.Actor{Kind: "operator", Subject: "second-operator"}, zoneID, "example.com", 0, []byte("cf-token-two-0123456789")); contract.Classify(err).Code != contract.Conflict {
+	if _, err := f.setup.ConfigureCloudflareCredential(ctx, contract.Actor{Kind: "operator", Subject: "second-operator"}, f.zoneID, "example.com", 0, []byte("cf-token-two-0123456789")); contract.Classify(err).Code != contract.Conflict {
 		t.Fatalf("stale replacement = %v", err)
 	}
-	if _, token, err := secrets.ResolveProviderCredential(ctx, scope); err != nil || string(token) != "cf-token-one-0123456789" {
+	if _, token, err := f.secrets.ResolveProviderCredential(ctx, f.scope); err != nil || string(token) != "cf-token-one-0123456789" {
 		t.Fatalf("stale replacement changed the credential: %q, %v", token, err)
 	} else {
 		clearProviderToken(token)
 	}
-
 	// A failed token validation leaves the old credential active too.
-	if _, err := setup.ConfigureCloudflareCredential(ctx, actor, zoneID, "example.com", 1, []byte("cf-token-bad-0123456789")); contract.Classify(err).Code != contract.Forbidden {
+	if _, err := f.setup.ConfigureCloudflareCredential(ctx, f.actor, f.zoneID, "example.com", 1, []byte("cf-token-bad-0123456789")); contract.Classify(err).Code != contract.Forbidden {
 		t.Fatalf("invalid token replacement = %v", err)
 	}
-	if _, token, err := secrets.ResolveProviderCredential(ctx, scope); err != nil || string(token) != "cf-token-one-0123456789" {
+	if _, token, err := f.secrets.ResolveProviderCredential(ctx, f.scope); err != nil || string(token) != "cf-token-one-0123456789" {
 		t.Fatalf("failed validation changed the credential: %q, %v", token, err)
 	} else {
 		clearProviderToken(token)
 	}
+}
 
+func assertProviderAuditRollback(t *testing.T, ctx context.Context, f providerCredentialFixture) {
+	t.Helper()
 	// A failed audit insert inside the commit transaction must roll back the
 	// encrypted revision too.
-	if _, err := pool.Exec(ctx, `CREATE FUNCTION eregion_test_fail_provider_audit() RETURNS trigger LANGUAGE plpgsql AS $$
+	if _, err := f.pool.Exec(ctx, `CREATE FUNCTION eregion_test_fail_provider_audit() RETURNS trigger LANGUAGE plpgsql AS $$
 		BEGIN RAISE EXCEPTION 'audit unavailable'; END $$`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `CREATE TRIGGER eregion_test_fail_provider_audit BEFORE INSERT ON eregion_integration_audit
+	if _, err := f.pool.Exec(ctx, `CREATE TRIGGER eregion_test_fail_provider_audit BEFORE INSERT ON eregion_integration_audit
 		FOR EACH ROW EXECUTE FUNCTION eregion_test_fail_provider_audit()`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := setup.ConfigureCloudflareCredential(ctx, actor, zoneID, "example.com", 1, []byte("cf-token-two-0123456789")); contract.Classify(err).Code != contract.Unavailable {
+	if _, err := f.setup.ConfigureCloudflareCredential(ctx, f.actor, f.zoneID, "example.com", 1, []byte("cf-token-two-0123456789")); contract.Classify(err).Code != contract.Unavailable {
 		t.Fatalf("audit failure replacement = %v", err)
 	}
-	if _, token, err := secrets.ResolveProviderCredential(ctx, scope); err != nil || string(token) != "cf-token-one-0123456789" {
+	if _, token, err := f.secrets.ResolveProviderCredential(ctx, f.scope); err != nil || string(token) != "cf-token-one-0123456789" {
 		t.Fatalf("audit failure changed the credential: %q, %v", token, err)
 	} else {
 		clearProviderToken(token)
 	}
 	var afterAuditFailure int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_provider_credential_revisions WHERE provider='cloudflare' AND zone_id=$1`, zoneID).Scan(&afterAuditFailure); err != nil || afterAuditFailure != 1 {
+	if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM eregion_provider_credential_revisions WHERE provider='cloudflare' AND zone_id=$1`, f.zoneID).Scan(&afterAuditFailure); err != nil || afterAuditFailure != 1 {
 		t.Fatalf("audit failure left revisions = %d, %v", afterAuditFailure, err)
 	}
-	if _, err := pool.Exec(ctx, `DROP TRIGGER eregion_test_fail_provider_audit ON eregion_integration_audit`); err != nil {
+	if _, err := f.pool.Exec(ctx, `DROP TRIGGER eregion_test_fail_provider_audit ON eregion_integration_audit`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `DROP FUNCTION eregion_test_fail_provider_audit()`); err != nil {
+	if _, err := f.pool.Exec(ctx, `DROP FUNCTION eregion_test_fail_provider_audit()`); err != nil {
 		t.Fatal(err)
 	}
+}
 
+func assertProviderRotation(t *testing.T, ctx context.Context, f providerCredentialFixture) {
+	t.Helper()
 	// A second operator replaces the credential with the observed revision.
-	second, err := setup.ConfigureCloudflareCredential(ctx, contract.Actor{Kind: "operator", Subject: "second-operator"}, zoneID, "example.com", 1, []byte("cf-token-two-0123456789"))
+	second, err := f.setup.ConfigureCloudflareCredential(ctx, contract.Actor{Kind: "operator", Subject: "second-operator"}, f.zoneID, "example.com", 1, []byte("cf-token-two-0123456789"))
 	if err != nil || second.LatestRevision != 2 || second.UpdatedBy.Subject != "second-operator" || second.CreatedBy.Subject != "first-operator" {
 		t.Fatalf("replacement = %+v, %v", second, err)
 	}
 	// A freshly constructed service resolves the new revision without a
 	// restart or a cached token.
-	fresh, err := newTestVaultService(t, pool, ring)
+	fresh, err := newTestVaultService(t, f.pool, f.ring)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, token, err := fresh.ResolveProviderCredential(ctx, scope); err != nil || string(token) != "cf-token-two-0123456789" {
+	if _, token, err := fresh.ResolveProviderCredential(ctx, f.scope); err != nil || string(token) != "cf-token-two-0123456789" {
 		t.Fatalf("fresh resolver = %q, %v", token, err)
 	} else {
 		clearProviderToken(token)
 	}
 	var revisions int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_provider_credential_revisions WHERE provider='cloudflare' AND zone_id=$1`, zoneID).Scan(&revisions); err != nil || revisions != 2 {
+	if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM eregion_provider_credential_revisions WHERE provider='cloudflare' AND zone_id=$1`, f.zoneID).Scan(&revisions); err != nil || revisions != 2 {
 		t.Fatalf("provider revisions = %d, %v", revisions, err)
 	}
 	var audits int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_integration_audit WHERE entry->>'action'='cloudflare.configure' AND entry->>'outcome'='succeeded'`).Scan(&audits); err != nil || audits != 2 {
+	if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM eregion_integration_audit WHERE entry->>'action'='cloudflare.configure' AND entry->>'outcome'='succeeded'`).Scan(&audits); err != nil || audits != 2 {
 		t.Fatalf("provider audit entries = %d, %v", audits, err)
 	}
-	fixture.mu.Lock()
-	defer fixture.mu.Unlock()
-	if fixture.mutations != 0 {
-		t.Fatalf("setup performed a provider mutation: %v", fixture.calls)
+}
+
+func assertProviderSetupNoMutations(t *testing.T, f providerCredentialFixture) {
+	t.Helper()
+	f.server.mu.Lock()
+	defer f.server.mu.Unlock()
+	if f.server.mutations != 0 {
+		t.Fatalf("setup performed a provider mutation: %v", f.server.calls)
 	}
 }
 
 func TestIntegrationProviderCredentialConcurrentCASActivatesExactlyOneRevision(t *testing.T) {
-	pool, _ := testPool(t, true)
+	f := newProviderCredentialFixture(t)
 	ctx := context.Background()
-	ring, err := vault.GenerateKeyRing()
-	if err != nil {
+	runConcurrentProviderCAS(t, ctx, f)
+}
+
+type providerCASResult struct {
+	metadata vault.ProviderMetadata
+	err      error
+}
+
+func runConcurrentProviderCAS(t *testing.T, ctx context.Context, f providerCredentialFixture) {
+	t.Helper()
+	if _, err := f.setup.ConfigureCloudflareCredential(ctx, f.actor, f.zoneID, "example.com", 0, []byte("cf-token-one-0123456789")); err != nil {
 		t.Fatal(err)
-	}
-	store := newTestEntities(t, pool)
-	secrets, err := vault.NewService(store.Secrets(), store.Secrets(), ring, store.Providers())
-	if err != nil {
-		t.Fatal(err)
-	}
-	fixture := newProviderSetupFixture()
-	server := httptest.NewServer(fixture)
-	defer server.Close()
-	setup := NewCloudflareSetup(secrets, store, server.URL+"/client/v4", server.Client())
-	const zoneID = "0123456789abcdef0123456789abcdef"
-	if _, err := setup.ConfigureCloudflareCredential(ctx, contract.Actor{Kind: "operator", Subject: "first-operator"}, zoneID, "example.com", 0, []byte("cf-token-one-0123456789")); err != nil {
-		t.Fatal(err)
-	}
-	type result struct {
-		metadata vault.ProviderMetadata
-		err      error
 	}
 	start := make(chan struct{})
-	results := make(chan result, 2)
+	results := make(chan providerCASResult, 2)
 	for index, token := range []string{"cf-token-two-0123456789", "cf-token-three-0123456789"} {
 		subject := "second-operator"
 		if index == 1 {
@@ -203,13 +236,33 @@ func TestIntegrationProviderCredentialConcurrentCASActivatesExactlyOneRevision(t
 		}
 		go func(subject, token string) {
 			<-start
-			metadata, err := setup.ConfigureCloudflareCredential(ctx, contract.Actor{Kind: "operator", Subject: subject}, zoneID, "example.com", 1, []byte(token))
-			results <- result{metadata: metadata, err: err}
+			metadata, err := f.setup.ConfigureCloudflareCredential(ctx, contract.Actor{Kind: "operator", Subject: subject}, f.zoneID, "example.com", 1, []byte(token))
+			results <- providerCASResult{metadata: metadata, err: err}
 		}(subject, token)
 	}
 	close(start)
+	assertProviderCASResults(t, results)
+	metadata, token, err := f.secrets.ResolveProviderCredential(ctx, f.scope)
+	if err != nil || metadata.LatestRevision != 2 {
+		t.Fatalf("active credential after concurrent CAS = %+v, %v", metadata, err)
+	}
+	winnerToken := string(token)
+	clearProviderToken(token)
+	if winnerToken != "cf-token-two-0123456789" && winnerToken != "cf-token-three-0123456789" {
+		t.Fatalf("active credential is not one of the concurrent winners: %q", winnerToken)
+	}
+	var revisions, audits int
+	if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM eregion_provider_credential_revisions WHERE provider='cloudflare' AND zone_id=$1`, f.zoneID).Scan(&revisions); err != nil || revisions != 2 {
+		t.Fatalf("revisions after concurrent CAS = %d, %v", revisions, err)
+	}
+	if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM eregion_integration_audit WHERE entry->>'action'='cloudflare.configure' AND entry->>'outcome'='succeeded'`).Scan(&audits); err != nil || audits != 2 {
+		t.Fatalf("audit entries after concurrent CAS = %d, %v", audits, err)
+	}
+}
+
+func assertProviderCASResults(t *testing.T, results <-chan providerCASResult) {
+	t.Helper()
 	successes, conflicts := 0, 0
-	var winnerToken string
 	for range 2 {
 		out := <-results
 		if out.err == nil {
@@ -226,23 +279,6 @@ func TestIntegrationProviderCredentialConcurrentCASActivatesExactlyOneRevision(t
 	}
 	if successes != 1 || conflicts != 1 {
 		t.Fatalf("concurrent CAS = %d success, %d conflict; want exactly one of each", successes, conflicts)
-	}
-	scope, _ := vault.NewProviderScope(vault.ProviderCloudflare, zoneID)
-	metadata, token, err := secrets.ResolveProviderCredential(ctx, scope)
-	if err != nil || metadata.LatestRevision != 2 {
-		t.Fatalf("active credential after concurrent CAS = %+v, %v", metadata, err)
-	}
-	winnerToken = string(token)
-	clearProviderToken(token)
-	if winnerToken != "cf-token-two-0123456789" && winnerToken != "cf-token-three-0123456789" {
-		t.Fatalf("active credential is not one of the concurrent winners: %q", winnerToken)
-	}
-	var revisions, audits int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_provider_credential_revisions WHERE provider='cloudflare' AND zone_id=$1`, zoneID).Scan(&revisions); err != nil || revisions != 2 {
-		t.Fatalf("revisions after concurrent CAS = %d, %v", revisions, err)
-	}
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_integration_audit WHERE entry->>'action'='cloudflare.configure' AND entry->>'outcome'='succeeded'`).Scan(&audits); err != nil || audits != 2 {
-		t.Fatalf("audit entries after concurrent CAS = %d, %v", audits, err)
 	}
 }
 
@@ -413,9 +449,26 @@ func setTestProviderCredential(t *testing.T, ctx context.Context, store *entitie
 // The provider revision guards are exercised against real PostgreSQL rows:
 // positive bigint exhaustion, explicit uint64-to-bigint rejection, and a
 // persisted negative revision that must fail closed as corrupt state.
+type providerBoundsFixture struct {
+	pool    *pgxpool.Pool
+	ctx     context.Context
+	store   *entities.Store
+	secrets *vault.Service
+	actor   contract.Actor
+	zoneA   string
+	zoneB   string
+}
+
 func TestIntegrationProviderRevisionBoundsAndCorruptState(t *testing.T) {
+	f := newProviderBoundsFixture(t)
+	assertProviderMaxRevisionGuard(t, f)
+	assertProviderUint64Guard(t, f)
+	assertProviderNegativeRevision(t, f)
+}
+
+func newProviderBoundsFixture(t *testing.T) providerBoundsFixture {
+	t.Helper()
 	pool, _ := testPool(t, true)
-	ctx := context.Background()
 	ring, err := vault.GenerateKeyRing()
 	if err != nil {
 		t.Fatal(err)
@@ -425,71 +478,84 @@ func TestIntegrationProviderRevisionBoundsAndCorruptState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	actor := contract.Actor{Kind: "operator", Subject: "provider-bounds"}
-	const zoneA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	const zoneB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-	scopeA := vault.ProviderScope{Provider: vault.ProviderCloudflare, ZoneID: zoneA}
+	f := providerBoundsFixture{
+		pool: pool, ctx: context.Background(), store: store, secrets: secrets,
+		actor: contract.Actor{Kind: "operator", Subject: "provider-bounds"},
+		zoneA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", zoneB: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+	}
+	if _, err := setTestProviderCredential(t, f.ctx, store, secrets, f.actor, f.zoneA, "bounds.example.com", 0); err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
 
-	if _, err := setTestProviderCredential(t, ctx, store, secrets, actor, zoneA, "bounds.example.com", 0); err != nil {
+func assertProviderMaxRevisionGuard(t *testing.T, f providerBoundsFixture) {
+	t.Helper()
+	if _, err := f.pool.Exec(f.ctx, `UPDATE eregion_provider_credentials
+		SET latest_revision=$2 WHERE provider='cloudflare' AND zone_id=$1`, f.zoneA, int64(math.MaxInt64)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `UPDATE eregion_provider_credentials
-		SET latest_revision=$2 WHERE provider='cloudflare' AND zone_id=$1`, zoneA, int64(math.MaxInt64)); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := setTestProviderCredential(t, ctx, store, secrets, actor, zoneA, "bounds.example.com", math.MaxInt64); contract.Classify(err).Code != contract.Conflict ||
+	if _, err := setTestProviderCredential(t, f.ctx, f.store, f.secrets, f.actor, f.zoneA, "bounds.example.com", math.MaxInt64); contract.Classify(err).Code != contract.Conflict ||
 		!strings.Contains(contract.Classify(err).Message, "revision space is exhausted") {
 		t.Fatalf("MaxInt64 guard = %v", err)
 	}
 	var latest int64
-	if err := pool.QueryRow(ctx, `SELECT latest_revision FROM eregion_provider_credentials
-		WHERE provider='cloudflare' AND zone_id=$1`, zoneA).Scan(&latest); err != nil || latest != int64(math.MaxInt64) {
+	if err := f.pool.QueryRow(f.ctx, `SELECT latest_revision FROM eregion_provider_credentials
+		WHERE provider='cloudflare' AND zone_id=$1`, f.zoneA).Scan(&latest); err != nil || latest != int64(math.MaxInt64) {
 		t.Fatalf("MaxInt64 guard changed latest_revision = %d, %v", latest, err)
 	}
 	var revisions int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_provider_credential_revisions
-		WHERE provider='cloudflare' AND zone_id=$1`, zoneA).Scan(&revisions); err != nil || revisions != 1 {
+	if err := f.pool.QueryRow(f.ctx, `SELECT count(*) FROM eregion_provider_credential_revisions
+		WHERE provider='cloudflare' AND zone_id=$1`, f.zoneA).Scan(&revisions); err != nil || revisions != 1 {
 		t.Fatalf("MaxInt64 guard wrote revisions = %d, %v", revisions, err)
 	}
+}
 
-	err = store.WithinTx(ctx, func(tx *entities.StoreTx) error {
-		_, err := tx.Providers().UpdateProviderCredentialRevision(ctx, scopeA, math.MaxUint64, math.MaxUint64, actor)
+func assertProviderUint64Guard(t *testing.T, f providerBoundsFixture) {
+	t.Helper()
+	scopeA := vault.ProviderScope{Provider: vault.ProviderCloudflare, ZoneID: f.zoneA}
+	err := f.store.WithinTx(f.ctx, func(tx *entities.StoreTx) error {
+		_, err := tx.Providers().UpdateProviderCredentialRevision(f.ctx, scopeA, math.MaxUint64, math.MaxUint64, f.actor)
 		return err
 	})
 	if contract.Classify(err).Code != contract.Conflict || !strings.Contains(contract.Classify(err).Message, "database range") {
 		t.Fatalf("uint64 bigint guard = %v", err)
 	}
-	if err := pool.QueryRow(ctx, `SELECT latest_revision FROM eregion_provider_credentials
-		WHERE provider='cloudflare' AND zone_id=$1`, zoneA).Scan(&latest); err != nil || latest != int64(math.MaxInt64) {
+	var latest int64
+	if err := f.pool.QueryRow(f.ctx, `SELECT latest_revision FROM eregion_provider_credentials
+		WHERE provider='cloudflare' AND zone_id=$1`, f.zoneA).Scan(&latest); err != nil || latest != int64(math.MaxInt64) {
 		t.Fatalf("uint64 bigint guard changed latest_revision = %d, %v", latest, err)
 	}
+}
 
-	if _, err := pool.Exec(ctx, `INSERT INTO eregion_provider_credentials
+func assertProviderNegativeRevision(t *testing.T, f providerBoundsFixture) {
+	t.Helper()
+	if _, err := f.pool.Exec(f.ctx, `INSERT INTO eregion_provider_credentials
 		(provider,zone_id,zone_name,latest_revision,created_by_kind,created_by_subject,updated_by_kind,updated_by_subject,created_at,updated_at)
-		VALUES('cloudflare',$1,'negative.example.com',-1,'operator','test','operator','test',clock_timestamp(),clock_timestamp())`, zoneB); err != nil {
+		VALUES('cloudflare',$1,'negative.example.com',-1,'operator','test','operator','test',clock_timestamp(),clock_timestamp())`, f.zoneB); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO eregion_provider_credential_revisions
+	if _, err := f.pool.Exec(f.ctx, `INSERT INTO eregion_provider_credential_revisions
 		(provider,zone_id,revision,key_id,ciphertext,ciphertext_sha256,revision_hash,created_by_kind,created_by_subject,created_at)
-		VALUES('cloudflare',$1,-1,'test',''::bytea,'x','x','operator','test',clock_timestamp())`, zoneB); err != nil {
+		VALUES('cloudflare',$1,-1,'test',''::bytea,'x','x','operator','test',clock_timestamp())`, f.zoneB); err != nil {
 		t.Fatal(err)
 	}
-	scopeB := vault.ProviderScope{Provider: vault.ProviderCloudflare, ZoneID: zoneB}
+	scopeB := vault.ProviderScope{Provider: vault.ProviderCloudflare, ZoneID: f.zoneB}
 	for name, call := range map[string]func() error{
 		"get": func() error {
-			_, err := secrets.GetProviderCredential(ctx, scopeB)
+			_, err := f.secrets.GetProviderCredential(f.ctx, scopeB)
 			return err
 		},
 		"list": func() error {
-			_, err := secrets.ListProviderCredentials(ctx, vault.ProviderCloudflare, 10)
+			_, err := f.secrets.ListProviderCredentials(f.ctx, vault.ProviderCloudflare, 10)
 			return err
 		},
 		"resolve": func() error {
-			_, _, err := secrets.ResolveProviderCredential(ctx, scopeB)
+			_, _, err := f.secrets.ResolveProviderCredential(f.ctx, scopeB)
 			return err
 		},
 		"set": func() error {
-			_, err := setTestProviderCredential(t, ctx, store, secrets, actor, zoneB, "negative.example.com", 0)
+			_, err := setTestProviderCredential(t, f.ctx, f.store, f.secrets, f.actor, f.zoneB, "negative.example.com", 0)
 			return err
 		},
 	} {
@@ -498,8 +564,9 @@ func TestIntegrationProviderRevisionBoundsAndCorruptState(t *testing.T) {
 			t.Fatalf("%s negative revision = %v", name, fault)
 		}
 	}
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_provider_credential_revisions
-		WHERE provider='cloudflare' AND zone_id=$1`, zoneB).Scan(&revisions); err != nil || revisions != 1 {
+	var revisions int
+	if err := f.pool.QueryRow(f.ctx, `SELECT count(*) FROM eregion_provider_credential_revisions
+		WHERE provider='cloudflare' AND zone_id=$1`, f.zoneB).Scan(&revisions); err != nil || revisions != 1 {
 		t.Fatalf("negative revision wrote revisions = %d, %v", revisions, err)
 	}
 }

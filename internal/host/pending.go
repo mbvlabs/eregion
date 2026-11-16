@@ -253,7 +253,7 @@ func (p *PendingInit) SaveAt(storePath string) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	raw, err := json.MarshalIndent(p, "", "  ")
+	raw, err := json.MarshalIndent(p, "", "  ") //nolint:gosec // G117: the private pending file is written owner-only and must hold the access key for resume.
 	if err != nil {
 		return err
 	}

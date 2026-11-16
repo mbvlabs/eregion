@@ -147,62 +147,27 @@ func Start(ctx context.Context, options Options) (*Fixture, error) {
 	if err != nil {
 		return nil, err
 	}
-	image := options.Image
-	if image == "" {
-		image = DefaultImage
-	}
-	tag, err := ensureImage(ctx, root, image)
+	image, err := fixtureImage(ctx, root, options.Image)
 	if err != nil {
 		return nil, err
 	}
-	image = tag
-
-	nodeName := options.NodeName
-	if nodeName == "" {
-		nodeName = "fixture-node"
-	}
-	user := options.User
-	if options.Root {
-		user = "root"
-	} else if user == "" {
-		user = "eregion"
-	}
+	nodeName, user := fixtureNames(options)
 	hostKey, hostKeyPath, err := generateHostKey()
 	if err != nil {
 		return nil, err
 	}
-	var identityPath string
-	var authorized []byte
-	if options.ClientKeyFile != "" {
-		raw, err := os.ReadFile(options.ClientKeyFile)
-		if err != nil {
-			return nil, err
-		}
-		signer, err := ssh.ParsePrivateKey(raw)
-		if err != nil {
-			return nil, err
-		}
-		identityPath, authorized = options.ClientKeyFile, ssh.MarshalAuthorizedKey(signer.PublicKey())
-	} else {
-		_, identityPath, authorized, err = generateClientKey()
-		if err != nil {
-			return nil, err
-		}
+	identityPath, authorized, err := fixtureIdentity(options)
+	if err != nil {
+		return nil, err
 	}
 
 	container := "eregion-ssh-fixture-" + strconv.Itoa(os.Getpid()) + "-" + randomSuffix()
-	run := []string{"run", "-d", "--init", "--name", container, "-p", "127.0.0.1::2222"}
-	if options.WireGuard {
-		run = []string{"run", "-d", "--init", "--name", container, "--cap-add", "NET_ADMIN", "-p", "127.0.0.1::" + wireGuardPort + "/udp"}
-	}
-	if options.NetAdmin {
-		run = []string{"run", "-d", "--init", "--name", container, "--cap-add", "NET_ADMIN", "-p", "127.0.0.1::2222", "-p", "127.0.0.1::" + wireGuardPort + "/udp"}
-	}
-	if _, err := runDocker(ctx, append(run, image, "sleep", "infinity")...); err != nil {
+	fixture := &Fixture{Name: container, image: image, HostKey: hostKey, IdentityFile: identityPath}
+	// Cleanup must run even when the caller's context has already ended.
+	cleanup := func() { _, _ = runDocker(context.WithoutCancel(ctx), "rm", "-f", container) }
+	if err := startContainer(ctx, options, container, image); err != nil {
 		return nil, err
 	}
-	fixture := &Fixture{Name: container, image: image, HostKey: hostKey, IdentityFile: identityPath}
-	cleanup := func() { _, _ = runDocker(context.Background(), "rm", "-f", container) }
 	if options.WireGuard {
 		node, err := setupWireGuard(ctx, container, filepath.Dir(identityPath))
 		if err != nil {
@@ -211,110 +176,24 @@ func Start(ctx context.Context, options Options) (*Fixture, error) {
 		}
 		fixture.WireGuard = node
 	}
-
-	if err := copyIntoContainer(ctx, container, hostKeyPath, "/etc/ssh/ssh_host_ed25519_key"); err != nil {
+	if err := configureContainer(ctx, options, container, user, nodeName, hostKeyPath, identityPath, authorized); err != nil {
 		cleanup()
 		return nil, err
 	}
-	if _, err := runDocker(ctx, "exec", container, "sh", "-c", "chmod 600 /etc/ssh/ssh_host_ed25519_key && rm -f /etc/ssh/ssh_host_rsa_key /etc/ssh/ssh_host_ecdsa_key /etc/ssh/ssh_host_dsa_key"); err != nil {
-		cleanup()
-		return nil, err
-	}
-	if options.Root {
-		if _, err := runDocker(ctx, "exec", container, "sh", "-c", "sed -i 's/^PermitRootLogin no/PermitRootLogin yes/' /etc/ssh/sshd_config.d/eregion.conf"); err != nil {
-			cleanup()
-			return nil, err
-		}
-	}
-	home := "/home/" + user
-	if options.Root {
-		home = "/root"
-	}
-	if _, err := runDocker(ctx, "exec", container, "sh", "-c", "mkdir -p "+home+"/.ssh && chown -R "+user+":"+user+" "+home); err != nil {
-		cleanup()
-		return nil, err
-	}
-	authorizedPath := filepath.Join(filepath.Dir(identityPath), "authorized_keys")
-	if err := os.WriteFile(authorizedPath, authorized, 0o600); err != nil {
-		cleanup()
-		return nil, err
-	}
-	if err := copyIntoContainer(ctx, container, authorizedPath, home+"/.ssh/authorized_keys"); err != nil {
-		cleanup()
-		return nil, err
-	}
-	if _, err := runDocker(ctx, "exec", container, "sh", "-c", "chown "+user+":"+user+" "+home+"/.ssh/authorized_keys && chmod 600 "+home+"/.ssh/authorized_keys"); err != nil {
-		cleanup()
-		return nil, err
-	}
-	config := map[string]any{"node": nodeName, "state_dir": "/var/lib/eregion/node"}
-	if len(options.WireGuardApply) > 0 {
-		config["wireguard_apply"] = options.WireGuardApply
-	}
-	scratch, err := os.MkdirTemp("", "eregion-ssh-files")
+	address, err := fixtureAddress(ctx, container, options)
 	if err != nil {
 		cleanup()
 		return nil, err
-	}
-	defer func() { _ = os.RemoveAll(scratch) }()
-	for path, content := range options.Files {
-		if err := installFile(ctx, container, scratch, path, content); err != nil {
-			cleanup()
-			return nil, err
-		}
-	}
-	if len(options.TaskCommand) > 0 {
-		config["task_command"] = options.TaskCommand
-	}
-	raw, err := json.Marshal(config)
-	if err != nil {
-		cleanup()
-		return nil, err
-	}
-	configPath := filepath.Join(filepath.Dir(identityPath), "node.json")
-	if err := os.WriteFile(configPath, raw, 0o600); err != nil {
-		cleanup()
-		return nil, err
-	}
-	if _, err := runDocker(ctx, "exec", container, "mkdir", "-p", "/etc/eregion"); err != nil {
-		cleanup()
-		return nil, err
-	}
-	if err := copyIntoContainer(ctx, container, configPath, "/etc/eregion/node.json"); err != nil {
-		cleanup()
-		return nil, err
-	}
-	if _, err := runDocker(ctx, "exec", container, "sh", "-c", "chown "+user+":"+user+" /etc/eregion/node.json && chmod 600 /etc/eregion/node.json && chown -R "+user+":"+user+" /var/lib/eregion"); err != nil {
-		cleanup()
-		return nil, err
-	}
-	if _, err := runDocker(ctx, "exec", "-d", container, "/usr/sbin/sshd", "-D", "-e", "-f", "/etc/ssh/sshd_config", "-p", "2222"); err != nil {
-		cleanup()
-		return nil, err
-	}
-	address := net.JoinHostPort(wireGuardNodeAddress, "2222")
-	if !options.WireGuard {
-		address, err = publishedAddress(ctx, container, "2222/tcp")
-		if err != nil {
-			cleanup()
-			return nil, err
-		}
 	}
 	fixture.Address = address
 	if options.NetAdmin {
-		if out, err := runDocker(ctx, "exec", container, "ip", "link", "add", "wgprobe", "type", "wireguard"); err != nil {
-			cleanup()
-			return nil, fmt.Errorf("%w: the node container cannot create a kernel WireGuard interface (it needs NET_ADMIN and the host's wireguard module): %s", ErrUnavailable, strings.TrimSpace(out))
-		}
-		_, _ = runDocker(ctx, "exec", container, "ip", "link", "del", "wgprobe")
-		if fixture.UDPEndpoint, err = publishedAddress(ctx, container, wireGuardPort+"/udp"); err != nil {
+		if err := configureNetAdmin(ctx, container, fixture); err != nil {
 			cleanup()
 			return nil, err
 		}
 	}
-	knownHosts := filepath.Join(filepath.Dir(identityPath), "known_hosts")
-	line := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(hostKey)))
-	if err := os.WriteFile(knownHosts, []byte(knownHostsLine(address)+" "+line+"\n"), 0o600); err != nil {
+	knownHosts, err := writeKnownHosts(identityPath, address, hostKey)
+	if err != nil {
 		cleanup()
 		return nil, err
 	}
@@ -334,10 +213,199 @@ func Start(ctx context.Context, options Options) (*Fixture, error) {
 	return fixture, nil
 }
 
+// fixtureImage resolves the fixture image tag, building it when needed.
+func fixtureImage(ctx context.Context, root, image string) (string, error) {
+	if image == "" {
+		image = DefaultImage
+	}
+	return ensureImage(ctx, root, image)
+}
+
+// fixtureNames resolves the node name and account from the options.
+func fixtureNames(options Options) (string, string) {
+	nodeName := options.NodeName
+	if nodeName == "" {
+		nodeName = "fixture-node"
+	}
+	user := options.User
+	if options.Root {
+		user = "root"
+	} else if user == "" {
+		user = "eregion"
+	}
+	return nodeName, user
+}
+
+// fixtureIdentity returns the client identity path and its authorized_keys
+// line, reusing the caller's key when one is configured.
+func fixtureIdentity(options Options) (string, []byte, error) {
+	if options.ClientKeyFile != "" {
+		raw, err := os.ReadFile(options.ClientKeyFile)
+		if err != nil {
+			return "", nil, err
+		}
+		signer, err := ssh.ParsePrivateKey(raw)
+		if err != nil {
+			return "", nil, err
+		}
+		return options.ClientKeyFile, ssh.MarshalAuthorizedKey(signer.PublicKey()), nil
+	}
+	_, identityPath, authorized, err := generateClientKey()
+	return identityPath, authorized, err
+}
+
+// startContainer starts the node container with the ports its mode needs.
+func startContainer(ctx context.Context, options Options, container, image string) error {
+	run := []string{"run", "-d", "--init", "--name", container, "-p", "127.0.0.1::2222"}
+	if options.WireGuard {
+		run = []string{"run", "-d", "--init", "--name", container, "--cap-add", "NET_ADMIN", "-p", "127.0.0.1::" + wireGuardPort + "/udp"}
+	}
+	if options.NetAdmin {
+		run = []string{"run", "-d", "--init", "--name", container, "--cap-add", "NET_ADMIN", "-p", "127.0.0.1::2222", "-p", "127.0.0.1::" + wireGuardPort + "/udp"}
+	}
+	_, err := runDocker(ctx, append(run, image, "sleep", "infinity")...)
+	return err
+}
+
+// configureContainer installs SSH access and the node configuration, then
+// starts sshd.
+func configureContainer(ctx context.Context, options Options, container, user, nodeName, hostKeyPath, identityPath string, authorized []byte) error {
+	if err := installSSHIdentity(ctx, container, user, options.Root, hostKeyPath, authorized); err != nil {
+		return err
+	}
+	if err := installNodeConfig(ctx, container, user, nodeName, options, identityPath); err != nil {
+		return err
+	}
+	_, err := runDocker(ctx, "exec", "-d", container, "/usr/sbin/sshd", "-D", "-e", "-f", "/etc/ssh/sshd_config", "-p", "2222")
+	return err
+}
+
+// installSSHIdentity installs the host key and the client's authorized key.
+func installSSHIdentity(ctx context.Context, container, user string, root bool, hostKeyPath string, authorized []byte) error {
+	if err := copyIntoContainer(ctx, container, hostKeyPath, "/etc/ssh/ssh_host_ed25519_key"); err != nil {
+		return err
+	}
+	if _, err := runDocker(ctx, "exec", container, "sh", "-c", "chmod 600 /etc/ssh/ssh_host_ed25519_key && rm -f /etc/ssh/ssh_host_rsa_key /etc/ssh/ssh_host_ecdsa_key /etc/ssh/ssh_host_dsa_key"); err != nil {
+		return err
+	}
+	if root {
+		if _, err := runDocker(ctx, "exec", container, "sh", "-c", "sed -i 's/^PermitRootLogin no/PermitRootLogin yes/' /etc/ssh/sshd_config.d/eregion.conf"); err != nil {
+			return err
+		}
+	}
+	home := "/home/" + user
+	if root {
+		home = "/root"
+	}
+	if _, err := runDocker(ctx, "exec", container, "sh", "-c", "mkdir -p "+home+"/.ssh && chown -R "+user+":"+user+" "+home); err != nil {
+		return err
+	}
+	authorizedPath, cleanup, err := writeAuthorizedKeys(authorized)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	if err := copyIntoContainer(ctx, container, authorizedPath, home+"/.ssh/authorized_keys"); err != nil {
+		return err
+	}
+	_, err = runDocker(ctx, "exec", container, "sh", "-c", "chown "+user+":"+user+" "+home+"/.ssh/authorized_keys && chmod 600 "+home+"/.ssh/authorized_keys")
+	return err
+}
+
+// writeAuthorizedKeys writes a private authorized_keys file and returns its
+// path together with a cleanup function.
+func writeAuthorizedKeys(authorized []byte) (string, func(), error) {
+	file, err := os.CreateTemp("", "eregion-ssh-authorized-*")
+	if err != nil {
+		return "", nil, err
+	}
+	path := file.Name()
+	cleanup := func() { _ = os.Remove(path) }
+	if _, err := file.Write(authorized); err != nil {
+		_ = file.Close()
+		cleanup()
+		return "", nil, err
+	}
+	if err := file.Close(); err != nil {
+		cleanup()
+		return "", nil, err
+	}
+	return path, cleanup, nil
+}
+
+// installNodeConfig installs the node configuration and any test files.
+func installNodeConfig(ctx context.Context, container, user, nodeName string, options Options, identityPath string) error {
+	config := map[string]any{"node": nodeName, "state_dir": "/var/lib/eregion/node"}
+	if len(options.WireGuardApply) > 0 {
+		config["wireguard_apply"] = options.WireGuardApply
+	}
+	if len(options.TaskCommand) > 0 {
+		config["task_command"] = options.TaskCommand
+	}
+	scratch, err := os.MkdirTemp("", "eregion-ssh-files")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.RemoveAll(scratch) }()
+	for path, content := range options.Files {
+		if err := installFile(ctx, container, scratch, path, content); err != nil {
+			return err
+		}
+	}
+	raw, err := json.Marshal(config)
+	if err != nil {
+		return err
+	}
+	configPath := filepath.Join(filepath.Dir(identityPath), "node.json")
+	if err := os.WriteFile(configPath, raw, 0o600); err != nil {
+		return err
+	}
+	if _, err := runDocker(ctx, "exec", container, "mkdir", "-p", "/etc/eregion"); err != nil {
+		return err
+	}
+	if err := copyIntoContainer(ctx, container, configPath, "/etc/eregion/node.json"); err != nil {
+		return err
+	}
+	_, err = runDocker(ctx, "exec", container, "sh", "-c", "chown "+user+":"+user+" /etc/eregion/node.json && chmod 600 /etc/eregion/node.json && chown -R "+user+":"+user+" /var/lib/eregion")
+	return err
+}
+
+// fixtureAddress resolves the address a client uses to reach the node.
+func fixtureAddress(ctx context.Context, container string, options Options) (string, error) {
+	if options.WireGuard {
+		return net.JoinHostPort(wireGuardNodeAddress, "2222"), nil
+	}
+	return publishedAddress(ctx, container, "2222/tcp")
+}
+
+// configureNetAdmin pins the node's WireGuard UDP port for a NetAdmin node.
+func configureNetAdmin(ctx context.Context, container string, fixture *Fixture) error {
+	if out, err := runDocker(ctx, "exec", container, "ip", "link", "add", "wgprobe", "type", "wireguard"); err != nil {
+		return fmt.Errorf("%w: the node container cannot create a kernel WireGuard interface (it needs NET_ADMIN and the host's wireguard module): %s", ErrUnavailable, strings.TrimSpace(out))
+	}
+	_, _ = runDocker(ctx, "exec", container, "ip", "link", "del", "wgprobe")
+	endpoint, err := publishedAddress(ctx, container, wireGuardPort+"/udp")
+	if err != nil {
+		return err
+	}
+	fixture.UDPEndpoint = endpoint
+	return nil
+}
+
+// writeKnownHosts pins the node host key in a known_hosts file.
+func writeKnownHosts(identityPath, address string, hostKey ssh.PublicKey) (string, error) {
+	knownHosts := filepath.Join(filepath.Dir(identityPath), "known_hosts")
+	line := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(hostKey)))
+	if err := os.WriteFile(knownHosts, []byte(knownHostsLine(address)+" "+line+"\n"), 0o600); err != nil {
+		return "", err
+	}
+	return knownHosts, nil
+}
+
 // installFile copies an executable file into the node.
 func installFile(ctx context.Context, container, scratch, path, content string) error {
 	source := filepath.Join(scratch, hex.EncodeToString([]byte(path)))
-	if err := os.WriteFile(source, []byte(content), 0o700); err != nil {
+	if err := writeExecutableFile(source, []byte(content)); err != nil {
 		return err
 	}
 	if _, err := runDocker(ctx, "exec", container, "mkdir", "-p", filepath.Dir(path)); err != nil {
@@ -348,6 +416,24 @@ func installFile(ctx context.Context, container, scratch, path, content string) 
 	}
 	_, err := runDocker(ctx, "exec", container, "chmod", "0755", path)
 	return err
+}
+
+// writeExecutableFile writes a private file the fixture installs as a
+// stand-in executable.
+func writeExecutableFile(path string, data []byte) error {
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := file.Write(data); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Chmod(0o700); err != nil {
+		_ = file.Close()
+		return err
+	}
+	return file.Close()
 }
 
 // InstallFile installs an executable file in a running node.
@@ -575,20 +661,20 @@ func ensureImage(ctx context.Context, root, image string) (string, error) {
 	if _, err := runDocker(ctx, "image", "inspect", tag); err == nil {
 		return tag, nil
 	}
-	context, err := os.MkdirTemp("", "eregion-ssh-fixture")
+	buildContext, err := os.MkdirTemp("", "eregion-ssh-fixture")
 	if err != nil {
 		return "", err
 	}
-	defer func() { _ = os.RemoveAll(context) }()
-	if err := os.WriteFile(filepath.Join(context, "Dockerfile"), dockerfile, 0o600); err != nil {
+	defer func() { _ = os.RemoveAll(buildContext) }()
+	if err := os.WriteFile(filepath.Join(buildContext, "Dockerfile"), dockerfile, 0o600); err != nil { //nolint:gosec // G703: buildContext is the fixture's own temp directory.
 		return "", err
 	}
-	if err := os.WriteFile(filepath.Join(context, "eregion"), binary, 0o700); err != nil {
+	if err := writeExecutableFile(filepath.Join(buildContext, "eregion"), binary); err != nil {
 		return "", err
 	}
-	build := exec.CommandContext(ctx, "docker", "build", "-t", tag, context)
+	build := exec.CommandContext(ctx, "docker", "build", "-t", tag, buildContext)
 	if output, err := build.CombinedOutput(); err != nil {
-		return "", fmt.Errorf("%w: the fixture image could not be built: %v: %s", ErrUnavailable, err, output)
+		return "", fmt.Errorf("%w: the fixture image could not be built: %w: %s", ErrUnavailable, err, output)
 	}
 	pruneOldImages(ctx, image, tag)
 	return tag, nil
@@ -621,7 +707,7 @@ func buildNodeBinary(ctx context.Context, root string) ([]byte, error) {
 	build := exec.CommandContext(ctx, "go", "build", "-o", binary, "./cmd/eregion")
 	build.Dir = root
 	if output, err := build.CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("build the node binary: %v: %s", err, output)
+		return nil, fmt.Errorf("build the node binary: %w: %s", err, output)
 	}
 	return os.ReadFile(binary)
 }
@@ -704,7 +790,7 @@ func publishedAddress(ctx context.Context, container, port string) (string, erro
 // fixture identity succeeds. A published port can accept TCP before sshd has
 // finished starting; only the handshake proves the node is ready.
 func waitForSSH(ctx context.Context, address, user, identityFile string, hostKey ssh.PublicKey, timeout time.Duration) error {
-	raw, err := os.ReadFile(identityFile) //nolint:gosec // G304: the fixture's own identity.
+	raw, err := os.ReadFile(identityFile)
 	if err != nil {
 		return err
 	}
@@ -721,7 +807,7 @@ func waitForSSH(ctx context.Context, address, user, identityFile string, hostKey
 	deadline := time.Now().Add(timeout)
 	var last error
 	for {
-		conn, dialErr := netDialTimeout(address, 5*time.Second)
+		conn, dialErr := netDialTimeout(ctx, address, 5*time.Second)
 		if dialErr != nil {
 			last = dialErr
 		} else {
@@ -750,7 +836,7 @@ func runDocker(ctx context.Context, args ...string) (string, error) {
 	command := exec.CommandContext(ctx, "docker", args...)
 	output, err := command.CombinedOutput()
 	if err != nil {
-		return string(output), fmt.Errorf("docker %s: %v: %s", strings.Join(args, " "), err, output)
+		return string(output), fmt.Errorf("docker %s: %w: %s", strings.Join(args, " "), err, output)
 	}
 	return string(output), nil
 }

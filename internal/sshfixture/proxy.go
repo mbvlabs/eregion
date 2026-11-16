@@ -1,6 +1,7 @@
 package sshfixture
 
 import (
+	"context"
 	"io"
 	"net"
 	"sync"
@@ -32,7 +33,7 @@ type proxyConnection struct {
 
 // NewCutProxy starts a proxy in front of target.
 func NewCutProxy(target string) (*CutProxy, error) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listener, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, err
 	}
@@ -103,7 +104,7 @@ func (p *CutProxy) accept() {
 }
 
 func (p *CutProxy) forward(client net.Conn) {
-	server, err := net.DialTimeout("tcp", p.target, 5*time.Second)
+	server, err := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(context.Background(), "tcp", p.target)
 	if err != nil {
 		_ = client.Close()
 		return

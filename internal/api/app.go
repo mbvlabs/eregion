@@ -260,7 +260,11 @@ func (s AppService) SubmitNormalizedWithFactor(ctx context.Context, actor contra
 	if dryRun {
 		return result, nil
 	}
-	return result.(operations.SubmissionResult).Operation, nil
+	submission, ok := result.(operations.SubmissionResult)
+	if !ok {
+		return nil, contract.NewFault(contract.Internal, "operation submission returned an invalid result", "Report the command and binary version.")
+	}
+	return submission.Operation, nil
 }
 
 // PreviewOrSubmitWithReceipt is the node transport entry point. It returns a

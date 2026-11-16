@@ -337,11 +337,7 @@ func (s *DomainStore) List(ctx context.Context, filter DomainFilter) ([]platform
 	}
 	result := make([]platform.DomainBinding, 0, len(rows))
 	for _, row := range rows {
-		item, err := domainBindingRow(row)
-		if err != nil {
-			return nil, err
-		}
-		result = append(result, item)
+		result = append(result, domainBindingRow(row))
 	}
 	return result, nil
 }
@@ -500,7 +496,7 @@ func (s *DomainStore) DeleteBindingAndDNSCleanup(ctx context.Context, environmen
 	return s.q.DeletePlatformDomainAndDNSCleanup(ctx, environmentIDs)
 }
 
-func domainBindingRow(row query.ListPlatformDomainsRow) (platform.DomainBinding, error) {
+func domainBindingRow(row query.ListPlatformDomainsRow) platform.DomainBinding {
 	item := platform.DomainBinding{
 		ID: platform.DomainID(row.ID), Domain: row.Name, App: row.Name_2, Environment: row.Name_3,
 		Primary: row.IsPrimary, CheckPath: row.CheckPath, DesiredRevision: row.DesiredRevision,
@@ -535,7 +531,7 @@ func domainBindingRow(row query.ListPlatformDomainsRow) (platform.DomainBinding,
 			Proxied: row.DesiredProxied, State: row.State, Generation: row.Generation, AppliedGeneration: row.AppliedGeneration,
 		}
 	}
-	return item, nil
+	return item
 }
 
 type DomainDNSStore struct{ q *query.Queries }

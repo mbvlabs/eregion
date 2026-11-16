@@ -95,7 +95,7 @@ func (s *registryStep) Check(ctx context.Context, _ engine.Runtime) (engine.Chec
 if systemctl is-active eregion-registry.service >/dev/null 2>&1; then echo active:ok; else echo active:missing; fi
 if docker image inspect %s >/dev/null 2>&1; then echo image:ok; else echo image:missing; fi
 if docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' eregion-registry 2>/dev/null | grep -q '^REGISTRY_STORAGE_DELETE_ENABLED=true$'; then echo deletion:ok; else echo deletion:missing; fi`, shellQuote(platform.RegistryImage))
-	output, err := checkOutput(ctx, engine.Runtime{}, s.exec, script)
+	output, err := checkOutput(ctx, s.exec, script)
 	if err != nil {
 		return engine.CheckResult{}, err
 	}
@@ -112,10 +112,10 @@ if docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' eregion-r
 }
 
 func (s *registryStep) Apply(ctx context.Context, runtime engine.Runtime, report engine.Reporter) (engine.ApplyResult, error) {
-	if err := writePublicFile(s.configPath(), s.config(), "root", "root"); err != nil {
+	if err := writePublicFile(s.configPath(), s.config(), "root"); err != nil {
 		return engine.ApplyResult{}, err
 	}
-	if err := writePublicFile(s.unitPath(), s.unit(), "root", "root"); err != nil {
+	if err := writePublicFile(s.unitPath(), s.unit(), "root"); err != nil {
 		return engine.ApplyResult{}, err
 	}
 	script := fmt.Sprintf(`set -euo pipefail

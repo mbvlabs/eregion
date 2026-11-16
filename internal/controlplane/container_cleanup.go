@@ -215,7 +215,7 @@ func (s *Service) removeContainerCleanupRow(ctx context.Context, row containerCl
 		return err
 	}
 	exec := engine.Execution{
-		OperationID: cleanupOperationID(row), Attempt: uint32(row.Attempts),
+		OperationID: cleanupOperationID(row), Attempt: uint32(row.Attempts), //nolint:gosec // G115: cleanup attempts are a non-negative database counter.
 		Step: step, RequestID: newRequestID(),
 	}
 	response, err := tr.Call(ctx, node.Request{
@@ -229,6 +229,8 @@ func (s *Service) removeContainerCleanupRow(ctx context.Context, row containerCl
 		return nil
 	case engine.StatusFailed:
 		return s.containerCleanupFailure(contract.Code(response.ErrorCode), response.Detail)
+	case engine.StatusAbsent, engine.StatusRunning, engine.StatusDeferred, engine.StatusStale:
+		fallthrough
 	default:
 		return contract.NewFault(contract.Unavailable, "container cleanup did not finish", "The maintenance job will retry with backoff.")
 	}
@@ -322,9 +324,9 @@ func cleanupOperationID(row containerCleanupRow) contract.OperationID {
 	return contract.OperationID("op_" + hex.EncodeToString(sum[:16]))
 }
 
-func logMaintenance(what string, err error) {
+func logMaintenance(ctx context.Context, what string, err error) {
 	if err == nil || errors.Is(err, context.Canceled) {
 		return
 	}
-	slog.WarnContext(context.Background(), what+" maintenance failed", "error", err)
+	slog.WarnContext(context.WithoutCancel(ctx), what+" maintenance failed", "error", err)
 }

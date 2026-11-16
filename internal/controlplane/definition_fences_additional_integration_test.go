@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/api"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/platform"
@@ -113,45 +114,58 @@ primary = true
 		t.Fatalf("claim=%v err=%v", ok, err)
 	}
 	worker := &platformWorker{service: s}
+	driveDefinitionHostnameClaim(t, ctx, pool, s, worker, parent, claimed)
+	var owner string
+	if err := pool.QueryRow(ctx, `SELECT a.name FROM eregion_platform_domains d JOIN eregion_platform_environments e ON e.id=d.environment_id JOIN eregion_platform_apps a ON a.id=e.app_id WHERE d.name='late.example.com'`).Scan(&owner); err != nil || owner != "other" {
+		t.Fatalf("hostname owner=%q err=%v", owner, err)
+	}
+}
+
+func driveDefinitionHostnameClaim(t *testing.T, ctx context.Context, pool *pgxpool.Pool, s *Service, worker *platformWorker, parent contract.OperationID, claimed contract.Operation) {
+	t.Helper()
 	var sawCancelling bool
 	for i := 0; i < 16; i++ {
-		err := worker.runDefinitionApply(ctx, claimed, 1)
-		var snooze *river.JobSnoozeError
-		if err != nil && !errors.As(err, &snooze) {
-			t.Fatalf("parent step: %v", err)
-		}
-		var state contract.State
-		var reserved bool
-		if err := pool.QueryRow(ctx, `SELECT o.state,r.finished_at IS NULL FROM eregion_operations o JOIN eregion_definition_runs r ON r.operation_id=o.id WHERE o.id=$1`, parent).Scan(&state, &reserved); err != nil {
-			t.Fatal(err)
-		}
-		if state == contract.Cancelling {
-			sawCancelling = true
-			if !reserved {
-				t.Fatal("reservation cleared before drain")
-			}
-		}
-		if state.Terminal() {
-			if state != contract.Failed || reserved || !sawCancelling {
-				t.Fatalf("state=%s reserved=%v sawCancelling=%v", state, reserved, sawCancelling)
-			}
-			break
-		}
-		var child *string
-		if err := pool.QueryRow(ctx, `SELECT (SELECT s.child_operation_id FROM eregion_definition_steps s JOIN eregion_operations c ON c.id=s.child_operation_id WHERE s.parent_operation_id=$1 AND c.state='queued' ORDER BY s.ordinal LIMIT 1)`, parent).Scan(&child); err != nil {
-			t.Fatal(err)
-		}
-		if child != nil {
-			if err := runPlatformAttempt(ctx, s, contract.OperationID(*child), 1); err != nil {
-				t.Fatal(err)
-			}
+		if definitionHostnameClaimStep(t, ctx, pool, s, worker, parent, claimed, &sawCancelling) {
+			return
 		}
 		if i == 15 {
 			t.Fatal("parent did not settle")
 		}
 	}
-	var owner string
-	if err := pool.QueryRow(ctx, `SELECT a.name FROM eregion_platform_domains d JOIN eregion_platform_environments e ON e.id=d.environment_id JOIN eregion_platform_apps a ON a.id=e.app_id WHERE d.name='late.example.com'`).Scan(&owner); err != nil || owner != "other" {
-		t.Fatalf("hostname owner=%q err=%v", owner, err)
+}
+
+func definitionHostnameClaimStep(t *testing.T, ctx context.Context, pool *pgxpool.Pool, s *Service, worker *platformWorker, parent contract.OperationID, claimed contract.Operation, sawCancelling *bool) bool {
+	t.Helper()
+	err := worker.runDefinitionApply(ctx, claimed, 1)
+	var snooze *river.JobSnoozeError
+	if err != nil && !errors.As(err, &snooze) {
+		t.Fatalf("parent step: %v", err)
 	}
+	var state contract.State
+	var reserved bool
+	if err := pool.QueryRow(ctx, `SELECT o.state,r.finished_at IS NULL FROM eregion_operations o JOIN eregion_definition_runs r ON r.operation_id=o.id WHERE o.id=$1`, parent).Scan(&state, &reserved); err != nil {
+		t.Fatal(err)
+	}
+	if state == contract.Cancelling {
+		*sawCancelling = true
+		if !reserved {
+			t.Fatal("reservation cleared before drain")
+		}
+	}
+	if state.Terminal() {
+		if state != contract.Failed || reserved || !*sawCancelling {
+			t.Fatalf("state=%s reserved=%v sawCancelling=%v", state, reserved, *sawCancelling)
+		}
+		return true
+	}
+	var child *string
+	if err := pool.QueryRow(ctx, `SELECT (SELECT s.child_operation_id FROM eregion_definition_steps s JOIN eregion_operations c ON c.id=s.child_operation_id WHERE s.parent_operation_id=$1 AND c.state='queued' ORDER BY s.ordinal LIMIT 1)`, parent).Scan(&child); err != nil {
+		t.Fatal(err)
+	}
+	if child != nil {
+		if err := runPlatformAttempt(ctx, s, contract.OperationID(*child), 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return false
 }

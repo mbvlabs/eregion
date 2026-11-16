@@ -28,7 +28,7 @@ func (s *platformStep) Inputs() ([]byte, error) {
 func (s *platformStep) Check(_ context.Context, _ engine.Runtime) (engine.CheckResult, error) {
 	platform, err := DetectPlatform(s.cfg.PlatformPath, s.cfg.Arch)
 	if err != nil {
-		return engine.CheckResult{}, fmt.Errorf("%w: %v", engine.ErrPermanent, err)
+		return engine.CheckResult{}, fmt.Errorf("%w: %w", engine.ErrPermanent, err)
 	}
 	if !platform.Supported() {
 		return engine.CheckResult{}, fmt.Errorf("%w: %s is not in the verified matrix (Debian 13, Ubuntu 26.04; amd64/arm64)", engine.ErrPermanent, platform)

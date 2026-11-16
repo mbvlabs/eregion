@@ -76,7 +76,7 @@ func TestIntegrationActionPayloadResourceStoredFactsFailClosed(t *testing.T) {
 	}
 	op := contract.Operation{ID: operationID, Kind: platform.KindResourceApply, Target: target}
 	var valid resourcePayload
-	raw := readActionPayload(t, pool, service, op, &valid)
+	raw := readActionPayload(t, service, op, &valid)
 	if valid.CurrentObservation == nil || valid.CurrentObservation.ID != string(resourceID) ||
 		valid.CurrentObservation.State != string(platform.ResourceReady) ||
 		!valid.CurrentObservation.UpdatedAt.Equal(storedUpdatedAt) ||

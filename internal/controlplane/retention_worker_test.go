@@ -70,6 +70,8 @@ func (f *retentionFakeTransport) Call(_ context.Context, request node.Request, _
 				Attempt: request.Execution.Attempt, ExecutionID: request.Execution.ExecutionID()}, nil
 		}
 		return node.Response{Status: engine.StatusCompleted, Result: json.RawMessage(`{"removed":true}`)}, nil
+	case node.MethodObserve:
+		return node.Response{}, fmt.Errorf("unexpected method %q", request.Method)
 	default:
 		return node.Response{}, fmt.Errorf("unexpected method %q", request.Method)
 	}
@@ -193,10 +195,117 @@ func submitRetentionWorkerPrune(t *testing.T, s *Service, key string) contract.O
 	return op
 }
 
-func retentionWorkerJob(id contract.OperationID, attempt, maxAttempts int) *river.Job[jobargs.Retention] {
+func retentionWorkerJob(id contract.OperationID, attempt, maxAttempts int) *river.Job[jobargs.Retention] { //nolint:unparam // shared test helper; callers keep the attempt policy explicit.
 	return &river.Job[jobargs.Retention]{
 		JobRow: &rivertype.JobRow{Attempt: attempt, MaxAttempts: maxAttempts},
 		Args:   jobargs.Retention{OperationID: id},
+	}
+}
+
+func assertRetentionOperationSucceeded(t *testing.T, pool *pgxpool.Pool, opID contract.OperationID) {
+	t.Helper()
+	var storedOp contract.Operation
+	if err := pool.QueryRow(context.Background(), "SELECT "+columns+" FROM eregion_operations WHERE id=$1", opID).
+		Scan(&storedOp.ID, &storedOp.Kind, &storedOp.Target, &storedOp.Actor.Kind, &storedOp.Actor.Subject,
+			&storedOp.State, &storedOp.Attempt, &storedOp.LastSequence, &storedOp.ErrorCode, &storedOp.CreatedAt, &storedOp.UpdatedAt); err != nil {
+		t.Fatal(err)
+	}
+	if storedOp.State != contract.Succeeded {
+		t.Fatalf("operation state = %s, want succeeded", storedOp.State)
+	}
+}
+
+func assertRetentionReleasePruning(t *testing.T, pool *pgxpool.Pool, oldID, newID string) {
+	t.Helper()
+	var oldPruned, newPruned *time.Time
+	if err := pool.QueryRow(context.Background(), `SELECT pruned_at FROM eregion_platform_releases WHERE id=$1`, oldID).Scan(&oldPruned); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(context.Background(), `SELECT pruned_at FROM eregion_platform_releases WHERE id=$1`, newID).Scan(&newPruned); err != nil {
+		t.Fatal(err)
+	}
+	if oldPruned == nil {
+		t.Fatal("the old release was not marked pruned")
+	}
+	if newPruned != nil {
+		t.Fatal("the retained release was pruned")
+	}
+}
+
+func assertRetentionRunSummary(t *testing.T, pool *pgxpool.Pool, opID contract.OperationID) []byte {
+	t.Helper()
+	var status string
+	var plannedBytes, reclaimedBytes int64
+	var plannedRaw, removedRaw, errorsRaw []byte
+	if err := pool.QueryRow(context.Background(), `SELECT status,planned_bytes,reclaimed_bytes,planned_items,removed_items,errors
+        FROM eregion_retention_runs WHERE operation_id=$1`, opID).
+		Scan(&status, &plannedBytes, &reclaimedBytes, &plannedRaw, &removedRaw, &errorsRaw); err != nil {
+		t.Fatal(err)
+	}
+	if status != string(retention.RunSucceeded) || plannedBytes != 100 || reclaimedBytes != 100 {
+		t.Fatalf("run = %s planned=%d reclaimed=%d errors=%s", status, plannedBytes, reclaimedBytes, errorsRaw)
+	}
+	var cacheBytes *int64
+	var cacheMeasuredAt *time.Time
+	if err := pool.QueryRow(context.Background(), `SELECT cache_bytes,cache_measured_at
+        FROM eregion_retention_runs WHERE operation_id=$1`, opID).Scan(&cacheBytes, &cacheMeasuredAt); err != nil {
+		t.Fatal(err)
+	}
+	if cacheBytes == nil || *cacheBytes != 30 || cacheMeasuredAt == nil {
+		t.Fatalf("cache measurement = %v at %v, want 30 bytes and a time", cacheBytes, cacheMeasuredAt)
+	}
+	return removedRaw
+}
+
+func assertRetentionRemovedKinds(t *testing.T, removedRaw []byte) {
+	t.Helper()
+	var removed []retention.Item
+	if err := json.Unmarshal(removedRaw, &removed); err != nil {
+		t.Fatal(err)
+	}
+	kinds := make([]string, 0, len(removed))
+	for _, item := range removed {
+		kinds = append(kinds, string(item.Kind))
+	}
+	if len(kinds) != 4 || kinds[0] != "release" || kinds[3] != "registry_gc" {
+		t.Fatalf("removed kinds = %v", kinds)
+	}
+	seenImage, seenRegistry := false, false
+	for _, item := range removed {
+		if item.Kind == retention.ItemImage {
+			seenImage = true
+		}
+		if item.Kind == retention.ItemRegistryArtifact {
+			seenRegistry = true
+		}
+	}
+	if !seenImage || !seenRegistry {
+		t.Fatalf("the run did not remove both the local image and the registry manifest: %+v", removed)
+	}
+}
+
+func assertRetentionRemovalPayloads(t *testing.T, fixture *retentionFixture) {
+	t.Helper()
+	if len(fixture.transport.payloads) != 2 {
+		t.Fatalf("removal payloads = %+v", fixture.transport.payloads)
+	}
+	seenImage, seenRegistry := false, false
+	for _, payload := range fixture.transport.payloads {
+		switch payload.Kind {
+		case string(retention.ItemImage):
+			seenImage = true
+		case string(retention.ItemRegistryArtifact):
+			if payload.Reference != fixture.orphan {
+				t.Fatalf("registry effect = %+v, want the orphan manifest", payload)
+			}
+			seenRegistry = true
+		}
+	}
+	if !seenImage || !seenRegistry {
+		t.Fatalf("removal payloads = %+v", fixture.transport.payloads)
+	}
+	if got := fixture.transport.steps[len(fixture.transport.steps)-1]; got != platform.RetentionGCStepID(1) {
+		t.Fatalf("last step = %s, want the registry garbage collection", got)
 	}
 }
 
@@ -253,94 +362,11 @@ func TestIntegrationRetentionWorkerMarksRemovesThenGCs(t *testing.T) {
 		t.Fatalf("%v: %v", err, errors.Unwrap(err))
 	}
 
-	var storedOp contract.Operation
-	if err := fixture.pool.QueryRow(context.Background(), "SELECT "+columns+" FROM eregion_operations WHERE id=$1", op.ID).
-		Scan(&storedOp.ID, &storedOp.Kind, &storedOp.Target, &storedOp.Actor.Kind, &storedOp.Actor.Subject,
-			&storedOp.State, &storedOp.Attempt, &storedOp.LastSequence, &storedOp.ErrorCode, &storedOp.CreatedAt, &storedOp.UpdatedAt); err != nil {
-		t.Fatal(err)
-	}
-	if storedOp.State != contract.Succeeded {
-		t.Fatalf("operation state = %s, want succeeded", storedOp.State)
-	}
-	var oldPruned, newPruned *time.Time
-	if err := fixture.pool.QueryRow(context.Background(), `SELECT pruned_at FROM eregion_platform_releases WHERE id=$1`, fixture.oldID).Scan(&oldPruned); err != nil {
-		t.Fatal(err)
-	}
-	if err := fixture.pool.QueryRow(context.Background(), `SELECT pruned_at FROM eregion_platform_releases WHERE id=$1`, fixture.newID).Scan(&newPruned); err != nil {
-		t.Fatal(err)
-	}
-	if oldPruned == nil {
-		t.Fatal("the old release was not marked pruned")
-	}
-	if newPruned != nil {
-		t.Fatal("the retained release was pruned")
-	}
-
-	var status string
-	var plannedBytes, reclaimedBytes int64
-	var plannedRaw, removedRaw, errorsRaw []byte
-	if err := fixture.pool.QueryRow(context.Background(), `SELECT status,planned_bytes,reclaimed_bytes,planned_items,removed_items,errors
-        FROM eregion_retention_runs WHERE operation_id=$1`, op.ID).
-		Scan(&status, &plannedBytes, &reclaimedBytes, &plannedRaw, &removedRaw, &errorsRaw); err != nil {
-		t.Fatal(err)
-	}
-	if status != string(retention.RunSucceeded) || plannedBytes != 100 || reclaimedBytes != 100 {
-		t.Fatalf("run = %s planned=%d reclaimed=%d errors=%s", status, plannedBytes, reclaimedBytes, errorsRaw)
-	}
-	var cacheBytes *int64
-	var cacheMeasuredAt *time.Time
-	if err := fixture.pool.QueryRow(context.Background(), `SELECT cache_bytes,cache_measured_at
-        FROM eregion_retention_runs WHERE operation_id=$1`, op.ID).Scan(&cacheBytes, &cacheMeasuredAt); err != nil {
-		t.Fatal(err)
-	}
-	if cacheBytes == nil || *cacheBytes != 30 || cacheMeasuredAt == nil {
-		t.Fatalf("cache measurement = %v at %v, want 30 bytes and a time", cacheBytes, cacheMeasuredAt)
-	}
-	var removed []retention.Item
-	if err := json.Unmarshal(removedRaw, &removed); err != nil {
-		t.Fatal(err)
-	}
-	kinds := make([]string, 0, len(removed))
-	for _, item := range removed {
-		kinds = append(kinds, string(item.Kind))
-	}
-	if len(kinds) != 4 || kinds[0] != "release" || kinds[3] != "registry_gc" {
-		t.Fatalf("removed kinds = %v", kinds)
-	}
-	seenImage, seenRegistry := false, false
-	for _, item := range removed {
-		switch item.Kind {
-		case retention.ItemImage:
-			seenImage = true
-		case retention.ItemRegistryArtifact:
-			seenRegistry = true
-		}
-	}
-	if !seenImage || !seenRegistry {
-		t.Fatalf("the run did not remove both the local image and the registry manifest: %+v", removed)
-	}
-
-	if len(fixture.transport.payloads) != 2 {
-		t.Fatalf("removal payloads = %+v", fixture.transport.payloads)
-	}
-	seenImage, seenRegistry = false, false
-	for _, payload := range fixture.transport.payloads {
-		switch payload.Kind {
-		case string(retention.ItemImage):
-			seenImage = true
-		case string(retention.ItemRegistryArtifact):
-			if payload.Reference != fixture.orphan {
-				t.Fatalf("registry effect = %+v, want the orphan manifest", payload)
-			}
-			seenRegistry = true
-		}
-	}
-	if !seenImage || !seenRegistry {
-		t.Fatalf("removal payloads = %+v", fixture.transport.payloads)
-	}
-	if got := fixture.transport.steps[len(fixture.transport.steps)-1]; got != platform.RetentionGCStepID(1) {
-		t.Fatalf("last step = %s, want the registry garbage collection", got)
-	}
+	assertRetentionOperationSucceeded(t, fixture.pool, op.ID)
+	assertRetentionReleasePruning(t, fixture.pool, fixture.oldID, fixture.newID)
+	removedRaw := assertRetentionRunSummary(t, fixture.pool, op.ID)
+	assertRetentionRemovedKinds(t, removedRaw)
+	assertRetentionRemovalPayloads(t, fixture)
 }
 
 func TestIntegrationRetentionWorkerRetriesAFailedEffect(t *testing.T) {
@@ -647,18 +673,52 @@ func TestIntegrationPlatformSubmissionRoutesRetentionToMaintenanceQueue(t *testi
 	}
 }
 
+// retentionDailyCase is one day-state scenario for the daily submitter.
+type retentionDailyCase struct {
+	name       string
+	state      contract.State
+	updatedAt  time.Time
+	want       int
+	wantSuffix string
+}
+
+func runRetentionDailyCase(t *testing.T, date string, test retentionDailyCase) {
+	t.Helper()
+	fixture := newRetentionFixture(t)
+	ctx := context.Background()
+	if err := fixture.service.submitDailyRetention(ctx); err != nil {
+		t.Fatal(err)
+	}
+	operations := dailyRetentionTestOperations(t, fixture.pool)
+	if len(operations) != 1 || operations[0].Key != retentionDailyKeyPrefix+date {
+		t.Fatalf("first daily operations = %+v, want the legacy date key", operations)
+	}
+	if _, err := fixture.pool.Exec(ctx, `UPDATE eregion_operations
+        SET state=$2,attempt=CASE WHEN $2='running' THEN greatest(attempt,1) ELSE attempt END,updated_at=$3
+        WHERE id=$1`, operations[0].ID, string(test.state), test.updatedAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.service.submitDailyRetention(ctx); err != nil {
+		t.Fatal(err)
+	}
+	operations = dailyRetentionTestOperations(t, fixture.pool)
+	if len(operations) != test.want {
+		t.Fatalf("daily operations after %s = %+v, want %d", test.state, operations, test.want)
+	}
+	if test.wantSuffix != "" {
+		want := retentionDailyKeyPrefix + date + test.wantSuffix
+		if last := operations[len(operations)-1]; last.Key != want {
+			t.Fatalf("retry key = %q, want %q", last.Key, want)
+		}
+	}
+}
+
 // TestIntegrationRetentionDailySubmissionHonoursTheDayState proves the daily
 // submitter never duplicates a successful or in-progress run, and gives a
 // failed or cancelled day exactly one new numbered attempt after its backoff.
 func TestIntegrationRetentionDailySubmissionHonoursTheDayState(t *testing.T) {
 	date := time.Now().UTC().Format("2006-01-02")
-	tests := []struct {
-		name       string
-		state      contract.State
-		updatedAt  time.Time
-		want       int
-		wantSuffix string
-	}{
+	tests := []retentionDailyCase{
 		{name: "failed after the retry delay", state: contract.Failed, updatedAt: time.Now().Add(-2 * time.Hour), want: 2, wantSuffix: ":2"},
 		{name: "failed within the retry delay", state: contract.Failed, updatedAt: time.Now().Add(-10 * time.Minute), want: 1},
 		{name: "succeeded", state: contract.Succeeded, updatedAt: time.Now().Add(-10 * time.Minute), want: 1},
@@ -667,33 +727,7 @@ func TestIntegrationRetentionDailySubmissionHonoursTheDayState(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			fixture := newRetentionFixture(t)
-			ctx := context.Background()
-			if err := fixture.service.submitDailyRetention(ctx); err != nil {
-				t.Fatal(err)
-			}
-			operations := dailyRetentionTestOperations(t, fixture.pool)
-			if len(operations) != 1 || operations[0].Key != retentionDailyKeyPrefix+date {
-				t.Fatalf("first daily operations = %+v, want the legacy date key", operations)
-			}
-			if _, err := fixture.pool.Exec(ctx, `UPDATE eregion_operations
-                SET state=$2,attempt=CASE WHEN $2='running' THEN greatest(attempt,1) ELSE attempt END,updated_at=$3
-                WHERE id=$1`, operations[0].ID, string(test.state), test.updatedAt); err != nil {
-				t.Fatal(err)
-			}
-			if err := fixture.service.submitDailyRetention(ctx); err != nil {
-				t.Fatal(err)
-			}
-			operations = dailyRetentionTestOperations(t, fixture.pool)
-			if len(operations) != test.want {
-				t.Fatalf("daily operations after %s = %+v, want %d", test.state, operations, test.want)
-			}
-			if test.wantSuffix != "" {
-				want := retentionDailyKeyPrefix + date + test.wantSuffix
-				if last := operations[len(operations)-1]; last.Key != want {
-					t.Fatalf("retry key = %q, want %q", last.Key, want)
-				}
-			}
+			runRetentionDailyCase(t, date, test)
 		})
 	}
 }

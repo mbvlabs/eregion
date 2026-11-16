@@ -85,6 +85,8 @@ func CanTransition(from, to State) bool {
 		return to == Cancelling || to == Succeeded || to == Failed
 	case Cancelling:
 		return to == Canceled || to == Succeeded || to == Failed
+	case Succeeded, Failed, Canceled:
+		return false
 	default:
 		return false
 	}
@@ -240,6 +242,31 @@ func (e Event) Validate() error {
 	if e.Sequence == 0 || e.At.IsZero() {
 		return NewFault(ValidationFailed, "event requires a sequence and timestamp", "Sequences start at 1 within each operation.")
 	}
+	if err := e.validateKind(); err != nil {
+		return err
+	}
+	if err := e.validateActionOutput(); err != nil {
+		return err
+	}
+	if err := e.validateExecution(); err != nil {
+		return err
+	}
+	if err := e.validateErrorCode(); err != nil {
+		return err
+	}
+	if err := e.validateProgress(); err != nil {
+		return err
+	}
+	if err := e.validateReleaseIdentities(); err != nil {
+		return err
+	}
+	if err := e.validateStepAndDuration(); err != nil {
+		return err
+	}
+	return e.validateHealth()
+}
+
+func (e Event) validateKind() error {
 	switch e.Kind {
 	case "state":
 		if !e.State.Valid() {
@@ -255,6 +282,10 @@ func (e Event) Validate() error {
 	if e.Kind == "step" && strings.TrimSpace(e.Stage) == "" {
 		return NewFault(ValidationFailed, "step event requires a stage", "Name the observed execution stage.")
 	}
+	return nil
+}
+
+func (e Event) validateActionOutput() error {
 	if e.ActionOutputStatus != "" {
 		if e.Kind != "step" || e.Stage != "action-output" ||
 			(e.ActionOutputStatus != "available" && e.ActionOutputStatus != "omitted_too_large" && e.ActionOutputStatus != "omitted_unserializable") ||
@@ -262,12 +293,22 @@ func (e Event) Validate() error {
 			(e.ActionOutputStatus != "available" && len(e.ActionOutput) != 0) {
 			return NewFault(ValidationFailed, "invalid action output", "Record a bounded JSON effect snapshot or an explicit omission.")
 		}
-	} else if len(e.ActionOutput) != 0 {
+		return nil
+	}
+	if len(e.ActionOutput) != 0 {
 		return NewFault(ValidationFailed, "action output requires availability", "Record its availability with the output.")
 	}
+	return nil
+}
+
+func (e Event) validateExecution() error {
 	if e.ExecutionID != "" && (e.Kind != "step" || !executionIDPattern.MatchString(e.ExecutionID)) {
 		return NewFault(ValidationFailed, "invalid execution identity", "Only step events may carry a durable node execution identity.")
 	}
+	return nil
+}
+
+func (e Event) validateErrorCode() error {
 	if e.ErrorCode != "" {
 		if e.Kind != "state" || e.State != Failed {
 			return NewFault(ValidationFailed, "invalid error code", "Only a failed state event carries an error code.")
@@ -276,32 +317,51 @@ func (e Event) Validate() error {
 			return NewFault(ValidationFailed, "invalid error code", "Use a known error code.")
 		}
 	}
+	return nil
+}
+
+func (e Event) validateProgress() error {
 	if e.Kind == "progress" {
 		if e.Progress == nil || e.Progress.Total == 0 || e.Progress.Current > e.Progress.Total || strings.TrimSpace(e.Progress.Unit) == "" {
 			return NewFault(ValidationFailed, "invalid measured progress", "Provide a unit and a known, positive total; do not estimate overall deployment progress.")
 		}
-	} else if e.Progress != nil {
+		return nil
+	}
+	if e.Progress != nil {
 		return NewFault(ValidationFailed, "only progress events carry measurements", "Emit a separate progress event.")
 	}
+	return nil
+}
+
+func (e Event) validateReleaseIdentities() error {
 	if e.ReleaseID != "" && !releaseIDPattern.MatchString(e.ReleaseID) {
 		return NewFault(ValidationFailed, "invalid event release identity", "Use the release ID returned by inventory.")
 	}
 	if e.ServingReleaseID != "" && !releaseIDPattern.MatchString(e.ServingReleaseID) {
 		return NewFault(ValidationFailed, "invalid serving release identity", "Use the release ID returned by inventory.")
 	}
+	return nil
+}
+
+func (e Event) validateStepAndDuration() error {
 	if e.Step != "" && (len(e.Step) > 128 || strings.ContainsAny(e.Step, " \t\r\n\x00")) {
 		return NewFault(ValidationFailed, "invalid event step", "Name one durable node step without whitespace.")
 	}
 	if e.DurationMS != nil && *e.DurationMS < 0 {
 		return NewFault(ValidationFailed, "invalid event duration", "Step durations cannot be negative.")
 	}
-	if e.Health != nil {
-		if strings.ContainsAny(e.Health.Target, "\r\n\x00") || strings.ContainsAny(e.Health.Detail, "\r\n\x00") {
-			return NewFault(ValidationFailed, "invalid health observation", "Health targets and details cannot contain control characters.")
-		}
-		if e.Health.Checks < 0 || e.Health.TimeoutSeconds < 0 {
-			return NewFault(ValidationFailed, "invalid health observation", "Probe counts and deadlines cannot be negative.")
-		}
+	return nil
+}
+
+func (e Event) validateHealth() error {
+	if e.Health == nil {
+		return nil
+	}
+	if strings.ContainsAny(e.Health.Target, "\r\n\x00") || strings.ContainsAny(e.Health.Detail, "\r\n\x00") {
+		return NewFault(ValidationFailed, "invalid health observation", "Health targets and details cannot contain control characters.")
+	}
+	if e.Health.Checks < 0 || e.Health.TimeoutSeconds < 0 {
+		return NewFault(ValidationFailed, "invalid health observation", "Probe counts and deadlines cannot be negative.")
 	}
 	return nil
 }

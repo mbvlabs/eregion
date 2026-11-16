@@ -132,19 +132,26 @@ func insertRunningNodeStep(t *testing.T, pool *pgxpool.Pool, operationID contrac
 	}
 }
 
-// TestIntegrationDeploymentEffectGuardUsesPinnedNodeAfterEnvironmentMove pins
-// a deployment to node-a, moves the environment to node-b, and proves the
-// cancellation guard observes the live effect on node-a. Observing the current
-// environment node alone would read an absent effect on node-b and cancel.
-func TestIntegrationDeploymentEffectGuardUsesPinnedNodeAfterEnvironmentMove(t *testing.T) {
+// pinnedEffectGuardCase names one effect guarded on a deployment's pinned node.
+type pinnedEffectGuardCase struct {
+	key         string
+	image       string
+	step        string
+	description string
+}
+
+// assertPinnedEffectGuard proves a cancellation guard observes the effect on
+// the deployment's pinned node, not on the environment's current node.
+func assertPinnedEffectGuard(t *testing.T, tc pinnedEffectGuardCase) {
+	t.Helper()
 	fixture := newDeploymentRetryFixtureWithTransport(t, &recordingDeployTransport{scriptedDeployTransport: newScriptedDeployTransport()})
 	fixture.deploy(t)
 	env := fixture.environment(t)
 	if env.RevisionID == "" {
 		t.Fatal("fixture environment has no pinned revision")
 	}
-	op, depID, _, _ := fixture.prepareOwnedCandidate(t, "pinned-guard", "registry.example/live:pinned-guard", "running")
-	insertRunningNodeStep(t, fixture.pool, op.ID, deploymentNetworkStep)
+	op, depID, _, _ := fixture.prepareOwnedCandidate(t, tc.key, tc.image, "running")
+	insertRunningNodeStep(t, fixture.pool, op.ID, tc.step)
 	// Register the placed nodes before the revision writer updates the
 	// environment's node FK.
 	liveA := &fixedStatusTransport{status: engine.StatusRunning}
@@ -167,27 +174,91 @@ func TestIntegrationDeploymentEffectGuardUsesPinnedNodeAfterEnvironmentMove(t *t
 	}
 	err = fixture.service.reconcileDeployment(fixture.ctx, current)
 	if err == nil {
-		t.Fatal("cancellation settled while the pinned node had a live effect")
+		t.Fatalf("cancellation settled while the pinned node had a live %s", tc.description)
 	}
 	if code := contract.Classify(err).Code; code != contract.Unavailable {
-		t.Fatalf("guard error code = %s, want unavailable: %v", code, err)
+		t.Fatalf("%s guard error code = %s, want unavailable: %v", tc.description, code, err)
 	}
 	if liveA.callCount() == 0 {
-		t.Fatal("the guard did not observe the pinned node")
+		t.Fatalf("the %s guard did not observe the pinned node", tc.description)
 	}
 	if absentB.callCount() != 0 {
-		t.Fatal("the guard observed the moved-to environment node instead of the pinned node")
+		t.Fatalf("the %s guard observed the moved-to environment node instead of the pinned node", tc.description)
 	}
 	final, err := fixture.service.Get(fixture.ctx, testActor, op.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if final.State.Terminal() {
-		t.Fatalf("pinned live effect terminalized cancellation: %+v", final)
+		t.Fatalf("pinned live %s terminalized cancellation: %+v", tc.description, final)
 	}
 	if _, has := ownerForFixture(t, fixture, env); !has {
-		t.Fatal("pinned live effect released the deployment owner")
+		t.Fatalf("pinned live %s released the deployment owner", tc.description)
 	}
+}
+
+// failureCleanupCase names one live effect that must block terminal cleanup.
+type failureCleanupCase struct {
+	key         string
+	image       string
+	step        string
+	description string
+}
+
+// assertFailureCleanupWaits proves terminal cleanup keeps ownership and writes
+// no cleanup row while a live effect remains on the deployment's pinned node.
+func assertFailureCleanupWaits(t *testing.T, tc failureCleanupCase) {
+	t.Helper()
+	fixture := newDeploymentRetryFixtureWithTransport(t, &recordingDeployTransport{scriptedDeployTransport: newScriptedDeployTransport()})
+	fixture.deploy(t)
+	env := fixture.environment(t)
+	op, depID, _, _ := fixture.prepareOwnedCandidate(t, tc.key, tc.image, "running")
+	insertRunningNodeStep(t, fixture.pool, op.ID, tc.step)
+	if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_platform_deployments SET revision_id=$2 WHERE id=$1`, depID, env.RevisionID); err != nil {
+		t.Fatal(err)
+	}
+	live := &fixedStatusTransport{status: engine.StatusRunning}
+	fixture.service.resolver = newTestNodeResolver(t, fixture.pool, map[string]node.Transport{env.Node: live})
+	dep, err := fixture.service.deploymentByID(fixture.ctx, depID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker := &platformWorker{service: fixture.service}
+	err = worker.finishDeploymentFailure(fixture.ctx, op.ID, 1, env, dep, nil, errPlatformCancelled)
+	if err == nil {
+		t.Fatalf("terminal cleanup proceeded while a %s was live", tc.description)
+	}
+	if code := contract.Classify(err).Code; code != contract.Unavailable {
+		t.Fatalf("%s cleanup guard code = %s, want unavailable: %v", tc.description, code, err)
+	}
+	var cleanupRows int
+	if err := fixture.pool.QueryRow(fixture.ctx, `SELECT count(*) FROM eregion_platform_container_cleanup WHERE deployment_id=$1`, depID).Scan(&cleanupRows); err != nil {
+		t.Fatal(err)
+	}
+	if cleanupRows != 0 {
+		t.Fatalf("live %s recorded %d cleanup row(s)", tc.description, cleanupRows)
+	}
+	current, err := fixture.service.Get(fixture.ctx, testActor, op.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.State.Terminal() {
+		t.Fatalf("live %s terminalized the operation: %+v", tc.description, current)
+	}
+	if _, has := ownerForFixture(t, fixture, env); !has {
+		t.Fatalf("live %s released the deployment owner", tc.description)
+	}
+}
+
+// TestIntegrationDeploymentEffectGuardUsesPinnedNodeAfterEnvironmentMove pins
+// a deployment to node-a, moves the environment to node-b, and proves the
+// cancellation guard observes the live effect on node-a. Observing the current
+// environment node alone would read an absent effect on node-b and cancel.
+func TestIntegrationDeploymentEffectGuardUsesPinnedNodeAfterEnvironmentMove(t *testing.T) {
+	assertPinnedEffectGuard(t, pinnedEffectGuardCase{
+		key: "pinned-guard", image: "registry.example/live:pinned-guard",
+		step: deploymentNetworkStep, description: "effect",
+	})
 }
 
 // TestIntegrationDeploymentReadyImageGuardUsesPinnedNodeAfterEnvironmentMove
@@ -195,57 +266,10 @@ func TestIntegrationDeploymentEffectGuardUsesPinnedNodeAfterEnvironmentMove(t *t
 // table: a detached docker pull for a ready release must be observed on the
 // deployment's pinned node before cancellation settles.
 func TestIntegrationDeploymentReadyImageGuardUsesPinnedNodeAfterEnvironmentMove(t *testing.T) {
-	fixture := newDeploymentRetryFixtureWithTransport(t, &recordingDeployTransport{scriptedDeployTransport: newScriptedDeployTransport()})
-	fixture.deploy(t)
-	env := fixture.environment(t)
-	if env.RevisionID == "" {
-		t.Fatal("fixture environment has no pinned revision")
-	}
-	op, depID, _, _ := fixture.prepareOwnedCandidate(t, "ready-image-pinned", "registry.example/live:ready-image-pinned", "running")
-	insertRunningNodeStep(t, fixture.pool, op.ID, deploymentReadyImageStep)
-	// Register the placed nodes before the revision writer updates the
-	// environment's node FK.
-	liveA := &fixedStatusTransport{status: engine.StatusRunning}
-	absentB := &fixedStatusTransport{status: engine.StatusAbsent}
-	fixture.service.resolver = newTestNodeResolver(t, fixture.pool, map[string]node.Transport{
-		"node-a": liveA,
-		"node-b": absentB,
+	assertPinnedEffectGuard(t, pinnedEffectGuardCase{
+		key: "ready-image-pinned", image: "registry.example/live:ready-image-pinned",
+		step: deploymentReadyImageStep, description: "ready-image effect",
 	})
-	pinnedRevision := appendEnvironmentNodeRevision(t, fixture, "node-a")
-	_ = appendEnvironmentNodeRevision(t, fixture, "node-b")
-	if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_platform_deployments SET revision_id=$2 WHERE id=$1`, depID, pinnedRevision); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_operations SET state='cancelling' WHERE id=$1`, op.ID); err != nil {
-		t.Fatal(err)
-	}
-	current, err := fixture.service.Get(fixture.ctx, testActor, op.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = fixture.service.reconcileDeployment(fixture.ctx, current)
-	if err == nil {
-		t.Fatal("cancellation settled while the pinned node had a live ready-image effect")
-	}
-	if code := contract.Classify(err).Code; code != contract.Unavailable {
-		t.Fatalf("ready-image guard error code = %s, want unavailable: %v", code, err)
-	}
-	if liveA.callCount() == 0 {
-		t.Fatal("the ready-image guard did not observe the pinned node")
-	}
-	if absentB.callCount() != 0 {
-		t.Fatal("the ready-image guard observed the moved-to environment node instead of the pinned node")
-	}
-	final, err := fixture.service.Get(fixture.ctx, testActor, op.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if final.State.Terminal() {
-		t.Fatalf("pinned live ready-image effect terminalized cancellation: %+v", final)
-	}
-	if _, has := ownerForFixture(t, fixture, env); !has {
-		t.Fatal("pinned live ready-image effect released the deployment owner")
-	}
 }
 
 // TestIntegrationDeploymentReadyImageUnknownStatusRetainsOwnership proves a
@@ -292,90 +316,20 @@ func TestIntegrationDeploymentReadyImageUnknownStatusRetainsOwnership(t *testing
 // terminalization path with the registry materialization step, so a lost pull
 // cannot persist cleanup or settle while the effect may still be live.
 func TestIntegrationDeploymentFailureCleanupWaitsForReadyImageEffect(t *testing.T) {
-	fixture := newDeploymentRetryFixtureWithTransport(t, &recordingDeployTransport{scriptedDeployTransport: newScriptedDeployTransport()})
-	fixture.deploy(t)
-	env := fixture.environment(t)
-	op, depID, _, _ := fixture.prepareOwnedCandidate(t, "ready-image-cleanup", "registry.example/live:ready-image-cleanup", "running")
-	insertRunningNodeStep(t, fixture.pool, op.ID, deploymentReadyImageStep)
-	if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_platform_deployments SET revision_id=$2 WHERE id=$1`, depID, env.RevisionID); err != nil {
-		t.Fatal(err)
-	}
-	live := &fixedStatusTransport{status: engine.StatusRunning}
-	fixture.service.resolver = newTestNodeResolver(t, fixture.pool, map[string]node.Transport{env.Node: live})
-	dep, err := fixture.service.deploymentByID(fixture.ctx, depID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	worker := &platformWorker{service: fixture.service}
-	err = worker.finishDeploymentFailure(fixture.ctx, nil, op.ID, 1, env, dep, nil, errPlatformCancelled)
-	if err == nil {
-		t.Fatal("terminal cleanup proceeded while a ready-image effect was live")
-	}
-	if code := contract.Classify(err).Code; code != contract.Unavailable {
-		t.Fatalf("ready-image cleanup guard code = %s, want unavailable: %v", code, err)
-	}
-	var cleanupRows int
-	if err := fixture.pool.QueryRow(fixture.ctx, `SELECT count(*) FROM eregion_platform_container_cleanup WHERE deployment_id=$1`, depID).Scan(&cleanupRows); err != nil {
-		t.Fatal(err)
-	}
-	if cleanupRows != 0 {
-		t.Fatalf("live ready-image effect recorded %d cleanup row(s)", cleanupRows)
-	}
-	current, err := fixture.service.Get(fixture.ctx, testActor, op.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if current.State.Terminal() {
-		t.Fatalf("live ready-image effect terminalized the operation: %+v", current)
-	}
-	if _, has := ownerForFixture(t, fixture, env); !has {
-		t.Fatal("live ready-image effect released the deployment owner")
-	}
+	assertFailureCleanupWaits(t, failureCleanupCase{
+		key: "ready-image-cleanup", image: "registry.example/live:ready-image-cleanup",
+		step: deploymentReadyImageStep, description: "ready-image effect",
+	})
 }
 
 // TestIntegrationDeploymentFailureCleanupWaitsForLivePinnedEffect exercises
 // the terminalization path itself: a cancellation/terminal cleanup cause must
 // not persist cleanup or settle while a live pinned effect remains.
 func TestIntegrationDeploymentFailureCleanupWaitsForLivePinnedEffect(t *testing.T) {
-	fixture := newDeploymentRetryFixtureWithTransport(t, &recordingDeployTransport{scriptedDeployTransport: newScriptedDeployTransport()})
-	fixture.deploy(t)
-	env := fixture.environment(t)
-	op, depID, _, _ := fixture.prepareOwnedCandidate(t, "live-failure", "registry.example/live:live-failure", "running")
-	insertRunningNodeStep(t, fixture.pool, op.ID, deploymentNetworkStep)
-	if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_platform_deployments SET revision_id=$2 WHERE id=$1`, depID, env.RevisionID); err != nil {
-		t.Fatal(err)
-	}
-	live := &fixedStatusTransport{status: engine.StatusRunning}
-	fixture.service.resolver = newTestNodeResolver(t, fixture.pool, map[string]node.Transport{env.Node: live})
-	dep, err := fixture.service.deploymentByID(fixture.ctx, depID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	worker := &platformWorker{service: fixture.service}
-	err = worker.finishDeploymentFailure(fixture.ctx, nil, op.ID, 1, env, dep, nil, errPlatformCancelled)
-	if err == nil {
-		t.Fatal("terminal cleanup proceeded while a pinned effect was live")
-	}
-	if code := contract.Classify(err).Code; code != contract.Unavailable {
-		t.Fatalf("cleanup guard code = %s, want unavailable: %v", code, err)
-	}
-	var cleanupRows int
-	if err := fixture.pool.QueryRow(fixture.ctx, `SELECT count(*) FROM eregion_platform_container_cleanup WHERE deployment_id=$1`, depID).Scan(&cleanupRows); err != nil {
-		t.Fatal(err)
-	}
-	if cleanupRows != 0 {
-		t.Fatalf("live effect recorded %d cleanup row(s)", cleanupRows)
-	}
-	current, err := fixture.service.Get(fixture.ctx, testActor, op.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if current.State.Terminal() {
-		t.Fatalf("live effect terminalized the operation: %+v", current)
-	}
-	if _, has := ownerForFixture(t, fixture, env); !has {
-		t.Fatal("live effect released the deployment owner")
-	}
+	assertFailureCleanupWaits(t, failureCleanupCase{
+		key: "live-failure", image: "registry.example/live:live-failure",
+		step: deploymentNetworkStep, description: "pinned effect",
+	})
 }
 
 // cancelLostPackTransport starts the pack step, accepts cancellation, and then
@@ -413,6 +367,8 @@ func (t *cancelLostPackTransport) Call(ctx context.Context, request node.Request
 		}
 		return node.Response{Status: engine.StatusFailed, Attempt: request.Execution.Attempt,
 			ExecutionID: request.Execution.ExecutionID(), Detail: "known pack failure"}, nil
+	case node.MethodObserve, node.MethodInventory:
+		return node.Response{}, errors.New("unexpected node method")
 	default:
 		return node.Response{}, errors.New("unexpected node method")
 	}

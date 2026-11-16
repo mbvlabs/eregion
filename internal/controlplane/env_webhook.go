@@ -60,7 +60,7 @@ func (r *PushWebhookResolver) ResolvePushWebhook(ctx context.Context, app, envir
 	if binding.SecretState == "" || binding.LatestRevision == 0 {
 		return api.PushWebhookTarget{}, false, contract.NewFault(contract.NotFound, "the environment webhook secret was not found", "Rotate it with eregion env update "+app+" "+environment+" --rotate-webhook-secret.")
 	}
-	if uint64(binding.Revision) != uint64(binding.LatestRevision) {
+	if binding.Revision != binding.LatestRevision {
 		return api.PushWebhookTarget{}, false, contract.NewFault(contract.PreconditionFailed, "the environment webhook secret is unusable", "Rotate it with eregion env update "+app+" "+environment+" --rotate-webhook-secret.")
 	}
 	namespace, err := vault.NewNamespace(binding.App, binding.Environment, binding.WebhookSecretName)
@@ -72,7 +72,7 @@ func (r *PushWebhookResolver) ResolvePushWebhook(ctx context.Context, app, envir
 		createdAt = binding.RevisionCreatedAt.UTC()
 	}
 	secret, ref, err := vault.OpenRevision(r.secrets.Store().Ring(), vault.EncryptedRevision{
-		Namespace: namespace, State: vault.State(binding.SecretState), Revision: uint64(binding.Revision),
+		Namespace: namespace, State: vault.State(binding.SecretState), Revision: uint64(binding.Revision), //nolint:gosec // G115: webhook secret revisions are positive database counters.
 		KeyID: binding.KeyID, Ciphertext: binding.Ciphertext, CiphertextSHA256: binding.CiphertextSHA256,
 		RevisionHash: binding.RevisionHash, CreatedAt: createdAt,
 	})

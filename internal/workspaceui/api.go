@@ -143,13 +143,13 @@ func DecodeSubmit(raw json.RawMessage, kind, target string) (SubmitResult, error
 	return SubmitResult{Operation: operation}, nil
 }
 
-func invalidAPI(message string) *contract.Fault {
+func invalidAPI(message string) *contract.FaultError {
 	return contract.NewFault(contract.Unavailable, message, "Check binary compatibility; if submission timed out, reuse the same idempotency key instead of creating a new one.")
 }
 
 // CodeOf returns the machine-readable code carried by err, if any.
 func CodeOf(err error) contract.Code {
-	var fault *contract.Fault
+	var fault *contract.FaultError
 	if errors.As(err, &fault) {
 		return fault.Code
 	}
@@ -191,6 +191,8 @@ func decodeInventory(tab Tab, raw json.RawMessage, clean func(string) string) ([
 		return decodeReleases(items, clean)
 	case Deployments:
 		return decodeDeployments(items, clean)
+	case tabCount:
+		return decodeGeneric(items, clean)
 	default:
 		return decodeGeneric(items, clean)
 	}
@@ -295,23 +297,24 @@ func decodeEnvironments(raw json.RawMessage, clean func(string) string) ([]Item,
 		if status == "" || status == string(platform.HealthUnknown) {
 			status = "health unknown"
 		}
-		details := []Detail{
-			{Label: "app", Value: app},
-			{Label: "environment", Value: name},
-			{Label: "node", Value: clean(environment.Node)},
-			{Label: "health", Value: status},
-			{Label: "health detail", Value: clean(environment.HealthDetail)},
-			{Label: "host port", Value: fmt.Sprint(environment.HostPort)},
-			{Label: "candidate port", Value: fmt.Sprint(environment.CandidatePort)},
-			{Label: "container port", Value: fmt.Sprint(environment.ContainerPort)},
-			{Label: "bind", Value: clean(environment.Bind)},
-			{Label: "desired release", Value: clean(string(environment.DesiredRelease))},
-			{Label: "applied release", Value: clean(string(environment.AppliedRelease))},
-			{Label: "serving release", Value: clean(string(environment.ServingRelease))},
-			{Label: "health check", Value: clean(environment.Health.Type + " " + environment.Health.Path)},
-			{Label: "created", Value: environment.CreatedAt.Format("2006-01-02 15:04:05Z07:00")},
-			{Label: "updated", Value: environment.UpdatedAt.Format("2006-01-02 15:04:05Z07:00")},
-		}
+		details := make([]Detail, 0, 20)
+		details = append(details,
+			Detail{Label: "app", Value: app},
+			Detail{Label: "environment", Value: name},
+			Detail{Label: "node", Value: clean(environment.Node)},
+			Detail{Label: "health", Value: status},
+			Detail{Label: "health detail", Value: clean(environment.HealthDetail)},
+			Detail{Label: "host port", Value: fmt.Sprint(environment.HostPort)},
+			Detail{Label: "candidate port", Value: fmt.Sprint(environment.CandidatePort)},
+			Detail{Label: "container port", Value: fmt.Sprint(environment.ContainerPort)},
+			Detail{Label: "bind", Value: clean(environment.Bind)},
+			Detail{Label: "desired release", Value: clean(string(environment.DesiredRelease))},
+			Detail{Label: "applied release", Value: clean(string(environment.AppliedRelease))},
+			Detail{Label: "serving release", Value: clean(string(environment.ServingRelease))},
+			Detail{Label: "health check", Value: clean(environment.Health.Type + " " + environment.Health.Path)},
+			Detail{Label: "created", Value: environment.CreatedAt.Format("2006-01-02 15:04:05Z07:00")},
+			Detail{Label: "updated", Value: environment.UpdatedAt.Format("2006-01-02 15:04:05Z07:00")},
+		)
 		details = append(details, envDetails(environment.Env, clean)...)
 		details = append(details, Detail{Label: "request metrics", Value: "not collected; node-local telemetry exposes only current host counters"})
 		search := joinSearch(title, environment.Node, string(environment.HealthState), string(environment.DesiredRelease), string(environment.AppliedRelease), string(environment.ServingRelease), environment.HealthDetail)
@@ -337,43 +340,7 @@ func decodeReleases(raw json.RawMessage, clean func(string) string) ([]Item, err
 		id := clean(string(release.ID))
 		title := app + "/" + environment + " " + id
 		status := clean(string(release.Status))
-		details := []Detail{
-			{Label: "release", Value: id},
-			{Label: "app", Value: app},
-			{Label: "environment", Value: environment},
-			{Label: "status", Value: status},
-			{Label: "image", Value: clean(release.Image)},
-			{Label: "image id", Value: clean(release.ImageID)},
-			{Label: "source", Value: clean(release.Source.Type)},
-			{Label: "created", Value: release.CreatedAt.Format("2006-01-02 15:04:05Z07:00")},
-		}
-		if release.Source.Path != "" {
-			details = append(details, Detail{Label: "source path", Value: clean(release.Source.Path)})
-		}
-		if release.Source.URL != "" {
-			details = append(details, Detail{Label: "source URL", Value: clean(release.Source.URL)})
-		}
-		if release.Source.Ref != "" {
-			details = append(details, Detail{Label: "source ref", Value: clean(release.Source.Ref)})
-		}
-		if release.Source.Selector != "" {
-			details = append(details, Detail{Label: "requested selector", Value: clean(release.Source.SelectorKind + " " + release.Source.Selector)})
-		}
-		if release.Build != nil {
-			details = append(details, Detail{Label: "builder", Value: clean(release.Build.Builder)})
-		}
-		if release.Command != nil {
-			details = append(details, Detail{Label: "release command", Value: clean(strings.Join(release.Command.Argv, " "))})
-		}
-		if release.CompletedAt != nil {
-			details = append(details, Detail{Label: "completed", Value: release.CompletedAt.Format("2006-01-02 15:04:05Z07:00")})
-		}
-		if release.ErrorCode != "" {
-			details = append(details, Detail{Label: "error code", Value: string(release.ErrorCode)})
-		}
-		if release.Error != "" {
-			details = append(details, Detail{Label: "error", Value: clean(release.Error)})
-		}
+		details := releaseDetails(release, clean)
 		search := joinSearch(title, status, release.Image, release.ImageID, release.Source.Type, release.Source.URL)
 		items = append(items, Item{
 			Key: id, Title: title, Subtitle: clean(release.Image), Status: status, Details: details, SearchText: search,
@@ -385,6 +352,48 @@ func decodeReleases(raw json.RawMessage, clean func(string) string) ([]Item, err
 		})
 	}
 	return items, nil
+}
+
+func releaseDetails(release platform.Release, clean func(string) string) []Detail {
+	details := make([]Detail, 0, 17)
+	details = append(details,
+		Detail{Label: "release", Value: clean(string(release.ID))},
+		Detail{Label: "app", Value: clean(release.App)},
+		Detail{Label: "environment", Value: clean(release.Environment)},
+		Detail{Label: "status", Value: clean(string(release.Status))},
+		Detail{Label: "image", Value: clean(release.Image)},
+		Detail{Label: "image id", Value: clean(release.ImageID)},
+		Detail{Label: "source", Value: clean(release.Source.Type)},
+		Detail{Label: "created", Value: release.CreatedAt.Format("2006-01-02 15:04:05Z07:00")},
+	)
+	if release.Source.Path != "" {
+		details = append(details, Detail{Label: "source path", Value: clean(release.Source.Path)})
+	}
+	if release.Source.URL != "" {
+		details = append(details, Detail{Label: "source URL", Value: clean(release.Source.URL)})
+	}
+	if release.Source.Ref != "" {
+		details = append(details, Detail{Label: "source ref", Value: clean(release.Source.Ref)})
+	}
+	if release.Source.Selector != "" {
+		details = append(details, Detail{Label: "requested selector", Value: clean(release.Source.SelectorKind + " " + release.Source.Selector)})
+	}
+	if release.Build != nil {
+		details = append(details, Detail{Label: "builder", Value: clean(release.Build.Builder)})
+	}
+	if release.Command != nil {
+		details = append(details, Detail{Label: "release command", Value: clean(strings.Join(release.Command.Argv, " "))})
+	}
+	if release.CompletedAt != nil {
+		details = append(details, Detail{Label: "completed", Value: release.CompletedAt.Format("2006-01-02 15:04:05Z07:00")})
+	}
+	if release.ErrorCode != "" {
+		details = append(details, Detail{Label: "error code", Value: string(release.ErrorCode)})
+	}
+	if release.Error != "" {
+		details = append(details, Detail{Label: "error", Value: clean(release.Error)})
+	}
+	return details
 }
 
 func decodeDeployments(raw json.RawMessage, clean func(string) string) ([]Item, error) {

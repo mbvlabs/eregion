@@ -84,6 +84,20 @@ func publicEndpointURL(hostname, path string) (string, error) {
 // Validate refuses an endpoint description that would claim an unauthenticated
 // or non-public URL, or reconstruct a target from the listener address.
 func (e EndpointInfo) Validate() error {
+	if err := e.validateHeader(); err != nil {
+		return err
+	}
+	switch e.State {
+	case EndpointStateUnconfigured:
+		return e.validateUnconfigured()
+	case EndpointStatePendingCredential, EndpointStateConfigured, EndpointStateNeedsApply:
+	default:
+		return fmt.Errorf("unexpected telemetry endpoint state %q", e.State)
+	}
+	return e.validateConfigured()
+}
+
+func (e EndpointInfo) validateHeader() error {
 	if e.Schema != EndpointSchema {
 		return fmt.Errorf("unexpected telemetry endpoint schema %q", e.Schema)
 	}
@@ -96,20 +110,21 @@ func (e EndpointInfo) Validate() error {
 	if e.MetricsPath != MetricsPath || e.DiscoveryPath != DiscoveryPath {
 		return fmt.Errorf("telemetry endpoint paths are unexpected")
 	}
-	switch e.State {
-	case EndpointStateUnconfigured:
-		if strings.TrimSpace(e.Hostname) != "" || e.MetricsURL != "" || e.DiscoveryURL != "" ||
-			e.Credential || e.Public {
-			return fmt.Errorf("an unconfigured telemetry endpoint must not claim a hostname, URL or credential")
-		}
-		if e.Access != EndpointStateUnconfigured || e.Authentication != "none" {
-			return fmt.Errorf("an unconfigured telemetry endpoint must not claim access")
-		}
-		return nil
-	case EndpointStatePendingCredential, EndpointStateConfigured, EndpointStateNeedsApply:
-	default:
-		return fmt.Errorf("unexpected telemetry endpoint state %q", e.State)
+	return nil
+}
+
+func (e EndpointInfo) validateUnconfigured() error {
+	if strings.TrimSpace(e.Hostname) != "" || e.MetricsURL != "" || e.DiscoveryURL != "" ||
+		e.Credential || e.Public {
+		return fmt.Errorf("an unconfigured telemetry endpoint must not claim a hostname, URL or credential")
 	}
+	if e.Access != EndpointStateUnconfigured || e.Authentication != "none" {
+		return fmt.Errorf("an unconfigured telemetry endpoint must not claim access")
+	}
+	return nil
+}
+
+func (e EndpointInfo) validateConfigured() error {
 	if (e.State == EndpointStateConfigured || e.State == EndpointStateNeedsApply) && !e.Credential {
 		return fmt.Errorf("a configured telemetry endpoint must report a credential")
 	}

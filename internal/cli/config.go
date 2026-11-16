@@ -58,7 +58,7 @@ func (a *app) configSpecs() []spec {
 			{
 				use:  "list <app> <environment>",
 				meta: list,
-				args: platformTwoNames("app", "environment"),
+				args: platformTwoNames(),
 				run: func(cmd *cobra.Command, args []string) (result, error) {
 					return a.configList(cmd, args[0], args[1])
 				},
@@ -155,7 +155,7 @@ func (a *app) configUnset(cmd *cobra.Command, args []string) (result, error) {
 }
 
 func (a *app) configList(cmd *cobra.Command, app, environment string) (result, error) {
-	env, _, err := a.readEnvironment(cmd, app, environment)
+	env, err := a.readEnvironment(cmd, app, environment)
 	if err != nil {
 		return result{}, err
 	}

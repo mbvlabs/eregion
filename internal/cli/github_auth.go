@@ -13,7 +13,7 @@ import (
 
 // defaultGitReadCredentialName is the vault name used when --github-auth has
 // no explicit --git-credential-name and the source does not already name one.
-const defaultGitReadCredentialName = "GIT_READ_TOKEN"
+const defaultGitReadCredentialName = "GIT_READ_TOKEN" //nolint:gosec // G101: the vault key's name, not a credential value.
 
 // githubAuthRequested reports the explicit opt-in. The local gh token may
 // carry broader scopes than a repository read credential, so it is never used
@@ -59,67 +59,12 @@ func applyGitHubAuthToSpecs(cmd *cobra.Command, ans *setupAnswers, specs []platf
 			"--github-auth conflicts with another credential value",
 			"Use one credential source: gh, a protected token file, or an existing value.")
 	}
-	requestedName := ""
-	if flagChanged(cmd, "git-credential-name") {
-		requestedName = flagString(cmd, "git-credential-name")
-	}
-
-	names := map[string]bool{}
-	gitSpecs := 0
-	for _, spec := range specs {
-		if spec.Source.URL == "" {
-			continue
-		}
-		gitSpecs++
-		if _, ok := platform.GitHubRepository(spec.Source.URL); !ok {
-			return nil, contract.NewFault(contract.ValidationFailed,
-				"--github-auth needs a GitHub HTTPS git source",
-				"Use an https://github.com/owner/repository source; another forge needs --git-credential-file with a token for that host.")
-		}
-		if spec.Source.CredentialSecretName != "" {
-			names[spec.Source.CredentialSecretName] = true
-		}
-	}
-	if gitSpecs == 0 {
-		return nil, contract.NewFault(contract.ValidationFailed,
-			"--github-auth needs a git source",
-			"Set an https://github.com/owner/repository source with --git-url.")
-	}
-	if requestedName == "" {
-		switch len(names) {
-		case 0:
-			requestedName = defaultGitReadCredentialName
-		case 1:
-			for name := range names {
-				requestedName = name
-			}
-		default:
-			return nil, contract.NewFault(contract.ValidationFailed,
-				"the environments name different read credentials",
-				"Use one credential name across the environments, then retry.")
-		}
-	}
-	if err := vault.ValidateName(requestedName); err != nil {
+	requestedName, err := gitHubReadCredentialName(cmd, specs)
+	if err != nil {
 		return nil, err
 	}
-	if ans != nil {
-		if _, exists := ans.SecretValues[requestedName]; exists {
-			return nil, contract.NewFault(contract.ValidationFailed,
-				"secret name conflicts with the git read credential",
-				"The read credential is not injected into the app; choose another secret name.")
-		}
-	}
-	for _, spec := range specs {
-		if spec.Source.URL == "" {
-			continue
-		}
-		for _, secretName := range spec.SecretNames {
-			if secretName == requestedName {
-				return nil, contract.NewFault(contract.ValidationFailed,
-					"secret name conflicts with the git read credential",
-					"The read credential is not injected into the app; choose another secret name.")
-			}
-		}
+	if err := validateGitHubCredentialName(ans, specs, requestedName); err != nil {
+		return nil, err
 	}
 
 	out := append([]platform.EnvironmentSpec(nil), specs...)
@@ -132,6 +77,75 @@ func applyGitHubAuthToSpecs(cmd *cobra.Command, ans *setupAnswers, specs []platf
 		ans.CredentialName = requestedName
 	}
 	return out, nil
+}
+
+func gitHubReadCredentialName(cmd *cobra.Command, specs []platform.EnvironmentSpec) (string, error) {
+	requestedName := ""
+	if flagChanged(cmd, "git-credential-name") {
+		requestedName = flagString(cmd, "git-credential-name")
+	}
+	names := map[string]bool{}
+	gitSpecs := 0
+	for _, spec := range specs {
+		if spec.Source.URL == "" {
+			continue
+		}
+		gitSpecs++
+		if _, ok := platform.GitHubRepository(spec.Source.URL); !ok {
+			return "", contract.NewFault(contract.ValidationFailed,
+				"--github-auth needs a GitHub HTTPS git source",
+				"Use an https://github.com/owner/repository source; another forge needs --git-credential-file with a token for that host.")
+		}
+		if spec.Source.CredentialSecretName != "" {
+			names[spec.Source.CredentialSecretName] = true
+		}
+	}
+	if gitSpecs == 0 {
+		return "", contract.NewFault(contract.ValidationFailed,
+			"--github-auth needs a git source",
+			"Set an https://github.com/owner/repository source with --git-url.")
+	}
+	if requestedName == "" {
+		switch len(names) {
+		case 0:
+			requestedName = defaultGitReadCredentialName
+		case 1:
+			for name := range names {
+				requestedName = name
+			}
+		default:
+			return "", contract.NewFault(contract.ValidationFailed,
+				"the environments name different read credentials",
+				"Use one credential name across the environments, then retry.")
+		}
+	}
+	if err := vault.ValidateName(requestedName); err != nil {
+		return "", err
+	}
+	return requestedName, nil
+}
+
+func validateGitHubCredentialName(ans *setupAnswers, specs []platform.EnvironmentSpec, requestedName string) error {
+	if ans != nil {
+		if _, exists := ans.SecretValues[requestedName]; exists {
+			return contract.NewFault(contract.ValidationFailed,
+				"secret name conflicts with the git read credential",
+				"The read credential is not injected into the app; choose another secret name.")
+		}
+	}
+	for _, spec := range specs {
+		if spec.Source.URL == "" {
+			continue
+		}
+		for _, secretName := range spec.SecretNames {
+			if secretName == requestedName {
+				return contract.NewFault(contract.ValidationFailed,
+					"secret name conflicts with the git read credential",
+					"The read credential is not injected into the app; choose another secret name.")
+			}
+		}
+	}
+	return nil
 }
 
 // acquireGitHubAuthToken reads the local gh session token into memory. The

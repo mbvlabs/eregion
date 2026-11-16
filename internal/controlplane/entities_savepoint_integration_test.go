@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/vault"
@@ -46,12 +47,17 @@ func TestIntegrationEntitiesSavepointPoisonRejectsCommit(t *testing.T) {
 	}
 
 	marker := mustOperationID(t)
+	checkSavepointPoisonRejectsCommit(t, ctx, store, existing, marker)
+}
+
+func checkSavepointPoisonRejectsCommit(t *testing.T, ctx context.Context, store *entities.Store, existing vault.Namespace, marker contract.OperationID) {
+	t.Helper()
 	markerKey := entities.OperationKey{
 		Kind: "diagnostic.test", Target: "control-plane", Actor: testActor,
 		IdempotencyKey: "savepoint-poison-marker",
 	}
 	outerSentinel := errors.New("outer savepoint sentinel")
-	err = store.WithinTx(ctx, func(tx *entities.StoreTx) error {
+	err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
 		inserted, err := tx.Operations().Insert(ctx, entities.OperationInsert{
 			ID: marker, Key: markerKey, InputHash: "poison-marker",
 			Input: json.RawMessage(`{"steps":1}`),
@@ -59,23 +65,8 @@ func TestIntegrationEntitiesSavepointPoisonRejectsCommit(t *testing.T) {
 		if err != nil || !inserted {
 			t.Fatalf("marker insert = %v err %v", inserted, err)
 		}
-		outerErr := tx.WithinSavepoint(ctx, func(outer *entities.StoreTx) error {
-			innerErr := outer.WithinSavepoint(ctx, func(inner *entities.StoreTx) error {
-				duplicateErr := inner.Secrets().InsertSecretNamespace(ctx, existing, testActor)
-				if contract.Classify(duplicateErr).Code != contract.Conflict {
-					t.Fatalf("inner duplicate error = %v, want Conflict", duplicateErr)
-				}
-				// PostgreSQL has aborted the transaction. Deliberately ignore
-				// the error and return nil so the release below must fail.
-				return nil
-			})
-			var savepointErr *entities.SavepointError
-			if !errors.As(innerErr, &savepointErr) || savepointErr.Operation() != entities.SavepointRelease {
-				t.Fatalf("inner savepoint error = %v, want release SavepointError", innerErr)
-			}
-			return outerSentinel
-		})
-		if outerErr != outerSentinel {
+		outerErr := runPoisonedSavepoints(t, ctx, tx, existing, outerSentinel)
+		if !errors.Is(outerErr, outerSentinel) {
 			t.Fatalf("outer savepoint error = %v, want the identical sentinel", outerErr)
 		}
 		// ROLLBACK TO SAVEPOINT S1 restored PostgreSQL usability.
@@ -100,6 +91,26 @@ func TestIntegrationEntitiesSavepointPoisonRejectsCommit(t *testing.T) {
 	}
 }
 
+func runPoisonedSavepoints(t *testing.T, ctx context.Context, tx *entities.StoreTx, existing vault.Namespace, outerSentinel error) error {
+	t.Helper()
+	return tx.WithinSavepoint(ctx, func(outer *entities.StoreTx) error {
+		innerErr := outer.WithinSavepoint(ctx, func(inner *entities.StoreTx) error {
+			duplicateErr := inner.Secrets().InsertSecretNamespace(ctx, existing, testActor)
+			if contract.Classify(duplicateErr).Code != contract.Conflict {
+				t.Fatalf("inner duplicate error = %v, want Conflict", duplicateErr)
+			}
+			// PostgreSQL has aborted the transaction. Deliberately ignore
+			// the error and return nil so the release below must fail.
+			return nil
+		})
+		var savepointErr *entities.SavepointError
+		if !errors.As(innerErr, &savepointErr) || savepointErr.Operation() != entities.SavepointRelease {
+			t.Fatalf("inner savepoint error = %v, want release SavepointError", innerErr)
+		}
+		return outerSentinel
+	})
+}
+
 // TestIntegrationEntitiesSavepointCallbackIdentityAndPanicWrite proves a
 // successful scope rollback returns the callback value unchanged and that a
 // write before a panic is rolled back while the outer transaction commits.
@@ -115,53 +126,34 @@ func TestIntegrationEntitiesSavepointCallbackIdentityAndPanicWrite(t *testing.T)
 	phantom := mustOperationID(t)
 	markerC := mustOperationID(t)
 	input := json.RawMessage(`{"steps":1}`)
-	keyFor := func(id contract.OperationID) entities.OperationKey {
-		return entities.OperationKey{
-			Kind: "diagnostic.test", Target: "control-plane", Actor: testActor,
-			IdempotencyKey: "savepoint-" + string(id),
-		}
-	}
-	insert := func(tx *entities.StoreTx, id contract.OperationID) error {
-		inserted, err := tx.Operations().Insert(ctx, entities.OperationInsert{
-			ID: id, Key: keyFor(id), InputHash: "identity-hash", Input: input,
-		})
-		if err != nil {
-			return err
-		}
-		if !inserted {
-			t.Fatalf("operation %s was not inserted", id)
-		}
-		return nil
-	}
 
+	checkSavepointCallbackIdentity(t, ctx, store, markerA, markerB, markerC, phantom, sentinel, input)
+}
+
+func checkSavepointCallbackIdentity(
+	t *testing.T,
+	ctx context.Context,
+	store *entities.Store,
+	markerA, markerB, markerC, phantom contract.OperationID,
+	sentinel error,
+	input json.RawMessage,
+) {
+	t.Helper()
 	if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
-		if err := insert(tx, markerA); err != nil {
+		if err := insertSavepointOperation(t, ctx, tx, markerA, input); err != nil {
 			return err
 		}
 		scopeErr := tx.WithinSavepoint(ctx, func(nested *entities.StoreTx) error {
-			if err := insert(nested, markerB); err != nil {
+			if err := insertSavepointOperation(t, ctx, nested, markerB, input); err != nil {
 				return err
 			}
 			return sentinel
 		})
-		if scopeErr != sentinel {
+		if !errors.Is(scopeErr, sentinel) {
 			t.Fatalf("scope rollback error = %v, want the identical sentinel", scopeErr)
 		}
-
-		func() {
-			defer func() {
-				if recovered := recover(); recovered == nil {
-					t.Fatalf("savepoint panic did not propagate")
-				}
-			}()
-			_ = tx.WithinSavepoint(ctx, func(nested *entities.StoreTx) error {
-				if err := insert(nested, phantom); err != nil {
-					return err
-				}
-				panic("savepoint write panic")
-			})
-		}()
-		return insert(tx, markerC)
+		expectSavepointPanic(t, ctx, tx, phantom, input)
+		return insertSavepointOperation(t, ctx, tx, markerC, input)
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -176,6 +168,42 @@ func TestIntegrationEntitiesSavepointCallbackIdentityAndPanicWrite(t *testing.T)
 			t.Fatalf("rolled-back marker %s found=%v err=%v", id, found, err)
 		}
 	}
+}
+
+func savepointOperationKey(id contract.OperationID) entities.OperationKey {
+	return entities.OperationKey{
+		Kind: "diagnostic.test", Target: "control-plane", Actor: testActor,
+		IdempotencyKey: "savepoint-" + string(id),
+	}
+}
+
+func insertSavepointOperation(t *testing.T, ctx context.Context, tx *entities.StoreTx, id contract.OperationID, input json.RawMessage) error {
+	t.Helper()
+	inserted, err := tx.Operations().Insert(ctx, entities.OperationInsert{
+		ID: id, Key: savepointOperationKey(id), InputHash: "identity-hash", Input: input,
+	})
+	if err != nil {
+		return err
+	}
+	if !inserted {
+		t.Fatalf("operation %s was not inserted", id)
+	}
+	return nil
+}
+
+func expectSavepointPanic(t *testing.T, ctx context.Context, tx *entities.StoreTx, phantom contract.OperationID, input json.RawMessage) {
+	t.Helper()
+	defer func() {
+		if recovered := recover(); recovered == nil {
+			t.Fatalf("savepoint panic did not propagate")
+		}
+	}()
+	_ = tx.WithinSavepoint(ctx, func(nested *entities.StoreTx) error {
+		if err := insertSavepointOperation(t, ctx, nested, phantom, input); err != nil {
+			return err
+		}
+		panic("savepoint write panic")
+	})
 }
 
 // TestIntegrationEntitiesSavepointAtomicSecretOperationRiverRollback proves a
@@ -210,6 +238,21 @@ func TestIntegrationEntitiesSavepointAtomicSecretOperationRiverRollback(t *testi
 	input := json.RawMessage(`{"steps":1}`)
 	discard := errors.New("discard speculative savepoint")
 
+	runAtomicSecretSavepoint(t, ctx, store, accepted, speculative, namespace, revision, input, discard)
+	checkAtomicSecretRolledBack(t, ctx, pool, store, accepted, speculative, namespace)
+}
+
+func runAtomicSecretSavepoint(
+	t *testing.T,
+	ctx context.Context,
+	store *entities.Store,
+	accepted, speculative contract.OperationID,
+	namespace vault.Namespace,
+	revision vault.SecretRevisionInput,
+	input json.RawMessage,
+	discard error,
+) {
+	t.Helper()
 	if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
 		inserted, err := tx.Operations().Insert(ctx, entities.OperationInsert{
 			ID: accepted,
@@ -222,39 +265,8 @@ func TestIntegrationEntitiesSavepointAtomicSecretOperationRiverRollback(t *testi
 		if err != nil || !inserted {
 			t.Fatalf("accepted insert = %v err %v", inserted, err)
 		}
-		scopeErr := tx.WithinSavepoint(ctx, func(nested *entities.StoreTx) error {
-			inserted, err := nested.Operations().Insert(ctx, entities.OperationInsert{
-				ID: speculative,
-				Key: entities.OperationKey{
-					Kind: "diagnostic.test", Target: "control-plane", Actor: testActor,
-					IdempotencyKey: "savepoint-speculative",
-				},
-				InputHash: "speculative", Input: input,
-			})
-			if err != nil || !inserted {
-				t.Fatalf("speculative insert = %v err %v", inserted, err)
-			}
-			op, found, err := nested.Operations().Lock(ctx, speculative)
-			if err != nil || !found {
-				t.Fatalf("speculative lock found=%v err=%v", found, err)
-			}
-			if err := nested.Operations().AppendEvent(ctx, &op, contract.Event{
-				Kind: "step", Stage: "speculative", Message: "speculative event",
-			}); err != nil {
-				return err
-			}
-			if err := nested.Secrets().InsertSecretNamespace(ctx, namespace, testActor); err != nil {
-				return err
-			}
-			if err := nested.Secrets().InsertSecretRevision(ctx, namespace, revision); err != nil {
-				return err
-			}
-			if _, err := nested.Jobs().EnqueueDiagnostic(ctx, speculative); err != nil {
-				return err
-			}
-			return discard
-		})
-		if scopeErr != discard {
+		scopeErr := runSpeculativeSecretSavepoint(t, ctx, tx, speculative, namespace, revision, input, discard)
+		if !errors.Is(scopeErr, discard) {
 			t.Fatalf("savepoint error = %v, want the identical sentinel", scopeErr)
 		}
 		// The savepoint rollback leaves the outer transaction usable and all
@@ -269,7 +281,55 @@ func TestIntegrationEntitiesSavepointAtomicSecretOperationRiverRollback(t *testi
 	}); err != nil {
 		t.Fatal(err)
 	}
+}
 
+func runSpeculativeSecretSavepoint(
+	t *testing.T,
+	ctx context.Context,
+	tx *entities.StoreTx,
+	speculative contract.OperationID,
+	namespace vault.Namespace,
+	revision vault.SecretRevisionInput,
+	input json.RawMessage,
+	discard error,
+) error {
+	t.Helper()
+	return tx.WithinSavepoint(ctx, func(nested *entities.StoreTx) error {
+		inserted, err := nested.Operations().Insert(ctx, entities.OperationInsert{
+			ID: speculative,
+			Key: entities.OperationKey{
+				Kind: "diagnostic.test", Target: "control-plane", Actor: testActor,
+				IdempotencyKey: "savepoint-speculative",
+			},
+			InputHash: "speculative", Input: input,
+		})
+		if err != nil || !inserted {
+			t.Fatalf("speculative insert = %v err %v", inserted, err)
+		}
+		op, found, err := nested.Operations().Lock(ctx, speculative)
+		if err != nil || !found {
+			t.Fatalf("speculative lock found=%v err=%v", found, err)
+		}
+		if err := nested.Operations().AppendEvent(ctx, &op, contract.Event{
+			Kind: "step", Stage: "speculative", Message: "speculative event",
+		}); err != nil {
+			return err
+		}
+		if err := nested.Secrets().InsertSecretNamespace(ctx, namespace, testActor); err != nil {
+			return err
+		}
+		if err := nested.Secrets().InsertSecretRevision(ctx, namespace, revision); err != nil {
+			return err
+		}
+		if _, err := nested.Jobs().EnqueueDiagnostic(ctx, speculative); err != nil {
+			return err
+		}
+		return discard
+	})
+}
+
+func checkAtomicSecretRolledBack(t *testing.T, ctx context.Context, pool *pgxpool.Pool, store *entities.Store, accepted, speculative contract.OperationID, namespace vault.Namespace) {
+	t.Helper()
 	if _, found, err := store.Operations().Get(ctx, speculative); err != nil || found {
 		t.Fatalf("speculative operation after commit found=%v err=%v", found, err)
 	}

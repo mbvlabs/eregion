@@ -75,17 +75,17 @@ func (a *app) resourceSpecs() []spec {
 		meta: parent,
 		run:  func(cmd *cobra.Command, _ []string) (result, error) { return a.help(cmd), nil },
 		children: []spec{
-			{use: "apply <app> <environment> <name>", meta: apply, args: platformThreeNames("app", "environment", "resource"), flags: applyFlags, run: a.resourceApply},
-			{use: "attach <app> <environment> <name>", meta: attach, args: platformThreeNames("app", "environment", "resource"), flags: changeFlags, run: a.resourceAttach},
-			{use: "detach <app> <environment> <name>", meta: detach, args: platformThreeNames("app", "environment", "resource"), flags: changeFlags, run: a.resourceDetach},
+			{use: "apply <app> <environment> <name>", meta: apply, args: platformThreeNames(), flags: applyFlags, run: a.resourceApply},
+			{use: "attach <app> <environment> <name>", meta: attach, args: platformThreeNames(), flags: changeFlags, run: a.resourceAttach},
+			{use: "detach <app> <environment> <name>", meta: detach, args: platformThreeNames(), flags: changeFlags, run: a.resourceDetach},
 			{use: "list", meta: platformMeta("List desired and observed managed resources", "eregion resource list --app api --environment production --json"), args: platformReadArgs, flags: func(cmd *cobra.Command) {
 				cmd.Flags().String("app", "", "Filter by app name")
 				cmd.Flags().String("environment", "", "Filter by environment name")
 				cmd.Flags().String("state", "", "Filter by lifecycle state")
 				cmd.Flags().Int("limit", 100, "Maximum items (1–200)")
 			}, run: a.resourceList},
-			{use: "status <app> <environment> <name>", meta: platformMeta("Show one managed resource's desired and observed state", "eregion resource status api production db --json"), args: platformThreeNames("app", "environment", "resource"), run: a.resourceStatus},
-			{use: "destroy <app> <environment> <name>", meta: destroy, args: platformThreeNames("app", "environment", "resource"), flags: func(cmd *cobra.Command) {
+			{use: "status <app> <environment> <name>", meta: platformMeta("Show one managed resource's desired and observed state", "eregion resource status api production db --json"), args: platformThreeNames(), run: a.resourceStatus},
+			{use: "destroy <app> <environment> <name>", meta: destroy, args: platformThreeNames(), flags: func(cmd *cobra.Command) {
 				changeFlags(cmd)
 				cmd.Flags().String("confirm", "", "Target-naming confirmation: app/environment/name")
 				cmd.Flags().Bool("delete-data", false, "Also permanently delete the resource's named volumes after removing the container")
@@ -107,7 +107,11 @@ func (a *app) resourceApply(cmd *cobra.Command, args []string) (result, error) {
 	if err != nil {
 		return result{}, err
 	}
-	input = *normalized.Input.(*platform.ResourceApplyInput)
+	typed, ok := normalized.Input.(*platform.ResourceApplyInput)
+	if !ok {
+		return result{}, fmt.Errorf("normalized resource input has type %T", normalized.Input)
+	}
+	input = *typed
 	dryRun, _ := cmd.Flags().GetBool("dry-run")
 	if dryRun {
 		preview, err := a.previewAction(cmd, platform.KindResourceApply, target.String(), input)
@@ -212,7 +216,7 @@ func (a *app) resourceDestroy(cmd *cobra.Command, args []string) (result, error)
 }
 
 func (a *app) resourceList(cmd *cobra.Command, _ []string) (result, error) {
-	_, items, raw, err := a.resourceInventory(cmd, "", "")
+	items, raw, err := a.resourceInventory(cmd, "", "")
 	if err != nil {
 		return result{}, err
 	}
@@ -231,7 +235,7 @@ func (a *app) resourceList(cmd *cobra.Command, _ []string) (result, error) {
 }
 
 func (a *app) resourceStatus(cmd *cobra.Command, args []string) (result, error) {
-	_, items, _, err := a.resourceInventory(cmd, args[0], args[1])
+	items, _, err := a.resourceInventory(cmd, args[0], args[1])
 	if err != nil {
 		return result{}, err
 	}
@@ -248,10 +252,10 @@ func (a *app) resourceStatus(cmd *cobra.Command, args []string) (result, error) 
 	return result{}, contract.NewFault(contract.NotFound, "resource not found", "List resources for this app and environment, or apply the declaration first.")
 }
 
-func (a *app) resourceInventory(cmd *cobra.Command, app, environment string) (string, []platform.Resource, json.RawMessage, error) {
+func (a *app) resourceInventory(cmd *cobra.Command, app, environment string) ([]platform.Resource, json.RawMessage, error) {
 	client, err := a.client(cmd)
 	if err != nil {
-		return "", nil, nil, err
+		return nil, nil, err
 	}
 	filters := url.Values{}
 	if app != "" {
@@ -277,15 +281,15 @@ func (a *app) resourceInventory(cmd *cobra.Command, app, environment string) (st
 	}
 	raw, err := client.PlatformInventory(cmd.Context(), "resources", filters)
 	if err != nil {
-		return "", nil, nil, err
+		return nil, nil, err
 	}
 	var page struct {
 		Items []platform.Resource `json:"items"`
 	}
 	if err := json.Unmarshal(raw, &page); err != nil {
-		return "", nil, nil, contract.NewFault(contract.Unavailable, "the node returned an invalid resource inventory", "Check binary compatibility before assuming the resource is absent.")
+		return nil, nil, contract.NewFault(contract.Unavailable, "the node returned an invalid resource inventory", "Check binary compatibility before assuming the resource is absent.")
 	}
-	return "resources", page.Items, raw, nil
+	return page.Items, raw, nil
 }
 
 func resourceApplyInput(cmd *cobra.Command, args []string) (platform.ResourceApplyInput, error) {

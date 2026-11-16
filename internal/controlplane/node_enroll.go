@@ -2,8 +2,6 @@ package controlplane
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -45,62 +43,23 @@ func (s *Service) resolverConfig() ResolverConfig {
 // capabilities, and the enrolled state are written by the worker after the
 // node proved itself.
 func (s *Service) prepareNodeEnroll(ctx context.Context, tx *entities.StoreTx, id contract.OperationID, in *platform.NodeEnrollInput) error {
-	existing, err := loadNodeConn(ctx, tx.Nodes(), in.Node)
-	found := err == nil
+	existing, found, err := loadOptionalNodeConn(ctx, tx.Nodes(), in.Node)
 	if err != nil {
-		if fault := contract.Classify(err); fault.Code != contract.NotFound {
-			return err
-		}
+		return err
 	}
 	if in.Retry {
-		if !found {
-			return contract.NewFault(contract.NotFound, "node not found", "Enroll the node first; there is no enrollment to retry.")
-		}
-		if existing.Transport != "ssh" {
-			return contract.NewFault(contract.PreconditionFailed, "node was not submitted for enrollment", "Enroll the node with its address and pinned host key.")
-		}
-		_, err := tx.Nodes().ResetEnrollment(ctx, in.Node, id)
-		if err != nil {
-			return unavailable(err)
-		}
-		return nil
+		return s.retryNodeEnroll(ctx, tx, id, in, existing, found)
 	}
-	state := platform.EnrollmentPending
-	capabilities := []string{"unverified"}
-	wgAddress := ""
-	if found {
-		if contains(existing.Roles, platform.RoleControlPlane) {
-			return contract.NewFault(contract.Conflict, "the main node cannot be re-enrolled", "The control-plane node keeps its local transport; enroll additional nodes under other names.")
-		}
-		if existing.Enrollment == platform.EnrollmentEnrolled {
-			if existing.HostKey != in.HostKey {
-				return contract.NewFault(contract.Conflict, "node is enrolled with a different pinned host key",
-					"A host key is never replaced by re-submission. Verify the node, then remove and re-enroll it under a new name.")
-			}
-			if existing.IdentityFP != "" && in.IdentityFingerprint != "" && existing.IdentityFP != in.IdentityFingerprint {
-				return contract.NewFault(contract.Conflict, "node is enrolled with a different identity key", "The pinned identity key is not replaced by re-submission.")
-			}
-			unchanged := existing.SSHAddress == in.Address && existing.SSHUser == in.User &&
-				joinSorted(existing.Roles) == joinSorted(in.Roles) && existing.BuildConcurrency == in.BuildConcurrency &&
-				existing.BuildUser == in.BuildUser && existing.WGEnabled == (in.PrivateNetwork != nil) &&
-				(in.PrivateNetwork == nil || (existing.WGEndpoint == in.PrivateNetwork.Endpoint && existing.WGSSHPort == in.PrivateNetwork.SSHPort))
-			if unchanged {
-				state = platform.EnrollmentEnrolled
-			}
-		}
-		wgAddress = existing.WGAddress
+	state, wgAddress, err := enrollmentState(existing, found, in)
+	if err != nil {
+		return err
 	}
-	wgEndpoint, wgSSHPort := "", 0
-	if in.PrivateNetwork != nil {
-		wgEndpoint, wgSSHPort = in.PrivateNetwork.Endpoint, in.PrivateNetwork.SSHPort
-		if wgAddress == "" {
-			if wgAddress, err = s.allocateWireGuardAddress(ctx, tx); err != nil {
-				return err
-			}
-		}
+	wgEndpoint, wgSSHPort, wgAddress, err := s.enrollmentNetwork(ctx, tx, in, wgAddress)
+	if err != nil {
+		return err
 	}
 	if _, err := tx.Nodes().UpsertEnrollment(ctx, entities.NodeEnrollment{
-		Name: in.Node, Roles: in.Roles, Capabilities: capabilities, Address: in.Address,
+		Name: in.Node, Roles: in.Roles, Capabilities: []string{"unverified"}, Address: in.Address,
 		State: state, User: in.User, HostKey: in.HostKey, HostKeyFingerprint: in.HostKeyFingerprint,
 		IdentityFingerprint: in.IdentityFingerprint, BuildConcurrency: in.BuildConcurrency,
 		BuildUser: in.BuildUser, WGEnabled: in.PrivateNetwork != nil, WGAddress: wgAddress,
@@ -109,6 +68,71 @@ func (s *Service) prepareNodeEnroll(ctx context.Context, tx *entities.StoreTx, i
 		return platformWriteError(err, "node enrollment conflicts with another node")
 	}
 	return nil
+}
+
+func loadOptionalNodeConn(ctx context.Context, nodes *entities.NodeStore, name string) (entities.NodeConnection, bool, error) {
+	existing, err := loadNodeConn(ctx, nodes, name)
+	if err == nil {
+		return existing, true, nil
+	}
+	if fault := contract.Classify(err); fault.Code != contract.NotFound {
+		return existing, false, err
+	}
+	return existing, false, nil
+}
+
+func (s *Service) retryNodeEnroll(ctx context.Context, tx *entities.StoreTx, id contract.OperationID, in *platform.NodeEnrollInput, existing entities.NodeConnection, found bool) error {
+	if !found {
+		return contract.NewFault(contract.NotFound, "node not found", "Enroll the node first; there is no enrollment to retry.")
+	}
+	if existing.Transport != "ssh" {
+		return contract.NewFault(contract.PreconditionFailed, "node was not submitted for enrollment", "Enroll the node with its address and pinned host key.")
+	}
+	if _, err := tx.Nodes().ResetEnrollment(ctx, in.Node, id); err != nil {
+		return unavailable(err)
+	}
+	return nil
+}
+
+func enrollmentState(existing entities.NodeConnection, found bool, in *platform.NodeEnrollInput) (platform.EnrollmentState, string, error) {
+	state := platform.EnrollmentPending
+	if !found {
+		return state, "", nil
+	}
+	if contains(existing.Roles, platform.RoleControlPlane) {
+		return state, "", contract.NewFault(contract.Conflict, "the main node cannot be re-enrolled", "The control-plane node keeps its local transport; enroll additional nodes under other names.")
+	}
+	if existing.Enrollment == platform.EnrollmentEnrolled {
+		if existing.HostKey != in.HostKey {
+			return state, "", contract.NewFault(contract.Conflict, "node is enrolled with a different pinned host key",
+				"A host key is never replaced by re-submission. Verify the node, then remove and re-enroll it under a new name.")
+		}
+		if existing.IdentityFP != "" && in.IdentityFingerprint != "" && existing.IdentityFP != in.IdentityFingerprint {
+			return state, "", contract.NewFault(contract.Conflict, "node is enrolled with a different identity key", "The pinned identity key is not replaced by re-submission.")
+		}
+		unchanged := existing.SSHAddress == in.Address && existing.SSHUser == in.User &&
+			joinSorted(existing.Roles) == joinSorted(in.Roles) && existing.BuildConcurrency == in.BuildConcurrency &&
+			existing.BuildUser == in.BuildUser && existing.WGEnabled == (in.PrivateNetwork != nil) &&
+			(in.PrivateNetwork == nil || (existing.WGEndpoint == in.PrivateNetwork.Endpoint && existing.WGSSHPort == in.PrivateNetwork.SSHPort))
+		if unchanged {
+			state = platform.EnrollmentEnrolled
+		}
+	}
+	return state, existing.WGAddress, nil
+}
+
+func (s *Service) enrollmentNetwork(ctx context.Context, tx *entities.StoreTx, in *platform.NodeEnrollInput, wgAddress string) (string, int, string, error) {
+	if in.PrivateNetwork == nil {
+		return "", 0, wgAddress, nil
+	}
+	if wgAddress == "" {
+		allocated, err := s.allocateWireGuardAddress(ctx, tx)
+		if err != nil {
+			return "", 0, "", err
+		}
+		wgAddress = allocated
+	}
+	return in.PrivateNetwork.Endpoint, in.PrivateNetwork.SSHPort, wgAddress, nil
 }
 
 // allocateWireGuardAddress returns the lowest free host address of the private
@@ -209,7 +233,10 @@ func (w *platformWorker) verifyNode(ctx context.Context, tr node.Transport, id c
 }
 
 func (w *platformWorker) runNodeEnroll(ctx context.Context, id contract.OperationID, attempt uint32, normalized platform.Normalized) error {
-	input := normalized.Input.(*platform.NodeEnrollInput)
+	input, err := typedOperationInput[*platform.NodeEnrollInput](normalized.Input)
+	if err != nil {
+		return w.settle(ctx, id, attempt, err)
+	}
 	rec, err := loadNodeConn(ctx, w.service.entities.Nodes(), input.Node)
 	if err != nil {
 		return w.settle(ctx, id, attempt, err)
@@ -217,7 +244,7 @@ func (w *platformWorker) runNodeEnroll(ctx context.Context, id contract.Operatio
 	if rec.Transport != "ssh" || rec.HostKey == "" {
 		return w.settleEnroll(ctx, id, attempt, rec.Name, contract.NewFault(contract.PreconditionFailed, "node was not submitted for enrollment", "Enroll the node with its address and pinned host key."))
 	}
-	tr, closer, err := w.service.resolver.Direct(rec)
+	tr, closer, err := w.service.resolver.Direct(ctx, rec)
 	if err != nil {
 		return w.settleEnroll(ctx, id, attempt, rec.Name, err)
 	}
@@ -294,6 +321,11 @@ func (w *platformWorker) settleEnroll(ctx context.Context, id contract.Operation
 	switch fault.Code {
 	case contract.ValidationFailed, contract.PreconditionFailed, contract.NotFound, contract.Forbidden, contract.Conflict:
 		terminal = true
+	case contract.Usage, contract.InvalidOutputMode, contract.InputRequired, contract.MissingTool,
+		contract.Unauthenticated, contract.DoctorFailed, contract.ConfirmationRequired,
+		contract.NodeVersionMismatch, contract.RemoteUnreachable, contract.Unavailable,
+		contract.Cancelled, contract.Internal:
+		terminal = false
 	}
 	message := truncateText(fault.Message, 1024)
 	_, _ = w.service.entities.Nodes().RecordEnrollmentFailure(
@@ -328,13 +360,13 @@ func truncateText(text string, limit int) string {
 func (w *platformWorker) runEnrolledCheck(ctx context.Context, id contract.OperationID, attempt uint32, rec entities.NodeConnection) error {
 	tr, err := w.service.resolver.TransportFor(ctx, rec.Name)
 	if err != nil {
-		w.service.recordNodeCheck(ctx, rec.Name, checkStateFor(err), contract.Classify(err).Message, false)
+		w.service.recordNodeCheck(ctx, rec.Name, checkStateFor(err), contract.Classify(err).Message)
 		return w.settle(ctx, id, attempt, err)
 	}
 	host, err := w.verifyNode(ctx, tr, id, attempt, rec)
 	if err != nil {
 		state := checkStateFor(err)
-		w.service.recordNodeCheck(ctx, rec.Name, state, contract.Classify(err).Message, false)
+		w.service.recordNodeCheck(ctx, rec.Name, state, contract.Classify(err).Message)
 		return w.settle(ctx, id, attempt, err)
 	}
 	capabilities := host.probe.Capabilities
@@ -358,13 +390,9 @@ func (w *platformWorker) runEnrolledCheck(ctx context.Context, id contract.Opera
 }
 
 // recordNodeCheck stores the outcome and time of an observation.
-func (s *Service) recordNodeCheck(ctx context.Context, name, state, detail string, ready bool) {
-	status := "unreachable"
-	if ready {
-		status = "ready"
-	}
+func (s *Service) recordNodeCheck(ctx context.Context, name, state, detail string) {
 	_, _ = s.entities.Nodes().RecordCheckStatus(context.WithoutCancel(ctx),
-		name, status, state, truncateText(detail, 1024))
+		name, "unreachable", state, truncateText(detail, 1024))
 }
 
 // -------------------------------------------------------------- reconcile
@@ -373,7 +401,10 @@ func (s *Service) recordNodeCheck(ctx context.Context, name, state, detail strin
 // peers. Every step is an idempotent Check/Apply on the node; running it again
 // changes nothing when the node already matches.
 func (w *platformWorker) runNodeReconcile(ctx context.Context, id contract.OperationID, attempt uint32, normalized platform.Normalized) error {
-	input := normalized.Input.(*platform.NodeReconcileInput)
+	input, err := typedOperationInput[*platform.NodeReconcileInput](normalized.Input)
+	if err != nil {
+		return w.settle(ctx, id, attempt, err)
+	}
 	rec, err := loadNodeConn(ctx, w.service.entities.Nodes(), input.Node)
 	if err != nil {
 		return w.settle(ctx, id, attempt, err)
@@ -383,7 +414,7 @@ func (w *platformWorker) runNodeReconcile(ctx context.Context, id contract.Opera
 	}
 	var tr node.Transport
 	if input.Via == "direct" {
-		direct, closer, err := w.service.resolver.Direct(rec)
+		direct, closer, err := w.service.resolver.Direct(ctx, rec)
 		if err != nil {
 			return w.settle(ctx, id, attempt, err)
 		}
@@ -499,33 +530,16 @@ func (s *Service) acquireBuildSlot(ctx context.Context, nodeName string, onWait 
 	endWait := func() {}
 	defer func() { endWait() }()
 	deadline := time.Now().Add(buildSlotWait)
-	limit := 0
 	for {
 		probe, err := s.entities.Nodes().ProbeBuildSlots(ctx, nodeName, platform.MaxBuildConcurrency)
 		if err != nil {
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
-			}
-			if errors.Is(err, entities.ErrPlatformPointerIntegrity) {
-				return nil, contract.NewFault(contract.PreconditionFailed, "build node is no longer registered", "Register the node before building.")
-			}
-			if errors.Is(err, entities.ErrPlatformLeaseUncertain) {
-				return nil, contract.NewFault(contract.Unavailable, "build slot probe cleanup is uncertain", "Retry when the control database is available.")
-			}
-			return nil, unavailable(err)
+			return nil, buildSlotProbeError(ctx, err)
 		}
-		limit = probe.Limit
-		if limit < 1 || limit > platform.MaxBuildConcurrency {
-			return nil, contract.NewFault(contract.PreconditionFailed, "build node concurrency is invalid", "Correct the node's build concurrency before building.")
+		if err := validateBuildSlotProbe(probe); err != nil {
+			return nil, err
 		}
-		if probe.Lease != nil {
-			release := probe.Lease
-			var once sync.Once
-			return func() {
-				once.Do(func() {
-					_ = release.Release()
-				})
-			}, nil
+		if release := buildSlotRelease(probe); release != nil {
+			return release, nil
 		}
 		if !waited {
 			waited = true
@@ -535,8 +549,7 @@ func (s *Service) acquireBuildSlot(ctx context.Context, nodeName string, onWait 
 			}
 		}
 		if time.Now().After(deadline) {
-			return nil, placementViolation(ReasonBuildCapacity, nodeName, fmt.Sprintf("node %q has all %d build slots busy", nodeName, limit),
-				"Wait for running builds to finish, or raise the node's build concurrency.", map[string]any{"build_concurrency": limit})
+			return nil, buildSlotCapacityFault(nodeName, probe.Limit)
 		}
 		select {
 		case <-ctx.Done():
@@ -546,15 +559,47 @@ func (s *Service) acquireBuildSlot(ctx context.Context, nodeName string, onWait 
 	}
 }
 
+func buildSlotProbeError(ctx context.Context, err error) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if errors.Is(err, entities.ErrPlatformPointerIntegrity) {
+		return contract.NewFault(contract.PreconditionFailed, "build node is no longer registered", "Register the node before building.")
+	}
+	if errors.Is(err, entities.ErrPlatformLeaseUncertain) {
+		return contract.NewFault(contract.Unavailable, "build slot probe cleanup is uncertain", "Retry when the control database is available.")
+	}
+	return unavailable(err)
+}
+
+func validateBuildSlotProbe(probe entities.BuildSlotProbe) error {
+	if probe.Limit < 1 || probe.Limit > platform.MaxBuildConcurrency {
+		return contract.NewFault(contract.PreconditionFailed, "build node concurrency is invalid", "Correct the node's build concurrency before building.")
+	}
+	return nil
+}
+
+func buildSlotRelease(probe entities.BuildSlotProbe) func() {
+	if probe.Lease == nil {
+		return nil
+	}
+	release := probe.Lease
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			_ = release.Release()
+		})
+	}
+}
+
+func buildSlotCapacityFault(nodeName string, limit int) error {
+	return placementViolation(ReasonBuildCapacity, nodeName, fmt.Sprintf("node %q has all %d build slots busy", nodeName, limit),
+		"Wait for running builds to finish, or raise the node's build concurrency.", map[string]any{"build_concurrency": limit})
+}
+
 // buildSlotWait bounds how long a build waits for a free slot; buildSlotPoll is
 // how often it looks. Tests shorten them.
 var (
 	buildSlotWait = 10 * time.Minute
 	buildSlotPoll = time.Second
 )
-
-// advisoryKey derives a stable 64-bit advisory-lock key from text.
-func advisoryKey(text string) int64 {
-	sum := sha256.Sum256([]byte(text))
-	return int64(binary.BigEndian.Uint64(sum[:8]))
-}

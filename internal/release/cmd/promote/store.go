@@ -208,8 +208,8 @@ func (s *productionStore) publishCompatibility(ctx context.Context) error {
 	return nil
 }
 
-func gitAncestor(a, b string) (bool, error) {
-	err := exec.Command("git", "merge-base", "--is-ancestor", a, b).Run()
+func gitAncestor(ctx context.Context, a, b string) (bool, error) {
+	err := exec.CommandContext(ctx, "git", "merge-base", "--is-ancestor", a, b).Run()
 	if err == nil {
 		return true, nil
 	}
@@ -239,9 +239,12 @@ func gitVersionCommit(ctx context.Context, version string) (string, error) {
 		return "", err
 	}
 	commit := strings.TrimSpace(string(raw))
-	ok, err := gitAncestor(commit, "refs/remotes/origin/master")
-	if err != nil || !ok {
-		return "", fmt.Errorf("release commit is not provably on master: %v", err)
+	ok, err := gitAncestor(ctx, commit, "refs/remotes/origin/master")
+	if err != nil {
+		return "", fmt.Errorf("release commit is not provably on master: %w", err)
+	}
+	if !ok {
+		return "", fmt.Errorf("release commit is not provably on master")
 	}
 	return commit, nil
 }
@@ -272,8 +275,7 @@ func checkCertificateCommit(path, commit string) error {
 	}
 	seen := make(map[string]bool)
 	for _, e := range cert.Extensions {
-		if e.Id.Equal(fulcio.OIDSourceRepositoryDigest) || e.Id.Equal(fulcio.OIDGitHubWorkflowSHA) ||
-			e.Id.Equal(fulcio.OIDBuildTrigger) || e.Id.Equal(fulcio.OIDGitHubWorkflowTrigger) {
+		if isSourceClaimExtension(e.Id.String()) {
 			key := e.Id.String()
 			if seen[key] {
 				return fmt.Errorf("duplicate signer certificate extension %s", key)
@@ -290,9 +292,9 @@ func checkCertificateCommit(path, commit string) error {
 		value string
 	}{
 		{fulcio.OIDSourceRepositoryDigest.String(), ext.SourceRepositoryDigest},
-		{fulcio.OIDGitHubWorkflowSHA.String(), ext.GithubWorkflowSHA},
+		{legacyWorkflowSHAOID, ext.GithubWorkflowSHA},
 		{fulcio.OIDBuildTrigger.String(), ext.BuildTrigger},
-		{fulcio.OIDGitHubWorkflowTrigger.String(), ext.GithubWorkflowTrigger},
+		{legacyWorkflowTriggerOID, ext.GithubWorkflowTrigger},
 	} {
 		if seen[claim.oid] && claim.value == "" {
 			return fmt.Errorf("empty signer certificate extension %s", claim.oid)
@@ -303,9 +305,23 @@ func checkCertificateCommit(path, commit string) error {
 
 var fullGitSHA = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
+// Older Fulcio certificates carry these claims under the original GitHub
+// extension OIDs. Keep validating them as well as the current generic OIDs.
+const (
+	legacyWorkflowSHAOID     = "1.3.6.1.4.1.57264.1.3"
+	legacyWorkflowTriggerOID = "1.3.6.1.4.1.57264.1.2"
+)
+
+func isSourceClaimExtension(oid string) bool {
+	return oid == fulcio.OIDSourceRepositoryDigest.String() ||
+		oid == legacyWorkflowSHAOID ||
+		oid == fulcio.OIDBuildTrigger.String() ||
+		oid == legacyWorkflowTriggerOID
+}
+
 func validateCertificateClaims(ext fulcio.Extensions, commit string) error {
 	if !fullGitSHA.MatchString(commit) {
-		return fmt.Errorf("Git commit is not a full source SHA")
+		return fmt.Errorf("git commit is not a full source SHA")
 	}
 	found := false
 	for _, sha := range []string{ext.SourceRepositoryDigest, ext.GithubWorkflowSHA} {

@@ -44,43 +44,16 @@ type webhookUpdate struct {
 // It records that an effectful enable or rotation needs a secret but never
 // generates one; replay detection and gh preflight must resolve first.
 func (a *app) readWebhookUpdate(cmd *cobra.Command, appName, environment string, current platform.Environment, patch platform.EnvironmentUpdateInput) (webhookUpdate, error) {
-	update := webhookUpdate{GitHub: boolFlag(cmd, "github-webhook")}
-	autoSet := flagChanged(cmd, "auto-deploy")
-	rotate, _ := cmd.Flags().GetBool("rotate-webhook-secret")
-	if !autoSet && !rotate {
-		return update, nil
+	toggle, err := readWebhookToggle(cmd)
+	if err != nil || toggle.done {
+		return toggle.update, err
 	}
-	enabled := true
-	if autoSet {
-		enabled, _ = cmd.Flags().GetBool("auto-deploy")
-	}
-	if rotate && autoSet && !enabled {
-		return update, contract.NewFault(contract.Usage, "choose --auto-deploy or --rotate-webhook-secret, not both", "Rotation needs auto-deploy to stay on.")
-	}
-	if autoSet {
-		update.Enabled = &enabled
-	}
-	if autoSet && !enabled {
-		// Disabling clears the recorded name; the vault revision remains.
-		empty := ""
-		update.SecretName = empty
-		return update, nil
-	}
-
-	currentEnabled := current.Revision != nil && current.Revision.AutoDeploy
-	currentName := ""
-	source := platform.SourceBinding{}
-	if current.Revision != nil {
-		currentName = current.Revision.WebhookSecretName
-		source = current.Revision.Source
-	}
-	if patch.Source != nil {
-		source = *patch.Source
-	}
-	if rotate && (!currentEnabled || currentName == "") {
+	update := toggle.update
+	currentEnabled, currentName, source := webhookCurrentSource(current, patch)
+	if toggle.rotate && (!currentEnabled || currentName == "") {
 		return update, contract.NewFault(contract.PreconditionFailed, "push to deploy is not enabled, so there is no secret to rotate", "Enable it with eregion env update "+appName+" "+environment+" --auto-deploy.")
 	}
-	needsSecret := rotate || (autoSet && enabled && (!currentEnabled || currentName == ""))
+	needsSecret := toggle.rotate || (toggle.autoSet && toggle.enabled && (!currentEnabled || currentName == ""))
 	if source.URL == "" {
 		return update, contract.NewFault(contract.PreconditionFailed, "push to deploy needs a git source", "Set a git source with --git-url and a branch ref first.")
 	}
@@ -102,11 +75,61 @@ func (a *app) readWebhookUpdate(cmd *cobra.Command, appName, environment string,
 		update.SecretName = platform.DefaultWebhookSecretName
 	}
 	update.Branch, update.Repository = branch, repository
-	update.Rotated = rotate
+	update.Rotated = toggle.rotate
 	update.NeedsSecret = needsSecret
 	// A dry run describes the effect but must not generate, preflight or store
 	// a secret; prepare handles that after authoritative replay resolution.
 	return update, nil
+}
+
+type webhookToggle struct {
+	update  webhookUpdate
+	autoSet bool
+	rotate  bool
+	enabled bool
+	done    bool
+}
+
+func readWebhookToggle(cmd *cobra.Command) (webhookToggle, error) {
+	toggle := webhookToggle{
+		update:  webhookUpdate{GitHub: boolFlag(cmd, "github-webhook")},
+		autoSet: flagChanged(cmd, "auto-deploy"),
+		enabled: true,
+	}
+	toggle.rotate, _ = cmd.Flags().GetBool("rotate-webhook-secret")
+	if !toggle.autoSet && !toggle.rotate {
+		toggle.done = true
+		return toggle, nil
+	}
+	if toggle.autoSet {
+		toggle.enabled, _ = cmd.Flags().GetBool("auto-deploy")
+	}
+	if toggle.rotate && toggle.autoSet && !toggle.enabled {
+		return toggle, contract.NewFault(contract.Usage, "choose --auto-deploy or --rotate-webhook-secret, not both", "Rotation needs auto-deploy to stay on.")
+	}
+	if toggle.autoSet {
+		toggle.update.Enabled = &toggle.enabled
+	}
+	if toggle.autoSet && !toggle.enabled {
+		// Disabling clears the recorded name; the vault revision remains.
+		toggle.update.SecretName = ""
+		toggle.done = true
+	}
+	return toggle, nil
+}
+
+func webhookCurrentSource(current platform.Environment, patch platform.EnvironmentUpdateInput) (bool, string, platform.SourceBinding) {
+	currentEnabled := current.Revision != nil && current.Revision.AutoDeploy
+	currentName := ""
+	source := platform.SourceBinding{}
+	if current.Revision != nil {
+		currentName = current.Revision.WebhookSecretName
+		source = current.Revision.Source
+	}
+	if patch.Source != nil {
+		source = *patch.Source
+	}
+	return currentEnabled, currentName, source
 }
 
 // generateWebhookSecret is a test seam for proving that replay and dry-run

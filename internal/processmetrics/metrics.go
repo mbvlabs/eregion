@@ -99,7 +99,7 @@ func BeginBuildCapacityWait(ctx context.Context) func() {
 
 // Start binds only loopback and never prevents the service from running.
 func (m *Metrics) Start(address string, logger *slog.Logger) func() {
-	listener, err := net.Listen("tcp", address)
+	listener, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", address)
 	if err != nil {
 		logger.Warn("metrics listener unavailable", "address", address, "error", err)
 		return func() {}

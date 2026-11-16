@@ -353,6 +353,8 @@ func (s *scriptedDeployTransport) Call(
 			Status: engine.StatusCompleted, ExecutionID: request.Execution.ExecutionID(),
 			InputsHash: hash, Executed: true, Result: scriptedResult(request),
 		}, nil
+	case node.MethodObserve, node.MethodInventory:
+		return node.Response{}, fmt.Errorf("unexpected method %q", request.Method)
 	default:
 		return node.Response{}, fmt.Errorf("unexpected method %q", request.Method)
 	}
@@ -368,16 +370,6 @@ func (s *scriptedDeployTransport) payload(op contract.OperationID, step string) 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append(json.RawMessage(nil), s.payloads[string(op)+"|"+step]...)
-}
-
-func latestRelease(t *testing.T, pool *pgxpool.Pool) string {
-	t.Helper()
-	var id string
-	if err := pool.QueryRow(context.Background(), `SELECT id FROM eregion_platform_releases ORDER BY created_at DESC LIMIT 1`).
-		Scan(&id); err != nil {
-		t.Fatal(err)
-	}
-	return id
 }
 
 func servingRelease(t *testing.T, pool *pgxpool.Pool) string {

@@ -91,30 +91,7 @@ func indexRegistryArtifacts(registry RegistryInventory) registryInventoryIndex {
 		digests:   map[string]bool{},
 	}
 	raw := append([]RegistryArtifact(nil), registry.Artifacts...)
-	sort.SliceStable(raw, func(i, j int) bool {
-		if left, right := strings.TrimSpace(
-			raw[i].Repository,
-		), strings.TrimSpace(
-			raw[j].Repository,
-		); left != right {
-			return left < right
-		}
-		if left, right := normalizeDigest(
-			raw[i].Digest,
-		), normalizeDigest(
-			raw[j].Digest,
-		); left != right {
-			return left < right
-		}
-		if left, right := normalizeDigest(
-			raw[i].ConfigDigest,
-		), normalizeDigest(
-			raw[j].ConfigDigest,
-		); left != right {
-			return left < right
-		}
-		return strings.Join(raw[i].Tags, ",") < strings.Join(raw[j].Tags, ",")
-	})
+	sort.SliceStable(raw, func(i, j int) bool { return registryArtifactLess(raw[i], raw[j]) })
 
 	position := map[artifactIdentity]int{}
 	for _, candidate := range raw {
@@ -123,35 +100,13 @@ func indexRegistryArtifacts(registry RegistryInventory) registryInventoryIndex {
 			continue
 		}
 		if existing, exists := position[key]; exists {
-			entry := &index.entries[existing]
-			if entry.artifact.Repository == "" {
-				entry.artifact.Repository = artifact.Repository
-			}
-			if entry.artifact.ConfigDigest == "" {
-				entry.artifact.ConfigDigest = artifact.ConfigDigest
-			}
-			entry.artifact.Tags = mergeTags(entry.artifact.Tags, artifact.Tags)
-			if entry.artifact.Bytes == 0 {
-				entry.artifact.Bytes = artifact.Bytes
-			}
-			if !artifact.CreatedAt.IsZero() &&
-				(entry.artifact.CreatedAt.IsZero() || artifact.CreatedAt.Before(entry.artifact.CreatedAt)) {
-				entry.artifact.CreatedAt = artifact.CreatedAt
-			}
+			mergeRegistryArtifact(&index.entries[existing], artifact)
 			continue
 		}
 		position[key] = len(index.entries)
 		index.entries = append(index.entries, registryArtifactEntry{artifact: artifact, key: key})
 	}
-	sort.SliceStable(index.entries, func(i, j int) bool {
-		if index.entries[i].key.repository != index.entries[j].key.repository {
-			return index.entries[i].key.repository < index.entries[j].key.repository
-		}
-		if index.entries[i].key.digest != index.entries[j].key.digest {
-			return index.entries[i].key.digest < index.entries[j].key.digest
-		}
-		return index.entries[i].artifact.Repository < index.entries[j].artifact.Repository
-	})
+	sort.SliceStable(index.entries, func(i, j int) bool { return registryEntryLess(index.entries[i], index.entries[j]) })
 
 	for _, entry := range index.entries {
 		index.manifests[entry.key] = true
@@ -164,6 +119,46 @@ func indexRegistryArtifacts(registry RegistryInventory) registryInventoryIndex {
 		}
 	}
 	return index
+}
+
+func registryArtifactLess(left, right RegistryArtifact) bool {
+	if l, r := strings.TrimSpace(left.Repository), strings.TrimSpace(right.Repository); l != r {
+		return l < r
+	}
+	if l, r := normalizeDigest(left.Digest), normalizeDigest(right.Digest); l != r {
+		return l < r
+	}
+	if l, r := normalizeDigest(left.ConfigDigest), normalizeDigest(right.ConfigDigest); l != r {
+		return l < r
+	}
+	return strings.Join(left.Tags, ",") < strings.Join(right.Tags, ",")
+}
+
+func mergeRegistryArtifact(entry *registryArtifactEntry, artifact RegistryArtifact) {
+	if entry.artifact.Repository == "" {
+		entry.artifact.Repository = artifact.Repository
+	}
+	if entry.artifact.ConfigDigest == "" {
+		entry.artifact.ConfigDigest = artifact.ConfigDigest
+	}
+	entry.artifact.Tags = mergeTags(entry.artifact.Tags, artifact.Tags)
+	if entry.artifact.Bytes == 0 {
+		entry.artifact.Bytes = artifact.Bytes
+	}
+	if !artifact.CreatedAt.IsZero() &&
+		(entry.artifact.CreatedAt.IsZero() || artifact.CreatedAt.Before(entry.artifact.CreatedAt)) {
+		entry.artifact.CreatedAt = artifact.CreatedAt
+	}
+}
+
+func registryEntryLess(left, right registryArtifactEntry) bool {
+	if left.key.repository != right.key.repository {
+		return left.key.repository < right.key.repository
+	}
+	if left.key.digest != right.key.digest {
+		return left.key.digest < right.key.digest
+	}
+	return left.artifact.Repository < right.artifact.Repository
 }
 
 func normalizeRegistryArtifact(
@@ -329,7 +324,7 @@ func (p *registryProtection) addRelease(release Release, localImages localImageI
 	for _, local := range localImages.references(release.ImageID) {
 		p.digests[local.digest] = true
 		if local.repository != "" {
-			p.manifests[artifactIdentity{repository: local.repository, digest: local.digest}] = true
+			p.manifests[artifactIdentity(local)] = true
 		}
 	}
 	if config := normalizeDigest(release.ImageID); validDigest(config) {
@@ -432,7 +427,7 @@ func (i *artifactMetadataIndex) recordRelease(
 		if local.repository != "" {
 			mergeArtifactMetadata(
 				i.manifests,
-				artifactIdentity{repository: local.repository, digest: local.digest},
+				artifactIdentity(local),
 				metadata,
 			)
 		}
@@ -637,40 +632,48 @@ func registrySkipReasons(
 		if releaseNeverProducedImage(release) {
 			continue
 		}
-		repository := releaseRepository(release)
-		if repository == "" {
-			if releaseHasImmutableIdentity(release, repository, index, localImages) {
-				continue
-			}
-			reason := fmt.Sprintf(
-				"release %s has no immutable image digest or config digest that resolves to a registry inventory artifact",
-				release.ID,
-			)
-			if image := strings.TrimSpace(release.Image); image != "" {
-				reason = fmt.Sprintf("%s (image %q)", reason, image)
-			}
+		repository, reason, skipAllRelease, skip := registryReleaseSkip(release, index, localImages)
+		if !skip {
+			continue
+		}
+		if skipAllRelease {
 			skipEverything(reason)
-			continue
+		} else {
+			skipRepository(repository, reason)
 		}
-		if !index.hasRepository(repository) {
-			continue
-		}
-		if releaseHasImmutableIdentity(release, repository, index, localImages) {
-			continue
-		}
-		reason := fmt.Sprintf(
-			"release %s has no immutable image digest or config digest that resolves to a registry inventory artifact",
-			release.ID,
-		)
-		if image := strings.TrimSpace(release.Image); image != "" {
-			reason = fmt.Sprintf("%s (image %q)", reason, image)
-		}
-		skipRepository(repository, reason)
 	}
 	if skipAll {
 		return map[string]string{"*": allReason}, true
 	}
 	return reasons, false
+}
+
+func registryReleaseSkip(release Release, index registryInventoryIndex, localImages localImageIndex) (string, string, bool, bool) {
+	repository := releaseRepository(release)
+	if repository == "" {
+		if releaseHasImmutableIdentity(release, repository, index, localImages) {
+			return "", "", false, false
+		}
+		return "", unresolvedReleaseReason(release), true, true
+	}
+	if !index.hasRepository(repository) {
+		return repository, "", false, false
+	}
+	if releaseHasImmutableIdentity(release, repository, index, localImages) {
+		return repository, "", false, false
+	}
+	return repository, unresolvedReleaseReason(release), false, true
+}
+
+func unresolvedReleaseReason(release Release) string {
+	reason := fmt.Sprintf(
+		"release %s has no immutable image digest or config digest that resolves to a registry inventory artifact",
+		release.ID,
+	)
+	if image := strings.TrimSpace(release.Image); image != "" {
+		reason = fmt.Sprintf("%s (image %q)", reason, image)
+	}
+	return reason
 }
 
 func planRegistryArtifacts(

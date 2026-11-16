@@ -70,7 +70,8 @@ type Command struct {
 type registry map[*cobra.Command]CommandMeta
 
 func walk(root *cobra.Command) []*cobra.Command {
-	out := []*cobra.Command{root}
+	out := make([]*cobra.Command, 1, 1+len(root.Commands()))
+	out[0] = root
 	for _, child := range root.Commands() {
 		out = append(out, walk(child)...)
 	}
@@ -81,124 +82,161 @@ func (r registry) validate(root *cobra.Command) error {
 	var failures []string
 	for _, cmd := range walk(root) {
 		meta, ok := r[cmd]
-		add := func(message string) { failures = append(failures, cmd.CommandPath()+": "+message) }
 		if !ok {
-			add("missing metadata")
+			failures = append(failures, cmd.CommandPath()+": missing metadata")
 			continue
 		}
-		if cmd.RunE == nil {
-			add("missing implemented handler")
-		}
-		if strings.TrimSpace(meta.Summary) == "" || meta.Summary != cmd.Short {
-			add("summary must match command help")
-		}
-		if !nonempty(meta.WhenToUse) || !nonempty(meta.Examples) {
-			add("when_to_use and examples are required")
-		}
-		if !nonempty(meta.Audience) || !allIn(meta.Audience, []string{"agent", "human", "node"}) {
-			add("audience must contain agent, human, or node")
-		}
-		if !nonempty(meta.Platforms) || !allIn(meta.Platforms, []string{"linux", "darwin"}) {
-			add("platforms must list linux or darwin")
-		}
-		if slices.Contains(meta.Audience, "node") && (len(meta.Platforms) != 1 || meta.Platforms[0] != "linux") {
-			add("node commands require Linux-only platforms")
-		}
-		nodePath := root.Name() + " node"
-		if slices.Contains(meta.Audience, "node") && cmd.CommandPath() != nodePath && !strings.HasPrefix(cmd.CommandPath(), nodePath+" ") {
-			add("node audience is only valid under " + nodePath)
-		}
-		if (cmd.CommandPath() == nodePath || strings.HasPrefix(cmd.CommandPath(), nodePath+" ")) && !slices.Contains(meta.Audience, "node") {
-			add("commands under " + nodePath + " require node audience")
-		}
-		if !slices.Contains([]string{"never", "possible", "required"}, meta.NeedsRestart) {
-			add("needs_restart must be never, possible, or required")
-		}
-		if !slices.Contains([]string{"result", "events"}, meta.Output) {
-			add("output must be result or events")
-		}
-		if !nonempty(meta.OutputModes) || !allIn(meta.OutputModes, []string{"plain", "json", "ndjson"}) || !slices.Contains(meta.OutputModes, "plain") {
-			add("output_modes must list plain, and only additionally json or ndjson")
-		}
-		if meta.TerminalOnly {
-			if slices.Contains(meta.OutputModes, "json") || slices.Contains(meta.OutputModes, "ndjson") {
-				add("terminal-only commands must not advertise machine output")
-			}
-			if len(meta.Audience) != 1 || meta.Audience[0] != "human" {
-				add("terminal-only commands require human-only audience")
-			}
-		} else if !slices.Contains(meta.OutputModes, "json") {
-			add("non-terminal commands must list plain and json output")
-		}
-		if meta.DurableSubmission && !meta.Mutating {
-			add("durable submissions must be mutating")
-		}
-		if meta.HumanFactor && !meta.Mutating {
-			add("human-factor commands must be mutating")
-		}
-		if len(meta.ErrorCodes) == 0 {
-			add("error_codes are required")
-		}
-		for _, code := range meta.ErrorCodes {
-			if !contract.KnownCode(code) {
-				add("unknown error code " + string(code))
-			}
-		}
-		mutating := meta.Mutating || len(meta.MutatingFlags) > 0
-		if mutating && !meta.DryRun && strings.TrimSpace(meta.DryRunReason) == "" {
-			add("mutations require dry-run or an explicit reason")
-		}
-		if meta.DryRun && (meta.DryRunReason != "" || flagFor(cmd, "dry-run") == nil) {
-			add("dry-run requires a flag and no exemption")
-		}
-		if flag := flagFor(cmd, "dry-run"); meta.DryRun && flag != nil && flag.Value.Type() != "bool" {
-			add("--dry-run must be boolean")
-		}
-		if meta.Destructive && !meta.Mutating {
-			add("destructive commands must be mutating")
-		}
-		if meta.Destructive && len(meta.DestructiveFlags) > 0 {
-			add("use destructive or destructive_flags, not both")
-		}
-		if (meta.Destructive || len(meta.DestructiveFlags) > 0) && meta.Confirmation == "" {
-			add("destructive actions require confirmation")
-		}
-		if meta.Confirmation != "" && (meta.Confirmation != "plan-bound" && meta.Confirmation != "target" || flagFor(cmd, "confirm") == nil) {
-			add("confirmation must be plan-bound or target and expose --confirm")
-		}
-		if flag := flagFor(cmd, "confirm"); meta.Confirmation != "" && flag != nil && flag.Value.Type() != "string" {
-			add("--confirm must accept a token string")
-		}
-		if meta.Prompts && len(meta.InputFlags) == 0 {
-			add("prompts require noninteractive input flags")
-		}
-		for _, name := range append(append(slices.Clone(meta.MutatingFlags), meta.DestructiveFlags...), meta.InputFlags...) {
-			if flagFor(cmd, name) == nil {
-				add("undefined metadata flag --" + name)
-			}
-		}
-		for _, name := range meta.DestructiveFlags {
-			if !meta.Mutating && !slices.Contains(meta.MutatingFlags, name) {
-				add("destructive flag must also be mutating: --" + name)
-			}
-		}
-		for _, next := range meta.Next {
-			parts := strings.Fields(next)
-			if len(parts) < 2 || parts[0] != root.Name() {
-				add("next must reference an implemented command")
-				continue
-			}
-			target, remaining, err := root.Find(parts[1:])
-			if err != nil || (target == root && len(remaining) > 0 && !strings.HasPrefix(remaining[0], "-")) {
-				add("next must reference an implemented command: " + next)
-			}
-		}
+		failures = append(failures, validateCommand(root, cmd, meta)...)
 	}
 	if len(failures) > 0 {
 		sort.Strings(failures)
 		return &contract.Fault{Code: contract.Internal, Message: "command metadata validation failed", Hint: "Fix the command registry before publishing this binary.", Details: map[string]any{"violations": failures}}
 	}
 	return nil
+}
+
+func validateCommand(root, cmd *cobra.Command, meta CommandMeta) []string {
+	var failures []string
+	add := func(message string) { failures = append(failures, cmd.CommandPath()+": "+message) }
+	if cmd.RunE == nil {
+		add("missing implemented handler")
+	}
+	validateCommandShape(root, cmd, meta, add)
+	validateCommandOutput(meta, add)
+	validateCommandSafety(cmd, meta, add)
+	validateCommandFlags(cmd, meta, add)
+	validateCommandNext(root, meta, add)
+	return failures
+}
+
+func validateCommandShape(root, cmd *cobra.Command, meta CommandMeta, add func(string)) {
+	if strings.TrimSpace(meta.Summary) == "" || meta.Summary != cmd.Short {
+		add("summary must match command help")
+	}
+	if !nonempty(meta.WhenToUse) || !nonempty(meta.Examples) {
+		add("when_to_use and examples are required")
+	}
+	if !nonempty(meta.Audience) || !allIn(meta.Audience, []string{"agent", "human", "node"}) {
+		add("audience must contain agent, human, or node")
+	}
+	if !nonempty(meta.Platforms) || !allIn(meta.Platforms, []string{"linux", "darwin"}) {
+		add("platforms must list linux or darwin")
+	}
+	nodeAudience := slices.Contains(meta.Audience, "node")
+	if nodeAudience && (len(meta.Platforms) != 1 || meta.Platforms[0] != "linux") {
+		add("node commands require Linux-only platforms")
+	}
+	nodePath := root.Name() + " node"
+	if nodeAudience && cmd.CommandPath() != nodePath && !strings.HasPrefix(cmd.CommandPath(), nodePath+" ") {
+		add("node audience is only valid under " + nodePath)
+	}
+	if (cmd.CommandPath() == nodePath || strings.HasPrefix(cmd.CommandPath(), nodePath+" ")) && !nodeAudience {
+		add("commands under " + nodePath + " require node audience")
+	}
+}
+
+func validateCommandOutput(meta CommandMeta, add func(string)) {
+	if !slices.Contains([]string{"never", "possible", "required"}, meta.NeedsRestart) {
+		add("needs_restart must be never, possible, or required")
+	}
+	if !slices.Contains([]string{"result", "events"}, meta.Output) {
+		add("output must be result or events")
+	}
+	if !nonempty(meta.OutputModes) || !allIn(meta.OutputModes, []string{"plain", "json", "ndjson"}) || !slices.Contains(meta.OutputModes, "plain") {
+		add("output_modes must list plain, and only additionally json or ndjson")
+	}
+	if meta.TerminalOnly {
+		if slices.Contains(meta.OutputModes, "json") || slices.Contains(meta.OutputModes, "ndjson") {
+			add("terminal-only commands must not advertise machine output")
+		}
+		if len(meta.Audience) != 1 || meta.Audience[0] != "human" {
+			add("terminal-only commands require human-only audience")
+		}
+		return
+	}
+	if !slices.Contains(meta.OutputModes, "json") {
+		add("non-terminal commands must list plain and json output")
+	}
+}
+
+func validateCommandSafety(cmd *cobra.Command, meta CommandMeta, add func(string)) {
+	validateCommandMutation(cmd, meta, add)
+	validateCommandConfirmation(cmd, meta, add)
+}
+
+func validateCommandMutation(cmd *cobra.Command, meta CommandMeta, add func(string)) {
+	if meta.DurableSubmission && !meta.Mutating {
+		add("durable submissions must be mutating")
+	}
+	if meta.HumanFactor && !meta.Mutating {
+		add("human-factor commands must be mutating")
+	}
+	mutating := meta.Mutating || len(meta.MutatingFlags) > 0
+	if mutating && !meta.DryRun && strings.TrimSpace(meta.DryRunReason) == "" {
+		add("mutations require dry-run or an explicit reason")
+	}
+	if meta.DryRun && (meta.DryRunReason != "" || flagFor(cmd, "dry-run") == nil) {
+		add("dry-run requires a flag and no exemption")
+	}
+	if flag := flagFor(cmd, "dry-run"); meta.DryRun && flag != nil && flag.Value.Type() != "bool" {
+		add("--dry-run must be boolean")
+	}
+}
+
+func validateCommandConfirmation(cmd *cobra.Command, meta CommandMeta, add func(string)) {
+	if meta.Destructive && !meta.Mutating {
+		add("destructive commands must be mutating")
+	}
+	if meta.Destructive && len(meta.DestructiveFlags) > 0 {
+		add("use destructive or destructive_flags, not both")
+	}
+	if (meta.Destructive || len(meta.DestructiveFlags) > 0) && meta.Confirmation == "" {
+		add("destructive actions require confirmation")
+	}
+	if meta.Confirmation != "" && (meta.Confirmation != "plan-bound" && meta.Confirmation != "target" || flagFor(cmd, "confirm") == nil) {
+		add("confirmation must be plan-bound or target and expose --confirm")
+	}
+	if flag := flagFor(cmd, "confirm"); meta.Confirmation != "" && flag != nil && flag.Value.Type() != "string" {
+		add("--confirm must accept a token string")
+	}
+	if meta.Prompts && len(meta.InputFlags) == 0 {
+		add("prompts require noninteractive input flags")
+	}
+}
+
+func validateCommandFlags(cmd *cobra.Command, meta CommandMeta, add func(string)) {
+	if len(meta.ErrorCodes) == 0 {
+		add("error_codes are required")
+	}
+	for _, code := range meta.ErrorCodes {
+		if !contract.KnownCode(code) {
+			add("unknown error code " + string(code))
+		}
+	}
+	for _, name := range append(append(slices.Clone(meta.MutatingFlags), meta.DestructiveFlags...), meta.InputFlags...) {
+		if flagFor(cmd, name) == nil {
+			add("undefined metadata flag --" + name)
+		}
+	}
+	for _, name := range meta.DestructiveFlags {
+		if !meta.Mutating && !slices.Contains(meta.MutatingFlags, name) {
+			add("destructive flag must also be mutating: --" + name)
+		}
+	}
+}
+
+func validateCommandNext(root *cobra.Command, meta CommandMeta, add func(string)) {
+	for _, next := range meta.Next {
+		parts := strings.Fields(next)
+		if len(parts) < 2 || parts[0] != root.Name() {
+			add("next must reference an implemented command")
+			continue
+		}
+		target, remaining, err := root.Find(parts[1:])
+		if err != nil || (target == root && len(remaining) > 0 && !strings.HasPrefix(remaining[0], "-")) {
+			add("next must reference an implemented command: " + next)
+		}
+	}
 }
 
 func (r registry) catalog(root *cobra.Command) []Command {
@@ -276,37 +314,61 @@ func allIn(items, allowed []string) bool {
 func plainHelp(command Command, children []Command) string {
 	var out strings.Builder
 	fmt.Fprintf(&out, "%s\n\n%s\n\n", command.Path, command.Summary)
-	if len(command.WhenToUse) > 0 {
-		out.WriteString("When to use:\n")
-		for _, when := range command.WhenToUse {
-			fmt.Fprintf(&out, "  %s\n", when)
-		}
-		out.WriteString("\n")
+	writeHelpWhenToUse(&out, command)
+	writeHelpUsage(&out, command, children)
+	writeHelpAudience(&out, command)
+	writeHelpSafety(&out, command)
+	writeHelpResults(&out, command)
+	out.WriteString("\nFlags:\n")
+	writePlainFlags(&out, command.Flags)
+	writeHelpExamples(&out, command)
+	writeHelpNext(&out, command)
+	return out.String()
+}
+
+func writeHelpWhenToUse(out *strings.Builder, command Command) {
+	if len(command.WhenToUse) == 0 {
+		return
 	}
-	fmt.Fprintf(&out, "Usage: %s\n", command.Use)
-	if len(children) > 0 {
-		fmt.Fprintf(&out, "       %s [command]\n", command.Path)
-		out.WriteString("\nAvailable commands:\n")
-		for _, child := range children {
-			fmt.Fprintf(&out, "  %-16s %s\n", strings.TrimPrefix(child.Path, command.Path+" "), child.Summary)
-		}
-		out.WriteString("\n")
-	} else {
-		out.WriteString("\n")
+	out.WriteString("When to use:\n")
+	for _, when := range command.WhenToUse {
+		fmt.Fprintf(out, "  %s\n", when)
 	}
-	fmt.Fprintf(&out, "Audience: %s\n", strings.Join(command.Audience, ", "))
+	out.WriteString("\n")
+}
+
+func writeHelpUsage(out *strings.Builder, command Command, children []Command) {
+	fmt.Fprintf(out, "Usage: %s\n", command.Use)
+	if len(children) == 0 {
+		out.WriteString("\n")
+		return
+	}
+	fmt.Fprintf(out, "       %s [command]\n", command.Path)
+	out.WriteString("\nAvailable commands:\n")
+	for _, child := range children {
+		fmt.Fprintf(out, "  %-16s %s\n", strings.TrimPrefix(child.Path, command.Path+" "), child.Summary)
+	}
+	out.WriteString("\n")
+}
+
+func writeHelpAudience(out *strings.Builder, command Command) {
+	fmt.Fprintf(out, "Audience: %s\n", strings.Join(command.Audience, ", "))
 	if command.TerminalOnly {
 		out.WriteString("Machine output: not supported (requires an interactive terminal)\n")
 	} else {
-		fmt.Fprintf(&out, "Machine output: %s\n", strings.Join(command.OutputModes, ", "))
+		fmt.Fprintf(out, "Machine output: %s\n", strings.Join(command.OutputModes, ", "))
 	}
-	if command.HumanFactor {
-		out.WriteString("Human factor: effectful execution may require a code from the authenticator app at a terminal")
-		if command.DryRun {
-			out.WriteString("; --dry-run remains machine-safe")
-		}
-		out.WriteString(".\n")
+	if !command.HumanFactor {
+		return
 	}
+	out.WriteString("Human factor: effectful execution may require a code from the authenticator app at a terminal")
+	if command.DryRun {
+		out.WriteString("; --dry-run remains machine-safe")
+	}
+	out.WriteString(".\n")
+}
+
+func writeHelpSafety(out *strings.Builder, command Command) {
 	var safety []string
 	if command.Mutating {
 		safety = append(safety, "mutating")
@@ -331,27 +393,34 @@ func plainHelp(command Command, children []Command) string {
 		safety = append(safety, "noninteractive inputs "+strings.Join(names, ", "))
 	}
 	if len(safety) > 0 {
-		fmt.Fprintf(&out, "Safety: %s\n", strings.Join(safety, "; "))
+		fmt.Fprintf(out, "Safety: %s\n", strings.Join(safety, "; "))
 	}
+}
+
+func writeHelpResults(out *strings.Builder, command Command) {
 	if command.DurableSubmission {
 		out.WriteString("Result: accepted work is a durable operation; follow it to observe completion.\n")
 	}
 	if command.Output == "events" {
 		out.WriteString("Result: an event stream over durable operation state; this command does not submit work.\n")
 	}
-	out.WriteString("\nFlags:\n")
-	writePlainFlags(&out, command.Flags)
+}
+
+func writeHelpExamples(out *strings.Builder, command Command) {
 	out.WriteString("\nExamples:\n")
 	for _, example := range command.Examples {
-		fmt.Fprintf(&out, "  %s\n", example)
+		fmt.Fprintf(out, "  %s\n", example)
 	}
-	if len(command.Next) > 0 {
-		out.WriteString("\nNext:\n")
-		for _, next := range command.Next {
-			fmt.Fprintf(&out, "  %s\n", next)
-		}
+}
+
+func writeHelpNext(out *strings.Builder, command Command) {
+	if len(command.Next) == 0 {
+		return
 	}
-	return out.String()
+	out.WriteString("\nNext:\n")
+	for _, next := range command.Next {
+		fmt.Fprintf(out, "  %s\n", next)
+	}
 }
 
 func writePlainFlags(out *strings.Builder, flags []Flag) {

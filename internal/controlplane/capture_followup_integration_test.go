@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/mbvlabs/eregion/internal/vault"
@@ -27,6 +29,15 @@ func TestIntegrationCandidateCapturePinnedRotationAndClaims(t *testing.T) {
 	})
 }
 
+type candidateFollowupFixture struct {
+	service *Service
+	pool    *pgxpool.Pool
+	ctx     context.Context
+	op      contract.Operation
+	env     platform.Environment
+	dep     platform.Deployment
+}
+
 func checkCandidateCapture(
 	t *testing.T,
 	old string,
@@ -34,6 +45,22 @@ func checkCandidateCapture(
 	missingPin bool,
 	neverStarted bool,
 ) {
+	t.Helper()
+	f := newCandidateFollowupFixture(t, old, missingPin)
+	result := candidateCaptureResult(t, f, old, neverStarted)
+	transport := &candidateCaptureTransport{
+		call: func(context.Context, platform.CandidateDiagnosticPayload) (platform.CandidateDiagnosticResult, error) {
+			return result, nil
+		},
+	}
+	f.service.resolver = newTestNodeResolver(t, f.pool, map[string]node.Transport{"local": transport})
+	f.service.captureCandidateDiagnostics(f.ctx, f.env, f.dep, 1)
+	f.service.captureCandidateDiagnostics(f.ctx, f.env, f.dep, 1)
+	assertCandidateCaptureClaims(t, f, old, wantLogs, neverStarted)
+	assertDistinctCandidateCaptureClaim(t, f)
+}
+
+func newCandidateFollowupFixture(t *testing.T, old string, missingPin bool) candidateFollowupFixture {
 	t.Helper()
 	s, pool := gitDeployFixture(t)
 	ctx := context.Background()
@@ -79,8 +106,17 @@ func checkCandidateCapture(
 		t.Fatal(err)
 	}
 	insertDeploymentOwner(t, pool, env, deploymentOwner{EnvironmentID: env.ID, OperationID: op.ID, DeploymentID: dep.ID, Attempt: 1, Phase: deploymentOwnerPrepared})
+	return candidateFollowupFixture{service: s, pool: pool, ctx: ctx, op: op, env: env, dep: dep}
+}
 
-	plan, err := platform.PlanDeployment(env.App, env.Name, env.Revision.RevisionState, dep.ReleaseID, dep.ID)
+func candidateCaptureResult(
+	t *testing.T,
+	f candidateFollowupFixture,
+	old string,
+	neverStarted bool,
+) platform.CandidateDiagnosticResult {
+	t.Helper()
+	plan, err := platform.PlanDeployment(f.env.App, f.env.Name, f.env.Revision.RevisionState, f.dep.ReleaseID, f.dep.ID)
 	if err != nil || len(plan) != 1 {
 		t.Fatalf("plan: %+v %v", plan, err)
 	}
@@ -94,7 +130,7 @@ func checkCandidateCapture(
 		observation.FinishedAt = time.Time{}
 		observation.ExitCode = nil
 	}
-	result := platform.CandidateDiagnosticResult{
+	return platform.CandidateDiagnosticResult{
 		Observations: []platform.CandidateObservation{observation},
 		Lines: []platform.CandidateDiagnosticLine{
 			candidateLine(containers[0], 0, observedAt, "before"),
@@ -103,17 +139,13 @@ func checkCandidateCapture(
 		},
 		LogTimestampSource: "observation_time",
 	}
-	transport := &candidateCaptureTransport{
-		call: func(context.Context, platform.CandidateDiagnosticPayload) (platform.CandidateDiagnosticResult, error) {
-			return result, nil
-		},
-	}
-	s.resolver = newTestNodeResolver(t, pool, map[string]node.Transport{"local": transport})
-	s.captureCandidateDiagnostics(ctx, env, dep, 1)
-	s.captureCandidateDiagnostics(ctx, env, dep, 1)
+}
+
+func assertCandidateCaptureClaims(t *testing.T, f candidateFollowupFixture, old string, wantLogs, neverStarted bool) {
+	t.Helper()
 	var claims, observations int
 	var events string
-	if err := pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE event->'candidate_diagnostic'->>'status'='unconfirmed'), count(*) FILTER (WHERE event->'candidate_diagnostic'->>'status'='observed'), string_agg(event::text, E'\n') FROM eregion_operation_events WHERE operation_id=$1 AND event->>'stage'=$2`, op.ID, platform.CandidateDiagnosticStage).Scan(&claims, &observations, &events); err != nil {
+	if err := f.pool.QueryRow(f.ctx, `SELECT count(*) FILTER (WHERE event->'candidate_diagnostic'->>'status'='unconfirmed'), count(*) FILTER (WHERE event->'candidate_diagnostic'->>'status'='observed'), string_agg(event::text, E'\n') FROM eregion_operation_events WHERE operation_id=$1 AND event->>'stage'=$2`, f.op.ID, platform.CandidateDiagnosticStage).Scan(&claims, &observations, &events); err != nil {
 		t.Fatal(err)
 	}
 	if claims != 1 || observations != 1 || strings.Contains(events, old) ||
@@ -123,15 +155,20 @@ func checkCandidateCapture(
 		(!wantLogs && !strings.Contains(events, `"status": "partial"`)) {
 		t.Fatalf("claims=%d observations=%d events=%s", claims, observations, events)
 	}
+}
+
+func assertDistinctCandidateCaptureClaim(t *testing.T, f candidateFollowupFixture) {
+	t.Helper()
 	// A newly recorded container execution in the same attempt produces a
 	// distinct capture claim, rather than suppressing the later observation.
 	step := "platform-container-evidence-v1"
-	execution := string(op.ID) + ":1:" + step
-	if _, err := pool.Exec(ctx, `INSERT INTO eregion_operation_steps(operation_id,step,inputs_hash,state,attempt,execution_id,started_at,error,error_code) VALUES($1,$2,'test','failed',1,$3,clock_timestamp(),'','')`, op.ID, step, execution); err != nil {
+	execution := string(f.op.ID) + ":1:" + step
+	if _, err := f.pool.Exec(f.ctx, `INSERT INTO eregion_operation_steps(operation_id,step,inputs_hash,state,attempt,execution_id,started_at,error,error_code) VALUES($1,$2,'test','failed',1,$3,clock_timestamp(),'','')`, f.op.ID, step, execution); err != nil {
 		t.Fatal(err)
 	}
-	s.captureCandidateDiagnostics(ctx, env, dep, 1)
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_operation_events WHERE operation_id=$1 AND event->'candidate_diagnostic'->>'status'='unconfirmed'`, op.ID).Scan(&claims); err != nil || claims != 2 {
+	f.service.captureCandidateDiagnostics(f.ctx, f.env, f.dep, 1)
+	var claims int
+	if err := f.pool.QueryRow(f.ctx, `SELECT count(*) FROM eregion_operation_events WHERE operation_id=$1 AND event->'candidate_diagnostic'->>'status'='unconfirmed'`, f.op.ID).Scan(&claims); err != nil || claims != 2 {
 		t.Fatalf("distinct execution claims=%d err=%v", claims, err)
 	}
 }

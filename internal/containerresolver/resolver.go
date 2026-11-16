@@ -34,7 +34,7 @@ func IsInvocation(args []string) bool {
 func Run(commandArgs []string, stderr io.Writer) int {
 	cwd, err := os.Getwd()
 	if err != nil {
-		fmt.Fprintf(stderr, "eregion container resolver: working directory: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "eregion container resolver: working directory: %v\n", err)
 		return 126
 	}
 	return runWith(commandArgs, cwd, os.Getenv("PATH"), os.Environ(), syscall.Exec, stderr)
@@ -42,7 +42,7 @@ func Run(commandArgs []string, stderr io.Writer) int {
 
 func runWith(commandArgs []string, cwd, pathEnv string, env []string, execFn func(string, []string, []string) error, stderr io.Writer) int {
 	if len(commandArgs) == 0 || commandArgs[0] == "" {
-		fmt.Fprintln(stderr, "eregion container resolver: command is required")
+		_, _ = fmt.Fprintln(stderr, "eregion container resolver: command is required")
 		return 2
 	}
 	command := commandArgs[0]
@@ -52,12 +52,12 @@ func runWith(commandArgs []string, cwd, pathEnv string, env []string, execFn fun
 		var err error
 		target, err = Resolve(command, pathEnv, cwd)
 		if err != nil {
-			fmt.Fprintf(stderr, "eregion container resolver: %s: %v\n", command, err)
+			_, _ = fmt.Fprintf(stderr, "eregion container resolver: %s: %v\n", command, err)
 			return 127
 		}
 	}
 	if err := execFn(target, argv, env); err != nil {
-		fmt.Fprintf(stderr, "eregion container resolver: %s: %v\n", command, err)
+		_, _ = fmt.Fprintf(stderr, "eregion container resolver: %s: %v\n", command, err)
 		return 126
 	}
 	return 0
@@ -114,7 +114,7 @@ func joinRaw(dir, name string) string {
 }
 
 func isExecutable(candidate string) bool {
-	info, err := os.Stat(candidate)
+	info, err := os.Stat(candidate) // #nosec G703 -- Resolving caller-selected paths inside the target container is this command's purpose; there is no restricted filesystem root.
 	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
 		return false
 	}

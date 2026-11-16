@@ -95,7 +95,7 @@ func buildResourceStep(exec engine.Execution, raw json.RawMessage) (engine.Step,
 	}
 }
 
-func decodePayload(exec engine.Execution, raw json.RawMessage, dst any) error {
+func decodePayload(raw json.RawMessage, dst any) error {
 	if len(raw) == 0 {
 		return fmt.Errorf("platform step payload is required")
 	}
@@ -132,7 +132,7 @@ type ArgvStep struct {
 
 func buildArgvStep(exec engine.Execution, raw json.RawMessage) (engine.Step, error) {
 	var payload ArgvPayload
-	if err := decodePayload(exec, raw, &payload); err != nil {
+	if err := decodePayload(raw, &payload); err != nil {
 		return nil, err
 	}
 	if payload.Step != exec.Step {
@@ -145,60 +145,88 @@ func buildArgvStep(exec engine.Execution, raw json.RawMessage) (engine.Step, err
 	if err := validateArgv(payload.Argv); err != nil {
 		return nil, err
 	}
-	// Container lifecycle create/start is reserved for the typed release
-	// command step; it is not a generic argv action.
-	if filepath.Base(payload.Argv[0]) == "docker" && len(payload.Argv) > 1 &&
-		(payload.Argv[1] == "create" || payload.Argv[1] == "start") {
-		return nil, errors.New("docker create and start are reserved for typed release commands")
+	if err := validateReservedArgv(payload.Argv); err != nil {
+		return nil, err
 	}
 	if len(payload.CheckArgv) > 0 {
 		if err := validateArgv(payload.CheckArgv); err != nil {
 			return nil, err
 		}
-		if filepath.Base(payload.CheckArgv[0]) == "docker" && len(payload.CheckArgv) > 1 &&
-			(payload.CheckArgv[1] == "create" || payload.CheckArgv[1] == "start") {
-			return nil, errors.New(
-				"docker create and start are reserved for typed release commands",
-			)
+		if err := validateReservedArgv(payload.CheckArgv); err != nil {
+			return nil, err
 		}
 	}
-	if payload.TimeoutSeconds == 0 {
-		payload.TimeoutSeconds = 120
-	}
-	if payload.TimeoutSeconds < 1 || payload.TimeoutSeconds > 900 {
-		return nil, errors.New("platform step timeout must be 1–900 seconds")
-	}
-	if err := validateEnv(payload.Env, "step environment"); err != nil {
+	if err := validateArgvStepSettings(&payload); err != nil {
 		return nil, err
-	}
-	for _, key := range payload.SecretEnvKeys {
-		if !envKeyPattern.MatchString(key) {
-			return nil, errors.New("invalid secret environment key")
-		}
 	}
 	step := &ArgvStep{exec: exec, payload: payload}
 	if exec.Step == "platform-network-01-v1" {
-		if len(payload.Argv) != 10 || !slices.Equal(payload.Argv[:5], []string{"docker", "network", "create", "--driver", "bridge"}) ||
-			payload.Argv[5] != "--label" ||
-			payload.Argv[7] != "--label" ||
-			!strings.HasPrefix(payload.Argv[6], "io.eregion.app=") ||
-			!strings.HasPrefix(payload.Argv[8], "io.eregion.environment=") ||
-			ValidateName(strings.TrimPrefix(payload.Argv[6], "io.eregion.app=")) != nil ||
-			ValidateName(strings.TrimPrefix(payload.Argv[8], "io.eregion.environment=")) != nil ||
-			!strings.HasPrefix(payload.Argv[9], "er-") ||
-			EnvironmentID(strings.TrimPrefix(payload.Argv[9], "er-")).Validate() != nil ||
-			!slices.Equal(payload.CheckArgv, []string{"docker", "network", "inspect", "--format", "{{.Name}}", payload.Argv[9]}) ||
-			len(payload.Env) != 0 ||
-			len(payload.SecretEnvKeys) != 0 ||
-			payload.AllowFailure ||
-			payload.MissingOK ||
-			payload.IsolatedDocker ||
-			payload.TimeoutSeconds != 30 {
-			return nil, errors.New("invalid exact deployment network ensure")
+		if err := validateDeploymentNetworkPayload(payload); err != nil {
+			return nil, err
 		}
 		return &deploymentNetworkStep{ArgvStep: step, network: payload.Argv[9]}, nil
 	}
 	return step, nil
+}
+
+// Container lifecycle create/start is reserved for the typed release command
+// step; it is not a generic argv action.
+func validateReservedArgv(argv []string) error {
+	if filepath.Base(argv[0]) != "docker" || len(argv) < 2 {
+		return nil
+	}
+	if argv[1] == "create" || argv[1] == "start" {
+		return errors.New("docker create and start are reserved for typed release commands")
+	}
+	return nil
+}
+
+func validateArgvStepSettings(payload *ArgvPayload) error {
+	if payload.TimeoutSeconds == 0 {
+		payload.TimeoutSeconds = 120
+	}
+	if payload.TimeoutSeconds < 1 || payload.TimeoutSeconds > 900 {
+		return errors.New("platform step timeout must be 1–900 seconds")
+	}
+	if err := validateEnv(payload.Env, "step environment"); err != nil {
+		return err
+	}
+	for _, key := range payload.SecretEnvKeys {
+		if !envKeyPattern.MatchString(key) {
+			return errors.New("invalid secret environment key")
+		}
+	}
+	return nil
+}
+
+func validateDeploymentNetworkPayload(payload ArgvPayload) error {
+	invalidPayload := errors.New("invalid exact deployment network ensure")
+	if len(payload.Argv) != 10 {
+		return invalidPayload
+	}
+	checks := []bool{
+		slices.Equal(payload.Argv[:5], []string{"docker", "network", "create", "--driver", "bridge"}),
+		payload.Argv[5] == "--label",
+		payload.Argv[7] == "--label",
+		strings.HasPrefix(payload.Argv[6], "io.eregion.app="),
+		strings.HasPrefix(payload.Argv[8], "io.eregion.environment="),
+		ValidateName(strings.TrimPrefix(payload.Argv[6], "io.eregion.app=")) == nil,
+		ValidateName(strings.TrimPrefix(payload.Argv[8], "io.eregion.environment=")) == nil,
+		strings.HasPrefix(payload.Argv[9], "er-"),
+		EnvironmentID(strings.TrimPrefix(payload.Argv[9], "er-")).Validate() == nil,
+		slices.Equal(payload.CheckArgv, []string{"docker", "network", "inspect", "--format", "{{.Name}}", payload.Argv[9]}),
+	}
+	for _, ok := range checks {
+		if !ok {
+			return invalidPayload
+		}
+	}
+	if len(payload.Env) != 0 || len(payload.SecretEnvKeys) != 0 ||
+		payload.AllowFailure || payload.MissingOK || payload.IsolatedDocker ||
+		payload.TimeoutSeconds != 30 {
+		return invalidPayload
+	}
+	return nil
 }
 
 type deploymentNetworkStep struct {
@@ -255,12 +283,12 @@ func (s *ArgvStep) Check(ctx context.Context, rt engine.Runtime) (engine.CheckRe
 func (s *ArgvStep) commandEnv(rt engine.Runtime) ([]string, func(), error) {
 	env, err := stepEnv(s.payload.Env, s.payload.SecretEnvKeys, rt)
 	if err != nil {
-		return nil, func() {}, fmt.Errorf("%w: %s", engine.ErrPermanent, err)
+		return nil, func() {}, fmt.Errorf("%w: %w", engine.ErrPermanent, err)
 	}
 	if s.payload.IsolatedDocker {
 		isolated, cleanup, isoErr := IsolatedDockerEnvironment()
 		if isoErr != nil {
-			return nil, func() {}, fmt.Errorf("%w: %s", engine.ErrPermanent, isoErr)
+			return nil, func() {}, fmt.Errorf("%w: %w", engine.ErrPermanent, isoErr)
 		}
 		env = append(env, isolated...)
 		return env, cleanup, nil
@@ -415,7 +443,7 @@ type ContainerStep struct {
 
 func buildContainerStep(exec engine.Execution, raw json.RawMessage) (engine.Step, error) {
 	var payload ContainerPayload
-	if err := decodePayload(exec, raw, &payload); err != nil {
+	if err := decodePayload(raw, &payload); err != nil {
 		return nil, err
 	}
 	if payload.Step != exec.Step {
@@ -436,9 +464,29 @@ func buildContainerStep(exec engine.Execution, raw json.RawMessage) (engine.Step
 			return nil, err
 		}
 	}
+	if err := normalizeContainerPublish(&payload); err != nil {
+		return nil, err
+	}
+	if err := validateContainerEnv(&payload); err != nil {
+		return nil, err
+	}
+	if err := validateContainerCommand(payload.Command); err != nil {
+		return nil, err
+	}
+	if err := validateContainerLabels(payload.Labels); err != nil {
+		return nil, err
+	}
+	hash, err := containerConfigHash(payload)
+	if err != nil {
+		return nil, err
+	}
+	return &ContainerStep{exec: exec, payload: payload, hash: hash}, nil
+}
+
+func normalizeContainerPublish(payload *ContainerPayload) error {
 	if payload.ContainerPort < 0 || payload.ContainerPort > 65535 || payload.HostPort < 0 ||
 		payload.HostPort > 65535 {
-		return nil, errors.New("container and host ports must be 0–65535")
+		return errors.New("container and host ports must be 0–65535")
 	}
 	if !payload.Publish && (payload.ContainerPort > 0 || payload.HostPort > 0) {
 		// Older payloads expressed publication by declaring a port.
@@ -446,54 +494,62 @@ func buildContainerStep(exec engine.Execution, raw json.RawMessage) (engine.Step
 	}
 	if payload.Publish {
 		if payload.ContainerPort < 1 {
-			return nil, errors.New("a published container needs a container port")
+			return errors.New("a published container needs a container port")
 		}
 		if payload.Bind == "" {
 			payload.Bind = "127.0.0.1"
 		}
-		if net.ParseIP(payload.Bind) == nil || !net.ParseIP(payload.Bind).IsLoopback() {
-			return nil, errors.New("container publish bind must be a loopback literal IP")
+		if ip := net.ParseIP(payload.Bind); ip == nil || !ip.IsLoopback() {
+			return errors.New("container publish bind must be a loopback literal IP")
 		}
 	} else if payload.ContainerPort != 0 || payload.HostPort != 0 {
-		return nil, errors.New("an unpublished container cannot declare ports")
+		return errors.New("an unpublished container cannot declare ports")
 	}
 	if payload.Restart == "" {
 		payload.Restart = "no"
 	}
 	if payload.Restart != "no" && payload.Restart != "unless-stopped" {
-		return nil, errors.New("unsupported container restart policy")
+		return errors.New("unsupported container restart policy")
 	}
+	return nil
+}
+
+func validateContainerEnv(payload *ContainerPayload) error {
 	if err := validateEnv(payload.Env, "container environment"); err != nil {
-		return nil, err
+		return err
 	}
 	for _, key := range payload.SecretEnvKeys {
 		if !envKeyPattern.MatchString(key) {
-			return nil, errors.New("invalid container secret environment key")
+			return errors.New("invalid container secret environment key")
 		}
 	}
-	if len(payload.Command) > 129 {
-		return nil, errors.New("container command has too many arguments")
+	return nil
+}
+
+func validateContainerCommand(command []string) error {
+	if len(command) > 129 {
+		return errors.New("container command has too many arguments")
 	}
-	for _, arg := range payload.Command {
+	for _, arg := range command {
 		if len(arg) > 4096 || strings.ContainsAny(arg, "\x00\r\n") {
-			return nil, errors.New(
+			return errors.New(
 				"container command argument is too long or contains a control character",
 			)
 		}
 	}
-	for key, value := range payload.Labels {
+	return nil
+}
+
+func validateContainerLabels(labels map[string]string) error {
+	for key, value := range labels {
 		if err := validateLabelKey(key); err != nil {
-			return nil, err
+			return err
 		}
 		if len(value) > 128 || strings.ContainsAny(value, "\x00\r\n") {
-			return nil, fmt.Errorf("container label %q has an invalid value", key)
+			return fmt.Errorf("container label %q has an invalid value", key)
 		}
 	}
-	hash, err := containerConfigHash(payload)
-	if err != nil {
-		return nil, err
-	}
-	return &ContainerStep{exec: exec, payload: payload, hash: hash}, nil
+	return nil
 }
 
 func containerConfigHash(payload ContainerPayload) (string, error) {
@@ -589,12 +645,43 @@ func (s *ContainerStep) Apply(
 	if err != nil {
 		return engine.ApplyResult{}, err
 	}
-	var previous *ExecutionEvidence
-	if _, _, _, exists, _ := s.inspect(ctx); exists {
-		evidence := captureExecutionEvidence(ctx, s.payload.Name, s.payload.Labels, rt)
-		previous = &evidence
+	previous := s.previousContainerEvidence(ctx, rt)
+	s.removeContainer(ctx, rt)
+	stderr, startInfo, err := s.startContainer(ctx, rt, args, env, report)
+	if err != nil {
+		return s.containerStartFailure(ctx, rt, report, stderr, startInfo, previous)
 	}
+	hostPort := s.payload.HostPort
+	if s.payload.Publish && hostPort == 0 {
+		resolved, failure, err := s.resolvePublishedPort(ctx, rt, previous)
+		if err != nil {
+			return failure, err
+		}
+		hostPort = resolved
+	}
+	if report != nil {
+		report(
+			engine.Event{
+				Kind:    "log",
+				Step:    s.ID(),
+				Message: "container " + s.payload.Name + " runs " + s.payload.Image,
+			},
+		)
+	}
+	return s.containerSuccessResult(rt, previous, hostPort), nil
+}
+
+func (s *ContainerStep) previousContainerEvidence(ctx context.Context, rt engine.Runtime) *ExecutionEvidence {
+	if _, _, _, exists, _ := s.inspect(ctx); !exists {
+		return nil
+	}
+	evidence := captureExecutionEvidence(ctx, s.payload.Name, s.payload.Labels, rt)
+	return &evidence
+}
+
+func (s *ContainerStep) removeContainer(ctx context.Context, rt engine.Runtime) {
 	removeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	_, _, _ = runArgv(
 		removeCtx,
 		[]string{"docker", "rm", "-f", s.payload.Name},
@@ -603,8 +690,11 @@ func (s *ContainerStep) Apply(
 		s.ID(),
 		nil,
 	)
-	cancel()
+}
+
+func (s *ContainerStep) startContainer(ctx context.Context, rt engine.Runtime, args, env []string, report engine.Reporter) (string, commandOutputInfo, error) {
 	runCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
 	var startInfo commandOutputInfo
 	_, stderr, err := runArgvWithEnvGraceCapture(
 		runCtx,
@@ -616,136 +706,113 @@ func (s *ContainerStep) Apply(
 		0,
 		&startInfo,
 	)
-	cancel()
-	if err != nil {
-		current := captureExecutionEvidence(ctx, s.payload.Name, s.payload.Labels, rt)
-		failure := engine.ApplyResult{
-			Result: StepExecutionEvidence{
-				Stage:              "container-start",
-				OutputAvailability: "bounded",
-				RedactionContext:   originalRedactionContext(rt),
-				Stderr:             truncate(stderr, 4096),
-				StderrTruncated:    startInfo.stderrTruncated || len(stderr) > 4096,
-				Previous:           previous,
-				Container:          &current,
-			},
+	return stderr, startInfo, err
+}
+
+func (s *ContainerStep) containerStartFailure(ctx context.Context, rt engine.Runtime, report engine.Reporter, stderr string, startInfo commandOutputInfo, previous *ExecutionEvidence) (engine.ApplyResult, error) {
+	current := captureExecutionEvidence(ctx, s.payload.Name, s.payload.Labels, rt)
+	failure := engine.ApplyResult{
+		Result: StepExecutionEvidence{
+			Stage:              "container-start",
+			OutputAvailability: "bounded",
+			RedactionContext:   originalRedactionContext(rt),
+			Stderr:             truncate(stderr, 4096),
+			StderrTruncated:    startInfo.stderrTruncated || len(stderr) > 4096,
+			Previous:           previous,
+			Container:          &current,
+		},
+	}
+	if s.payload.FallbackImage != "" {
+		fallbackErr, envErr := s.restoreFallbackImage(ctx, rt, report)
+		if envErr != nil {
+			return failure, envErr
 		}
-		if s.payload.FallbackImage != "" {
-			fallbackArgs, fallbackEnv, fallbackEnvErr := s.runArgs(ctx, s.payload.FallbackImage, rt)
-			if fallbackEnvErr != nil {
-				return failure, fallbackEnvErr
-			}
-			fallbackCtx, fallbackCancel := context.WithTimeout(ctx, 2*time.Minute)
-			_, _, fallbackErr := runArgv(fallbackCtx, fallbackArgs, fallbackEnv, rt, s.ID(), report)
-			fallbackCancel()
-			if fallbackErr == nil {
-				return failure, fmt.Errorf(
-					"%w: starting %s failed (%s); the previous image was restored",
-					engine.ErrPermanent,
-					s.payload.Image,
-					firstLine(stderr),
-				)
-			}
+		if fallbackErr == nil {
+			return failure, fmt.Errorf(
+				"%w: starting %s failed (%s); the previous image was restored",
+				engine.ErrPermanent,
+				s.payload.Image,
+				firstLine(stderr),
+			)
 		}
-		return failure, fmt.Errorf(
-			"%w: docker run failed: %s",
+	}
+	return failure, fmt.Errorf(
+		"%w: docker run failed: %s",
+		engine.ErrPermanent,
+		firstLine(stderr),
+	)
+}
+
+func (s *ContainerStep) restoreFallbackImage(ctx context.Context, rt engine.Runtime, report engine.Reporter) (error, error) {
+	fallbackArgs, fallbackEnv, envErr := s.runArgs(ctx, s.payload.FallbackImage, rt)
+	if envErr != nil {
+		return nil, envErr
+	}
+	fallbackCtx, fallbackCancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer fallbackCancel()
+	_, _, fallbackErr := runArgv(fallbackCtx, fallbackArgs, fallbackEnv, rt, s.ID(), report)
+	return fallbackErr, nil
+}
+
+func (s *ContainerStep) resolvePublishedPort(ctx context.Context, rt engine.Runtime, previous *ExecutionEvidence) (int, engine.ApplyResult, error) {
+	portCtx, portCancel := context.WithTimeout(ctx, 20*time.Second)
+	defer portCancel()
+	var portInfo commandOutputInfo
+	output, portStderr, portErr := runArgvWithEnvGraceCapture(
+		portCtx,
+		[]string{
+			"docker",
+			"port",
+			s.payload.Name,
+			fmt.Sprintf("%d/tcp", s.payload.ContainerPort),
+		},
+		os.Environ(),
+		rt,
+		s.ID(),
+		nil,
+		0,
+		&portInfo,
+	)
+	if portErr != nil {
+		evidence := captureExecutionEvidence(ctx, s.payload.Name, s.payload.Labels, rt)
+		failure := s.portObservationFailure(ctx, rt, StepExecutionEvidence{
+			Stage:              "container-port",
+			OutputAvailability: "bounded",
+			RedactionContext:   originalRedactionContext(rt),
+			Stderr:             truncate(portStderr, 4096),
+			StderrTruncated:    portInfo.stderrTruncated || len(portStderr) > 4096,
+			Previous:           previous,
+			Container:          &evidence,
+		})
+		return 0, failure, fmt.Errorf(
+			"%w: reading the dynamic loopback port failed: %s",
 			engine.ErrPermanent,
-			firstLine(stderr),
+			firstLine(portStderr),
 		)
 	}
-	hostPort := s.payload.HostPort
-	if s.payload.Publish && hostPort == 0 {
-		portCtx, portCancel := context.WithTimeout(ctx, 20*time.Second)
-		var portInfo commandOutputInfo
-		output, portStderr, portErr := runArgvWithEnvGraceCapture(
-			portCtx,
-			[]string{
-				"docker",
-				"port",
-				s.payload.Name,
-				fmt.Sprintf("%d/tcp", s.payload.ContainerPort),
-			},
-			os.Environ(),
-			rt,
-			s.ID(),
-			nil,
-			0,
-			&portInfo,
-		)
-		portCancel()
-		if portErr != nil {
-			evidence := captureExecutionEvidence(ctx, s.payload.Name, s.payload.Labels, rt)
-			cleanupCtx, cleanupCancel := context.WithTimeout(
-				context.WithoutCancel(ctx),
-				30*time.Second,
-			)
-			_, _, _ = runArgv(
-				cleanupCtx,
-				[]string{"docker", "rm", "-f", s.payload.Name},
-				nil,
-				rt,
-				s.ID(),
-				nil,
-			)
-			cleanupCancel()
-			return engine.ApplyResult{
-				Result: StepExecutionEvidence{
-					Stage:              "container-port",
-					OutputAvailability: "bounded",
-					RedactionContext:   originalRedactionContext(rt),
-					Stderr:             truncate(portStderr, 4096),
-					StderrTruncated:    portInfo.stderrTruncated || len(portStderr) > 4096,
-					Previous:           previous,
-					Container:          &evidence,
-				},
-			}, fmt.Errorf(
-				"%w: reading the dynamic loopback port failed: %s",
-				engine.ErrPermanent,
-				firstLine(portStderr),
-			)
-		}
-		hostPort, err = ParsePublishedPort(output, s.payload.ContainerPort)
-		if err != nil {
-			evidence := captureExecutionEvidence(ctx, s.payload.Name, s.payload.Labels, rt)
-			cleanupCtx, cleanupCancel := context.WithTimeout(
-				context.WithoutCancel(ctx),
-				30*time.Second,
-			)
-			_, _, _ = runArgv(
-				cleanupCtx,
-				[]string{"docker", "rm", "-f", s.payload.Name},
-				nil,
-				rt,
-				s.ID(),
-				nil,
-			)
-			cleanupCancel()
-			return engine.ApplyResult{
-				Result: StepExecutionEvidence{
-					Stage:              "container-port",
-					OutputAvailability: "bounded",
-					RedactionContext:   originalRedactionContext(rt),
-					Stdout:             truncate(portInfo.stdoutSafe, 8192),
-					StdoutTruncated:    portInfo.stdoutTruncated || len(portInfo.stdoutSafe) > 8192,
-					Previous:           previous,
-					Container:          &evidence,
-				},
-			}, fmt.Errorf(
-				"%w: %s",
-				engine.ErrPermanent,
-				err,
-			)
-		}
+	hostPort, err := ParsePublishedPort(output, s.payload.ContainerPort)
+	if err == nil {
+		return hostPort, engine.ApplyResult{}, nil
 	}
-	if report != nil {
-		report(
-			engine.Event{
-				Kind:    "log",
-				Step:    s.ID(),
-				Message: "container " + s.payload.Name + " runs " + s.payload.Image,
-			},
-		)
-	}
+	evidence := captureExecutionEvidence(ctx, s.payload.Name, s.payload.Labels, rt)
+	failure := s.portObservationFailure(ctx, rt, StepExecutionEvidence{
+		Stage:              "container-port",
+		OutputAvailability: "bounded",
+		RedactionContext:   originalRedactionContext(rt),
+		Stdout:             truncate(portInfo.stdoutSafe, 8192),
+		StdoutTruncated:    portInfo.stdoutTruncated || len(portInfo.stdoutSafe) > 8192,
+		Previous:           previous,
+		Container:          &evidence,
+	})
+	return 0, failure, fmt.Errorf("%w: %w", engine.ErrPermanent, err)
+}
+
+func (s *ContainerStep) portObservationFailure(ctx context.Context, rt engine.Runtime, evidence StepExecutionEvidence) engine.ApplyResult {
+	s.removeContainer(context.WithoutCancel(ctx), rt)
+	return engine.ApplyResult{Result: evidence}
+}
+
+func (s *ContainerStep) containerSuccessResult(rt engine.Runtime, previous *ExecutionEvidence, hostPort int) engine.ApplyResult {
 	result := map[string]any{
 		"container": s.payload.Name,
 		"image":     s.payload.Image,
@@ -758,7 +825,7 @@ func (s *ContainerStep) Apply(
 		result["host_port"] = hostPort
 		result["container_port"] = s.payload.ContainerPort
 	}
-	return engine.ApplyResult{Result: result}, nil
+	return engine.ApplyResult{Result: result}
 }
 
 // PublishArgument renders Docker's loopback publish argument. A zero host port
@@ -799,7 +866,7 @@ func ParsePublishedPort(output string, containerPort int) (int, error) {
 	}
 	if fallback == 0 {
 		return 0, fmt.Errorf(
-			"Docker did not publish a host port for container port %d",
+			"docker did not publish a host port for container port %d",
 			containerPort,
 		)
 	}
@@ -980,7 +1047,7 @@ func containerResolverSource() (string, error) {
 	executable, err := resolverExecutable()
 	if err != nil {
 		return "", fmt.Errorf(
-			"%w: locate the eregion resolver binary: %v",
+			"%w: locate the eregion resolver binary: %w",
 			engine.ErrPermanent,
 			err,
 		)
@@ -988,7 +1055,7 @@ func containerResolverSource() (string, error) {
 	source, err := filepath.EvalSymlinks(executable)
 	if err != nil {
 		return "", fmt.Errorf(
-			"%w: resolve the eregion resolver binary: %v",
+			"%w: resolve the eregion resolver binary: %w",
 			engine.ErrPermanent,
 			err,
 		)
@@ -1043,7 +1110,7 @@ type HealthStep struct {
 
 func buildHealthStep(exec engine.Execution, raw json.RawMessage) (engine.Step, error) {
 	var payload HealthPayload
-	if err := decodePayload(exec, raw, &payload); err != nil {
+	if err := decodePayload(raw, &payload); err != nil {
 		return nil, err
 	}
 	if payload.Step != exec.Step {
@@ -1119,7 +1186,8 @@ func (s *HealthStep) probe(ctx context.Context) (bool, string, int) {
 	timeout := 3 * time.Second
 	switch s.payload.Type {
 	case "tcp":
-		conn, err := net.DialTimeout("tcp", s.payload.Target, timeout)
+		dialer := &net.Dialer{Timeout: timeout}
+		conn, err := dialer.DialContext(ctx, "tcp", s.payload.Target)
 		if err != nil {
 			return false, "tcp connect failed", 0
 		}
@@ -1143,7 +1211,7 @@ func (s *HealthStep) probe(ctx context.Context) (bool, string, int) {
 		if err != nil {
 			return false, "health request failed", 0
 		}
-		defer response.Body.Close()
+		defer func() { _ = response.Body.Close() }()
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
 		if response.StatusCode >= 200 && response.StatusCode < 400 {
 			return true, "http status " + strconv.Itoa(response.StatusCode), response.StatusCode
@@ -1167,7 +1235,7 @@ func (s *HealthStep) Apply(
 	deadline := time.Now().Add(time.Duration(s.payload.TimeoutSeconds) * time.Second)
 	interval := time.Duration(s.payload.IntervalMS) * time.Millisecond
 	checks := 0
-	last := "no probe completed"
+	var last string
 	for {
 		checks++
 		probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
@@ -1306,7 +1374,7 @@ type PackStep struct {
 
 func buildPackStep(exec engine.Execution, raw json.RawMessage) (engine.Step, error) {
 	var payload PackPayload
-	if err := decodePayload(exec, raw, &payload); err != nil {
+	if err := decodePayload(raw, &payload); err != nil {
 		return nil, err
 	}
 	if payload.Step != exec.Step {
@@ -1335,68 +1403,87 @@ func buildPackStep(exec engine.Execution, raw json.RawMessage) (engine.Step, err
 	if err := ValidateImage(payload.Builder); err != nil {
 		return nil, err
 	}
-	if (payload.Path == "") == (payload.GitURL == "") {
-		return nil, errors.New("pack source must have exactly one of path or git_url")
-	}
-	if payload.Path != "" && !filepath.IsAbs(payload.Path) {
-		return nil, errors.New("pack source path must be absolute")
-	}
-	if payload.GitContextPath != "" {
-		if payload.GitURL == "" {
-			return nil, errors.New("a git context path requires a git source")
-		}
-		if err := validateContextPath(payload.GitContextPath); err != nil {
-			return nil, err
-		}
-	}
-	if payload.GitURL != "" {
-		if err := ValidateGitSourceURL(payload.GitURL); err != nil {
-			return nil, err
-		}
-		switch {
-		case payload.GitRef == "":
-		case shaPattern.MatchString(payload.GitRef):
-		case validGitRef(payload.GitRef):
-		default:
-			return nil, errors.New("invalid git ref")
-		}
-	}
-	if err := validateEnv(payload.Env, "build environment"); err != nil {
+	if err := normalizePackSource(&payload); err != nil {
 		return nil, err
 	}
-	payload.GoTargets, err = buildpacks.NormalizeTargets(payload.GoTargets)
-	if err != nil {
+	if err := normalizePackSettings(&payload); err != nil {
 		return nil, err
-	}
-	payload.Buildpacks, err = buildpacks.NormalizeSettings(payload.Buildpacks)
-	if err != nil {
-		return nil, err
-	}
-	if payload.GitCredentialSecretKey != "" {
-		if payload.GitURL == "" {
-			return nil, errors.New("a git credential requires a git source")
-		}
-		if !envKeyPattern.MatchString(payload.GitCredentialSecretKey) {
-			return nil, errors.New("invalid git credential secret key")
-		}
-	}
-	if payload.TimeoutSeconds == 0 {
-		payload.TimeoutSeconds = 600
-	}
-	if payload.TimeoutSeconds < 10 || payload.TimeoutSeconds > 1800 {
-		return nil, errors.New("build timeout must be 10–1800 seconds")
-	}
-	if payload.Cache != "" && !cacheVolumePattern.MatchString(payload.Cache) {
-		return nil, errors.New("a build cache must be an eregion build cache volume name")
-	}
-	if payload.LaunchCache != "" && !cacheVolumePattern.MatchString(payload.LaunchCache) {
-		return nil, errors.New("a launch cache must be an eregion launch cache volume name")
 	}
 	step := &PackStep{exec: exec, payload: payload}
 	if exec.Step == "platform-pack-03-v1" {
 		return &sharedPackStep{PackStep: step}, nil
 	}
 	return step, nil
+}
+
+func normalizePackSource(payload *PackPayload) error {
+	if (payload.Path == "") == (payload.GitURL == "") {
+		return errors.New("pack source must have exactly one of path or git_url")
+	}
+	if payload.Path != "" && !filepath.IsAbs(payload.Path) {
+		return errors.New("pack source path must be absolute")
+	}
+	if payload.GitContextPath != "" {
+		if payload.GitURL == "" {
+			return errors.New("a git context path requires a git source")
+		}
+		if err := validateContextPath(payload.GitContextPath); err != nil {
+			return err
+		}
+	}
+	if payload.GitURL != "" {
+		if err := ValidateGitSourceURL(payload.GitURL); err != nil {
+			return err
+		}
+		if err := validatePackGitRef(payload.GitRef); err != nil {
+			return err
+		}
+	}
+	if err := validateEnv(payload.Env, "build environment"); err != nil {
+		return err
+	}
+	if payload.GitCredentialSecretKey == "" {
+		return nil
+	}
+	if payload.GitURL == "" {
+		return errors.New("a git credential requires a git source")
+	}
+	if !envKeyPattern.MatchString(payload.GitCredentialSecretKey) {
+		return errors.New("invalid git credential secret key")
+	}
+	return nil
+}
+
+func validatePackGitRef(ref string) error {
+	if ref == "" || shaPattern.MatchString(ref) || validGitRef(ref) {
+		return nil
+	}
+	return errors.New("invalid git ref")
+}
+
+func normalizePackSettings(payload *PackPayload) error {
+	var err error
+	payload.GoTargets, err = buildpacks.NormalizeTargets(payload.GoTargets)
+	if err != nil {
+		return err
+	}
+	payload.Buildpacks, err = buildpacks.NormalizeSettings(payload.Buildpacks)
+	if err != nil {
+		return err
+	}
+	if payload.TimeoutSeconds == 0 {
+		payload.TimeoutSeconds = 600
+	}
+	if payload.TimeoutSeconds < 10 || payload.TimeoutSeconds > 1800 {
+		return errors.New("build timeout must be 10–1800 seconds")
+	}
+	if payload.Cache != "" && !cacheVolumePattern.MatchString(payload.Cache) {
+		return errors.New("a build cache must be an eregion build cache volume name")
+	}
+	if payload.LaunchCache != "" && !cacheVolumePattern.MatchString(payload.LaunchCache) {
+		return errors.New("a launch cache must be an eregion launch cache volume name")
+	}
+	return nil
 }
 
 type sharedPackStep struct{ *PackStep }
@@ -1499,23 +1586,32 @@ func (s *PackStep) Check(ctx context.Context, rt engine.Runtime) (engine.CheckRe
 	}, nil
 }
 
+type packBuild struct {
+	step       *PackStep
+	rt         engine.Runtime
+	report     engine.Reporter
+	work       string
+	isolation  []string
+	source     string
+	commit     string
+	builder    string
+	platform   string
+	registry   registryContainer
+	network    string
+	repository string
+	tag        string
+}
+
 func (s *PackStep) Apply(
 	ctx context.Context,
 	rt engine.Runtime,
 	report engine.Reporter,
 ) (result engine.ApplyResult, applyErr error) {
-	work := filepath.Join(rt.Root, "builds", string(s.exec.OperationID)+"-"+s.payload.Step)
-	if err := os.RemoveAll(work); err != nil {
+	b := &packBuild{step: s, rt: rt, report: report}
+	if err := b.prepareWork(); err != nil {
 		return engine.ApplyResult{}, err
 	}
-	if err := os.MkdirAll(work, 0o700); err != nil {
-		return engine.ApplyResult{}, err
-	}
-	defer os.RemoveAll(work)
-	isolation, err := buildIsolation(work)
-	if err != nil {
-		return engine.ApplyResult{}, err
-	}
+	defer b.cleanupWork()
 	buildCtx, stopBuild := context.WithCancel(ctx)
 	defer stopBuild()
 	go watchBuildCancel(
@@ -1523,219 +1619,17 @@ func (s *PackStep) Apply(
 		buildCancelPath(rt.Root, string(s.exec.OperationID), s.payload.Step),
 		stopBuild,
 	)
-
-	source := s.payload.Path
-	commit := ""
-	if s.payload.GitURL != "" {
-		if err := CheckGitSourceResolution(ctx, s.payload.GitURL); err != nil {
-			return engine.ApplyResult{}, fmt.Errorf("%w: %s", engine.ErrPermanent, err)
-		}
-		gitEnv, envErr := gitBuildEnvironment(isolation, work, s.payload.GitCredentialSecretKey, rt)
-		if envErr != nil {
-			return engine.ApplyResult{}, fmt.Errorf("%w: %s", engine.ErrPermanent, envErr)
-		}
-		source = filepath.Join(work, "src")
-		args := []string{"git", "clone"}
-		if shaPattern.MatchString(s.payload.GitRef) {
-			// A commit SHA is immutable but is not a branch/tag; fetch the
-			// repository without checkout and detach at the exact commit.
-			args = append(args, "--no-checkout", "--filter=blob:none", s.payload.GitURL, source)
-		} else {
-			args = append(args, "--depth", "1")
-			if s.payload.GitRef != "" {
-				args = append(args, "--branch", s.payload.GitRef)
-			}
-			args = append(args, s.payload.GitURL, source)
-		}
-		cloneCtx, cancel := context.WithTimeout(buildCtx, 5*time.Minute)
-		_, cloneStderr, err := runArgvClean(cloneCtx, args, gitEnv, rt, s.ID(), report)
-		cancel()
-		if err != nil {
-			if buildCtx.Err() != nil {
-				return engine.ApplyResult{}, engine.ErrInterrupted
-			}
-			return engine.ApplyResult{}, fmt.Errorf(
-				"%w: git clone failed: %s",
-				engine.ErrPermanent,
-				firstLine(cloneStderr),
-			)
-		}
-		if shaPattern.MatchString(s.payload.GitRef) {
-			checkoutCtx, cancel := context.WithTimeout(buildCtx, 2*time.Minute)
-			_, checkoutStderr, err := runArgvClean(
-				checkoutCtx,
-				[]string{"git", "-C", source, "checkout", "--detach", s.payload.GitRef},
-				gitEnv,
-				rt,
-				s.ID(),
-				report,
-			)
-			cancel()
-			if err != nil {
-				if buildCtx.Err() != nil {
-					return engine.ApplyResult{}, engine.ErrInterrupted
-				}
-				return engine.ApplyResult{}, fmt.Errorf(
-					"%w: git checkout failed: %s",
-					engine.ErrPermanent,
-					firstLine(checkoutStderr),
-				)
-			}
-		}
-		resolveCtx, cancel := context.WithTimeout(buildCtx, 30*time.Second)
-		stdout, resolveStderr, resolveErr := runArgvClean(
-			resolveCtx,
-			[]string{"git", "-C", source, "rev-parse", "HEAD"},
-			gitEnv,
-			rt,
-			s.ID(),
-			nil,
-		)
-		cancel()
-		if resolveErr != nil {
-			if buildCtx.Err() != nil {
-				return engine.ApplyResult{}, engine.ErrInterrupted
-			}
-			return engine.ApplyResult{}, fmt.Errorf(
-				"%w: git ref resolution failed: %s",
-				engine.ErrPermanent,
-				firstLine(resolveStderr),
-			)
-		}
-		commit = strings.TrimSpace(stdout)
-		if !shaPattern.MatchString(commit) {
-			return engine.ApplyResult{}, fmt.Errorf(
-				"%w: git ref did not resolve to an exact commit",
-				engine.ErrPermanent,
-			)
-		}
-		if shaPattern.MatchString(s.payload.GitRef) && commit != s.payload.GitRef {
-			return engine.ApplyResult{}, fmt.Errorf(
-				"%w: checked-out commit %s does not match the resolved commit %s",
-				engine.ErrPermanent,
-				commit,
-				s.payload.GitRef,
-			)
-		}
-	}
-	if s.payload.GitContextPath != "" {
-		resolved, err := resolveGitContextPath(source, s.payload.GitContextPath)
-		if err != nil {
-			return engine.ApplyResult{}, fmt.Errorf("%w: %s", engine.ErrPermanent, err)
-		}
-		source = resolved
-	}
-	info, err := os.Stat(
-		source,
-	) //nolint:gosec // G304: resolved source root or a directory under the node root.
-	if err != nil || !info.IsDir() {
-		return engine.ApplyResult{}, fmt.Errorf(
-			"%w: build source %s is not a readable directory on the node",
-			engine.ErrPermanent,
-			source,
-		)
-	}
-	builder, runImage := s.payload.Builder, ""
-	if builder == "" {
-		return engine.ApplyResult{}, fmt.Errorf("%w: Git build source has no explicit Buildpacks builder; set source.builder or --builder (there is no built-in default)", engine.ErrPermanent)
-	}
-	platform, err := buildpacks.TargetPlatform(runtime.GOARCH)
-	if err != nil {
-		return engine.ApplyResult{}, fmt.Errorf("%w: %s", engine.ErrPermanent, err)
-	}
-	if err := verifyBuilderPlatformAPI(
-		buildCtx,
-		rt,
-		isolation,
-		builder,
-		platform,
-		s.ID(),
-		report,
-	); err != nil {
-		if buildCtx.Err() != nil {
-			return engine.ApplyResult{}, engine.ErrInterrupted
-		}
-		return engine.ApplyResult{}, fmt.Errorf("%w: %s", engine.ErrPermanent, err)
-	}
-	registry, err := inspectRegistryContainer(
-		buildCtx,
-		rt,
-		isolation,
-		s.payload.Registry,
-		s.ID(),
-		report,
-	)
-	if err != nil {
-		if buildCtx.Err() != nil {
-			return engine.ApplyResult{}, engine.ErrInterrupted
-		}
+	if err := b.prepareSource(buildCtx); err != nil {
 		return engine.ApplyResult{}, err
 	}
-	if err := removeStaleBuildNetworks(
-		buildCtx,
-		rt,
-		isolation,
-		registry.ID,
-		s.exec,
-		report,
-	); err != nil {
-		if buildCtx.Err() != nil {
-			return engine.ApplyResult{}, engine.ErrInterrupted
-		}
+	if err := b.prepareBuilder(buildCtx); err != nil {
 		return engine.ApplyResult{}, err
 	}
-	networkCtx, cancelNetwork := context.WithTimeout(buildCtx, buildNetworkCreateTimeout)
-	network, err := createBuildNetwork(
-		networkCtx,
-		rt,
-		isolation,
-		s.exec.OperationID,
-		s.payload.Step,
-		s.exec.Attempt,
-	)
-	cancelNetwork()
-	if err != nil {
-		cleanupErr := cleanupAmbiguousBuildNetwork(
-			ctx,
-			rt,
-			isolation,
-			network,
-			s.exec.OperationID,
-			s.payload.Step,
-			s.exec.Attempt,
-			registry.ID,
-		)
-		if cleanupErr != nil && report != nil {
-			report(engine.Event{Kind: "warning", Step: s.ID(), Message: cleanupErr.Error()})
-		}
-		if buildCtx.Err() != nil {
-			return engine.ApplyResult{}, engine.ErrInterrupted
-		}
-		if cleanupErr != nil {
-			return engine.ApplyResult{}, fmt.Errorf(
-				"%w; cleaning the build network after an ambiguous create failed: %v",
-				err,
-				cleanupErr,
-			)
-		}
+	if err := b.prepareNetwork(buildCtx); err != nil {
 		return engine.ApplyResult{}, err
 	}
 	defer func() {
-		cleanupCtx, cancel := context.WithTimeout(
-			context.WithoutCancel(ctx),
-			buildNetworkCleanupTimeout,
-		)
-		defer cancel()
-		cleanupErr := removeBuildNetwork(
-			cleanupCtx,
-			rt,
-			isolation,
-			network,
-			s.exec.OperationID,
-			s.payload.Step,
-			s.exec.Attempt,
-			registry.ID,
-		)
+		cleanupErr := b.removeNetwork(context.WithoutCancel(ctx))
 		if cleanupErr == nil {
 			return
 		}
@@ -1743,183 +1637,459 @@ func (s *PackStep) Apply(
 			report(engine.Event{Kind: "warning", Step: s.ID(), Message: cleanupErr.Error()})
 		}
 		if applyErr != nil {
-			applyErr = fmt.Errorf("%w; cleaning the build network failed: %v", applyErr, cleanupErr)
+			applyErr = fmt.Errorf("%w; cleaning the build network failed: %w", applyErr, cleanupErr)
 		}
 	}()
-	transientEndpoint, err := attachRegistryToBuildNetwork(
-		buildCtx,
-		rt,
-		isolation,
-		network,
-		registry,
-		s.ID(),
-		report,
-	)
-	if err != nil {
-		if buildCtx.Err() != nil {
-			return engine.ApplyResult{}, engine.ErrInterrupted
-		}
+	if err := b.runBuild(buildCtx); err != nil {
 		return engine.ApplyResult{}, err
 	}
-	publishReference, repository, tag, err := packPublishReference(
-		s.payload.Image,
-		transientEndpoint,
+	completion, err := b.publishAndTag(buildCtx)
+	if err != nil {
+		return engine.ApplyResult{}, err
+	}
+	return engine.ApplyResult{Result: completion.result()}, nil
+}
+
+func (b *packBuild) prepareWork() error {
+	b.work = filepath.Join(b.rt.Root, "builds", string(b.step.exec.OperationID)+"-"+b.step.payload.Step)
+	if err := os.RemoveAll(b.work); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(b.work, 0o700); err != nil {
+		return err
+	}
+	isolation, err := buildIsolation(b.work)
+	if err != nil {
+		return err
+	}
+	b.isolation = isolation
+	return nil
+}
+
+func (b *packBuild) cleanupWork() {
+	_ = os.RemoveAll(b.work)
+}
+
+func (b *packBuild) prepareSource(ctx context.Context) error {
+	b.source = b.step.payload.Path
+	if b.step.payload.GitURL != "" {
+		commit, err := b.prepareGitSource(ctx)
+		if err != nil {
+			return err
+		}
+		b.commit = commit
+	}
+	if b.step.payload.GitContextPath != "" {
+		resolved, err := resolveGitContextPath(b.source, b.step.payload.GitContextPath)
+		if err != nil {
+			return fmt.Errorf("%w: %w", engine.ErrPermanent, err)
+		}
+		b.source = resolved
+	}
+	info, err := os.Stat(b.source)
+	if err != nil || !info.IsDir() {
+		return fmt.Errorf(
+			"%w: build source %s is not a readable directory on the node",
+			engine.ErrPermanent,
+			b.source,
+		)
+	}
+	return nil
+}
+
+func (b *packBuild) prepareGitSource(ctx context.Context) (string, error) {
+	payload := b.step.payload
+	if err := CheckGitSourceResolution(ctx, payload.GitURL); err != nil {
+		return "", fmt.Errorf("%w: %w", engine.ErrPermanent, err)
+	}
+	gitEnv, err := gitBuildEnvironment(b.isolation, b.work, payload.GitCredentialSecretKey, b.rt)
+	if err != nil {
+		return "", fmt.Errorf("%w: %w", engine.ErrPermanent, err)
+	}
+	b.source = filepath.Join(b.work, "src")
+	if err := b.cloneGitSource(ctx, gitEnv); err != nil {
+		return "", err
+	}
+	if shaPattern.MatchString(payload.GitRef) {
+		if err := b.checkoutGitSource(ctx, gitEnv); err != nil {
+			return "", err
+		}
+	}
+	commit, err := b.resolveGitSource(ctx, gitEnv)
+	if err != nil {
+		return "", err
+	}
+	if shaPattern.MatchString(payload.GitRef) && commit != payload.GitRef {
+		return "", fmt.Errorf(
+			"%w: checked-out commit %s does not match the resolved commit %s",
+			engine.ErrPermanent,
+			commit,
+			payload.GitRef,
+		)
+	}
+	return commit, nil
+}
+
+func (b *packBuild) cloneGitSource(ctx context.Context, gitEnv []string) error {
+	payload := b.step.payload
+	args := []string{"git", "clone"}
+	if shaPattern.MatchString(payload.GitRef) {
+		// A commit SHA is immutable but is not a branch/tag; fetch the
+		// repository without checkout and detach at the exact commit.
+		args = append(args, "--no-checkout", "--filter=blob:none", payload.GitURL, b.source)
+	} else {
+		args = append(args, "--depth", "1")
+		if payload.GitRef != "" {
+			args = append(args, "--branch", payload.GitRef)
+		}
+		args = append(args, payload.GitURL, b.source)
+	}
+	cloneCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+	_, stderr, err := runArgvClean(cloneCtx, args, gitEnv, b.rt, b.step.ID(), b.report)
+	if err != nil {
+		if ctx.Err() != nil {
+			return engine.ErrInterrupted
+		}
+		return fmt.Errorf("%w: git clone failed: %s", engine.ErrPermanent, firstLine(stderr))
+	}
+	return nil
+}
+
+func (b *packBuild) checkoutGitSource(ctx context.Context, gitEnv []string) error {
+	checkoutCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	_, stderr, err := runArgvClean(
+		checkoutCtx,
+		[]string{"git", "-C", b.source, "checkout", "--detach", b.step.payload.GitRef},
+		gitEnv,
+		b.rt,
+		b.step.ID(),
+		b.report,
 	)
 	if err != nil {
-		return engine.ApplyResult{}, fmt.Errorf("%w: %s", engine.ErrPermanent, err)
+		if ctx.Err() != nil {
+			return engine.ErrInterrupted
+		}
+		return fmt.Errorf("%w: git checkout failed: %s", engine.ErrPermanent, firstLine(stderr))
 	}
-	args := packBuildArgs(
-		s.payload,
-		source,
+	return nil
+}
+
+func (b *packBuild) resolveGitSource(ctx context.Context, gitEnv []string) (string, error) {
+	resolveCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	stdout, stderr, err := runArgvClean(
+		resolveCtx,
+		[]string{"git", "-C", b.source, "rev-parse", "HEAD"},
+		gitEnv,
+		b.rt,
+		b.step.ID(),
+		nil,
+	)
+	if err != nil {
+		if ctx.Err() != nil {
+			return "", engine.ErrInterrupted
+		}
+		return "", fmt.Errorf("%w: git ref resolution failed: %s", engine.ErrPermanent, firstLine(stderr))
+	}
+	commit := strings.TrimSpace(stdout)
+	if !shaPattern.MatchString(commit) {
+		return "", fmt.Errorf("%w: git ref did not resolve to an exact commit", engine.ErrPermanent)
+	}
+	return commit, nil
+}
+
+func (b *packBuild) prepareBuilder(ctx context.Context) error {
+	b.builder = b.step.payload.Builder
+	if b.builder == "" {
+		return fmt.Errorf("%w: Git build source has no explicit Buildpacks builder; set source.builder or --builder (there is no built-in default)", engine.ErrPermanent)
+	}
+	platform, err := buildpacks.TargetPlatform(runtime.GOARCH)
+	if err != nil {
+		return fmt.Errorf("%w: %w", engine.ErrPermanent, err)
+	}
+	b.platform = platform
+	if err := verifyBuilderPlatformAPI(
+		ctx,
+		b.rt,
+		b.isolation,
+		b.builder,
+		b.platform,
+		b.step.ID(),
+		b.report,
+	); err != nil {
+		if ctx.Err() != nil {
+			return engine.ErrInterrupted
+		}
+		return fmt.Errorf("%w: %w", engine.ErrPermanent, err)
+	}
+	return nil
+}
+
+func (b *packBuild) prepareNetwork(ctx context.Context) error {
+	registry, err := inspectRegistryContainer(
+		ctx,
+		b.rt,
+		b.isolation,
+		b.step.payload.Registry,
+		b.step.ID(),
+		b.report,
+	)
+	if err != nil {
+		if ctx.Err() != nil {
+			return engine.ErrInterrupted
+		}
+		return err
+	}
+	b.registry = registry
+	if err := removeStaleBuildNetworks(
+		ctx,
+		b.rt,
+		b.isolation,
+		registry.ID,
+		b.step.exec,
+		b.report,
+	); err != nil {
+		if ctx.Err() != nil {
+			return engine.ErrInterrupted
+		}
+		return err
+	}
+	networkCtx, cancel := context.WithTimeout(ctx, buildNetworkCreateTimeout)
+	network, err := createBuildNetwork(
+		networkCtx,
+		b.rt,
+		b.isolation,
+		b.step.exec.OperationID,
+		b.step.payload.Step,
+		b.step.exec.Attempt,
+	)
+	cancel()
+	if err != nil {
+		return b.recoverAmbiguousNetwork(ctx, network, err)
+	}
+	b.network = network
+	return nil
+}
+
+func (b *packBuild) recoverAmbiguousNetwork(ctx context.Context, network string, createErr error) error {
+	cleanupErr := cleanupAmbiguousBuildNetwork(
+		ctx,
+		b.rt,
+		b.isolation,
 		network,
-		builder,
-		runImage,
+		b.step.exec.OperationID,
+		b.step.payload.Step,
+		b.step.exec.Attempt,
+		b.registry.ID,
+	)
+	if cleanupErr != nil && b.report != nil {
+		b.report(engine.Event{Kind: "warning", Step: b.step.ID(), Message: cleanupErr.Error()})
+	}
+	if ctx.Err() != nil {
+		return engine.ErrInterrupted
+	}
+	if cleanupErr != nil {
+		return fmt.Errorf(
+			"%w; cleaning the build network after an ambiguous create failed: %w",
+			createErr,
+			cleanupErr,
+		)
+	}
+	return createErr
+}
+
+func (b *packBuild) removeNetwork(ctx context.Context) error {
+	cleanupCtx, cancel := context.WithTimeout(ctx, buildNetworkCleanupTimeout)
+	defer cancel()
+	return removeBuildNetwork(
+		cleanupCtx,
+		b.rt,
+		b.isolation,
+		b.network,
+		b.step.exec.OperationID,
+		b.step.payload.Step,
+		b.step.exec.Attempt,
+		b.registry.ID,
+	)
+}
+
+func (b *packBuild) runBuild(ctx context.Context) error {
+	transientEndpoint, err := attachRegistryToBuildNetwork(
+		ctx,
+		b.rt,
+		b.isolation,
+		b.network,
+		b.registry,
+		b.step.ID(),
+		b.report,
+	)
+	if err != nil {
+		if ctx.Err() != nil {
+			return engine.ErrInterrupted
+		}
+		return err
+	}
+	publishReference, repository, tag, err := packPublishReference(b.step.payload.Image, transientEndpoint)
+	if err != nil {
+		return fmt.Errorf("%w: %w", engine.ErrPermanent, err)
+	}
+	b.repository = repository
+	b.tag = tag
+	args := packBuildArgs(
+		b.step.payload,
+		b.source,
+		b.network,
+		b.builder,
+		"",
 		publishReference,
-		platform,
+		b.platform,
 		transientEndpoint,
 	)
 	buildRunCtx, cancel := context.WithTimeout(
-		buildCtx,
-		time.Duration(s.payload.TimeoutSeconds)*time.Second,
+		ctx,
+		time.Duration(b.step.payload.TimeoutSeconds)*time.Second,
 	)
 	defer cancel()
-	_, stderr, err := runArgvCleanPack(buildRunCtx, args, isolation, rt, s.ID(), report)
-	if err != nil {
-		if buildCtx.Err() != nil {
-			return engine.ApplyResult{}, engine.ErrInterrupted
-		}
-		if errors.Is(err, exec.ErrNotFound) ||
-			strings.Contains(strings.ToLower(err.Error()), "executable file not found") {
-			return engine.ApplyResult{}, fmt.Errorf(
-				"%w: pack is not installed on this node; install Buildpacks or use an image release",
-				engine.ErrPermanent,
-			)
-		}
-		return engine.ApplyResult{}, fmt.Errorf(
-			"%w: pack build failed: %s",
+	_, stderr, err := runArgvCleanPack(buildRunCtx, args, b.isolation, b.rt, b.step.ID(), b.report)
+	if err == nil {
+		return nil
+	}
+	if ctx.Err() != nil {
+		return engine.ErrInterrupted
+	}
+	if errors.Is(err, exec.ErrNotFound) ||
+		strings.Contains(strings.ToLower(err.Error()), "executable file not found") {
+		return fmt.Errorf(
+			"%w: pack is not installed on this node; install Buildpacks or use an image release",
 			engine.ErrPermanent,
-			commandDetail(err, stderr),
 		)
 	}
-	resolveCtx, cancelResolve := context.WithTimeout(buildCtx, 30*time.Second)
-	address, addressErr := normalizeRegistryAddress(s.payload.Registry)
-	if addressErr != nil {
-		cancelResolve()
-		return engine.ApplyResult{}, addressErr
-	}
-	resolver := &registrymeta.Client{
-		HTTPClient: registrymeta.NewHTTPClient(true),
-		Base:       "http://" + address,
-	}
-	resolution, resolveErr := resolver.Resolve(
-		resolveCtx,
-		repository,
-		tag,
-		registrymeta.Options{Architecture: runtime.GOARCH, AllowIndex: false},
-	)
-	cancelResolve()
-	if resolveErr != nil {
-		if buildCtx.Err() != nil {
-			return engine.ApplyResult{}, engine.ErrInterrupted
-		}
-		if errors.Is(resolveErr, registrymeta.ErrIndexNotAllowed) {
-			return engine.ApplyResult{}, fmt.Errorf(
-				"%w: the published tag is an image index; the bounded single-platform publish contract refuses it",
-				engine.ErrPermanent,
-			)
-		}
-		return engine.ApplyResult{}, resolveErr
-	}
-	digest, configDigest := resolution.ManifestDigest, resolution.ConfigDigest
-	canonical := s.payload.Registry + "/" + repository + "@" + digest
-	runtimeID, err := pullAndVerifyPublishedImage(
-		buildCtx,
-		rt,
-		isolation,
-		canonical,
-		runtime.GOARCH,
-		s.ID(),
-		report,
-	)
+	return fmt.Errorf("%w: pack build failed: %s", engine.ErrPermanent, commandDetail(err, stderr))
+}
+
+func (b *packBuild) publishAndTag(ctx context.Context) (packCompletion, error) {
+	digest, configDigest, canonical, runtimeID, err := b.resolvePublishedImage(ctx, b.repository, b.tag)
 	if err != nil {
-		if buildCtx.Err() != nil {
-			return engine.ApplyResult{}, engine.ErrInterrupted
-		}
-		return engine.ApplyResult{}, err
+		return packCompletion{}, err
 	}
 	// The registry attachment and every lifecycle container belong to the
 	// transient build. Clean them before the local completion tag so a failure
 	// here cannot leave a tag that looks like a finished artifact.
-	cleanupCtx, cancelCleanup := context.WithTimeout(
-		context.WithoutCancel(ctx),
-		buildNetworkCleanupTimeout,
-	)
-	cleanupErr := removeBuildNetwork(
-		cleanupCtx,
-		rt,
-		isolation,
-		network,
-		s.exec.OperationID,
-		s.payload.Step,
-		s.exec.Attempt,
-		registry.ID,
-	)
-	cancelCleanup()
-	if cleanupErr != nil {
-		return engine.ApplyResult{}, fmt.Errorf(
-			"cleaning the build network before completion failed: %w",
-			cleanupErr,
-		)
+	if err := b.removeNetwork(context.WithoutCancel(ctx)); err != nil {
+		return packCompletion{}, fmt.Errorf("cleaning the build network before completion failed: %w", err)
 	}
-	if buildCtx.Err() != nil {
-		return engine.ApplyResult{}, engine.ErrInterrupted
+	if ctx.Err() != nil {
+		return packCompletion{}, engine.ErrInterrupted
 	}
-	inputs, err := s.Inputs()
+	completion, err := b.writeCompletion(canonical, digest, configDigest, runtimeID)
 	if err != nil {
-		return engine.ApplyResult{}, err
-	}
-	completion := packCompletion{
-		Schema:      packCompletionSchema,
-		OperationID: string(s.exec.OperationID),
-		Step:        s.payload.Step,
-		Attempt:     s.exec.Attempt,
-		InputsHash:  engine.InputsHash(s.ID(), inputs),
-		Image:       s.payload.Image,
-		Registry:    s.payload.Registry,
-		Platform:    platform,
-		Reference:   canonical,
-		Digest:      digest,
-		ImageID:     configDigest,
-		RuntimeID:   runtimeID,
-		Commit:      commit,
-	}
-	if err := writePackCompletion(rt.Root, completion); err != nil {
-		return engine.ApplyResult{}, err
+		return packCompletion{}, err
 	}
 	taggedID, err := tagVerifiedPublishedImage(
-		buildCtx,
-		rt,
-		isolation,
-		s.payload.Image,
+		ctx,
+		b.rt,
+		b.isolation,
+		b.step.payload.Image,
 		canonical,
-		s.ID(),
-		report,
+		b.step.ID(),
+		b.report,
 	)
 	if err != nil {
-		if buildCtx.Err() != nil {
-			return engine.ApplyResult{}, engine.ErrInterrupted
+		if ctx.Err() != nil {
+			return packCompletion{}, engine.ErrInterrupted
 		}
-		return engine.ApplyResult{}, err
+		return packCompletion{}, err
 	}
 	if taggedID != runtimeID {
-		return engine.ApplyResult{}, fmt.Errorf(
+		return packCompletion{}, fmt.Errorf(
 			"%w: the local completion tag resolved to %s, not the materialized runtime image %s",
 			engine.ErrPermanent,
 			taggedID,
 			runtimeID,
 		)
 	}
-	return engine.ApplyResult{Result: completion.result()}, nil
+	return completion, nil
+}
+
+func (b *packBuild) resolvePublishedImage(ctx context.Context, repository, tag string) (string, string, string, string, error) {
+	resolveCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	// Post-publish metadata is read over the host-side validated loopback
+	// registry endpoint. The Docker bridge address is only for the in-network
+	// pack push and insecure-registry argument; NewHTTPClient also intentionally
+	// restricts destinations to loopback.
+	address, err := normalizeRegistryAddress(b.step.payload.Registry)
+	if err != nil {
+		return "", "", "", "", err
+	}
+	resolver := &registrymeta.Client{
+		HTTPClient: registrymeta.NewHTTPClient(true),
+		Base:       "http://" + address,
+	}
+	resolution, err := resolver.Resolve(
+		resolveCtx,
+		repository,
+		tag,
+		registrymeta.Options{Architecture: runtime.GOARCH, AllowIndex: false},
+	)
+	if err != nil {
+		if ctx.Err() != nil {
+			return "", "", "", "", engine.ErrInterrupted
+		}
+		if errors.Is(err, registrymeta.ErrIndexNotAllowed) {
+			return "", "", "", "", fmt.Errorf(
+				"%w: the published tag is an image index; the bounded single-platform publish contract refuses it",
+				engine.ErrPermanent,
+			)
+		}
+		return "", "", "", "", err
+	}
+	digest, configDigest := resolution.ManifestDigest, resolution.ConfigDigest
+	canonical := b.step.payload.Registry + "/" + repository + "@" + digest
+	runtimeID, err := pullAndVerifyPublishedImage(
+		ctx,
+		b.rt,
+		b.isolation,
+		canonical,
+		runtime.GOARCH,
+		b.step.ID(),
+		b.report,
+	)
+	if err != nil {
+		if ctx.Err() != nil {
+			return "", "", "", "", engine.ErrInterrupted
+		}
+		return "", "", "", "", err
+	}
+	return digest, configDigest, canonical, runtimeID, nil
+}
+
+func (b *packBuild) writeCompletion(canonical, digest, configDigest, runtimeID string) (packCompletion, error) {
+	inputs, err := b.step.Inputs()
+	if err != nil {
+		return packCompletion{}, err
+	}
+	completion := packCompletion{
+		Schema:      packCompletionSchema,
+		OperationID: string(b.step.exec.OperationID),
+		Step:        b.step.payload.Step,
+		Attempt:     b.step.exec.Attempt,
+		InputsHash:  engine.InputsHash(b.step.ID(), inputs),
+		Image:       b.step.payload.Image,
+		Registry:    b.step.payload.Registry,
+		Platform:    b.platform,
+		Reference:   canonical,
+		Digest:      digest,
+		ImageID:     configDigest,
+		RuntimeID:   runtimeID,
+		Commit:      b.commit,
+	}
+	if err := writePackCompletion(b.rt.Root, completion); err != nil {
+		return packCompletion{}, err
+	}
+	return completion, nil
 }
 
 // packBuildArgs renders one Buildpacks build. Explicit volume caches keep the
@@ -2018,7 +2188,8 @@ func createBuildNetwork(
 ) (string, error) {
 	name := buildNetworkName(operationID, step, attempt)
 	labels := buildNetworkLabels(operationID, step, attempt)
-	args := []string{"docker", "network", "create"}
+	args := make([]string, 0, 3+2*len(labels)+1)
+	args = append(args, "docker", "network", "create")
 	for _, key := range sortedEnvKeys(labels) {
 		args = append(args, "--label", key+"="+labels[key])
 	}
@@ -2108,7 +2279,7 @@ func inspectBuildNetwork(
 	var inspection buildNetworkInspection
 	if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &inspection); err != nil {
 		return buildNetworkInspection{}, false, fmt.Errorf(
-			"build network %s did not report its details: %v",
+			"build network %s did not report its details: %w",
 			name,
 			err,
 		)
@@ -2146,84 +2317,14 @@ func removeBuildNetwork(
 	if !exists {
 		return nil
 	}
-	for key, want := range expected {
-		if inspection.Labels[key] != want {
-			return fmt.Errorf(
-				"refusing to clean build network %s: label %s does not have the expected ownership value",
-				name,
-				key,
-			)
-		}
-	}
-	removeContainers := func() error {
-		listed, listStderr, listErr := runArgvClean(
-			ctx,
-			[]string{
-				"docker",
-				"ps",
-				"-aq",
-				"--filter",
-				"network=" + name,
-				"--filter",
-				"label=author=pack",
-			},
-			isolation,
-			rt,
-			step,
-			nil,
-		)
-		if listErr != nil {
-			return fmt.Errorf(
-				"listing containers on build network %s failed: %s",
-				name,
-				commandDetail(listErr, listStderr),
-			)
-		}
-		ids := strings.Fields(listed)
-		if len(ids) == 0 {
-			return nil
-		}
-		args := append([]string{"docker", "rm", "-f"}, ids...)
-		_, removeStderr, removeErr := runArgvClean(ctx, args, isolation, rt, step, nil)
-		if removeErr != nil && !containerAlreadyGone(removeStderr) {
-			return fmt.Errorf(
-				"removing containers on build network %s failed: %s",
-				name,
-				commandDetail(removeErr, removeStderr),
-			)
-		}
-		return nil
-	}
-	detachRegistry := func() error {
-		if registryID == "" {
-			return nil
-		}
-		if _, attached := inspection.Containers[registryID]; !attached {
-			return nil
-		}
-		_, disconnectStderr, disconnectErr := runArgvClean(
-			ctx,
-			[]string{"docker", "network", "disconnect", name, registryID},
-			isolation,
-			rt,
-			step,
-			nil,
-		)
-		if disconnectErr != nil && !buildNetworkNotConnected(disconnectStderr) &&
-			!buildNetworkGone(disconnectStderr) {
-			return fmt.Errorf(
-				"detaching the registry container from build network %s failed: %s",
-				name,
-				commandDetail(disconnectErr, disconnectStderr),
-			)
-		}
-		return nil
+	if err := verifyBuildNetworkOwnership(name, expected, inspection); err != nil {
+		return err
 	}
 	for pass := 0; pass < 2; pass++ {
-		if err := removeContainers(); err != nil {
+		if err := removeNetworkContainers(ctx, rt, isolation, name, step); err != nil {
 			return err
 		}
-		if err := detachRegistry(); err != nil {
+		if err := detachRegistryFromBuildNetwork(ctx, rt, isolation, name, step, registryID, inspection); err != nil {
 			return err
 		}
 		_, stderr, err := runArgvClean(
@@ -2244,6 +2345,85 @@ func removeBuildNetwork(
 				commandDetail(err, stderr),
 			)
 		}
+	}
+	return nil
+}
+
+func verifyBuildNetworkOwnership(name string, expected map[string]string, inspection buildNetworkInspection) error {
+	for key, want := range expected {
+		if inspection.Labels[key] != want {
+			return fmt.Errorf(
+				"refusing to clean build network %s: label %s does not have the expected ownership value",
+				name,
+				key,
+			)
+		}
+	}
+	return nil
+}
+
+func removeNetworkContainers(ctx context.Context, rt engine.Runtime, isolation []string, name, step string) error {
+	listed, listStderr, listErr := runArgvClean(
+		ctx,
+		[]string{
+			"docker",
+			"ps",
+			"-aq",
+			"--filter",
+			"network=" + name,
+			"--filter",
+			"label=author=pack",
+		},
+		isolation,
+		rt,
+		step,
+		nil,
+	)
+	if listErr != nil {
+		return fmt.Errorf(
+			"listing containers on build network %s failed: %s",
+			name,
+			commandDetail(listErr, listStderr),
+		)
+	}
+	ids := strings.Fields(listed)
+	if len(ids) == 0 {
+		return nil
+	}
+	args := append([]string{"docker", "rm", "-f"}, ids...)
+	_, removeStderr, removeErr := runArgvClean(ctx, args, isolation, rt, step, nil)
+	if removeErr != nil && !containerAlreadyGone(removeStderr) {
+		return fmt.Errorf(
+			"removing containers on build network %s failed: %s",
+			name,
+			commandDetail(removeErr, removeStderr),
+		)
+	}
+	return nil
+}
+
+func detachRegistryFromBuildNetwork(ctx context.Context, rt engine.Runtime, isolation []string, name, step, registryID string, inspection buildNetworkInspection) error {
+	if registryID == "" {
+		return nil
+	}
+	if _, attached := inspection.Containers[registryID]; !attached {
+		return nil
+	}
+	_, disconnectStderr, disconnectErr := runArgvClean(
+		ctx,
+		[]string{"docker", "network", "disconnect", name, registryID},
+		isolation,
+		rt,
+		step,
+		nil,
+	)
+	if disconnectErr != nil && !buildNetworkNotConnected(disconnectStderr) &&
+		!buildNetworkGone(disconnectStderr) {
+		return fmt.Errorf(
+			"detaching the registry container from build network %s failed: %s",
+			name,
+			commandDetail(disconnectErr, disconnectStderr),
+		)
 	}
 	return nil
 }
@@ -2290,44 +2470,11 @@ func removeStaleBuildNetworks(
 		if !exists {
 			continue
 		}
-		if inspection.Labels[buildNetworkOwnerLabel] != buildNetworkOwner {
-			return fmt.Errorf(
-				"refusing to clean build network %s: it does not carry the pack ownership label",
-				id,
-			)
+		stale, err := validateStaleBuildNetwork(inspection, execution)
+		if err != nil {
+			return err
 		}
-		operationID := contract.OperationID(inspection.Labels[buildNetworkOperationLabel])
-		if err := operationID.Validate(); err != nil {
-			return fmt.Errorf(
-				"refusing to clean build network %s: its operation label is invalid",
-				id,
-			)
-		}
-		networkStep := inspection.Labels[buildNetworkStepLabel]
-		if !packStepPattern.MatchString(networkStep) {
-			return fmt.Errorf("refusing to clean build network %s: its step label is invalid", id)
-		}
-		attemptValue := inspection.Labels[buildNetworkAttemptLabel]
-		attempt, parseErr := strconv.ParseUint(attemptValue, 10, 32)
-		if parseErr != nil || attempt == 0 {
-			return fmt.Errorf(
-				"refusing to clean build network %s: its attempt label is invalid",
-				id,
-			)
-		}
-		if expectedName := buildNetworkName(
-			operationID,
-			networkStep,
-			uint32(attempt),
-		); inspection.Name != expectedName {
-			return fmt.Errorf(
-				"refusing to clean build network %s: it is not the deterministic network %s",
-				inspection.Name,
-				expectedName,
-			)
-		}
-		if operationID != execution.OperationID || networkStep != execution.Step ||
-			uint32(attempt) > execution.Attempt {
+		if !stale.remove {
 			continue
 		}
 		if err := removeBuildNetwork(
@@ -2335,9 +2482,9 @@ func removeStaleBuildNetworks(
 			rt,
 			isolation,
 			inspection.Name,
-			operationID,
-			networkStep,
-			uint32(attempt),
+			stale.operationID,
+			stale.step,
+			stale.attempt,
 			registryID,
 		); err != nil {
 			return err
@@ -2355,13 +2502,62 @@ func removeStaleBuildNetworks(
 	return nil
 }
 
+type staleBuildNetwork struct {
+	operationID contract.OperationID
+	step        string
+	attempt     uint32
+	remove      bool
+}
+
+func validateStaleBuildNetwork(inspection buildNetworkInspection, execution engine.Execution) (staleBuildNetwork, error) {
+	id := inspection.Name
+	if inspection.Labels[buildNetworkOwnerLabel] != buildNetworkOwner {
+		return staleBuildNetwork{}, fmt.Errorf(
+			"refusing to clean build network %s: it does not carry the pack ownership label",
+			id,
+		)
+	}
+	operationID := contract.OperationID(inspection.Labels[buildNetworkOperationLabel])
+	if err := operationID.Validate(); err != nil {
+		return staleBuildNetwork{}, fmt.Errorf(
+			"refusing to clean build network %s: its operation label is invalid",
+			id,
+		)
+	}
+	networkStep := inspection.Labels[buildNetworkStepLabel]
+	if !packStepPattern.MatchString(networkStep) {
+		return staleBuildNetwork{}, fmt.Errorf("refusing to clean build network %s: its step label is invalid", id)
+	}
+	attemptValue := inspection.Labels[buildNetworkAttemptLabel]
+	attempt, parseErr := strconv.ParseUint(attemptValue, 10, 32)
+	if parseErr != nil || attempt == 0 {
+		return staleBuildNetwork{}, fmt.Errorf(
+			"refusing to clean build network %s: its attempt label is invalid",
+			id,
+		)
+	}
+	if expectedName := buildNetworkName(operationID, networkStep, uint32(attempt)); inspection.Name != expectedName {
+		return staleBuildNetwork{}, fmt.Errorf(
+			"refusing to clean build network %s: it is not the deterministic network %s",
+			inspection.Name,
+			expectedName,
+		)
+	}
+	return staleBuildNetwork{
+		operationID: operationID,
+		step:        networkStep,
+		attempt:     uint32(attempt),
+		remove: operationID == execution.OperationID && networkStep == execution.Step &&
+			uint32(attempt) <= execution.Attempt,
+	}, nil
+}
+
 // sweepCompletedBuildNetworks runs only under the retention effect's exclusive
 // host fence. Failed, resumable, unreadable and locked effects remain untouched.
 func sweepCompletedBuildNetworks(
 	ctx context.Context,
 	rt engine.Runtime,
 	step string,
-	report engine.Reporter,
 ) error {
 	isolation, cleanup, err := IsolatedDockerEnvironment()
 	if err != nil {
@@ -2534,7 +2730,7 @@ func inspectRegistryContainer(
 	host, port, err := net.SplitHostPort(endpoint)
 	if err != nil {
 		return registryContainer{}, fmt.Errorf(
-			"%w: configured registry endpoint %q is invalid: %v",
+			"%w: configured registry endpoint %q is invalid: %w",
 			engine.ErrPermanent,
 			endpoint,
 			err,
@@ -2976,54 +3172,9 @@ func verifyBuilderPlatformAPI(
 	builder, platform, step string,
 	report engine.Reporter,
 ) error {
-	format := `{{index .Config.Labels "io.buildpacks.builder.metadata"}}`
-	inspectBuilder := func() (string, string, error) {
-		return runArgvClean(
-			ctx,
-			[]string{"docker", "image", "inspect", "--format", format, builder},
-			isolation,
-			rt,
-			step,
-			nil,
-		)
-	}
-	stdout, stderr, err := inspectBuilder()
+	stdout, err := builderMetadataOutput(ctx, rt, isolation, builder, platform, step, report)
 	if err != nil {
-		if !imageMissingError(stderr) {
-			return fmt.Errorf(
-				"inspecting builder %s failed: %s",
-				builder,
-				commandDetail(err, stderr),
-			)
-		}
-		pullCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
-		_, pullStderr, pullErr := runArgvClean(
-			pullCtx,
-			[]string{"docker", "pull", "--platform", platform, builder},
-			isolation,
-			rt,
-			step,
-			report,
-		)
-		cancel()
-		if pullErr != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			return fmt.Errorf(
-				"pulling builder %s failed: %s",
-				builder,
-				commandDetail(pullErr, pullStderr),
-			)
-		}
-		stdout, stderr, err = inspectBuilder()
-		if err != nil {
-			return fmt.Errorf(
-				"inspecting builder %s after pull failed: %s",
-				builder,
-				commandDetail(err, stderr),
-			)
-		}
+		return err
 	}
 	raw := strings.TrimSpace(stdout)
 	if raw == "" || raw == "<no value>" || raw == "null" {
@@ -3034,22 +3185,13 @@ func verifyBuilderPlatformAPI(
 	}
 	var metadata builderMetadata
 	if err := json.Unmarshal([]byte(raw), &metadata); err != nil {
-		return fmt.Errorf("builder %s has unreadable Buildpacks metadata: %v", builder, err)
+		return fmt.Errorf("builder %s has unreadable Buildpacks metadata: %w", builder, err)
 	}
 	versions := append(
 		append([]string{}, metadata.Lifecycle.APIs.Platform.Deprecated...),
 		metadata.Lifecycle.APIs.Platform.Supported...)
-	selected := 0
-	for _, version := range versions {
-		minor, ok := platformAPIMinor(version)
-		if !ok || minor < packPublishPlatformAPIMinor || minor > packSupportedPlatformAPIMinor {
-			continue
-		}
-		if minor > selected {
-			selected = minor
-		}
-	}
-	if selected == 0 {
+	selected, err := selectBuilderPlatformAPI(versions)
+	if err != nil {
 		return fmt.Errorf(
 			"builder %s does not advertise a Platform API from 0.%d to 0.%d; --insecure-registry would be ignored (supported: %s)",
 			builder,
@@ -3074,6 +3216,78 @@ func verifyBuilderPlatformAPI(
 	return nil
 }
 
+func builderMetadataOutput(ctx context.Context, rt engine.Runtime, isolation []string, builder, platform, step string, report engine.Reporter) (string, error) {
+	stdout, stderr, err := inspectBuilderMetadata(ctx, rt, isolation, builder, step)
+	if err == nil {
+		return stdout, nil
+	}
+	if !imageMissingError(stderr) {
+		return "", fmt.Errorf(
+			"inspecting builder %s failed: %s",
+			builder,
+			commandDetail(err, stderr),
+		)
+	}
+	pullCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	_, pullStderr, pullErr := runArgvClean(
+		pullCtx,
+		[]string{"docker", "pull", "--platform", platform, builder},
+		isolation,
+		rt,
+		step,
+		report,
+	)
+	cancel()
+	if pullErr != nil {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		return "", fmt.Errorf(
+			"pulling builder %s failed: %s",
+			builder,
+			commandDetail(pullErr, pullStderr),
+		)
+	}
+	stdout, stderr, err = inspectBuilderMetadata(ctx, rt, isolation, builder, step)
+	if err != nil {
+		return "", fmt.Errorf(
+			"inspecting builder %s after pull failed: %s",
+			builder,
+			commandDetail(err, stderr),
+		)
+	}
+	return stdout, nil
+}
+
+func inspectBuilderMetadata(ctx context.Context, rt engine.Runtime, isolation []string, builder, step string) (string, string, error) {
+	format := `{{index .Config.Labels "io.buildpacks.builder.metadata"}}`
+	return runArgvClean(
+		ctx,
+		[]string{"docker", "image", "inspect", "--format", format, builder},
+		isolation,
+		rt,
+		step,
+		nil,
+	)
+}
+
+func selectBuilderPlatformAPI(versions []string) (int, error) {
+	selected := 0
+	for _, version := range versions {
+		minor, ok := platformAPIMinor(version)
+		if !ok || minor < packPublishPlatformAPIMinor || minor > packSupportedPlatformAPIMinor {
+			continue
+		}
+		if minor > selected {
+			selected = minor
+		}
+	}
+	if selected == 0 {
+		return 0, errors.New("no supported platform API")
+	}
+	return selected, nil
+}
+
 func packCompletionPath(root string, operationID contract.OperationID, step string) string {
 	return filepath.Join(root, "builds", "completions", string(operationID)+"-"+step+".json")
 }
@@ -3085,7 +3299,7 @@ func loadPackCompletion(
 ) (packCompletion, bool, error) {
 	raw, err := os.ReadFile(
 		packCompletionPath(root, operationID, step),
-	) //nolint:gosec // G304: fixed path beneath the node state directory.
+	)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return packCompletion{}, false, nil
@@ -3162,7 +3376,7 @@ func watchBuildCancel(ctx context.Context, path string, cancel context.CancelFun
 	for {
 		if _, err := os.Stat(
 			path,
-		); err == nil { //nolint:gosec // G304: fixed path beneath the node state directory.
+		); err == nil {
 			cancel()
 			return
 		}
@@ -3198,7 +3412,7 @@ func gitBuildEnvironment(
 // appear in argv, the step payload, the journal, or an event.
 func gitCredentialEnvironment(isolation []string, work, credential string) ([]string, error) {
 	askpass := filepath.Join(work, "git-askpass.sh")
-	if err := os.WriteFile(askpass, gitAskpassScript, 0o700); err != nil {
+	if err := os.WriteFile(askpass, gitAskpassScript, 0o700); err != nil { //nolint:gosec // G306: the git askpass helper must be executable by the build user.
 		return nil, err
 	}
 	env := append([]string{}, isolation...)
@@ -3236,7 +3450,7 @@ type ReadyImageStep struct {
 
 func buildReadyImageStep(exec engine.Execution, raw json.RawMessage) (engine.Step, error) {
 	var payload ReadyImagePayload
-	if err := decodePayload(exec, raw, &payload); err != nil {
+	if err := decodePayload(raw, &payload); err != nil {
 		return nil, err
 	}
 	if payload.Step != exec.Step {
@@ -3449,7 +3663,7 @@ type BuildStopStep struct {
 
 func buildBuildStopStep(exec engine.Execution, raw json.RawMessage) (engine.Step, error) {
 	var payload BuildStopPayload
-	if err := decodePayload(exec, raw, &payload); err != nil {
+	if err := decodePayload(raw, &payload); err != nil {
 		return nil, err
 	}
 	if payload.Step != exec.Step {
@@ -3595,98 +3809,121 @@ func validateArgv(argv []string) error {
 			)
 		}
 	}
-	program := filepath.Base(argv[0])
-	switch program {
+	switch program := filepath.Base(argv[0]); program {
 	case "docker":
-		if len(argv) < 2 {
-			return errors.New("docker command is missing a subcommand")
-		}
-		switch argv[1] {
-		case "version",
-			"pull",
-			"run",
-			"create",
-			"start",
-			"stop",
-			"rm",
-			"inspect",
-			"port",
-			"ps",
-			"network",
-			"restart",
-			"exec",
-			"tag":
-		case "image":
-			if len(argv) < 3 || (argv[2] != "inspect" && argv[2] != "ls" && argv[2] != "rm") {
-				return errors.New("unsupported docker image command")
-			}
-		case "volume":
-			if len(argv) < 3 ||
-				(argv[2] != "create" && argv[2] != "ls" && argv[2] != "inspect" && argv[2] != "rm") {
-				return errors.New("unsupported docker volume command")
-			}
-		default:
-			return errors.New("unsupported docker command")
-		}
-		execCommand := argv[1] == "exec"
-		for index := 1; index < len(argv); index++ {
-			arg := argv[index]
-			switch {
-			case arg == "--privileged",
-				strings.HasPrefix(arg, "--cap-add"),
-				strings.HasPrefix(arg, "--device"),
-				strings.HasPrefix(arg, "--security-opt"),
-				strings.HasPrefix(arg, "--network=host"),
-				strings.HasPrefix(
-					arg,
-					"--pid=host",
-				),
-				arg == "-v",
-				strings.HasPrefix(arg, "--volume"),
-				strings.HasPrefix(arg, "--env-file"):
-				return errors.New("privileged or host-mutating docker option is not allowed")
-			case arg == "--network" && index+1 < len(argv) && argv[index+1] == "host":
-				return errors.New("host networking is not allowed")
-			case execCommand && (arg == "-e" || arg == "--env" || strings.HasPrefix(arg, "--env=")):
-				return errors.New("environment values are not allowed in a docker exec argv")
-			case arg == "--mount":
-				if index+1 >= len(argv) {
-					return errors.New("docker --mount needs a value")
-				}
-				if err := validateMountOption(argv[index+1]); err != nil {
-					return err
-				}
-				index++
-			case strings.HasPrefix(arg, "--mount="):
-				return errors.New("use --mount with a separate named-volume value")
-			}
-		}
+		return validateDockerArgv(argv)
 	case "pack":
-		// `pack version` is the read-only availability probe used by node
-		// checks. Builds are the only mutating pack operation.
-		if len(argv) == 2 && argv[1] == "version" {
-			break
-		}
-		if len(argv) < 2 || argv[1] != "build" {
-			return errors.New("only pack build and pack version are supported")
-		}
+		return validatePackArgv(argv)
 	case "git":
-		subcommand := 1
-		if len(argv) > 3 && argv[1] == "-C" {
-			subcommand = 3
-		}
-		if len(argv) <= subcommand {
-			return errors.New("git subcommand is missing")
-		}
-		switch argv[subcommand] {
-		case "clone", "checkout", "rev-parse":
-		default:
-			return errors.New("only git clone, checkout, and rev-parse are supported")
-		}
+		return validateGitArgv(argv)
 	default:
 		return fmt.Errorf("unsupported platform command %q", program)
 	}
+}
+
+func validateDockerArgv(argv []string) error {
+	if len(argv) < 2 {
+		return errors.New("docker command is missing a subcommand")
+	}
+	if err := validateDockerSubcommand(argv); err != nil {
+		return err
+	}
+	return validateDockerOptions(argv)
+}
+
+func validateDockerSubcommand(argv []string) error {
+	switch argv[1] {
+	case "version",
+		"pull",
+		"run",
+		"create",
+		"start",
+		"stop",
+		"rm",
+		"inspect",
+		"port",
+		"ps",
+		"network",
+		"restart",
+		"exec",
+		"tag":
+		return nil
+	case "image":
+		if len(argv) < 3 || (argv[2] != "inspect" && argv[2] != "ls" && argv[2] != "rm") {
+			return errors.New("unsupported docker image command")
+		}
+		return nil
+	case "volume":
+		if len(argv) < 3 ||
+			(argv[2] != "create" && argv[2] != "ls" && argv[2] != "inspect" && argv[2] != "rm") {
+			return errors.New("unsupported docker volume command")
+		}
+		return nil
+	default:
+		return errors.New("unsupported docker command")
+	}
+}
+
+func validateDockerOptions(argv []string) error {
+	execCommand := argv[1] == "exec"
+	for index := 1; index < len(argv); index++ {
+		arg := argv[index]
+		switch {
+		case arg == "--privileged",
+			strings.HasPrefix(arg, "--cap-add"),
+			strings.HasPrefix(arg, "--device"),
+			strings.HasPrefix(arg, "--security-opt"),
+			strings.HasPrefix(arg, "--network=host"),
+			strings.HasPrefix(arg, "--pid=host"),
+			arg == "-v",
+			strings.HasPrefix(arg, "--volume"),
+			strings.HasPrefix(arg, "--env-file"):
+			return errors.New("privileged or host-mutating docker option is not allowed")
+		case arg == "--network" && index+1 < len(argv) && argv[index+1] == "host":
+			return errors.New("host networking is not allowed")
+		case execCommand && (arg == "-e" || arg == "--env" || strings.HasPrefix(arg, "--env=")):
+			return errors.New("environment values are not allowed in a docker exec argv")
+		case arg == "--mount":
+			if index+1 >= len(argv) {
+				return errors.New("docker --mount needs a value")
+			}
+			if err := validateMountOption(argv[index+1]); err != nil {
+				return err
+			}
+			index++
+		case strings.HasPrefix(arg, "--mount="):
+			return errors.New("use --mount with a separate named-volume value")
+		}
+	}
 	return nil
+}
+
+func validatePackArgv(argv []string) error {
+	// `pack version` is the read-only availability probe used by node checks.
+	// Builds are the only mutating pack operation.
+	if len(argv) == 2 && argv[1] == "version" {
+		return nil
+	}
+	if len(argv) < 2 || argv[1] != "build" {
+		return errors.New("only pack build and pack version are supported")
+	}
+	return nil
+}
+
+func validateGitArgv(argv []string) error {
+	subcommand := 1
+	if len(argv) > 3 && argv[1] == "-C" {
+		subcommand = 3
+	}
+	if len(argv) <= subcommand {
+		return errors.New("git subcommand is missing")
+	}
+	switch argv[subcommand] {
+	case "clone", "checkout", "rev-parse":
+		return nil
+	default:
+		return errors.New("only git clone, checkout, and rev-parse are supported")
+	}
 }
 
 func validateMountOption(value string) error {
@@ -3868,34 +4105,12 @@ func runArgvWithEnvGraceCapture(
 	info *commandOutputInfo,
 ) (string, string, error) {
 	if err := validateArgv(argv); err != nil {
-		return "", "", fmt.Errorf("%w: %s", engine.ErrPermanent, err)
+		return "", "", fmt.Errorf("%w: %w", engine.ErrPermanent, err)
 	}
 	command := exec.CommandContext(ctx, argv[0], argv[1:]...) //nolint:gosec // G204: argv is validated and no shell is used.
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if grace > 0 {
-		done := make(chan struct{})
-		var once sync.Once
-		command.Cancel = func() error {
-			once.Do(func() {
-				if command.Process == nil {
-					return
-				}
-				pid := command.Process.Pid
-				_ = syscall.Kill(-pid, syscall.SIGTERM)
-				go func() {
-					timer := time.NewTimer(grace)
-					defer timer.Stop()
-					select {
-					case <-timer.C:
-						_ = syscall.Kill(-pid, syscall.SIGKILL)
-					case <-done:
-					}
-				}()
-			})
-			return nil
-		}
-		defer close(done)
-	}
+	closeDone := configureGracefulCancel(command, grace)
+	defer closeDone()
 	if len(env) > 0 {
 		command.Env = env
 	}
@@ -3927,6 +4142,34 @@ func runArgvWithEnvGraceCapture(
 		return stdout.String(), stderr.String(), ctx.Err()
 	}
 	return stdout.String(), stderr.String(), err
+}
+
+func configureGracefulCancel(command *exec.Cmd, grace time.Duration) func() {
+	if grace <= 0 {
+		return func() {}
+	}
+	done := make(chan struct{})
+	var once sync.Once
+	command.Cancel = func() error {
+		once.Do(func() {
+			if command.Process == nil {
+				return
+			}
+			pid := command.Process.Pid
+			_ = syscall.Kill(-pid, syscall.SIGTERM)
+			go func() {
+				timer := time.NewTimer(grace)
+				defer timer.Stop()
+				select {
+				case <-timer.C:
+					_ = syscall.Kill(-pid, syscall.SIGKILL)
+				case <-done:
+				}
+			}()
+		})
+		return nil
+	}
+	return func() { close(done) }
 }
 
 func mergeEnv(base, extra []string) []string {
@@ -4042,7 +4285,7 @@ func (s *lineSink) Write(p []byte) (int, error) {
 		room = len(p)
 	}
 	_, _ = s.buf.Write(p[:room])
-	s.discarded += uint64(len(p) - room)
+	s.discarded += uint64(len(p) - room) //nolint:gosec // G115: room is capped at len(p), so the difference is non-negative.
 	if s.streaming && s.capture.report != nil {
 		for len(p) > 0 {
 			index := bytes.IndexByte(p, '\n')

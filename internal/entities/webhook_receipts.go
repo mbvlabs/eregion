@@ -87,25 +87,9 @@ func (tx *WebhookTx) Lock(ctx context.Context, environmentID, deliveryIDHash str
 }
 
 func webhookGet(ctx context.Context, q *query.Queries, environmentID, deliveryIDHash string, lock bool) (WebhookReceipt, bool, error) {
-	var row query.GetWebhookReceiptRow
-	if lock {
-		locked, lockErr := q.LockWebhookReceipt(ctx, query.LockWebhookReceiptParams{EnvironmentID: environmentID, DeliveryIDHash: deliveryIDHash})
-		if errors.Is(lockErr, pgx.ErrNoRows) {
-			return WebhookReceipt{}, false, nil
-		}
-		if lockErr != nil {
-			return WebhookReceipt{}, false, lockErr
-		}
-		row = query.GetWebhookReceiptRow(locked)
-	} else {
-		var err error
-		row, err = q.GetWebhookReceipt(ctx, query.GetWebhookReceiptParams{EnvironmentID: environmentID, DeliveryIDHash: deliveryIDHash})
-		if errors.Is(err, pgx.ErrNoRows) {
-			return WebhookReceipt{}, false, nil
-		}
-		if err != nil {
-			return WebhookReceipt{}, false, err
-		}
+	row, found, err := webhookReceiptRow(ctx, q, environmentID, deliveryIDHash, lock)
+	if err != nil || !found {
+		return WebhookReceipt{}, false, err
 	}
 	secretRevision, err := platformUint64(row.SecretRevision)
 	if err != nil {
@@ -133,6 +117,27 @@ func webhookGet(ctx context.Context, q *query.Queries, environmentID, deliveryID
 		FirstSeenAt: firstSeen,
 		Actor:       contract.Actor{Kind: row.ActorKind, Subject: row.ActorSubject},
 	}, true, nil
+}
+
+func webhookReceiptRow(ctx context.Context, q *query.Queries, environmentID, deliveryIDHash string, lock bool) (query.GetWebhookReceiptRow, bool, error) {
+	if !lock {
+		row, err := q.GetWebhookReceipt(ctx, query.GetWebhookReceiptParams{EnvironmentID: environmentID, DeliveryIDHash: deliveryIDHash})
+		if errors.Is(err, pgx.ErrNoRows) {
+			return query.GetWebhookReceiptRow{}, false, nil
+		}
+		if err != nil {
+			return query.GetWebhookReceiptRow{}, false, err
+		}
+		return row, true, nil
+	}
+	locked, err := q.LockWebhookReceipt(ctx, query.LockWebhookReceiptParams{EnvironmentID: environmentID, DeliveryIDHash: deliveryIDHash})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return query.GetWebhookReceiptRow{}, false, nil
+	}
+	if err != nil {
+		return query.GetWebhookReceiptRow{}, false, err
+	}
+	return query.GetWebhookReceiptRow(locked), true, nil
 }
 
 // Admit inserts the first receipt and returns its database first_seen_at. false

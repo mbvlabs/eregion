@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/platform"
 )
@@ -12,10 +13,20 @@ import (
 // record: one row per release and digest, a stale running row is replaceable, a
 // succeeded row is skipped, and the row goes with its release.
 func TestIntegrationReleaseCommandRuns(t *testing.T) {
+	pool, service, ctx, releaseID, operationID, digest := newReleaseCommandRunsFixture(t)
+	competing := assertReleaseCommandRunningClaim(t, ctx, pool, service, releaseID, operationID, digest)
+	assertReleaseCommandStaleOwner(t, ctx, pool, service, releaseID, operationID, competing, digest)
+	assertReleaseCommandFailedRetry(t, ctx, service, releaseID, competing, digest)
+	assertReleaseCommandSucceededAndCleanup(t, ctx, pool, service, releaseID, digest)
+}
+
+func newReleaseCommandRunsFixture(
+	t *testing.T,
+) (*pgxpool.Pool, *Service, context.Context, platform.ReleaseID, contract.OperationID, string) {
+	t.Helper()
 	pool, _ := testPool(t, true)
 	service := &Service{entities: newTestEntities(t, pool)}
 	ctx := context.Background()
-
 	appID, err := platform.NewAppID()
 	if err != nil {
 		t.Fatal(err)
@@ -50,8 +61,33 @@ func TestIntegrationReleaseCommandRuns(t *testing.T) {
         VALUES($1,$2,$3,$4,'demo:one','','{}','ready','','',clock_timestamp(),'')`, releaseID, operationID, appID, envID); err != nil {
 		t.Fatal(err)
 	}
-
 	digest := platform.ReleaseCommandDigest(platform.CommandSpec{Argv: []string{"bin/migrate"}, TimeoutSeconds: 120})
+	return pool, service, ctx, releaseID, operationID, digest
+}
+
+func insertReleaseCommandOperation(t *testing.T, ctx context.Context, pool *pgxpool.Pool, key string) contract.OperationID {
+	t.Helper()
+	id, err := contract.NewOperationID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO eregion_operations(id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state,attempt,completed_steps,last_sequence,created_at,updated_at,error_code)
+        VALUES($1,'platform.deploy','env/demo/production','operator','tester',$2,'hash','{}','failed',1,0,0,clock_timestamp(),clock_timestamp(),'')`, id, key); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func assertReleaseCommandRunningClaim(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	service *Service,
+	releaseID platform.ReleaseID,
+	operationID contract.OperationID,
+	digest string,
+) contract.OperationID {
+	t.Helper()
 	if err := service.startReleaseCommandRun(ctx, releaseID, digest, operationID); err != nil {
 		t.Fatal(err)
 	}
@@ -65,18 +101,7 @@ func TestIntegrationReleaseCommandRuns(t *testing.T) {
 	if got := releaseCommandAction(row, platform.ActionDeploy, operationID); got != releaseCommandRunNow {
 		t.Fatalf("own running command action = %v, want run", got)
 	}
-	createOperation := func(key string) contract.OperationID {
-		id, err := contract.NewOperationID()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := pool.Exec(ctx, `INSERT INTO eregion_operations(id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state,attempt,completed_steps,last_sequence,created_at,updated_at,error_code)
-            VALUES($1,'platform.deploy','env/demo/production','operator','tester',$2,'hash','{}','failed',1,0,0,clock_timestamp(),clock_timestamp(),'')`, id, key); err != nil {
-			t.Fatal(err)
-		}
-		return id
-	}
-	competing := createOperation("competing-release-command")
+	competing := insertReleaseCommandOperation(t, ctx, pool, "competing-release-command")
 	if err := service.startReleaseCommandRun(ctx, releaseID, digest, competing); err == nil {
 		t.Fatal("a running command owned by another operation was overwritten")
 	}
@@ -87,10 +112,23 @@ func TestIntegrationReleaseCommandRuns(t *testing.T) {
 	if row.OperationID != operationID || row.State != "running" {
 		t.Fatalf("running ownership changed after a refused claim: %+v", row)
 	}
+	return competing
+}
+
+func assertReleaseCommandStaleOwner(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	service *Service,
+	releaseID platform.ReleaseID,
+	operationID, competing contract.OperationID,
+	digest string,
+) {
+	t.Helper()
 	if _, err := pool.Exec(ctx, `UPDATE eregion_operations SET state='failed' WHERE id=$1`, operationID); err != nil {
 		t.Fatal(err)
 	}
-	row, err = service.releaseCommandRun(ctx, releaseID, digest)
+	row, err := service.releaseCommandRun(ctx, releaseID, digest)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,7 +142,18 @@ func TestIntegrationReleaseCommandRuns(t *testing.T) {
 		contract.NewFault(contract.PreconditionFailed, "command failed", "Fix the command.")); err != nil {
 		t.Fatal(err)
 	}
-	row, err = service.releaseCommandRun(ctx, releaseID, digest)
+}
+
+func assertReleaseCommandFailedRetry(
+	t *testing.T,
+	ctx context.Context,
+	service *Service,
+	releaseID platform.ReleaseID,
+	competing contract.OperationID,
+	digest string,
+) {
+	t.Helper()
+	row, err := service.releaseCommandRun(ctx, releaseID, digest)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,11 +169,22 @@ func TestIntegrationReleaseCommandRuns(t *testing.T) {
 	if err := service.finishReleaseCommandRun(ctx, releaseID, digest, competing, nil); err != nil {
 		t.Fatal(err)
 	}
-	succeeded := createOperation("succeeded-release-command")
+}
+
+func assertReleaseCommandSucceededAndCleanup(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	service *Service,
+	releaseID platform.ReleaseID,
+	digest string,
+) {
+	t.Helper()
+	succeeded := insertReleaseCommandOperation(t, ctx, pool, "succeeded-release-command")
 	if err := service.startReleaseCommandRun(ctx, releaseID, digest, succeeded); err == nil {
 		t.Fatal("a succeeded command was overwritten")
 	}
-	row, err = service.releaseCommandRun(ctx, releaseID, digest)
+	row, err := service.releaseCommandRun(ctx, releaseID, digest)
 	if err != nil {
 		t.Fatal(err)
 	}

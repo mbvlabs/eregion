@@ -197,82 +197,101 @@ func (n *actionResultNode) Call(_ context.Context, request node.Request, _ func(
 		Detail: "original node failure"}, nil
 }
 
+type releaseCommandGuardCase struct {
+	name                             string
+	status                           engine.Status
+	prior, oldFailure, fresh, cancel bool
+}
+
 func TestIntegrationReleaseCommandAmbiguousStatusNeverRedispatches(t *testing.T) {
 	pool, _ := testPool(t, true)
 	run := testRuntime(t, pool, 0)
 	ctx := context.Background()
-	tests := []struct {
-		name                             string
-		status                           engine.Status
-		prior, oldFailure, fresh, cancel bool
-	}{
+	for _, tc := range []releaseCommandGuardCase{
 		{"stale", engine.StatusStale, false, false, false, false},
 		{"absent-after-intent", engine.StatusAbsent, true, false, false, false},
 		{"old-retryable-failure", engine.StatusFailed, true, true, false, false},
 		{"cancel-after-old-failure", engine.StatusFailed, true, true, false, true},
 		{"fresh", engine.StatusAbsent, false, false, true, false},
-	}
-	for _, tc := range tests {
+	} {
 		t.Run(tc.name, func(t *testing.T) {
-			op, err := run.Service.Submit(ctx, operations.Submission{Kind: operations.TestKind, Target: operations.TestTarget,
-				Actor: testActor, IdempotencyKey: "release-guard-" + tc.name, Input: []byte(`{}`)})
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, _, ok, err := run.Service.claimAttempt(ctx, op.ID, 1, "test"); err != nil || !ok {
-				t.Fatalf("claim: %v %v", ok, err)
-			}
-			payload := platform.ReleaseCommandPayload{Step: deploymentCommandStep, Name: "release-command", Network: "app-network",
-				Image: "example.org/app:one", Command: []string{"/bin/migrate"}, TimeoutSeconds: 30}
-			raw, err := json.Marshal(payload)
-			if err != nil {
-				t.Fatal(err)
-			}
-			exec := engine.Execution{OperationID: op.ID, Attempt: 1, Step: deploymentCommandStep}
-			step, err := node.DefaultRegistry().Build(exec, raw)
-			if err != nil {
-				t.Fatal(err)
-			}
-			inputs, err := step.Inputs()
-			if err != nil {
-				t.Fatal(err)
-			}
-			hash := engine.InputsHash(step.ID(), inputs)
-			if tc.prior {
-				if _, err := run.Service.beginStep(ctx, op.ID, 1, deploymentCommandStep, hash, exec.ExecutionID()); err != nil {
-					t.Fatal(err)
-				}
-			}
-			attempt := uint32(1)
-			if tc.oldFailure {
-				attempt = 2
-				if _, _, ok, err := run.Service.claimAttempt(ctx, op.ID, 2, "test"); err != nil || !ok {
-					t.Fatalf("claim: %v %v", ok, err)
-				}
-			}
-			if tc.cancel {
-				if _, err := run.Service.RequestCancel(ctx, testActor, op.ID); err != nil {
-					t.Fatal(err)
-				}
-			}
-			tr := &actionResultNode{status: tc.status, hash: hash, retryable: tc.oldFailure}
-			if tc.oldFailure {
-				tr.attempt = 1
-			}
-			_, err = (&platformWorker{service: run.Service}).runStepOn(ctx, tr, op.ID, attempt, deploymentCommandStep, payload, nil)
-			if tc.fresh {
-				if err != nil || tr.runs != 1 {
-					t.Fatalf("fresh: runs=%d err=%v", tr.runs, err)
-				}
-				record, found, err := run.Service.stepRecord(ctx, op.ID, deploymentCommandStep)
-				if err != nil || !found || record.State != "completed" {
-					t.Fatalf("record: %+v %v", record, err)
-				}
-			} else if !errors.Is(err, errNodeEffectOutcomeUnknown) || tr.runs != 0 {
-				t.Fatalf("ambiguous: runs=%d err=%v", tr.runs, err)
-			}
+			runReleaseCommandGuardCase(t, ctx, run, tc)
 		})
 	}
+}
+
+func runReleaseCommandGuardCase(t *testing.T, ctx context.Context, run *Runtime, tc releaseCommandGuardCase) {
+	t.Helper()
+	op, payload, hash, attempt := prepareReleaseCommandGuard(t, ctx, run, tc)
+	tr := &actionResultNode{status: tc.status, hash: hash, retryable: tc.oldFailure}
+	if tc.oldFailure {
+		tr.attempt = 1
+	}
+	_, err := (&platformWorker{service: run.Service}).runStepOn(ctx, tr, op.ID, attempt, deploymentCommandStep, payload, nil)
+	if !tc.fresh {
+		if !errors.Is(err, errNodeEffectOutcomeUnknown) || tr.runs != 0 {
+			t.Fatalf("ambiguous: runs=%d err=%v", tr.runs, err)
+		}
+		return
+	}
+	if err != nil || tr.runs != 1 {
+		t.Fatalf("fresh: runs=%d err=%v", tr.runs, err)
+	}
+	record, found, err := run.Service.stepRecord(ctx, op.ID, deploymentCommandStep)
+	if err != nil || !found || record.State != "completed" {
+		t.Fatalf("record: %+v %v", record, err)
+	}
+}
+
+func prepareReleaseCommandGuard(
+	t *testing.T,
+	ctx context.Context,
+	run *Runtime,
+	tc releaseCommandGuardCase,
+) (contract.Operation, platform.ReleaseCommandPayload, string, uint32) {
+	t.Helper()
+	op, err := run.Service.Submit(ctx, operations.Submission{Kind: operations.TestKind, Target: operations.TestTarget,
+		Actor: testActor, IdempotencyKey: "release-guard-" + tc.name, Input: []byte(`{}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok, err := run.Service.claimAttempt(ctx, op.ID, 1, "test"); err != nil || !ok {
+		t.Fatalf("claim: %v %v", ok, err)
+	}
+	payload := platform.ReleaseCommandPayload{Step: deploymentCommandStep, Name: "release-command", Network: "app-network",
+		Image: "example.org/app:one", Command: []string{"/bin/migrate"}, TimeoutSeconds: 30}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec := engine.Execution{OperationID: op.ID, Attempt: 1, Step: deploymentCommandStep}
+	step, err := node.DefaultRegistry().Build(exec, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputs, err := step.Inputs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := engine.InputsHash(step.ID(), inputs)
+	if tc.prior {
+		if _, err := run.Service.beginStep(ctx, op.ID, 1, deploymentCommandStep, hash, exec.ExecutionID()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	attempt := uint32(1)
+	if tc.oldFailure {
+		attempt = 2
+		if _, _, ok, err := run.Service.claimAttempt(ctx, op.ID, 2, "test"); err != nil || !ok {
+			t.Fatalf("claim: %v %v", ok, err)
+		}
+	}
+	if tc.cancel {
+		if _, err := run.Service.RequestCancel(ctx, testActor, op.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return op, payload, hash, attempt
 }
 
 func TestIntegrationNodeFailureEvidenceOriginalAttemptAndDedup(t *testing.T) {
@@ -285,73 +304,106 @@ func TestIntegrationNodeFailureEvidenceOriginalAttemptAndDedup(t *testing.T) {
 			name = "old"
 		}
 		t.Run(name, func(t *testing.T) {
-			op, err := run.Service.Submit(ctx, operations.Submission{Kind: operations.TestKind, Target: operations.TestTarget,
-				Actor: testActor, IdempotencyKey: "node-evidence-" + name, Input: []byte(`{}`)})
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, _, ok, err := run.Service.claimAttempt(ctx, op.ID, 1, "test"); err != nil || !ok {
-				t.Fatalf("claim: %v %v", ok, err)
-			}
-			payload := platform.ReleaseCommandPayload{Step: deploymentCommandStep, Name: "release-command", Network: "app-network",
-				Image: "example.org/app:one", Command: []string{"/bin/migrate"}, TimeoutSeconds: 30}
-			raw, _ := json.Marshal(payload)
-			exec := engine.Execution{OperationID: op.ID, Attempt: 1, Step: deploymentCommandStep}
-			step, err := node.DefaultRegistry().Build(exec, raw)
-			if err != nil {
-				t.Fatal(err)
-			}
-			inputs, err := step.Inputs()
-			if err != nil {
-				t.Fatal(err)
-			}
-			hash := engine.InputsHash(step.ID(), inputs)
-			if _, err := run.Service.beginStep(ctx, op.ID, 1, deploymentCommandStep, hash, exec.ExecutionID()); err != nil {
-				t.Fatal(err)
-			}
-			attempt := uint32(1)
-			if old {
-				attempt = 2
-				if _, _, ok, err := run.Service.claimAttempt(ctx, op.ID, 2, "test"); err != nil || !ok {
-					t.Fatalf("claim: %v %v", ok, err)
-				}
-			}
-			tr := &actionResultNode{status: engine.StatusFailed, attempt: 1, hash: hash, retryable: true,
-				result: json.RawMessage(`{"stage":"release-command-create","output_availability":"bounded","redaction_context":"original","stderr":"original stderr","stderr_truncated":false}`)}
-			for range 2 {
-				if _, err := (&platformWorker{service: run.Service}).runStepOn(ctx, tr, op.ID, attempt, deploymentCommandStep, payload, nil); err == nil {
-					t.Fatal("failure was lost")
-				}
-			}
-			page, err := run.Service.Events(ctx, testActor, contract.Cursor{OperationID: op.ID}, 200)
-			if err != nil {
-				t.Fatal(err)
-			}
-			count := 0
-			for _, event := range page.Events {
-				if event.NodeEvidence != nil {
-					count++
-					if event.NodeEvidence.Attempt != 1 || event.NodeEvidence.ExecutionID != exec.ExecutionID() ||
-						event.Attempt != attempt || event.NodeEvidence.Stderr != "original stderr" {
-						t.Fatalf("evidence: %+v", event)
-					}
-				}
-			}
-			if count != 1 || tr.runs != 0 {
-				t.Fatalf("evidence count=%d runs=%d", count, tr.runs)
-			}
-			if !old {
-				if err := run.Service.recordRetryResult(ctx, op.ID, 1, contract.Unavailable, "failed"); err != nil {
-					t.Fatal(err)
-				}
-				got, err := run.Service.Get(ctx, testActor, op.ID)
-				if err != nil || got.State != contract.Running || got.LatestResult == nil ||
-					got.LatestResult.Stage != "release-command-create" || got.LatestResult.Excerpt != "original stderr" ||
-					got.LatestResult.ExcerptCursor == nil || got.LatestResult.Evidence != "partial" {
-					t.Fatalf("result: %+v %v", got, err)
-				}
-			}
+			runNodeFailureEvidenceCase(t, ctx, run, name, old)
 		})
+	}
+}
+
+func runNodeFailureEvidenceCase(t *testing.T, ctx context.Context, run *Runtime, name string, old bool) {
+	t.Helper()
+	op, payload, exec, attempt, tr := prepareNodeFailureEvidence(t, ctx, run, name, old)
+	for range 2 {
+		if _, err := (&platformWorker{service: run.Service}).runStepOn(ctx, tr, op.ID, attempt, deploymentCommandStep, payload, nil); err == nil {
+			t.Fatal("failure was lost")
+		}
+	}
+	assertNodeFailureEvidence(t, ctx, run, op, exec, attempt, tr, old)
+}
+
+func prepareNodeFailureEvidence(
+	t *testing.T,
+	ctx context.Context,
+	run *Runtime,
+	name string,
+	old bool,
+) (contract.Operation, platform.ReleaseCommandPayload, engine.Execution, uint32, *actionResultNode) {
+	t.Helper()
+	op, err := run.Service.Submit(ctx, operations.Submission{Kind: operations.TestKind, Target: operations.TestTarget,
+		Actor: testActor, IdempotencyKey: "node-evidence-" + name, Input: []byte(`{}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok, err := run.Service.claimAttempt(ctx, op.ID, 1, "test"); err != nil || !ok {
+		t.Fatalf("claim: %v %v", ok, err)
+	}
+	payload := platform.ReleaseCommandPayload{Step: deploymentCommandStep, Name: "release-command", Network: "app-network",
+		Image: "example.org/app:one", Command: []string{"/bin/migrate"}, TimeoutSeconds: 30}
+	raw, _ := json.Marshal(payload)
+	exec := engine.Execution{OperationID: op.ID, Attempt: 1, Step: deploymentCommandStep}
+	step, err := node.DefaultRegistry().Build(exec, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputs, err := step.Inputs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := engine.InputsHash(step.ID(), inputs)
+	if _, err := run.Service.beginStep(ctx, op.ID, 1, deploymentCommandStep, hash, exec.ExecutionID()); err != nil {
+		t.Fatal(err)
+	}
+	attempt := uint32(1)
+	if old {
+		attempt = 2
+		if _, _, ok, err := run.Service.claimAttempt(ctx, op.ID, 2, "test"); err != nil || !ok {
+			t.Fatalf("claim: %v %v", ok, err)
+		}
+	}
+	tr := &actionResultNode{status: engine.StatusFailed, attempt: 1, hash: hash, retryable: true,
+		result: json.RawMessage(`{"stage":"release-command-create","output_availability":"bounded","redaction_context":"original","stderr":"original stderr","stderr_truncated":false}`)}
+	return op, payload, exec, attempt, tr
+}
+
+func assertNodeFailureEvidence(
+	t *testing.T,
+	ctx context.Context,
+	run *Runtime,
+	op contract.Operation,
+	exec engine.Execution,
+	attempt uint32,
+	tr *actionResultNode,
+	old bool,
+) {
+	t.Helper()
+	page, err := run.Service.Events(ctx, testActor, contract.Cursor{OperationID: op.ID}, 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for _, event := range page.Events {
+		if event.NodeEvidence == nil {
+			continue
+		}
+		count++
+		if event.NodeEvidence.Attempt != 1 || event.NodeEvidence.ExecutionID != exec.ExecutionID() ||
+			event.Attempt != attempt || event.NodeEvidence.Stderr != "original stderr" {
+			t.Fatalf("evidence: %+v", event)
+		}
+	}
+	if count != 1 || tr.runs != 0 {
+		t.Fatalf("evidence count=%d runs=%d", count, tr.runs)
+	}
+	if old {
+		return
+	}
+	if err := run.Service.recordRetryResult(ctx, op.ID, 1, contract.Unavailable, "failed"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := run.Service.Get(ctx, testActor, op.ID)
+	if err != nil || got.State != contract.Running || got.LatestResult == nil ||
+		got.LatestResult.Stage != "release-command-create" || got.LatestResult.Excerpt != "original stderr" ||
+		got.LatestResult.ExcerptCursor == nil || got.LatestResult.Evidence != "partial" {
+		t.Fatalf("result: %+v %v", got, err)
 	}
 }
 
@@ -421,11 +473,7 @@ func TestIntegrationActionResultsSurviveRetryAndPaging(t *testing.T) {
 	if _, _, ok, err := run.Service.claimAttempt(ctx, op.ID, 1, "test"); err != nil || !ok {
 		t.Fatalf("claim: %v %v", ok, err)
 	}
-	for range 2 {
-		if err := run.Service.recordRetryResult(ctx, op.ID, 1, contract.Unavailable, "temporary failure"); err != nil {
-			t.Fatal(err)
-		}
-	}
+	recordRetryFailures(t, ctx, run, op.ID, 2)
 	first, err := run.Service.Get(ctx, testActor, op.ID)
 	if err != nil || first.State != contract.Running || first.LatestResult == nil || first.LatestResult.Status != contract.Failed {
 		t.Fatalf("first result: %+v %v", first, err)
@@ -433,7 +481,7 @@ func TestIntegrationActionResultsSurviveRetryAndPaging(t *testing.T) {
 	if _, _, ok, err := run.Service.claimAttempt(ctx, op.ID, 2, "test"); err != nil || !ok {
 		t.Fatalf("second claim: %v %v", ok, err)
 	}
-	if err := run.Service.recordRetryResult(ctx, op.ID, 1, contract.Unavailable, "stale"); err != errNotOwned {
+	if err := run.Service.recordRetryResult(ctx, op.ID, 1, contract.Unavailable, "stale"); !errors.Is(err, errNotOwned) {
 		t.Fatalf("stale attempt: %v", err)
 	}
 	if err := run.Service.finishPlatformOperation(ctx, op.ID, 2, func(*entities.StoreTx, *contract.Operation) error { return nil }); err != nil {
@@ -446,9 +494,32 @@ func TestIntegrationActionResultsSurviveRetryAndPaging(t *testing.T) {
 	if len(outcomes) != 2 || outcomes[0] != "retrying" || outcomes[1] != "succeeded" {
 		t.Fatalf("outcomes: %v", outcomes)
 	}
-	cursor := contract.Cursor{OperationID: op.ID}
+	results := collectActionResults(t, ctx, run, op.ID, final.LastSequence)
+	if len(results) != 2 || results[0].Attempt != 1 || results[1].Attempt != 2 {
+		t.Fatalf("history: %+v", results)
+	}
+}
+
+func recordRetryFailures(t *testing.T, ctx context.Context, run *Runtime, opID contract.OperationID, times int) {
+	t.Helper()
+	for range times {
+		if err := run.Service.recordRetryResult(ctx, opID, 1, contract.Unavailable, "temporary failure"); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func collectActionResults(
+	t *testing.T,
+	ctx context.Context,
+	run *Runtime,
+	opID contract.OperationID,
+	lastSequence uint64,
+) []contract.ActionResult {
+	t.Helper()
+	cursor := contract.Cursor{OperationID: opID}
 	var results []contract.ActionResult
-	for cursor.After < final.LastSequence {
+	for cursor.After < lastSequence {
 		page, err := run.Service.Events(ctx, testActor, cursor, 1)
 		if err != nil {
 			t.Fatal(err)
@@ -460,9 +531,7 @@ func TestIntegrationActionResultsSurviveRetryAndPaging(t *testing.T) {
 		}
 		cursor = page.Cursor
 	}
-	if len(results) != 2 || results[0].Attempt != 1 || results[1].Attempt != 2 {
-		t.Fatalf("history: %+v", results)
-	}
+	return results
 }
 
 func TestIntegrationActionResultTerminalAfterRetryKeepsOriginalStage(t *testing.T) {
@@ -490,7 +559,7 @@ func TestIntegrationActionResultTerminalAfterRetryKeepsOriginalStage(t *testing.
 	if _, err := run.Service.beginStep(ctx, op.ID, 1, "cleanup-v1", "cleanup", cleanup); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := run.Service.ackStep(ctx, op.ID, 1, "cleanup-v1", "cleanup", cleanup, nil, 2); err != nil {
+	if err := run.Service.ackStep(ctx, op.ID, 1, "cleanup-v1", "cleanup", cleanup, nil, 2); err != nil {
 		t.Fatal(err)
 	}
 	if err := run.Service.recordRetryResult(ctx, op.ID, 1, contract.Unavailable, "original failure"); err != nil {
@@ -576,7 +645,7 @@ func TestIntegrationActionResultReadFailurePreservesExecutionState(t *testing.T)
 	if _, _, ok, err := run.Service.claimAttempt(ctx, op.ID, 1, "test"); err != nil || !ok {
 		t.Fatalf("claim: %v %v", ok, err)
 	}
-	if _, err := run.Service.finishSucceeded(ctx, op.ID, 1); err != nil {
+	if err := run.Service.finishSucceeded(ctx, op.ID, 1); err != nil {
 		t.Fatal(err)
 	}
 	// Add a malformed later history record without changing any prior event.
@@ -593,14 +662,16 @@ func TestIntegrationActionResultReadFailurePreservesExecutionState(t *testing.T)
 	}
 }
 
+type evidenceAttemptCase struct {
+	name, summary, expected string
+	claim, capture, old     bool
+}
+
 func TestIntegrationActionResultEvidenceAttemptScope(t *testing.T) {
 	pool, _ := testPool(t, true)
 	run := testRuntime(t, pool, 0)
 	ctx := context.Background()
-	cases := []struct {
-		name, summary, expected string
-		claim, capture, old     bool
-	}{
+	for _, tc := range []evidenceAttemptCase{
 		{"none", "", "not_collected", false, false, false},
 		{"old", "complete", "not_collected", true, true, true},
 		{"interrupted", "", "interrupted", true, false, false},
@@ -608,57 +679,66 @@ func TestIntegrationActionResultEvidenceAttemptScope(t *testing.T) {
 		{"partial", "unavailable", "partial", true, true, false},
 		{"truncated", "truncated", "truncated", true, true, false},
 		{"full", "complete", "full", true, true, false},
-	}
-	for _, tc := range cases {
+	} {
 		t.Run(tc.name, func(t *testing.T) {
-			op, err := run.Service.Submit(ctx, operations.Submission{Kind: operations.TestKind, Target: operations.TestTarget,
-				Actor: testActor, IdempotencyKey: "evidence-" + tc.name, Input: []byte(`{}`)})
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, _, ok, err := run.Service.claimAttempt(ctx, op.ID, 1, "test"); err != nil || !ok {
-				t.Fatalf("claim: %v %v", ok, err)
-			}
-			if tc.claim {
-				_, _, err := run.Service.mutateOwned(ctx, op.ID, 1, func(tx *entities.StoreTx, current *contract.Operation) error {
-					diagnostic := func(status, message string) error {
-						return appendEvent(ctx, tx, current, contract.Event{Kind: "warning", Stage: "candidate", Message: message,
-							CandidateDiagnostic: &contract.CandidateDiagnostic{DeploymentID: "fixture", Status: status, RedactionContext: "original"}})
-					}
-					if err := diagnostic("unavailable", "Candidate diagnostic capture started."); err != nil {
-						return err
-					}
-					if tc.capture {
-						if err := diagnostic("captured", "original safe output"); err != nil {
-							return err
-						}
-					}
-					if tc.summary != "" {
-						return diagnostic(tc.summary, "Candidate diagnostic capture: "+tc.summary+".")
-					}
-					return nil
-				})
-				if err != nil {
-					t.Fatal(err)
-				}
-			}
-			attempt := uint32(1)
-			if tc.old {
-				attempt = 2
-				if _, _, ok, err := run.Service.claimAttempt(ctx, op.ID, attempt, "test"); err != nil || !ok {
-					t.Fatalf("claim: %v %v", ok, err)
-				}
-			}
-			if err := run.Service.recordRetryResult(ctx, op.ID, attempt, contract.Unavailable, "failed"); err != nil {
-				t.Fatal(err)
-			}
-			got, err := run.Service.Get(ctx, testActor, op.ID)
-			if err != nil || got.LatestResult == nil || got.LatestResult.Evidence != tc.expected || got.LatestResult.Stage != "action" {
-				t.Fatalf("result: %+v %v", got.LatestResult, err)
-			}
-			if tc.capture && !tc.old && (got.LatestResult.Excerpt != "original safe output" || got.LatestResult.History.After != 0 || got.LatestResult.ExcerptCursor == nil) {
-				t.Fatalf("excerpt and cursor: %+v", got.LatestResult)
-			}
+			runEvidenceAttemptCase(t, ctx, run, tc)
 		})
+	}
+}
+
+func runEvidenceAttemptCase(t *testing.T, ctx context.Context, run *Runtime, tc evidenceAttemptCase) {
+	t.Helper()
+	op, err := run.Service.Submit(ctx, operations.Submission{Kind: operations.TestKind, Target: operations.TestTarget,
+		Actor: testActor, IdempotencyKey: "evidence-" + tc.name, Input: []byte(`{}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok, err := run.Service.claimAttempt(ctx, op.ID, 1, "test"); err != nil || !ok {
+		t.Fatalf("claim: %v %v", ok, err)
+	}
+	if tc.claim {
+		recordEvidenceDiagnostics(t, ctx, run, op, tc)
+	}
+	attempt := uint32(1)
+	if tc.old {
+		attempt = 2
+		if _, _, ok, err := run.Service.claimAttempt(ctx, op.ID, attempt, "test"); err != nil || !ok {
+			t.Fatalf("claim: %v %v", ok, err)
+		}
+	}
+	if err := run.Service.recordRetryResult(ctx, op.ID, attempt, contract.Unavailable, "failed"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := run.Service.Get(ctx, testActor, op.ID)
+	if err != nil || got.LatestResult == nil || got.LatestResult.Evidence != tc.expected || got.LatestResult.Stage != "action" {
+		t.Fatalf("result: %+v %v", got.LatestResult, err)
+	}
+	if tc.capture && !tc.old && (got.LatestResult.Excerpt != "original safe output" || got.LatestResult.History.After != 0 || got.LatestResult.ExcerptCursor == nil) {
+		t.Fatalf("excerpt and cursor: %+v", got.LatestResult)
+	}
+}
+
+func recordEvidenceDiagnostics(t *testing.T, ctx context.Context, run *Runtime, op contract.Operation, tc evidenceAttemptCase) {
+	t.Helper()
+	_, _, err := run.Service.mutateOwned(ctx, op.ID, 1, func(tx *entities.StoreTx, current *contract.Operation) error {
+		diagnostic := func(status, message string) error {
+			return appendEvent(ctx, tx, current, contract.Event{Kind: "warning", Stage: "candidate", Message: message,
+				CandidateDiagnostic: &contract.CandidateDiagnostic{DeploymentID: "fixture", Status: status, RedactionContext: "original"}})
+		}
+		if err := diagnostic("unavailable", "Candidate diagnostic capture started."); err != nil {
+			return err
+		}
+		if tc.capture {
+			if err := diagnostic("captured", "original safe output"); err != nil {
+				return err
+			}
+		}
+		if tc.summary != "" {
+			return diagnostic(tc.summary, "Candidate diagnostic capture: "+tc.summary+".")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 }

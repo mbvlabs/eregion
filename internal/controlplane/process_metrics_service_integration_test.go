@@ -2,6 +2,7 @@ package controlplane
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/api"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/platform"
@@ -33,7 +35,7 @@ func TestIntegrationProcessMetricsRunningAPI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer occupied.Close()
+	defer func() { _ = occupied.Close() }()
 	stop := m.Start(occupied.Addr().String(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	defer stop()
 
@@ -82,23 +84,19 @@ func TestIntegrationProcessMetricsRunningAPI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatal(err)
 	}
 	body := string(raw)
-	for _, want := range []string{
+	assertContainsEach(t, body, []string{
 		`eregion_http_requests_total{method="GET",route="health",status="200"} 1`,
 		`eregion_http_requests_total{method="GET",route="api",status="401"} 1`,
 		`eregion_http_request_duration_seconds_count{method="GET",route="api",status="401"} 1`,
 		`eregion_http_inflight_requests{method="GET",route="api"} 0`,
 		`go_goroutines`,
-	} {
-		if !strings.Contains(body, want) {
-			t.Errorf("missing metric %q", want)
-		}
-	}
+	})
 	if strings.Contains(body, "private-identifier") {
 		t.Fatal("raw request path leaked into metrics")
 	}
@@ -106,9 +104,14 @@ func TestIntegrationProcessMetricsRunningAPI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, path := range []string{telemetry.MetricsPath, telemetry.APIMetricsPath, telemetry.WorkerMetricsPath} {
-		if !strings.Contains(string(targets), path) {
-			t.Errorf("discovery missing %s", path)
+	assertContainsEach(t, string(targets), []string{telemetry.MetricsPath, telemetry.APIMetricsPath, telemetry.WorkerMetricsPath})
+}
+
+func assertContainsEach(t *testing.T, body string, wants []string) {
+	t.Helper()
+	for _, want := range wants {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing %q", want)
 		}
 	}
 }
@@ -166,31 +169,37 @@ func TestIntegrationProcessMetricsRiverPostgres(t *testing.T) {
 			return false
 		}
 		scrape = string(raw)
-		current, err := run.Service.Get(ctx, testActor, op.ID)
-		failure, failureErr := run.Service.Get(ctx, definitionIntegrationActor, failed.ID)
-		var riverState string
-		riverErr := pool.QueryRow(ctx, `SELECT state FROM river_job WHERE id=(SELECT job_id FROM eregion_operations WHERE id=$1)`, failed.ID).Scan(&riverState)
-		return err == nil && current.State == contract.Succeeded &&
-			failureErr == nil && failure.State == contract.Failed &&
-			riverErr == nil && riverState == "completed" &&
-			strings.Contains(scrape, `eregion_worker_attempts_total{action="platform.definition.apply",job="platform_action",outcome="snoozed"}`) &&
-			strings.Contains(scrape, `eregion_worker_attempts_total{action="none",job="diagnostic_test",outcome="error"} 1`) &&
-			strings.Contains(scrape, `eregion_worker_attempts_total{action="none",job="diagnostic_test",outcome="success"} 1`) &&
-			strings.Contains(scrape, `eregion_worker_retry_attempts_total{action="none",job="diagnostic_test"} 1`) &&
-			strings.Contains(scrape, `eregion_worker_attempts_total{action="platform.app.create",job="platform_action",outcome="success"}`) &&
-			strings.Contains(scrape, "eregion_action_attempts_total{action=\"platform.app.create\",outcome=\"failed\"} 1\n")
+		return metricsWorkerStateSettled(ctx, pool, run.Service, op, failed, scrape)
 	})
-	for _, want := range []string{
+	assertContainsEach(t, scrape, []string{
 		`eregion_worker_attempt_duration_seconds_count{action="none",job="diagnostic_test",outcome="error"} 1`,
 		"eregion_action_attempt_duration_seconds_count{action=\"platform.app.create\",outcome=\"failed\"} 1\n",
 		`eregion_db_pool_total_connections `,
 		`eregion_db_pool_acquired_connections `,
 		`eregion_db_pool_max_connections `,
-	} {
-		if !strings.Contains(scrape, want) {
-			t.Errorf("missing metric %q", want)
-		}
-	}
+	})
+}
+
+func metricsWorkerStateSettled(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	service *Service,
+	op, failed contract.Operation,
+	scrape string,
+) bool {
+	current, err := service.Get(ctx, testActor, op.ID)
+	failure, failureErr := service.Get(ctx, definitionIntegrationActor, failed.ID)
+	var riverState string
+	riverErr := pool.QueryRow(ctx, `SELECT state FROM river_job WHERE id=(SELECT job_id FROM eregion_operations WHERE id=$1)`, failed.ID).Scan(&riverState)
+	return err == nil && current.State == contract.Succeeded &&
+		failureErr == nil && failure.State == contract.Failed &&
+		riverErr == nil && riverState == "completed" &&
+		strings.Contains(scrape, `eregion_worker_attempts_total{action="platform.definition.apply",job="platform_action",outcome="snoozed"}`) &&
+		strings.Contains(scrape, `eregion_worker_attempts_total{action="none",job="diagnostic_test",outcome="error"} 1`) &&
+		strings.Contains(scrape, `eregion_worker_attempts_total{action="none",job="diagnostic_test",outcome="success"} 1`) &&
+		strings.Contains(scrape, `eregion_worker_retry_attempts_total{action="none",job="diagnostic_test"} 1`) &&
+		strings.Contains(scrape, `eregion_worker_attempts_total{action="platform.app.create",job="platform_action",outcome="success"}`) &&
+		strings.Contains(scrape, "eregion_action_attempts_total{action=\"platform.app.create\",outcome=\"failed\"} 1\n")
 }
 
 func TestIntegrationProcessMetricsBuildCapacityPostgres(t *testing.T) {
@@ -206,15 +215,7 @@ func TestIntegrationProcessMetricsBuildCapacityPostgres(t *testing.T) {
 	}
 	defer release()
 	m := processmetrics.New(pool)
-	waiting := make(chan struct{})
-	done := make(chan error, 1)
-	go func() {
-		unlock, err := service.acquireBuildSlot(processmetrics.WithWorker(ctx, m), "local", func() { close(waiting) })
-		if err == nil {
-			unlock()
-		}
-		done <- err
-	}()
+	waiting, done := acquireBuildSlotInBackground(ctx, service, m)
 	select {
 	case <-waiting:
 	case <-time.After(10 * time.Second):
@@ -222,20 +223,7 @@ func TestIntegrationProcessMetricsBuildCapacityPostgres(t *testing.T) {
 	}
 	exporter := httptest.NewServer(promhttp.HandlerFor(m.Registry, promhttp.HandlerOpts{}))
 	defer exporter.Close()
-	scrape := func() string {
-		t.Helper()
-		resp, err := http.Get(exporter.URL)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer resp.Body.Close()
-		raw, err := io.ReadAll(resp.Body)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return string(raw)
-	}
-	if body := scrape(); !strings.Contains(body, "eregion_worker_build_capacity_waiting 1") || !strings.Contains(body, "eregion_worker_build_capacity_waits_total 1") {
+	if body := scrapeProcessMetrics(t, exporter.URL); !strings.Contains(body, "eregion_worker_build_capacity_waiting 1") || !strings.Contains(body, "eregion_worker_build_capacity_waits_total 1") {
 		t.Fatalf("in-progress capacity wait not exposed")
 	}
 	release()
@@ -247,7 +235,7 @@ func TestIntegrationProcessMetricsBuildCapacityPostgres(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("build capacity wait did not finish")
 	}
-	if body := scrape(); !strings.Contains(body, "eregion_worker_build_capacity_waiting 0") || !strings.Contains(body, "eregion_worker_build_capacity_wait_duration_seconds_count 1") {
+	if body := scrapeProcessMetrics(t, exporter.URL); !strings.Contains(body, "eregion_worker_build_capacity_waiting 0") || !strings.Contains(body, "eregion_worker_build_capacity_wait_duration_seconds_count 1") {
 		t.Fatal("completed capacity wait not exposed")
 	}
 	releaseAgain, err := service.acquireBuildSlot(ctx, "local", nil)
@@ -257,15 +245,7 @@ func TestIntegrationProcessMetricsBuildCapacityPostgres(t *testing.T) {
 	defer releaseAgain()
 	cancelledContext, cancelWait := context.WithCancel(ctx)
 	defer cancelWait()
-	waitingAgain := make(chan struct{})
-	cancelled := make(chan error, 1)
-	go func() {
-		unlock, err := service.acquireBuildSlot(processmetrics.WithWorker(cancelledContext, m), "local", func() { close(waitingAgain) })
-		if err == nil {
-			unlock()
-		}
-		cancelled <- err
-	}()
+	waitingAgain, cancelled := acquireBuildSlotInBackground(cancelledContext, service, m)
 	select {
 	case <-waitingAgain:
 	case <-time.After(10 * time.Second):
@@ -274,15 +254,42 @@ func TestIntegrationProcessMetricsBuildCapacityPostgres(t *testing.T) {
 	cancelWait()
 	select {
 	case err := <-cancelled:
-		if err != context.Canceled {
+		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("cancelled capacity wait: %v", err)
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("cancelled capacity wait did not finish")
 	}
-	if body := scrape(); !strings.Contains(body, "eregion_worker_build_capacity_waiting 0\n") ||
+	if body := scrapeProcessMetrics(t, exporter.URL); !strings.Contains(body, "eregion_worker_build_capacity_waiting 0\n") ||
 		!strings.Contains(body, "eregion_worker_build_capacity_waits_total 2\n") ||
 		!strings.Contains(body, "eregion_worker_build_capacity_wait_duration_seconds_count 2\n") {
 		t.Fatal("cancelled capacity wait did not balance its measurements")
 	}
+}
+
+func scrapeProcessMetrics(t *testing.T, url string) string {
+	t.Helper()
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(raw)
+}
+
+func acquireBuildSlotInBackground(ctx context.Context, service *Service, m *processmetrics.Metrics) (<-chan struct{}, <-chan error) {
+	waiting := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		unlock, err := service.acquireBuildSlot(processmetrics.WithWorker(ctx, m), "local", func() { close(waiting) })
+		if err == nil {
+			unlock()
+		}
+		done <- err
+	}()
+	return waiting, done
 }

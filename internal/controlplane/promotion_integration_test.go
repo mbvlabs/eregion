@@ -14,6 +14,7 @@ import (
 	"github.com/mbvlabs/eregion/internal/platform"
 )
 
+//nolint:unparam // shared with deployment-retry tests that pass the same fixture app name.
 func promotionServingRelease(t *testing.T, pool *pgxpool.Pool, app, environment string) string {
 	t.Helper()
 	var id *string
@@ -38,12 +39,47 @@ func promotionReleaseImageID(t *testing.T, pool *pgxpool.Pool, releaseID string)
 	return imageID
 }
 
+func runPlatformOperation(t *testing.T, ctx context.Context, s *Service, op contract.Operation) {
+	t.Helper()
+	if err := runPlatformAttempt(ctx, s, op.ID, 1); err != nil {
+		t.Fatalf("%s attempt: %v", op.Kind, err)
+	}
+	platformAwaitContext(ctx, t, s, op, contract.Succeeded)
+}
+
 // TestIntegrationPromotionPinsTheServingArtifactAndUsesProductionState proves
 // the dedicated promotion path creates a new production release from the exact
 // source image digest, runs no build, uses production's revision/config/secrets
 // and release command, leaves the previous production release serving until the
 // blue/green switch succeeds, and refuses a duplicate artifact.
+type promotionFixture struct {
+	pool              *pgxpool.Pool
+	service           *Service
+	fake              *scriptedDeployTransport
+	resolver          *snapshotSecretResolver
+	ctx               context.Context
+	productionRelease platform.ReleaseID
+	stagingRelease    platform.ReleaseID
+}
+
 func TestIntegrationPromotionPinsTheServingArtifactAndUsesProductionState(t *testing.T) {
+	f := newPromotionFixture(t)
+	preview := preparePromotionPreview(t, f)
+	promotion := platformSubmit(
+		t,
+		f.service,
+		platform.KindPromote,
+		"env/live/production",
+		"promote-1",
+		preview.input,
+	)
+	runPlatformOperation(t, f.ctx, f.service, promotion)
+	assertPromotedRelease(t, f, preview, promotion)
+	assertPromotionReplay(t, f, preview, promotion)
+}
+
+func newPromotionFixture(t *testing.T) promotionFixture {
+	t.Helper()
 	pool, _ := testPool(t, true)
 	resolver := newSnapshotSecretResolver()
 	resolver.set("PROD_ONLY", 1, "production-secret")
@@ -60,239 +96,192 @@ func TestIntegrationPromotionPinsTheServingArtifactAndUsesProductionState(t *tes
 	s.routeSwitch = func(context.Context, platform.Environment, []string) error { return nil }
 	s.publicVerify = func(context.Context, platform.Environment, string) error { return nil }
 	ctx := context.Background()
-
-	runOperation := func(op contract.Operation) {
-		t.Helper()
-		if err := runPlatformAttempt(ctx, s, op.ID, 1); err != nil {
-			t.Fatalf("%s attempt: %v", op.Kind, err)
-		}
-		platformAwait(t, s, op, contract.Succeeded)
-	}
-
-	runOperation(
-		platformSubmit(t, s, platform.KindNodeRegister, "platform", "promote-node", map[string]any{
-			"name": "local",
-			"roles": []string{
-				platform.RoleApplication,
-				platform.RoleBuilder,
-				platform.RoleControlPlane,
-			},
-			"capabilities": []string{platform.CapabilityDocker, platform.CapabilityBuildpacks},
-		}),
-	)
-	runOperation(
-		platformSubmit(
-			t,
-			s,
-			platform.KindAppCreate,
-			"platform",
-			"promote-app",
-			map[string]any{"name": "live"},
-		),
-	)
-
-	createEnvironment := func(key, name, domain, role, secret, releaseCommand string) {
-		runOperation(
-			platformSubmit(t, s, platform.KindEnvironmentCreate, "app/live", key, map[string]any{
-				"name": name, "node": "local", "container_port": 80,
-				"health": map[string]any{"timeout_seconds": 2},
-				"domain": domain, "domain_primary": true,
-				"config":       map[string]string{"ROLE": role},
-				"secret_names": []string{secret},
-				"runtime": map[string]any{
-					"release_command": map[string]any{
-						"argv":            []string{"/bin/migrate", releaseCommand},
-						"timeout_seconds": 5,
-					},
-				},
-			}),
-		)
-	}
-	createEnvironment(
-		"promote-prod-env",
-		"production",
-		"prod.example.com",
-		"production",
-		"PROD_ONLY",
-		"production",
-	)
-	createEnvironment(
-		"promote-stage-env",
-		"staging",
-		"staging.example.com",
-		"staging",
-		"STAGE_ONLY",
-		"staging",
-	)
-
-	createRelease := func(_, environment, image string) platform.ReleaseID {
-		return seedArtifactRelease(t, pool, s, "live", environment, image).ID
-	}
-	productionRelease := createRelease(
-		"promote-prod-release",
-		"production",
-		"registry.example/live:v1",
-	)
-	runOperation(
-		platformSubmit(
-			t,
-			s,
-			platform.KindDeploy,
-			"env/live/production",
-			"promote-prod-deploy",
-			map[string]any{"release_id": productionRelease},
-		),
-	)
-	stagingRelease := createRelease("promote-stage-release", "staging", "registry.example/live:v2")
-	runOperation(
-		platformSubmit(
-			t,
-			s,
-			platform.KindDeploy,
-			"env/live/staging",
-			"promote-stage-deploy",
-			map[string]any{"release_id": stagingRelease},
-		),
-	)
-
-	if got := promotionServingRelease(
+	runPlatformOperation(t, ctx, s, platformSubmit(t, s, platform.KindNodeRegister, "platform", "promote-node", map[string]any{
+		"name": "local",
+		"roles": []string{
+			platform.RoleApplication,
+			platform.RoleBuilder,
+			platform.RoleControlPlane,
+		},
+		"capabilities": []string{platform.CapabilityDocker, platform.CapabilityBuildpacks},
+	}))
+	runPlatformOperation(t, ctx, s, platformSubmit(
 		t,
-		pool,
-		"live",
-		"production",
-	); got != string(
-		productionRelease,
-	) {
-		t.Fatalf("production serving = %q, want %q", got, productionRelease)
+		s,
+		platform.KindAppCreate,
+		"platform",
+		"promote-app",
+		map[string]any{"name": "live"},
+	))
+	createPromotionEnvironment(t, ctx, s, "promote-prod-env", "production", "prod.example.com", "production", "PROD_ONLY", "production")
+	createPromotionEnvironment(t, ctx, s, "promote-stage-env", "staging", "staging.example.com", "staging", "STAGE_ONLY", "staging")
+	productionRelease := seedArtifactRelease(t, pool, s, "live", "production", "registry.example/live:v1").ID
+	runPlatformOperation(t, ctx, s, platformSubmit(
+		t,
+		s,
+		platform.KindDeploy,
+		"env/live/production",
+		"promote-prod-deploy",
+		map[string]any{"release_id": productionRelease},
+	))
+	stagingRelease := seedArtifactRelease(t, pool, s, "live", "staging", "registry.example/live:v2").ID
+	runPlatformOperation(t, ctx, s, platformSubmit(
+		t,
+		s,
+		platform.KindDeploy,
+		"env/live/staging",
+		"promote-stage-deploy",
+		map[string]any{"release_id": stagingRelease},
+	))
+	return promotionFixture{
+		pool: pool, service: s, fake: fake, resolver: resolver, ctx: ctx,
+		productionRelease: productionRelease, stagingRelease: stagingRelease,
 	}
-	if got := promotionServingRelease(t, pool, "live", "staging"); got != string(stagingRelease) {
-		t.Fatalf("staging serving = %q, want %q", got, stagingRelease)
+}
+
+func createPromotionEnvironment(
+	t *testing.T,
+	ctx context.Context,
+	s *Service,
+	key, name, domain, role, secret, releaseCommand string,
+) {
+	t.Helper()
+	runPlatformOperation(t, ctx, s, platformSubmitContext(ctx, t, s, platform.KindEnvironmentCreate, "app/live", key, map[string]any{
+		"name": name, "node": "local", "container_port": 80,
+		"health": map[string]any{"timeout_seconds": 2},
+		"domain": domain, "domain_primary": true,
+		"config":       map[string]string{"ROLE": role},
+		"secret_names": []string{secret},
+		"runtime": map[string]any{
+			"release_command": map[string]any{
+				"argv":            []string{"/bin/migrate", releaseCommand},
+				"timeout_seconds": 5,
+			},
+		},
+	}))
+}
+
+type promotionPreview struct {
+	input          platform.PromoteInput
+	normalized     platform.Normalized
+	domainsBefore  string
+	stagingImageID string
+}
+
+func preparePromotionPreview(t *testing.T, f promotionFixture) promotionPreview {
+	t.Helper()
+	if got := promotionServingRelease(t, f.pool, "live", "production"); got != string(f.productionRelease) {
+		t.Fatalf("production serving = %q, want %q", got, f.productionRelease)
+	}
+	if got := promotionServingRelease(t, f.pool, "live", "staging"); got != string(f.stagingRelease) {
+		t.Fatalf("staging serving = %q, want %q", got, f.stagingRelease)
 	}
 	var domainsBefore string
-	if err := pool.QueryRow(ctx, `SELECT coalesce(string_agg(d.name, ',' ORDER BY d.name),'')
+	if err := f.pool.QueryRow(f.ctx, `SELECT coalesce(string_agg(d.name, ',' ORDER BY d.name),'')
         FROM eregion_platform_domains d
         JOIN eregion_platform_environments e ON e.id=d.environment_id
         JOIN eregion_platform_apps a ON a.id=e.app_id WHERE a.name='live'`).Scan(&domainsBefore); err != nil {
 		t.Fatal(err)
 	}
-	stagingImageID := promotionReleaseImageID(t, pool, string(stagingRelease))
-
+	stagingImageID := promotionReleaseImageID(t, f.pool, string(f.stagingRelease))
 	input := platform.PromoteInput{App: "live", SourceEnvironment: "staging"}
 	raw, _ := json.Marshal(input)
-	normalized, err := platform.Default().
-		Normalize(platform.KindPromote, "env/live/production", raw)
+	normalized, err := platform.Default().Normalize(platform.KindPromote, "env/live/production", raw)
 	if err != nil {
 		t.Fatal(err)
 	}
-	before := operationCount(t, pool)
-	preview, err := s.Preview(ctx, testActor, normalized, "")
+	before := operationCount(t, f.pool)
+	preview, err := f.service.Preview(f.ctx, testActor, normalized, "")
 	if err != nil {
 		t.Fatalf("promotion preview: %v", err)
 	}
-	if preview.Replay || preview.Data["source_release_id"] != string(stagingRelease) ||
+	if preview.Replay || preview.Data["source_release_id"] != string(f.stagingRelease) ||
 		preview.Data["source_image_id"] != stagingImageID ||
 		preview.Data["target_environment"] != "production" {
 		t.Fatalf("preview = %+v", preview)
 	}
-	if after := operationCount(t, pool); after != before {
+	if after := operationCount(t, f.pool); after != before {
 		t.Fatalf("promotion preview accepted an operation: %d -> %d", before, after)
 	}
+	return promotionPreview{input: input, normalized: normalized, domainsBefore: domainsBefore, stagingImageID: stagingImageID}
+}
 
-	promotion := platformSubmit(
-		t,
-		s,
-		platform.KindPromote,
-		"env/live/production",
-		"promote-1",
-		input,
-	)
-	runOperation(promotion)
-
+func assertPromotedRelease(t *testing.T, f promotionFixture, preview promotionPreview, promotion contract.Operation) {
+	t.Helper()
 	var targetReleaseID, targetImage, targetImageRef, targetCommand, targetBuild string
-	if err := pool.QueryRow(ctx, `SELECT id,image_id,image,coalesce(command::text,''),coalesce(build_id,'')
+	if err := f.pool.QueryRow(f.ctx, `SELECT id,image_id,image,coalesce(command::text,''),coalesce(build_id,'')
         FROM eregion_platform_releases WHERE operation_id=$1`, promotion.ID).
 		Scan(&targetReleaseID, &targetImage, &targetImageRef, &targetCommand, &targetBuild); err != nil {
 		t.Fatal(err)
 	}
-	if targetReleaseID == "" || targetReleaseID == string(productionRelease) ||
-		targetReleaseID == string(stagingRelease) {
+	if targetReleaseID == "" || targetReleaseID == string(f.productionRelease) ||
+		targetReleaseID == string(f.stagingRelease) {
 		t.Fatalf("promotion release ID = %q", targetReleaseID)
 	}
 	var stagingImageRef string
-	if err := pool.QueryRow(ctx, `SELECT image FROM eregion_platform_releases WHERE id=$1`, stagingRelease).
+	if err := f.pool.QueryRow(f.ctx, `SELECT image FROM eregion_platform_releases WHERE id=$1`, f.stagingRelease).
 		Scan(&stagingImageRef); err != nil {
 		t.Fatal(err)
 	}
-	if targetImage != stagingImageID {
-		t.Fatalf("promotion image ID = %q, want staging image %q", targetImage, stagingImageID)
+	if targetImage != preview.stagingImageID {
+		t.Fatalf("promotion image ID = %q, want staging image %q", targetImage, preview.stagingImageID)
 	}
 	if targetImageRef != stagingImageRef {
-		t.Fatalf(
-			"promotion image reference = %q, want staging reference %q",
-			targetImageRef,
-			stagingImageRef,
-		)
+		t.Fatalf("promotion image reference = %q, want staging reference %q", targetImageRef, stagingImageRef)
 	}
 	if targetCommand != "" || targetBuild != "" {
-		t.Fatalf(
-			"promotion copied source command/build: command=%q build=%q",
-			targetCommand,
-			targetBuild,
-		)
+		t.Fatalf("promotion copied source command/build: command=%q build=%q", targetCommand, targetBuild)
 	}
-	if got := promotionServingRelease(t, pool, "live", "production"); got != targetReleaseID {
+	assertPromotionServingAndDomains(t, f, preview, targetReleaseID)
+	if promotion.Kind != platform.KindPromote || promotion.Target != "env/live/production" {
+		t.Fatalf("promotion operation = %s %s", promotion.Kind, promotion.Target)
+	}
+	assertPromotionExecution(t, f, promotion, stagingImageRef)
+}
+
+func assertPromotionServingAndDomains(t *testing.T, f promotionFixture, preview promotionPreview, targetReleaseID string) {
+	t.Helper()
+	if got := promotionServingRelease(t, f.pool, "live", "production"); got != targetReleaseID {
 		t.Fatalf("production serving = %q, want promoted %q", got, targetReleaseID)
 	}
-	if got := promotionServingRelease(t, pool, "live", "staging"); got != string(stagingRelease) {
+	if got := promotionServingRelease(t, f.pool, "live", "staging"); got != string(f.stagingRelease) {
 		t.Fatalf("staging serving changed to %q", got)
 	}
 	var domainsAfter string
-	if err := pool.QueryRow(ctx, `SELECT coalesce(string_agg(d.name, ',' ORDER BY d.name),'')
+	if err := f.pool.QueryRow(f.ctx, `SELECT coalesce(string_agg(d.name, ',' ORDER BY d.name),'')
         FROM eregion_platform_domains d
         JOIN eregion_platform_environments e ON e.id=d.environment_id
         JOIN eregion_platform_apps a ON a.id=e.app_id WHERE a.name='live'`).Scan(&domainsAfter); err != nil {
 		t.Fatal(err)
 	}
-	if domainsAfter != domainsBefore {
-		t.Fatalf("promotion changed domains: %q -> %q", domainsBefore, domainsAfter)
+	if domainsAfter != preview.domainsBefore {
+		t.Fatalf("promotion changed domains: %q -> %q", preview.domainsBefore, domainsAfter)
 	}
-	if promotion.Kind != platform.KindPromote || promotion.Target != "env/live/production" {
-		t.Fatalf("promotion operation = %s %s", promotion.Kind, promotion.Target)
-	}
-	if fake.runCount(promotion.ID, deploymentPackStep) != 0 {
+}
+
+func assertPromotionExecution(t *testing.T, f promotionFixture, promotion contract.Operation, stagingImageRef string) {
+	t.Helper()
+	if f.fake.runCount(promotion.ID, deploymentPackStep) != 0 {
 		t.Fatal("promotion requested a build")
 	}
-	if fake.runCount(promotion.ID, deploymentCommandStep) != 1 {
-		t.Fatalf(
-			"release command runs = %d, want 1",
-			fake.runCount(promotion.ID, deploymentCommandStep),
-		)
+	if f.fake.runCount(promotion.ID, deploymentCommandStep) != 1 {
+		t.Fatalf("release command runs = %d, want 1", f.fake.runCount(promotion.ID, deploymentCommandStep))
 	}
 	var commandPayload platform.ReleaseCommandPayload
-	if err := json.Unmarshal(
-		fake.payload(promotion.ID, deploymentCommandStep),
-		&commandPayload,
-	); err != nil {
+	if err := json.Unmarshal(f.fake.payload(promotion.ID, deploymentCommandStep), &commandPayload); err != nil {
 		t.Fatal(err)
 	}
 	if strings.Join(commandPayload.Command, " ") != "/bin/migrate production" {
 		t.Fatalf("release command = %v, want production's command", commandPayload.Command)
 	}
 	var containerPayload platform.ContainerPayload
-	if err := json.Unmarshal(
-		fake.payload(promotion.ID, containerStepID("web", "1")),
-		&containerPayload,
-	); err != nil {
+	if err := json.Unmarshal(f.fake.payload(promotion.ID, containerStepID("web", "1")), &containerPayload); err != nil {
 		t.Fatal(err)
 	}
 	if containerPayload.Image != stagingImageRef || containerPayload.Env["ROLE"] != "production" {
-		t.Fatalf(
-			"production container payload = image %q env %+v",
-			containerPayload.Image,
-			containerPayload.Env,
-		)
+		t.Fatalf("production container payload = image %q env %+v", containerPayload.Image, containerPayload.Env)
 	}
-	calls := resolver.snapshot()
+	calls := f.resolver.snapshot()
 	if len(calls) == 0 {
 		t.Fatal("promotion resolved no secrets")
 	}
@@ -302,79 +291,67 @@ func TestIntegrationPromotionPinsTheServingArtifactAndUsesProductionState(t *tes
 		t.Fatalf("promotion secret resolution = %+v, want production's PROD_ONLY", last)
 	}
 	var changeKind string
-	if err := pool.QueryRow(ctx, `SELECT kind FROM eregion_platform_changes WHERE operation_id=$1`, promotion.ID).
+	if err := f.pool.QueryRow(f.ctx, `SELECT kind FROM eregion_platform_changes WHERE operation_id=$1`, promotion.ID).
 		Scan(&changeKind); err != nil {
 		t.Fatal(err)
 	}
 	if changeKind != "promotion.succeeded" {
 		t.Fatalf("change kind = %q", changeKind)
 	}
+}
 
+func assertPromotionReplay(t *testing.T, f promotionFixture, preview promotionPreview, promotion contract.Operation) {
+	t.Helper()
 	// The same idempotency key replays the accepted operation without a second
 	// release, even though a new submission would now be refused.
-	replayed, err := s.Submit(
-		ctx,
-		platformSubmission(platform.KindPromote, "env/live/production", "promote-1", input),
+	replayed, err := f.service.Submit(
+		f.ctx,
+		platformSubmission(platform.KindPromote, "env/live/production", "promote-1", preview.input),
 	)
 	if err != nil || replayed.ID != promotion.ID {
 		t.Fatalf("same-key replay = %+v, %v", replayed, err)
 	}
 	// A preview with the same key and identical normalized input replays the
 	// accepted operation without re-resolving or applying conflict checks.
-	replayedPreview, err := s.Preview(ctx, testActor, normalized, "promote-1")
+	replayedPreview, err := f.service.Preview(f.ctx, testActor, preview.normalized, "promote-1")
 	if err != nil || !replayedPreview.Replay || replayedPreview.Operation == nil ||
 		replayedPreview.Operation.ID != promotion.ID {
 		t.Fatalf("same-key preview replay = %+v, %v", replayedPreview, err)
 	}
 	// The same key with changed input is a conflict before any source
 	// resolution or conflict checks, exactly like submit.
-	changed := input
+	changed := preview.input
 	changed.SourceEnvironment = "not-staging"
 	changedRaw, _ := json.Marshal(changed)
-	changedNormalized, err := platform.Default().
-		Normalize(platform.KindPromote, "env/live/production", changedRaw)
+	changedNormalized, err := platform.Default().Normalize(platform.KindPromote, "env/live/production", changedRaw)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Preview(
-		ctx,
-		testActor,
-		changedNormalized,
-		"promote-1",
-	); contract.Classify(
-		err,
-	).Code != contract.Conflict {
+	if _, err := f.service.Preview(f.ctx, testActor, changedNormalized, "promote-1"); contract.Classify(err).Code != contract.Conflict {
 		t.Fatalf("changed-input preview with the same key = %v, want conflict", err)
 	}
-	var productionReleases int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_platform_releases r
-        JOIN eregion_platform_environments e ON e.id=r.environment_id
-        JOIN eregion_platform_apps a ON a.id=e.app_id
-        WHERE a.name='live' AND e.name='production'`).Scan(&productionReleases); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.Submit(
-		ctx,
-		platformSubmission(platform.KindPromote, "env/live/production", "promote-2", input),
-	); contract.Classify(
-		err,
-	).Code != contract.Conflict {
+	productionReleases := promotionProductionReleaseCount(t, f)
+	if _, err := f.service.Submit(
+		f.ctx,
+		platformSubmission(platform.KindPromote, "env/live/production", "promote-2", preview.input),
+	); contract.Classify(err).Code != contract.Conflict {
 		t.Fatalf("duplicate promotion = %v, want conflict", err)
 	}
-	var afterDuplicate int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_platform_releases r
+	if afterDuplicate := promotionProductionReleaseCount(t, f); afterDuplicate != productionReleases {
+		t.Fatalf("duplicate promotion recorded a release: %d -> %d", productionReleases, afterDuplicate)
+	}
+}
+
+func promotionProductionReleaseCount(t *testing.T, f promotionFixture) int {
+	t.Helper()
+	var count int
+	if err := f.pool.QueryRow(f.ctx, `SELECT count(*) FROM eregion_platform_releases r
         JOIN eregion_platform_environments e ON e.id=r.environment_id
         JOIN eregion_platform_apps a ON a.id=e.app_id
-        WHERE a.name='live' AND e.name='production'`).Scan(&afterDuplicate); err != nil {
+        WHERE a.name='live' AND e.name='production'`).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
-	if afterDuplicate != productionReleases {
-		t.Fatalf(
-			"duplicate promotion recorded a release: %d -> %d",
-			productionReleases,
-			afterDuplicate,
-		)
-	}
+	return count
 }
 
 func TestIntegrationPromotionAdmissionSerializesProductionDeployments(t *testing.T) {
@@ -394,10 +371,7 @@ func TestIntegrationPromotionAdmissionSerializesProductionDeployments(t *testing
 
 	runOperation := func(op contract.Operation) {
 		t.Helper()
-		if err := runPlatformAttempt(ctx, s, op.ID, 1); err != nil {
-			t.Fatalf("%s attempt: %v", op.Kind, err)
-		}
-		platformAwait(t, s, op, contract.Succeeded)
+		runPlatformOperation(t, ctx, s, op)
 	}
 	runOperation(
 		platformSubmit(

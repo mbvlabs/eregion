@@ -178,7 +178,7 @@ func (a *app) envSpecs() []spec {
 			{
 				use:   "update <app> <environment>",
 				meta:  update,
-				args:  platformTwoNames("app", "environment"),
+				args:  platformTwoNames(),
 				flags: addEnvironmentUpdateFlags,
 				run:   a.envUpdate,
 			},
@@ -194,7 +194,7 @@ func (a *app) envSpecs() []spec {
 			{
 				use:  "status <app> <environment>",
 				meta: status,
-				args: platformTwoNames("app", "environment"),
+				args: platformTwoNames(),
 				run: func(cmd *cobra.Command, args []string) (result, error) {
 					return a.envStatus(cmd, args[0], args[1])
 				},
@@ -240,7 +240,7 @@ func (a *app) envProtectionSpec(protected bool) spec {
 	return spec{
 		use:  use,
 		meta: meta,
-		args: platformTwoNames("app", "environment"),
+		args: platformTwoNames(),
 		flags: func(cmd *cobra.Command) {
 			cmd.Flags().
 				Bool("dry-run", false, "Validate and show the protection change without accepting work")
@@ -270,7 +270,7 @@ func (a *app) runEnvProtection(
 	app, environment string,
 	protected bool,
 ) (result, error) {
-	env, _, err := a.readEnvironment(cmd, app, environment)
+	env, err := a.readEnvironment(cmd, app, environment)
 	if err != nil {
 		return result{}, err
 	}
@@ -453,64 +453,17 @@ func (a *app) envCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 		return result{}, setupPromptError("env create", err)
 	}
 	defer ans.clearSecrets()
-	if ans.ImageRepository != "" {
-		appRecord, err := a.findApp(cmd, ans.App)
-		if err != nil {
-			return result{}, err
-		}
-		if appRecord.ImageRepository != ans.ImageRepository {
-			return result{}, contract.NewFault(
-				contract.ValidationFailed,
-				"environment definition cannot change the app image repository",
-				"The image repository is app-level immutable metadata; remove image_repository from the environment's definition.",
-			)
-		}
-	}
-	spec, err := ans.environmentSpec(cmd)
+	spec, err := a.envCreateSpec(cmd, ans)
 	if err != nil {
 		return result{}, err
 	}
-	specs, err := applyGitHubAuthToSpecs(cmd, ans, []platform.EnvironmentSpec{spec})
-	if err != nil {
-		return result{}, err
-	}
-	if err := validateEnvironmentGitCredentialRoles(specs); err != nil {
-		return result{}, err
-	}
-	spec = specs[0]
 	follow := !boolFlag(cmd, "detach") &&
 		(streamsNDJSON(cmd) || (interactive && ans.Deploy && followsByDefault(cmd)))
 	if err := validateFollowRequest(cmd, follow); err != nil {
 		return result{}, err
 	}
-	if err := validateIdempotencyFlag(cmd); err != nil {
+	if err := a.checkEnvCreateTarget(cmd, ans); err != nil {
 		return result{}, err
-	}
-	if key, _ := cmd.Flags().GetString("idempotency-key"); key == "" {
-		// A named key reaches preview first: preview knows whether it replays
-		// an accepted submission and must skip the same conflict checks.
-		exists, err := a.appExists(cmd, ans.App)
-		if err != nil {
-			return result{}, err
-		}
-		if !exists {
-			return result{}, contract.NewFault(
-				contract.NotFound,
-				"app "+ans.App+" was not found",
-				"Create it with eregion app create, or choose an existing app.",
-			)
-		}
-		exists, err = a.environmentExists(cmd, ans.App, ans.Environment)
-		if err != nil {
-			return result{}, err
-		}
-		if exists {
-			return result{}, contract.NewFault(
-				contract.Conflict,
-				"environment "+ans.App+"/"+ans.Environment+" already exists",
-				"Change it with eregion env update, or choose another name.",
-			)
-		}
 	}
 	input := platform.EnvironmentCreateInput{
 		App:             ans.App,
@@ -521,15 +474,121 @@ func (a *app) envCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 	if err != nil {
 		return result{}, err
 	}
-	preview, err := a.previewAction(cmd, platform.KindEnvironmentCreate, target.String(), input)
+	preview, deferred, plan, err := a.envCreatePlan(cmd, ans, input, target, interactive)
 	if err != nil {
 		return result{}, err
+	}
+	if err := confirmEnvCreate(ans, interactive, dryRun(cmd)); err != nil {
+		return result{}, err
+	}
+	summary := newEnvCreateSummary(ans, spec, preview, deferred, cmd)
+	if dryRun(cmd) {
+		summary.DryRun, summary.Preview, summary.plan = true, &preview, plan
+		if interactive {
+			return result{streamed: true}, nil
+		}
+		return result{data: summary, plain: summary.plainText()}, nil
+	}
+	if err := a.prepareEnvCreateSecrets(cmd, ans, spec, preview, &summary); err != nil {
+		return result{}, err
+	}
+	op, err := a.submitAccepted(cmd, platform.KindEnvironmentCreate, target.String(), input, "")
+	if err != nil {
+		return result{}, err
+	}
+	summary.OperationID = op.ID
+	summary.FirstDeployOperationID = op.FirstDeployOperationID
+	if err := a.submitEnvCreateResources(cmd, ans, op.ID, &summary); err != nil {
+		return result{}, err
+	}
+	if interactive {
+		return a.envCreateInteractiveResult(cmd, ans, spec, summary, op, target)
+	}
+	if streamsNDJSON(cmd) && !boolFlag(cmd, "detach") {
+		return a.envCreateNDJSONResult(cmd, ans, op, target)
+	}
+	return result{data: summary, plain: summary.plainText()}, nil
+}
+
+func (a *app) envCreateSpec(cmd *cobra.Command, ans *setupAnswers) (platform.EnvironmentSpec, error) {
+	if ans.ImageRepository != "" {
+		appRecord, err := a.findApp(cmd, ans.App)
+		if err != nil {
+			return platform.EnvironmentSpec{}, err
+		}
+		if appRecord.ImageRepository != ans.ImageRepository {
+			return platform.EnvironmentSpec{}, contract.NewFault(
+				contract.ValidationFailed,
+				"environment definition cannot change the app image repository",
+				"The image repository is app-level immutable metadata; remove image_repository from the environment's definition.",
+			)
+		}
+	}
+	spec, err := ans.environmentSpec(cmd)
+	if err != nil {
+		return platform.EnvironmentSpec{}, err
+	}
+	specs, err := applyGitHubAuthToSpecs(cmd, ans, []platform.EnvironmentSpec{spec})
+	if err != nil {
+		return platform.EnvironmentSpec{}, err
+	}
+	if err := validateEnvironmentGitCredentialRoles(specs); err != nil {
+		return platform.EnvironmentSpec{}, err
+	}
+	return specs[0], nil
+}
+
+func (a *app) checkEnvCreateTarget(cmd *cobra.Command, ans *setupAnswers) error {
+	if err := validateIdempotencyFlag(cmd); err != nil {
+		return err
+	}
+	key, _ := cmd.Flags().GetString("idempotency-key")
+	if key != "" {
+		return nil
+	}
+	// A named key reaches preview first: preview knows whether it replays
+	// an accepted submission and must skip the same conflict checks.
+	exists, err := a.appExists(cmd, ans.App)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return contract.NewFault(
+			contract.NotFound,
+			"app "+ans.App+" was not found",
+			"Create it with eregion app create, or choose an existing app.",
+		)
+	}
+	exists, err = a.environmentExists(cmd, ans.App, ans.Environment)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return contract.NewFault(
+			contract.Conflict,
+			"environment "+ans.App+"/"+ans.Environment+" already exists",
+			"Change it with eregion env update, or choose another name.",
+		)
+	}
+	return nil
+}
+
+func (a *app) envCreatePlan(
+	cmd *cobra.Command,
+	ans *setupAnswers,
+	input platform.EnvironmentCreateInput,
+	target platform.Target,
+	interactive bool,
+) (platform.Preview, []deferredDefinitionResource, string, error) {
+	preview, err := a.previewAction(cmd, platform.KindEnvironmentCreate, target.String(), input)
+	if err != nil {
+		return platform.Preview{}, nil, "", err
 	}
 	var deferred []deferredDefinitionResource
 	if dryRun(cmd) && !preview.Replay {
 		_, deferred, err = a.bootstrapDefinitionResources(cmd, ans.ResourceSpecs, true)
 		if err != nil {
-			return result{}, err
+			return platform.Preview{}, nil, "", err
 		}
 		for _, item := range deferred {
 			preview.Warnings = append(preview.Warnings, item.warning())
@@ -543,24 +602,38 @@ func (a *app) envCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 			ui.PanelFit("Plan for environment "+ans.App+"/"+ans.Environment, plan, 80),
 		)
 	}
-	dry := dryRun(cmd)
-	if interactive && !dry {
-		ok, err := ui.YesNoDefault(
-			"Create environment "+ans.App+"/"+ans.Environment+" now?",
-			"The environment and its first revision are accepted in one submission; a requested first deploy is queued from it.",
-			true,
-		)
-		if err != nil {
-			return result{}, setupPromptError("env create", err)
-		}
-		if !ok {
-			return result{}, contract.NewFault(
-				contract.Cancelled,
-				"environment creation was not confirmed",
-				"Nothing was written; the plan above is unchanged.",
-			)
-		}
+	return preview, deferred, plan, nil
+}
+
+func confirmEnvCreate(ans *setupAnswers, interactive, dry bool) error {
+	if !interactive || dry {
+		return nil
 	}
+	ok, err := ui.YesNoDefault(
+		"Create environment "+ans.App+"/"+ans.Environment+" now?",
+		"The environment and its first revision are accepted in one submission; a requested first deploy is queued from it.",
+		true,
+	)
+	if err != nil {
+		return setupPromptError("env create", err)
+	}
+	if !ok {
+		return contract.NewFault(
+			contract.Cancelled,
+			"environment creation was not confirmed",
+			"Nothing was written; the plan above is unchanged.",
+		)
+	}
+	return nil
+}
+
+func newEnvCreateSummary(
+	ans *setupAnswers,
+	spec platform.EnvironmentSpec,
+	preview platform.Preview,
+	deferred []deferredDefinitionResource,
+	cmd *cobra.Command,
+) setupResult {
 	summary := setupResult{
 		App:                  ans.App,
 		Environment:          ans.Environment,
@@ -594,136 +667,227 @@ func (a *app) envCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 		)
 	}
 	summary.SecretNames = setupSecretNames(ans)
-	if dry {
-		summary.DryRun, summary.Preview, summary.plan = true, &preview, plan
-		if interactive {
-			return result{streamed: true}, nil
-		}
-		return result{data: summary, plain: summary.plainText()}, nil
-	}
+	return summary
+}
 
+func (a *app) prepareEnvCreateSecrets(
+	cmd *cobra.Command,
+	ans *setupAnswers,
+	spec platform.EnvironmentSpec,
+	preview platform.Preview,
+	summary *setupResult,
+) error {
 	if preview.Replay {
 		// The original submission already wrote the values; a replay only
 		// needs the same accepted operation.
 		summary.SecretNames = setupSecretNames(ans)
-	} else {
-		if err := a.fillGitHubAuthCredential(cmd, ans); err != nil {
-			return result{}, err
-		}
-		if _, err := a.writeSetupSecrets(cmd, ans, spec); err != nil {
-			return result{}, err
-		}
-		summary.SecretNames = setupSecretNames(ans)
+		return nil
 	}
-	op, err := a.submitAccepted(cmd, platform.KindEnvironmentCreate, target.String(), input, "")
+	if err := a.fillGitHubAuthCredential(cmd, ans); err != nil {
+		return err
+	}
+	if _, err := a.writeSetupSecrets(cmd, ans, spec); err != nil {
+		return err
+	}
+	summary.SecretNames = setupSecretNames(ans)
+	return nil
+}
+
+func (a *app) submitEnvCreateResources(
+	cmd *cobra.Command,
+	ans *setupAnswers,
+	operationID contract.OperationID,
+	summary *setupResult,
+) error {
+	if len(ans.ResourceSpecs) == 0 {
+		return nil
+	}
+	resourceIDs, deferred, err := a.bootstrapDefinitionResources(cmd, ans.ResourceSpecs, false)
 	if err != nil {
-		return result{}, err
+		return resourceAfterAcceptedFault(err, operationID)
 	}
-	summary.OperationID = op.ID
-	summary.FirstDeployOperationID = op.FirstDeployOperationID
-	if len(ans.ResourceSpecs) > 0 {
-		resourceIDs, deferred, err := a.bootstrapDefinitionResources(cmd, ans.ResourceSpecs, false)
-		if err != nil {
-			return result{}, resourceAfterAcceptedFault(err, op.ID)
-		}
-		summary.ResolvedResourceIDs = resourceIDs
-		summary.DeferredResources = deferred
-		for _, item := range deferred {
-			summary.Warnings = append(summary.Warnings, item.warning())
-		}
-		if len(resourceIDs) > 0 {
-			summary.Warnings = append(
-				summary.Warnings,
-				"Managed resources were accepted for provisioning; they are not ready until their health checks pass, and the first deploy waits for attached resources.",
-			)
-		}
+	summary.ResolvedResourceIDs = resourceIDs
+	summary.DeferredResources = deferred
+	for _, item := range deferred {
+		summary.Warnings = append(summary.Warnings, item.warning())
 	}
-	if interactive {
-		if ans.Deploy && followsByDefault(cmd) {
-			client, err := a.client(cmd)
-			if err != nil {
-				return result{}, err
-			}
-			return a.followGuidedCreate(
-				cmd,
-				client,
-				op,
-				target.String(),
-				a.deployOutcome(ans.App, ans.Environment),
-			)
-		}
-		fmt.Fprintln(os.Stderr, "")
-		rows := [][2]string{
-			{"node", ans.Node},
-			{"source", describeSource(spec.Source)},
-			{"operation", string(op.ID)},
-		}
-		if ans.Deploy {
-			rows = append(rows, [2]string{"first deploy", "queued from the revision"})
-			if summary.FirstDeployOperationID != "" {
-				rows = append(
-					rows,
-					[2]string{"first deploy operation", string(summary.FirstDeployOperationID)},
-				)
-			}
-		}
-		if ans.Domain != "" {
-			rows = append(rows, [2]string{"domain", ans.Domain})
-			dns := "point " + ans.Domain + " at the main node's public IPv4 address"
-			if summary.DNSRecord != nil {
-				dns = summary.DNSRecord.Type + " " + summary.DNSRecord.Name + " " + summary.DNSRecord.Value
-			}
-			rows = append(rows, [2]string{"DNS record", dns})
-		}
-		for _, id := range summary.ResolvedResourceIDs {
-			rows = append(rows, [2]string{"resource operation", string(id)})
-		}
-		footer := []string{
-			ui.Dim("the revision is desired state, not a running deployment"),
-			ui.Dim("next:"),
-			"  " + ui.Code("eregion env status "+ans.App+" "+ans.Environment+" --json"),
-		}
-		for _, item := range summary.DeferredResources {
-			footer = append(footer, item.warning())
-		}
-		if summary.FirstDeployOperationID != "" {
-			footer = append(
-				footer,
-				"  "+ui.Code("eregion operations follow "+string(summary.FirstDeployOperationID)),
-			)
-		}
-		fmt.Fprintln(
-			os.Stderr,
-			ui.Card("Environment "+ans.App+"/"+ans.Environment+" created", rows, footer),
+	if len(resourceIDs) > 0 {
+		summary.Warnings = append(
+			summary.Warnings,
+			"Managed resources were accepted for provisioning; they are not ready until their health checks pass, and the first deploy waits for attached resources.",
 		)
-		return result{streamed: true}, nil
 	}
-	if streamsNDJSON(cmd) && !boolFlag(cmd, "detach") {
+	return nil
+}
+
+func (a *app) envCreateInteractiveResult(
+	cmd *cobra.Command,
+	ans *setupAnswers,
+	spec platform.EnvironmentSpec,
+	summary setupResult,
+	op contract.Operation,
+	target platform.Target,
+) (result, error) {
+	if ans.Deploy && followsByDefault(cmd) {
 		client, err := a.client(cmd)
 		if err != nil {
 			return result{}, err
 		}
-		if ans.Deploy && op.FirstDeployOperationID != "" {
-			return a.followGuidedCreate(
-				cmd,
-				client,
-				op,
-				target.String(),
-				a.deployOutcome(ans.App, ans.Environment),
+		return a.followGuidedCreate(
+			cmd,
+			client,
+			op,
+			target.String(),
+			a.deployOutcome(ans.App, ans.Environment),
+		)
+	}
+	fmt.Fprintln(os.Stderr, "")
+	rows := [][2]string{
+		{"node", ans.Node},
+		{"source", describeSource(spec.Source)},
+		{"operation", string(op.ID)},
+	}
+	if ans.Deploy {
+		rows = append(rows, [2]string{"first deploy", "queued from the revision"})
+		if summary.FirstDeployOperationID != "" {
+			rows = append(
+				rows,
+				[2]string{"first deploy operation", string(summary.FirstDeployOperationID)},
 			)
 		}
-		return a.followAccepted(cmd, client, op)
 	}
-	return result{data: summary, plain: summary.plainText()}, nil
+	if ans.Domain != "" {
+		rows = append(rows, [2]string{"domain", ans.Domain})
+		dns := "point " + ans.Domain + " at the main node's public IPv4 address"
+		if summary.DNSRecord != nil {
+			dns = summary.DNSRecord.Type + " " + summary.DNSRecord.Name + " " + summary.DNSRecord.Value
+		}
+		rows = append(rows, [2]string{"DNS record", dns})
+	}
+	for _, id := range summary.ResolvedResourceIDs {
+		rows = append(rows, [2]string{"resource operation", string(id)})
+	}
+	footer := []string{
+		ui.Dim("the revision is desired state, not a running deployment"),
+		ui.Dim("next:"),
+		"  " + ui.Code("eregion env status "+ans.App+" "+ans.Environment+" --json"),
+	}
+	for _, item := range summary.DeferredResources {
+		footer = append(footer, item.warning())
+	}
+	if summary.FirstDeployOperationID != "" {
+		footer = append(
+			footer,
+			"  "+ui.Code("eregion operations follow "+string(summary.FirstDeployOperationID)),
+		)
+	}
+	fmt.Fprintln(
+		os.Stderr,
+		ui.Card("Environment "+ans.App+"/"+ans.Environment+" created", rows, footer),
+	)
+	return result{streamed: true}, nil
 }
 
-func (a *app) envUpdate(cmd *cobra.Command, args []string) (result, error) {
-	if from := flagString(cmd, "from"); from != "" {
-		return a.envUpdateFromFile(cmd, args[0], args[1], from)
+func (a *app) envCreateNDJSONResult(
+	cmd *cobra.Command,
+	ans *setupAnswers,
+	op contract.Operation,
+	target platform.Target,
+) (result, error) {
+	client, err := a.client(cmd)
+	if err != nil {
+		return result{}, err
 	}
+	if ans.Deploy && op.FirstDeployOperationID != "" {
+		return a.followGuidedCreate(
+			cmd,
+			client,
+			op,
+			target.String(),
+			a.deployOutcome(ans.App, ans.Environment),
+		)
+	}
+	return a.followAccepted(cmd, client, op)
+}
+
+type envUpdateState struct {
+	appName          string
+	environment      string
+	current          platform.Environment
+	patch            platform.EnvironmentUpdateInput
+	credential       []byte
+	credentialName   string
+	changed          []string
+	diff             []string
+	webhookRequested bool
+	guided           bool
+	webhook          webhookUpdate
+	preview          platform.Preview
+	report           *githubWebhookReport
+}
+
+type envUpdateResult struct {
+	App                  string                          `json:"app"`
+	Environment          string                          `json:"environment"`
+	OperationID          contract.OperationID            `json:"operation_id,omitempty"`
+	Changed              []string                        `json:"changed"`
+	CredentialSecretName string                          `json:"credential_secret_name,omitempty"`
+	WebhookSecretName    string                          `json:"webhook_secret_name,omitempty"`
+	WebhookURL           string                          `json:"webhook_url,omitempty"`
+	WebhookBranch        string                          `json:"webhook_branch,omitempty"`
+	WebhookRotated       bool                            `json:"webhook_rotated,omitempty"`
+	WebhookReplay        bool                            `json:"webhook_replay,omitempty"`
+	WebhookActivated     bool                            `json:"webhook_secret_activated,omitempty"`
+	WebhookMessage       string                          `json:"webhook_message,omitempty"`
+	GitHubWebhook        *githubWebhookReport            `json:"github_webhook,omitempty"`
+	Patch                platform.EnvironmentUpdateInput `json:"patch"`
+	DryRun               bool                            `json:"dry_run,omitempty"`
+}
+
+func (a *app) readEnvUpdateState(cmd *cobra.Command, args []string) (*envUpdateState, error) {
+	if err := validateFlagBasedEnvUpdate(cmd); err != nil {
+		return nil, err
+	}
+	appName, environment := args[0], args[1]
+	current, err := a.readEnvironment(cmd, appName, environment)
+	if err != nil {
+		return nil, err
+	}
+	patch, credentialName, changed, err := a.buildEnvironmentUpdate(cmd, current)
+	if err != nil {
+		return nil, err
+	}
+	webhookRequested := flagChanged(cmd, "auto-deploy")
+	if !webhookRequested {
+		webhookRequested, _ = cmd.Flags().GetBool("rotate-webhook-secret")
+	}
+	state := &envUpdateState{
+		appName: appName, environment: environment, current: current,
+		patch: patch, credentialName: credentialName, changed: changed,
+		webhookRequested: webhookRequested,
+	}
+	if len(changed) == 0 && !webhookRequested && humanInteractive(cmd) {
+		if err := a.applyGuidedEnvUpdate(cmd, state); err != nil {
+			return nil, err
+		}
+	}
+	if !state.guided {
+		if err := a.applyEnvUpdateWebhook(cmd, state); err != nil {
+			clearBytes(state.credential)
+			return nil, err
+		}
+	}
+	if err := validateEnvUpdateCredentialSelection(state); err != nil {
+		clearBytes(state.credential)
+		return nil, err
+	}
+	return state, nil
+}
+
+func validateFlagBasedEnvUpdate(cmd *cobra.Command) error {
 	for _, name := range []string{"from", "plan-nonce", "confirm-plan", "confirm-domain", "detach", "interactive", "ascii", "reduced-motion", "poll-interval"} {
 		if flagChanged(cmd, name) {
-			return result{}, contract.NewFault(
+			return contract.NewFault(
 				contract.Usage,
 				"--"+name+" requires a definition with --from",
 				"Use definition flags with --from, or omit them for flag-based updates.",
@@ -731,382 +895,424 @@ func (a *app) envUpdate(cmd *cobra.Command, args []string) (result, error) {
 		}
 	}
 	if streamsNDJSON(cmd) {
-		return result{}, contract.NewFault(
+		return contract.NewFault(
 			contract.InvalidOutputMode,
 			"flag-based environment updates do not stream NDJSON",
 			"Use plain or JSON output, or use --from to follow a definition operation.",
 		)
 	}
 	if err := validateIdempotencyFlag(cmd); err != nil {
-		return result{}, err
+		return err
 	}
 	if err := validateGitHubAuthFlags(cmd); err != nil {
-		return result{}, err
+		return err
 	}
-	if err := validateGitHubWebhookFlags(cmd); err != nil {
-		return result{}, err
-	}
-	appName, environment := args[0], args[1]
-	current, _, err := a.readEnvironment(cmd, appName, environment)
-	if err != nil {
-		return result{}, err
-	}
-	var credential []byte
-	patch, credentialName, changed, err := a.buildEnvironmentUpdate(cmd, current)
-	if err != nil {
-		clearBytes(credential)
-		return result{}, err
-	}
-	webhookRequested := flagChanged(cmd, "auto-deploy")
-	if !webhookRequested {
-		webhookRequested, _ = cmd.Flags().GetBool("rotate-webhook-secret")
-	}
-	guided := false
-	var diff []string
-	if len(changed) == 0 && !webhookRequested && humanInteractive(cmd) {
-		edit, err := a.envUpdateGuided(cmd, current)
-		if err != nil {
-			clearBytes(credential)
-			return result{}, setupPromptError("env update", err)
-		}
-		patch, credential, credentialName = edit.Patch, edit.Credential, edit.CredentialName
-		changed, diff = edit.Changed, edit.Diff
-		guided = true
-	}
-	var webhook webhookUpdate
-	if !guided {
-		webhook, err = a.readWebhookUpdate(cmd, appName, environment, current, patch)
-		if err != nil {
-			clearBytes(credential)
-			return result{}, err
-		}
-		applyWebhookPatch(&patch, webhook)
-		if webhook.Enabled != nil {
-			enabled := *webhook.Enabled
-			currentAutoDeploy := current.Revision != nil && current.Revision.AutoDeploy
-			currentName := ""
-			if current.Revision != nil {
-				currentName = current.Revision.WebhookSecretName
-			}
-			if current.Revision == nil || currentAutoDeploy != enabled ||
-				(enabled && currentName != webhook.SecretName) {
-				changed = append(changed, "auto_deploy")
-			}
-		}
-		if webhook.Rotated {
-			changed = append(changed, "webhook_secret_rotation")
-		}
-	}
-	defer func() { clearBytes(credential) }()
-	runtimeSecrets, webhookSecret := revisionCredentialRoles(current)
-	if patch.WebhookSecretName != nil {
-		webhookSecret = *patch.WebhookSecretName
-	}
-	validateSelectedCredential := credentialName != ""
-	if guided && len(credential) == 0 {
-		existing := ""
-		if current.Revision != nil {
-			existing = current.Revision.Source.CredentialSecretName
-		}
-		validateSelectedCredential = credentialName != existing
-	}
-	if validateSelectedCredential {
-		if err := validateGitCredentialRole(
-			credentialName,
-			runtimeSecrets,
-			webhookSecret,
-		); err != nil {
-			return result{}, err
-		}
-	}
-	if len(changed) == 0 {
-		if guided {
-			fmt.Fprintln(os.Stderr, ui.Note("No changes; nothing was submitted."))
-			return result{streamed: true}, nil
-		}
-		if !webhookRequested {
-			return result{}, contract.NewFault(
-				contract.InputRequired,
-				"nothing to update",
-				"Pass at least one of --node, --build-node, a source flag, --health-type, --health-path, --health-timeout, --release-command, --process, --auto-deploy or --rotate-webhook-secret.",
-			)
-		}
-	}
-	var preview platform.Preview
-	if len(changed) > 0 || webhookRequested {
-		preview, err = a.previewAction(
-			cmd,
-			platform.KindEnvironmentUpdate,
-			"env/"+appName+"/"+environment,
-			patch,
-		)
-		if err != nil {
-			return result{}, err
-		}
-	}
-	resultData := struct {
-		App                  string                          `json:"app"`
-		Environment          string                          `json:"environment"`
-		OperationID          contract.OperationID            `json:"operation_id,omitempty"`
-		Changed              []string                        `json:"changed"`
-		CredentialSecretName string                          `json:"credential_secret_name,omitempty"`
-		WebhookSecretName    string                          `json:"webhook_secret_name,omitempty"`
-		WebhookURL           string                          `json:"webhook_url,omitempty"`
-		WebhookBranch        string                          `json:"webhook_branch,omitempty"`
-		WebhookRotated       bool                            `json:"webhook_rotated,omitempty"`
-		WebhookReplay        bool                            `json:"webhook_replay,omitempty"`
-		WebhookActivated     bool                            `json:"webhook_secret_activated,omitempty"`
-		WebhookMessage       string                          `json:"webhook_message,omitempty"`
-		GitHubWebhook        *githubWebhookReport            `json:"github_webhook,omitempty"`
-		Patch                platform.EnvironmentUpdateInput `json:"patch"`
-		DryRun               bool                            `json:"dry_run,omitempty"`
-	}{
-		App:                  appName,
-		Environment:          environment,
-		Changed:              changed,
-		CredentialSecretName: credentialName,
-		WebhookSecretName:    webhook.SecretName,
-		WebhookURL:           webhook.URL,
-		WebhookBranch:        webhook.Branch,
-		WebhookRotated:       webhook.Rotated,
-		Patch:                patch,
-	}
-	if guided {
-		body := strings.Join(diff, "\n")
-		if body == "" {
-			body = "changed: " + strings.Join(changed, ", ")
-		}
-		for _, warning := range preview.Warnings {
-			body += "\nwarning: " + warning
-		}
-		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(
-			os.Stderr,
-			ui.PanelFit("Changes to "+appName+"/"+environment, output.SafeText(body), 80),
-		)
-		if dryRun(cmd) {
-			return result{streamed: true}, nil
-		}
-		ok, err := ui.YesNoDefault(
-			"Update "+appName+"/"+environment+" now?",
-			"The change is a new immutable revision; no deploy is queued.",
-			true,
-		)
-		if err != nil {
-			return result{}, setupPromptError("env update", err)
-		}
-		if !ok {
-			return result{}, contract.NewFault(
-				contract.Cancelled,
-				"environment update was not confirmed",
-				"Nothing was submitted and no secret value was written.",
-			)
-		}
-	} else if dryRun(cmd) {
-		resultData.DryRun = true
-		var plain strings.Builder
-		fmt.Fprintf(&plain, "Dry run: update %s/%s\n", appName, environment)
-		if len(changed) > 0 {
-			plain.WriteString(updatePreviewText(preview))
-		}
-		if webhook.URL != "" {
-			if webhook.Rotated {
-				fmt.Fprintf(
-					&plain,
-					"Would rotate the push-to-deploy secret for %s (branch %s).\n",
-					webhook.URL,
-					webhook.Branch,
-				)
-			} else {
-				fmt.Fprintf(&plain, "Push to deploy: %s (branch %s)\n", webhook.URL, webhook.Branch)
-			}
-		}
-		if webhook.GitHub {
-			plain.WriteString(
-				"Would use gh to create or update the repository webhook after the environment change.\n",
-			)
-		}
-		return result{data: resultData, plain: plain.String()}, nil
-	}
+	return validateGitHubWebhookFlags(cmd)
+}
 
-	if err := a.prepareWebhookUpdate(cmd, &webhook, preview.Replay); err != nil {
+func (a *app) applyGuidedEnvUpdate(cmd *cobra.Command, state *envUpdateState) error {
+	edit, err := a.envUpdateGuided(cmd, state.current)
+	if err != nil {
+		return setupPromptError("env update", err)
+	}
+	state.patch, state.credential, state.credentialName = edit.Patch, edit.Credential, edit.CredentialName
+	state.changed, state.diff = edit.Changed, edit.Diff
+	state.guided = true
+	return nil
+}
+
+func (a *app) applyEnvUpdateWebhook(cmd *cobra.Command, state *envUpdateState) error {
+	webhook, err := a.readWebhookUpdate(cmd, state.appName, state.environment, state.current, state.patch)
+	if err != nil {
+		return err
+	}
+	state.webhook = webhook
+	applyWebhookPatch(&state.patch, state.webhook)
+	if webhook.Enabled != nil && envUpdateAutoDeployChanged(state.current, webhook) {
+		state.changed = append(state.changed, "auto_deploy")
+	}
+	if webhook.Rotated {
+		state.changed = append(state.changed, "webhook_secret_rotation")
+	}
+	return nil
+}
+
+func envUpdateAutoDeployChanged(current platform.Environment, webhook webhookUpdate) bool {
+	enabled := *webhook.Enabled
+	currentAutoDeploy := current.Revision != nil && current.Revision.AutoDeploy
+	currentName := ""
+	if current.Revision != nil {
+		currentName = current.Revision.WebhookSecretName
+	}
+	return current.Revision == nil || currentAutoDeploy != enabled ||
+		(enabled && currentName != webhook.SecretName)
+}
+
+func validateEnvUpdateCredentialSelection(state *envUpdateState) error {
+	runtimeSecrets, webhookSecret := revisionCredentialRoles(state.current)
+	if state.patch.WebhookSecretName != nil {
+		webhookSecret = *state.patch.WebhookSecretName
+	}
+	validateSelected := state.credentialName != ""
+	if state.guided && len(state.credential) == 0 {
+		existing := ""
+		if state.current.Revision != nil {
+			existing = state.current.Revision.Source.CredentialSecretName
+		}
+		validateSelected = state.credentialName != existing
+	}
+	if !validateSelected {
+		return nil
+	}
+	return validateGitCredentialRole(state.credentialName, runtimeSecrets, webhookSecret)
+}
+
+func (a *app) envUpdateNoChanges(state *envUpdateState) (result, bool, error) {
+	if len(state.changed) > 0 {
+		return result{}, false, nil
+	}
+	if state.guided {
+		fmt.Fprintln(os.Stderr, ui.Note("No changes; nothing was submitted."))
+		return result{streamed: true}, true, nil
+	}
+	if state.webhookRequested {
+		return result{}, false, nil
+	}
+	return result{}, true, contract.NewFault(
+		contract.InputRequired,
+		"nothing to update",
+		"Pass at least one of --node, --build-node, a source flag, --health-type, --health-path, --health-timeout, --release-command, --process, --auto-deploy or --rotate-webhook-secret.",
+	)
+}
+
+func (a *app) envUpdatePreview(cmd *cobra.Command, state *envUpdateState) (platform.Preview, error) {
+	if len(state.changed) == 0 && !state.webhookRequested {
+		return platform.Preview{}, nil
+	}
+	return a.previewAction(
+		cmd,
+		platform.KindEnvironmentUpdate,
+		"env/"+state.appName+"/"+state.environment,
+		state.patch,
+	)
+}
+
+func (a *app) envUpdate(cmd *cobra.Command, args []string) (result, error) {
+	if from := flagString(cmd, "from"); from != "" {
+		return a.envUpdateFromFile(cmd, args[0], args[1], from)
+	}
+	state, err := a.readEnvUpdateState(cmd, args)
+	if err != nil {
 		return result{}, err
 	}
-	if !preview.Replay && flagChanged(cmd, "git-credential-file") {
-		value, err := readProtectedSecretFile(flagString(cmd, "git-credential-file"))
-		if err != nil {
-			return result{}, err
-		}
-		clearBytes(credential)
-		credential = value
-		a.registerSecretValue(credential)
+	defer func() { clearBytes(state.credential) }()
+	if res, done, err := a.envUpdateNoChanges(state); done {
+		return res, err
 	}
-	if githubAuthRequested(cmd) && credentialName != "" && !preview.Replay {
-		token, err := acquireGitHubAuthToken(cmd.Context())
-		if err != nil {
-			return result{}, err
-		}
-		a.registerSecretValue(token)
-		credential = token
+	preview, err := a.envUpdatePreview(cmd, state)
+	if err != nil {
+		return result{}, err
 	}
-	if !preview.Replay && credentialName != "" && len(credential) > 0 {
-		namespace, err := vault.NewNamespace(appName, environment, credentialName)
-		if err != nil {
-			return result{}, err
-		}
-		if _, err := a.putSecret(cmd, namespace, credential); err != nil {
-			return result{}, err
-		}
+	state.preview = preview
+	resultData := newEnvUpdateResult(state)
+	if res, done, err := presentEnvUpdateGuided(cmd, state); done {
+		return res, err
 	}
-	var op contract.Operation
-	receipt := submissionReceipt{}
-	if webhookRequested {
-		op, receipt, err = a.submitWebhookUpdate(cmd, appName, environment, patch, webhook)
-	} else {
-		op, err = a.submitAccepted(
-			cmd,
-			platform.KindEnvironmentUpdate,
-			"env/"+appName+"/"+environment,
-			patch,
-			"",
-		)
+	if dryRun(cmd) {
+		return envUpdateDryRunResult(state, resultData), nil
 	}
+	if err := a.applyEnvUpdateCredentials(cmd, state); err != nil {
+		return result{}, err
+	}
+	op, receipt, err := a.submitEnvUpdate(cmd, state)
 	if err != nil {
 		return result{}, err
 	}
 	resultData.OperationID = op.ID
-	var report *githubWebhookReport
-	if webhookRequested {
-		resultData.WebhookReplay = receipt.Replay
-		resultData.WebhookRotated = webhook.Rotated && !receipt.Replay
-		resultData.WebhookActivated = receipt.WebhookSecretActivated
-		if receipt.Replay {
-			resultData.WebhookRotated = false
-			switch {
-			case len(webhook.Secret) > 0:
-				clearBytes(webhook.Secret)
-				webhook.Secret = nil
-				resultData.WebhookMessage = "Concurrent admission replay: a local candidate secret was generated but was not activated, printed or installed; the winning submission owns the secret. The GitHub webhook was NOT retried or verified."
-				plain := fmt.Sprintf(
-					"Concurrent admission replay: returned the accepted operation %s. The local candidate secret was discarded and not printed; the winning submission owns the secret, and the GitHub webhook was NOT retried or verified.\nnext: eregion env status %s %s --json\n",
-					op.ID,
-					appName,
-					environment,
-				)
-				return result{data: resultData, plain: plain}, nil
-			default:
-				resultData.WebhookMessage = "Idempotent replay: the original operation is returned; the GitHub webhook was NOT retried or verified."
-				plain := fmt.Sprintf(
-					"Idempotent replay: returned the original accepted operation %s; no secret was generated and the GitHub webhook was NOT retried or verified.\nnext: eregion env status %s %s --json\n",
-					op.ID,
-					appName,
-					environment,
-				)
-				return result{data: resultData, plain: plain}, nil
-			}
-		}
-		if len(webhook.Secret) > 0 && !receipt.WebhookSecretActivated {
-			return result{}, contract.NewFault(
-				contract.Internal,
-				"the operation was admitted without activating the requested webhook secret",
-				"Do not retry with the same key; inspect the operation and report the command and binary version.",
-			)
-		}
-		if webhook.GitHub {
-			report = a.setupWebhookWithGitHub(cmd, webhook)
-			resultData.GitHubWebhook = report
-			if report != nil && !report.configured() {
-				activation := "accepted"
-				if len(changed) == 0 && !webhook.Rotated {
-					activation = "already_enabled"
-				}
-				return result{}, webhookPartialFault(
-					appName,
-					environment,
-					op.ID,
-					activation,
-					webhook.Rotated,
-					*report,
-				)
-			}
-		} else if len(webhook.Secret) > 0 {
-			printWebhookOnce(cmd, webhook)
-		}
+	if res, done, err := a.finishEnvUpdateWebhook(cmd, state, receipt, op, &resultData); done {
+		return res, err
 	}
-	if guided {
+	if state.guided {
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(
 			os.Stderr,
-			ui.Card("Environment "+appName+"/"+environment+" updated", [][2]string{
-				{"changed", strings.Join(changed, ", ")},
+			ui.Card("Environment "+state.appName+"/"+state.environment+" updated", [][2]string{
+				{"changed", strings.Join(state.changed, ", ")},
 				{"operation", string(op.ID)},
 			}, []string{
 				ui.Dim("no deploy was queued; the next deploy applies the revision"),
 				ui.Dim("next:"),
-				"  " + ui.Code("eregion env status "+appName+" "+environment+" --json"),
+				"  " + ui.Code("eregion env status "+state.appName+" "+state.environment+" --json"),
 			}),
 		)
 		return result{streamed: true}, nil
 	}
-	rotationOnly := webhook.Rotated
-	for _, field := range changed {
-		if field != "webhook_secret_rotation" {
-			rotationOnly = false
-			break
+	return envUpdatePlainResult(state, op, resultData), nil
+}
+
+func newEnvUpdateResult(state *envUpdateState) envUpdateResult {
+	return envUpdateResult{
+		App:                  state.appName,
+		Environment:          state.environment,
+		Changed:              state.changed,
+		CredentialSecretName: state.credentialName,
+		WebhookSecretName:    state.webhook.SecretName,
+		WebhookURL:           state.webhook.URL,
+		WebhookBranch:        state.webhook.Branch,
+		WebhookRotated:       state.webhook.Rotated,
+		Patch:                state.patch,
+	}
+}
+
+func presentEnvUpdateGuided(cmd *cobra.Command, state *envUpdateState) (result, bool, error) {
+	if !state.guided {
+		return result{}, false, nil
+	}
+	body := strings.Join(state.diff, "\n")
+	if body == "" {
+		body = "changed: " + strings.Join(state.changed, ", ")
+	}
+	for _, warning := range state.preview.Warnings {
+		body += "\nwarning: " + warning
+	}
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(
+		os.Stderr,
+		ui.PanelFit("Changes to "+state.appName+"/"+state.environment, output.SafeText(body), 80),
+	)
+	if dryRun(cmd) {
+		return result{streamed: true}, true, nil
+	}
+	ok, err := ui.YesNoDefault(
+		"Update "+state.appName+"/"+state.environment+" now?",
+		"The change is a new immutable revision; no deploy is queued.",
+		true,
+	)
+	if err != nil {
+		return result{}, true, setupPromptError("env update", err)
+	}
+	if !ok {
+		return result{}, true, contract.NewFault(
+			contract.Cancelled,
+			"environment update was not confirmed",
+			"Nothing was submitted and no secret value was written.",
+		)
+	}
+	return result{}, false, nil
+}
+
+func envUpdateDryRunResult(state *envUpdateState, resultData envUpdateResult) result {
+	resultData.DryRun = true
+	var plain strings.Builder
+	fmt.Fprintf(&plain, "Dry run: update %s/%s\n", state.appName, state.environment)
+	if len(state.changed) > 0 {
+		plain.WriteString(updatePreviewText(state.preview))
+	}
+	if state.webhook.URL != "" {
+		if state.webhook.Rotated {
+			fmt.Fprintf(
+				&plain,
+				"Would rotate the push-to-deploy secret for %s (branch %s).\n",
+				state.webhook.URL,
+				state.webhook.Branch,
+			)
+		} else {
+			fmt.Fprintf(&plain, "Push to deploy: %s (branch %s)\n", state.webhook.URL, state.webhook.Branch)
 		}
 	}
-	if rotationOnly {
-		plain := fmt.Sprintf(
-			"Rotated the push-to-deploy webhook secret for %s/%s; desired state is unchanged.\noperation: %s\nnext: eregion env status %s %s --json\n",
-			appName,
-			environment,
-			op.ID,
-			appName,
-			environment,
+	if state.webhook.GitHub {
+		plain.WriteString(
+			"Would use gh to create or update the repository webhook after the environment change.\n",
 		)
-		if report != nil && report.configured() {
-			plain += "push to deploy: " + webhook.URL + "\n" + report.summary() + "\n"
-		}
-		return result{data: resultData, plain: plain}, nil
 	}
-	if webhookRequested && len(changed) == 0 {
-		state := "enabled"
-		if webhook.Enabled != nil && !*webhook.Enabled {
-			state = "disabled"
+	return result{data: resultData, plain: plain.String()}
+}
+
+func (a *app) applyEnvUpdateCredentials(cmd *cobra.Command, state *envUpdateState) error {
+	if err := a.prepareWebhookUpdate(cmd, &state.webhook, state.preview.Replay); err != nil {
+		return err
+	}
+	if !state.preview.Replay && flagChanged(cmd, "git-credential-file") {
+		value, err := readProtectedSecretFile(flagString(cmd, "git-credential-file"))
+		if err != nil {
+			return err
 		}
+		clearBytes(state.credential)
+		state.credential = value
+		a.registerSecretValue(state.credential)
+	}
+	if githubAuthRequested(cmd) && state.credentialName != "" && !state.preview.Replay {
+		token, err := acquireGitHubAuthToken(cmd.Context())
+		if err != nil {
+			return err
+		}
+		a.registerSecretValue(token)
+		state.credential = token
+	}
+	if state.preview.Replay || state.credentialName == "" || len(state.credential) == 0 {
+		return nil
+	}
+	namespace, err := vault.NewNamespace(state.appName, state.environment, state.credentialName)
+	if err != nil {
+		return err
+	}
+	return a.putSecret(cmd, namespace, state.credential)
+}
+
+func (a *app) submitEnvUpdate(cmd *cobra.Command, state *envUpdateState) (contract.Operation, submissionReceipt, error) {
+	if state.webhookRequested {
+		return a.submitWebhookUpdate(cmd, state.appName, state.environment, state.patch, state.webhook)
+	}
+	op, err := a.submitAccepted(
+		cmd,
+		platform.KindEnvironmentUpdate,
+		"env/"+state.appName+"/"+state.environment,
+		state.patch,
+		"",
+	)
+	return op, submissionReceipt{}, err
+}
+
+func (a *app) finishEnvUpdateWebhook(
+	cmd *cobra.Command,
+	state *envUpdateState,
+	receipt submissionReceipt,
+	op contract.Operation,
+	resultData *envUpdateResult,
+) (result, bool, error) {
+	if !state.webhookRequested {
+		return result{}, false, nil
+	}
+	resultData.WebhookReplay = receipt.Replay
+	resultData.WebhookRotated = state.webhook.Rotated && !receipt.Replay
+	resultData.WebhookActivated = receipt.WebhookSecretActivated
+	if receipt.Replay {
+		resultData.WebhookRotated = false
+		if len(state.webhook.Secret) > 0 {
+			clearBytes(state.webhook.Secret)
+			state.webhook.Secret = nil
+			resultData.WebhookMessage = "Concurrent admission replay: a local candidate secret was generated but was not activated, printed or installed; the winning submission owns the secret. The GitHub webhook was NOT retried or verified."
+			plain := fmt.Sprintf(
+				"Concurrent admission replay: returned the accepted operation %s. The local candidate secret was discarded and not printed; the winning submission owns the secret, and the GitHub webhook was NOT retried or verified.\nnext: eregion env status %s %s --json\n",
+				op.ID,
+				state.appName,
+				state.environment,
+			)
+			return result{data: *resultData, plain: plain}, true, nil
+		}
+		resultData.WebhookMessage = "Idempotent replay: the original operation is returned; the GitHub webhook was NOT retried or verified."
 		plain := fmt.Sprintf(
-			"Push to deploy is already %s for %s/%s; no desired state changed.\noperation: %s\nnext: eregion env status %s %s --json\n",
-			state,
-			appName,
-			environment,
+			"Idempotent replay: returned the original accepted operation %s; no secret was generated and the GitHub webhook was NOT retried or verified.\nnext: eregion env status %s %s --json\n",
 			op.ID,
-			appName,
-			environment,
+			state.appName,
+			state.environment,
 		)
-		if report != nil && report.configured() {
-			plain += "push to deploy: " + webhook.URL + "\n" + report.summary() + "\n"
+		return result{data: *resultData, plain: plain}, true, nil
+	}
+	if len(state.webhook.Secret) > 0 && !receipt.WebhookSecretActivated {
+		return result{}, true, contract.NewFault(
+			contract.Internal,
+			"the operation was admitted without activating the requested webhook secret",
+			"Do not retry with the same key; inspect the operation and report the command and binary version.",
+		)
+	}
+	if state.webhook.GitHub {
+		report := a.setupWebhookWithGitHub(cmd, state.webhook)
+		state.report = report
+		resultData.GitHubWebhook = report
+		if report != nil && !report.configured() {
+			activation := "accepted"
+			if len(state.changed) == 0 && !state.webhook.Rotated {
+				activation = "already_enabled"
+			}
+			return result{}, true, webhookPartialFault(
+				state.appName,
+				state.environment,
+				op.ID,
+				activation,
+				state.webhook.Rotated,
+				*report,
+			)
 		}
-		return result{data: resultData, plain: plain}, nil
+	} else if len(state.webhook.Secret) > 0 {
+		printWebhookOnce(cmd, state.webhook)
+	}
+	return result{}, false, nil
+}
+
+func envUpdatePlainResult(state *envUpdateState, op contract.Operation, resultData envUpdateResult) result {
+	if envUpdateRotationOnly(state) {
+		return envUpdateRotationResult(state, op, resultData)
+	}
+	if state.webhookRequested && len(state.changed) == 0 {
+		return envUpdateNoStateChangeResult(state, op, resultData)
 	}
 	plain := fmt.Sprintf(
 		"Updated %s/%s desired state.\noperation: %s\nchanged: %s\nnext: eregion env status %s %s --json\n",
-		appName,
-		environment,
+		state.appName,
+		state.environment,
 		op.ID,
-		strings.Join(changed, ", "),
-		appName,
-		environment,
+		strings.Join(state.changed, ", "),
+		state.appName,
+		state.environment,
 	)
-	if webhook.URL != "" {
-		if report != nil && report.configured() {
-			plain += "push to deploy: " + webhook.URL + "\n" + report.summary() + "\n"
-		} else if len(webhook.Secret) > 0 {
-			plain += "push to deploy: " + webhook.URL + " (secret shown once on stderr)\n"
+	if state.webhook.URL != "" {
+		if state.report != nil && state.report.configured() {
+			plain += "push to deploy: " + state.webhook.URL + "\n" + state.report.summary() + "\n"
+		} else if len(state.webhook.Secret) > 0 {
+			plain += "push to deploy: " + state.webhook.URL + " (secret shown once on stderr)\n"
 		} else {
-			plain += "push to deploy: " + webhook.URL + "\n"
+			plain += "push to deploy: " + state.webhook.URL + "\n"
 		}
 	}
-	return result{data: resultData, plain: plain}, nil
+	return result{data: resultData, plain: plain}
+}
+
+func envUpdateRotationOnly(state *envUpdateState) bool {
+	if !state.webhook.Rotated {
+		return false
+	}
+	for _, field := range state.changed {
+		if field != "webhook_secret_rotation" {
+			return false
+		}
+	}
+	return true
+}
+
+func envUpdateRotationResult(state *envUpdateState, op contract.Operation, resultData envUpdateResult) result {
+	plain := fmt.Sprintf(
+		"Rotated the push-to-deploy webhook secret for %s/%s; desired state is unchanged.\noperation: %s\nnext: eregion env status %s %s --json\n",
+		state.appName,
+		state.environment,
+		op.ID,
+		state.appName,
+		state.environment,
+	)
+	if state.report != nil && state.report.configured() {
+		plain += "push to deploy: " + state.webhook.URL + "\n" + state.report.summary() + "\n"
+	}
+	return result{data: resultData, plain: plain}
+}
+
+func envUpdateNoStateChangeResult(state *envUpdateState, op contract.Operation, resultData envUpdateResult) result {
+	status := "enabled"
+	if state.webhook.Enabled != nil && !*state.webhook.Enabled {
+		status = "disabled"
+	}
+	plain := fmt.Sprintf(
+		"Push to deploy is already %s for %s/%s; no desired state changed.\noperation: %s\nnext: eregion env status %s %s --json\n",
+		status,
+		state.appName,
+		state.environment,
+		op.ID,
+		state.appName,
+		state.environment,
+	)
+	if state.report != nil && state.report.configured() {
+		plain += "push to deploy: " + state.webhook.URL + "\n" + state.report.summary() + "\n"
+	}
+	return result{data: resultData, plain: plain}
 }
 
 func (a *app) envUpdateFromFile(
@@ -1168,31 +1374,10 @@ func (a *app) buildEnvironmentUpdate(
 		base.Config = current.Env
 	}
 	changed := make([]string, 0, 4)
-
-	if flagChanged(cmd, "node") {
-		value := flagString(cmd, "node")
-		if err := platform.ValidateName(value); err != nil {
-			return patch, "", nil, err
-		}
-		patch.Node = &value
-		changed = append(changed, "node")
+	if err := updateNodeFields(cmd, &patch, &changed); err != nil {
+		return patch, "", nil, err
 	}
-	if flagChanged(cmd, "build-node") {
-		value := flagString(cmd, "build-node")
-		if value != "" {
-			if err := platform.ValidateName(value); err != nil {
-				return patch, "", nil, err
-			}
-		}
-		patch.BuildNode = &value
-		changed = append(changed, "build_node")
-	}
-
-	source, sourceChanged, credentialName, err := a.readUpdateSource(
-		cmd,
-		base.Source,
-		current,
-	)
+	source, sourceChanged, credentialName, err := a.readUpdateSource(cmd, base.Source, current)
 	if err != nil {
 		return patch, "", nil, err
 	}
@@ -1200,58 +1385,101 @@ func (a *app) buildEnvironmentUpdate(
 		patch.Source = &source
 		changed = append(changed, "source")
 	}
-
-	runtimeChanged := flagChanged(cmd, "health-type") || flagChanged(cmd, "health-path") ||
-		flagChanged(cmd, "health-timeout") || flagChanged(cmd, "release-command")
-	if runtimeChanged {
-		runtime := base.Runtime
-		if runtime.Node == "" {
-			runtime.Node = current.Node
-		}
-		if runtime.HealthType == "" {
-			runtime.HealthType = "http"
-		}
-		if runtime.HealthPath == "" {
-			runtime.HealthPath = platform.DefaultHealthPath
-		}
-		if runtime.HealthTimeoutSeconds == 0 {
-			runtime.HealthTimeoutSeconds = platform.DefaultHealthTimeout
-		}
-		if patch.Node != nil {
-			runtime.Node = *patch.Node
-		}
-		if flagChanged(cmd, "health-type") {
-			runtime.HealthType = strings.ToLower(flagString(cmd, "health-type"))
-		}
-		if flagChanged(cmd, "health-path") {
-			runtime.HealthPath = flagString(cmd, "health-path")
-		}
-		if flagChanged(cmd, "health-timeout") {
-			runtime.HealthTimeoutSeconds = flagInt(cmd, "health-timeout")
-		}
-		if flagChanged(cmd, "release-command") {
-			command, err := commandSpecFromLine(flagString(cmd, "release-command"))
-			if err != nil {
-				return patch, "", nil, err
-			}
-			if command != nil && base.Runtime.ReleaseCommand != nil {
-				command.TimeoutSeconds = base.Runtime.ReleaseCommand.TimeoutSeconds
-			}
-			runtime.ReleaseCommand = command
-		}
-		patch.Runtime = &runtime
-		changed = append(changed, "runtime")
+	if err := updateRuntimeFields(cmd, current, base, &patch, &changed); err != nil {
+		return patch, "", nil, err
 	}
-
-	if flagChanged(cmd, "process") {
-		processes, err := parseProcessSpecs(flagArray(cmd, "process"))
-		if err != nil {
-			return patch, "", nil, err
-		}
-		patch.Processes = &processes
-		changed = append(changed, "processes")
+	if err := updateProcessFields(cmd, &patch, &changed); err != nil {
+		return patch, "", nil, err
 	}
 	return patch, credentialName, changed, nil
+}
+
+func updateNodeFields(cmd *cobra.Command, patch *platform.EnvironmentUpdateInput, changed *[]string) error {
+	if flagChanged(cmd, "node") {
+		value := flagString(cmd, "node")
+		if err := platform.ValidateName(value); err != nil {
+			return err
+		}
+		patch.Node = &value
+		*changed = append(*changed, "node")
+	}
+	if !flagChanged(cmd, "build-node") {
+		return nil
+	}
+	value := flagString(cmd, "build-node")
+	if value != "" {
+		if err := platform.ValidateName(value); err != nil {
+			return err
+		}
+	}
+	patch.BuildNode = &value
+	*changed = append(*changed, "build_node")
+	return nil
+}
+
+func updateRuntimeFields(
+	cmd *cobra.Command,
+	current platform.Environment,
+	base platform.RevisionState,
+	patch *platform.EnvironmentUpdateInput,
+	changed *[]string,
+) error {
+	runtimeChanged := flagChanged(cmd, "health-type") || flagChanged(cmd, "health-path") ||
+		flagChanged(cmd, "health-timeout") || flagChanged(cmd, "release-command")
+	if !runtimeChanged {
+		return nil
+	}
+	runtime := base.Runtime
+	if runtime.Node == "" {
+		runtime.Node = current.Node
+	}
+	if runtime.HealthType == "" {
+		runtime.HealthType = "http"
+	}
+	if runtime.HealthPath == "" {
+		runtime.HealthPath = platform.DefaultHealthPath
+	}
+	if runtime.HealthTimeoutSeconds == 0 {
+		runtime.HealthTimeoutSeconds = platform.DefaultHealthTimeout
+	}
+	if patch.Node != nil {
+		runtime.Node = *patch.Node
+	}
+	if flagChanged(cmd, "health-type") {
+		runtime.HealthType = strings.ToLower(flagString(cmd, "health-type"))
+	}
+	if flagChanged(cmd, "health-path") {
+		runtime.HealthPath = flagString(cmd, "health-path")
+	}
+	if flagChanged(cmd, "health-timeout") {
+		runtime.HealthTimeoutSeconds = flagInt(cmd, "health-timeout")
+	}
+	if flagChanged(cmd, "release-command") {
+		command, err := commandSpecFromLine(flagString(cmd, "release-command"))
+		if err != nil {
+			return err
+		}
+		if command != nil && base.Runtime.ReleaseCommand != nil {
+			command.TimeoutSeconds = base.Runtime.ReleaseCommand.TimeoutSeconds
+		}
+		runtime.ReleaseCommand = command
+	}
+	patch.Runtime = &runtime
+	*changed = append(*changed, "runtime")
+	return nil
+}
+
+func updateProcessFields(cmd *cobra.Command, patch *platform.EnvironmentUpdateInput, changed *[]string) error {
+	if !flagChanged(cmd, "process") {
+		return nil
+	}
+	processes, err := parseProcessSpecs(flagArray(cmd, "process"))
+	if err != nil {
+		return err
+	}
+	patch.Processes = &processes
+	*changed = append(*changed, "processes")
+	return nil
 }
 
 func (a *app) readUpdateSource(
@@ -1268,16 +1496,9 @@ func (a *app) readUpdateSource(
 			"Use --github-auth for the local gh token, or --git-credential-file for an explicit protected token file, not both.",
 		)
 	}
-	gitChanged := githubAuth || flagChanged(cmd, "git-url") || flagChanged(cmd, "git-ref") ||
-		flagChanged(cmd, "git-credential-file") || flagChanged(cmd, "git-credential-name") ||
-		flagChanged(
-			cmd,
-			"builder",
-		) || flagChanged(cmd, "context-path") || flagChanged(cmd, "build-env") || buildpackFlagsChanged(cmd)
-	if !gitChanged {
+	if !updateSourceChanged(cmd, githubAuth) {
 		return platform.SourceBinding{}, false, "", nil
 	}
-
 	source := platform.SourceBinding{}
 	if base.URL != "" {
 		source = platform.CloneRevisionState(platform.RevisionState{Source: base}).Source
@@ -1286,12 +1507,7 @@ func (a *app) readUpdateSource(
 		source.URL = flagString(cmd, "git-url")
 	}
 	if source.URL == "" {
-		if flagChanged(cmd, "git-url") && !flagChanged(cmd, "git-ref") && !flagChanged(cmd, "builder") &&
-			!flagChanged(cmd, "context-path") && !flagChanged(cmd, "build-env") &&
-			!buildpackFlagsChanged(cmd) &&
-			!flagChanged(cmd, "git-credential-name") &&
-			!flagChanged(cmd, "git-credential-file") &&
-			!githubAuth {
+		if canClearGitSource(cmd, githubAuth) {
 			return platform.SourceBinding{}, true, "", nil
 		}
 		return platform.SourceBinding{}, false, "", contract.NewFault(
@@ -1312,6 +1528,29 @@ func (a *app) readUpdateSource(
 			)
 		}
 	}
+	if err := applyUpdateSourceFields(cmd, &source); err != nil {
+		return platform.SourceBinding{}, false, "", err
+	}
+	return updateSourceCredential(cmd, githubAuth, runtimeSecrets, webhookSecret, source)
+}
+
+func updateSourceChanged(cmd *cobra.Command, githubAuth bool) bool {
+	return githubAuth || flagChanged(cmd, "git-url") || flagChanged(cmd, "git-ref") ||
+		flagChanged(cmd, "git-credential-file") || flagChanged(cmd, "git-credential-name") ||
+		flagChanged(cmd, "builder") || flagChanged(cmd, "context-path") ||
+		flagChanged(cmd, "build-env") || buildpackFlagsChanged(cmd)
+}
+
+func canClearGitSource(cmd *cobra.Command, githubAuth bool) bool {
+	return flagChanged(cmd, "git-url") && !flagChanged(cmd, "git-ref") && !flagChanged(cmd, "builder") &&
+		!flagChanged(cmd, "context-path") && !flagChanged(cmd, "build-env") &&
+		!buildpackFlagsChanged(cmd) &&
+		!flagChanged(cmd, "git-credential-name") &&
+		!flagChanged(cmd, "git-credential-file") &&
+		!githubAuth
+}
+
+func applyUpdateSourceFields(cmd *cobra.Command, source *platform.SourceBinding) error {
 	if flagChanged(cmd, "git-ref") {
 		source.Ref = flagString(cmd, "git-ref")
 	}
@@ -1324,13 +1563,19 @@ func (a *app) readUpdateSource(
 	if flagChanged(cmd, "build-env") {
 		values, err := parseAssignments(flagArray(cmd, "build-env"), "--build-env")
 		if err != nil {
-			return platform.SourceBinding{}, false, "", err
+			return err
 		}
 		source.BuildEnv = values
 	}
-	if err := applyBuildpackFlags(cmd, &source); err != nil {
-		return platform.SourceBinding{}, false, "", err
-	}
+	return applyBuildpackFlags(cmd, source)
+}
+
+func updateSourceCredential(
+	cmd *cobra.Command,
+	githubAuth bool,
+	runtimeSecrets []string, webhookSecret string,
+	source platform.SourceBinding,
+) (platform.SourceBinding, bool, string, error) {
 	if githubAuth {
 		name := source.CredentialSecretName
 		if flagChanged(cmd, "git-credential-name") {
@@ -1339,10 +1584,7 @@ func (a *app) readUpdateSource(
 		if name == "" {
 			name = defaultGitReadCredentialName
 		}
-		if err := vault.ValidateName(name); err != nil {
-			return platform.SourceBinding{}, false, "", err
-		}
-		if err := validateGitCredentialRole(name, runtimeSecrets, webhookSecret); err != nil {
+		if err := validateUpdateCredentialName(name, runtimeSecrets, webhookSecret); err != nil {
 			return platform.SourceBinding{}, false, "", err
 		}
 		source.CredentialSecretName = name
@@ -1351,35 +1593,36 @@ func (a *app) readUpdateSource(
 	if flagChanged(cmd, "git-credential-name") && !flagChanged(cmd, "git-credential-file") {
 		name := flagString(cmd, "git-credential-name")
 		if name != "" {
-			if err := vault.ValidateName(name); err != nil {
-				return platform.SourceBinding{}, false, "", err
-			}
-			if err := validateGitCredentialRole(name, runtimeSecrets, webhookSecret); err != nil {
+			if err := validateUpdateCredentialName(name, runtimeSecrets, webhookSecret); err != nil {
 				return platform.SourceBinding{}, false, "", err
 			}
 		}
 		source.CredentialSecretName = name
 	}
-	if flagChanged(cmd, "git-credential-file") {
-		name := flagString(cmd, "git-credential-name")
-		if name == "" {
-			name = source.CredentialSecretName
-		}
-		if name == "" {
-			name = defaultGitReadCredentialName
-		}
-		if err := vault.ValidateName(name); err != nil {
-			return platform.SourceBinding{}, false, "", err
-		}
-		if err := validateGitCredentialRole(name, runtimeSecrets, webhookSecret); err != nil {
-			return platform.SourceBinding{}, false, "", err
-		}
-		// The value is read only after an authoritative preview says this is a
-		// fresh submission. A known replay never opens the secret file.
-		source.CredentialSecretName = name
-		return source, true, name, nil
+	if !flagChanged(cmd, "git-credential-file") {
+		return source, true, "", nil
 	}
-	return source, true, "", nil
+	name := flagString(cmd, "git-credential-name")
+	if name == "" {
+		name = source.CredentialSecretName
+	}
+	if name == "" {
+		name = defaultGitReadCredentialName
+	}
+	if err := validateUpdateCredentialName(name, runtimeSecrets, webhookSecret); err != nil {
+		return platform.SourceBinding{}, false, "", err
+	}
+	// The value is read only after an authoritative preview says this is a
+	// fresh submission. A known replay never opens the secret file.
+	source.CredentialSecretName = name
+	return source, true, name, nil
+}
+
+func validateUpdateCredentialName(name string, runtimeSecrets []string, webhookSecret string) error {
+	if err := vault.ValidateName(name); err != nil {
+		return err
+	}
+	return validateGitCredentialRole(name, runtimeSecrets, webhookSecret)
 }
 
 func updatePreviewText(preview platform.Preview) string {

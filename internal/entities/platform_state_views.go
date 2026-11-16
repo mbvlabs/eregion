@@ -163,7 +163,7 @@ func (s *EnvironmentStore) GetByName(ctx context.Context, app, name string) (Env
 	if err != nil {
 		return EnvironmentObservation{}, false, err
 	}
-	env, err := environmentRow(query.GetPlatformEnvironmentByNameRow(row))
+	env, err := environmentRow(row)
 	return env, err == nil, err
 }
 
@@ -516,7 +516,7 @@ func (s *RevisionStore) GetByID(ctx context.Context, id platform.RevisionID) (pl
 	if err != nil {
 		return platform.EnvironmentRevision{}, false, err
 	}
-	revision, err := revisionRow(query.GetPlatformRevisionByIDRow(row))
+	revision, err := revisionRow(row)
 	return revision, err == nil, err
 }
 

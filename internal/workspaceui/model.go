@@ -44,6 +44,8 @@ func (t Tab) String() string {
 		return "Releases"
 	case Deployments:
 		return "Deployments"
+	case tabCount:
+		return "Unknown"
 	default:
 		return "Unknown"
 	}
@@ -62,6 +64,8 @@ func (t Tab) Collection() string {
 		return "releases"
 	case Deployments:
 		return "deployments"
+	case tabCount:
+		return ""
 	default:
 		return ""
 	}
@@ -595,7 +599,7 @@ func (m Model) handleKey(message tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if m.detail {
 		return m.handleDetailKey(pressed)
 	}
-	return m.handleListKey(message, pressed)
+	return m.handleListKey(pressed)
 }
 
 func (m Model) detach() (tea.Model, tea.Cmd) {
@@ -604,7 +608,7 @@ func (m Model) detach() (tea.Model, tea.Cmd) {
 	return m, tea.Quit
 }
 
-func (m Model) handleListKey(message tea.KeyPressMsg, pressed string) (tea.Model, tea.Cmd) {
+func (m Model) handleListKey(pressed string) (tea.Model, tea.Cmd) {
 	items := m.visibleItems()
 	index := m.selected[m.tab]
 	switch pressed {
@@ -651,22 +655,7 @@ func (m Model) handleListKey(message tea.KeyPressMsg, pressed string) (tea.Model
 		}
 	case "enter":
 		if m.tab == Deployments {
-			if item, ok := m.selectedItem(); ok {
-				if item.OperationID.Validate() != nil {
-					m.notice = "Operation history unavailable for this deployment; press i for details."
-					return m, nil
-				}
-				if m.opts.API == nil {
-					m.notice = "This workspace has no API client."
-					return m, nil
-				}
-				m.notice = ""
-				m.detailScroll = 0
-				m.op = &opView{id: item.OperationID, loading: true, at: m.now,
-					reducer: viewer.New(item.OperationID, viewer.Options{Clean: m.clean})}
-				return m, tea.Batch(m.operationCommand(item.OperationID), m.spinCommand())
-			}
-			return m, nil
+			return m.handleDeploymentEnter()
 		}
 		fallthrough
 	case " ", "i":
@@ -697,6 +686,26 @@ func (m Model) handleListKey(message tea.KeyPressMsg, pressed string) (tea.Model
 		m.showHelp = true
 	}
 	return m, nil
+}
+
+func (m Model) handleDeploymentEnter() (tea.Model, tea.Cmd) {
+	item, ok := m.selectedItem()
+	if !ok {
+		return m, nil
+	}
+	if item.OperationID.Validate() != nil {
+		m.notice = "Operation history unavailable for this deployment; press i for details."
+		return m, nil
+	}
+	if m.opts.API == nil {
+		m.notice = "This workspace has no API client."
+		return m, nil
+	}
+	m.notice = ""
+	m.detailScroll = 0
+	m.op = &opView{id: item.OperationID, loading: true, at: m.now,
+		reducer: viewer.New(item.OperationID, viewer.Options{Clean: m.clean})}
+	return m, tea.Batch(m.operationCommand(item.OperationID), m.spinCommand())
 }
 
 func (m Model) handleFilterKey(message tea.KeyPressMsg) (tea.Model, tea.Cmd) {
@@ -840,13 +849,6 @@ func sanitizeEvent(event contract.Event, clean func(string) string) contract.Eve
 	return event
 }
 
-func sanitizeText(registry *secrets.Registry, text string) string {
-	if registry != nil {
-		text = registry.Redact(text)
-	}
-	return Sanitize(nil, text)
-}
-
 func (m Model) listCapacity() int {
 	// Header, tab bar, and footer are rendered outside the row list.
 	return max(1, m.height-7)
@@ -882,11 +884,6 @@ func shortDuration(value time.Duration) string {
 		return fmt.Sprintf("%dm", int(value.Minutes()))
 	}
 	return fmt.Sprintf("%dh", int(value.Hours()))
-}
-
-func (m Model) stale() bool {
-	_, stale := m.freshness(m.current())
-	return stale
 }
 
 // Key bindings are also the help text; they never advertise a key that the

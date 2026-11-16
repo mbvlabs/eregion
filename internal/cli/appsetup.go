@@ -121,7 +121,7 @@ func humanInteractive(cmd *cobra.Command) bool {
 	return !jsonMode && plain &&
 		term.IsTerminal(
 			int(os.Stdin.Fd()),
-		) && ui.Enabled(os.Stderr) //nolint:gosec // G115: file descriptors fit in int.
+		) && ui.Enabled(os.Stderr)
 }
 
 // addSetupFlags adds the source, runtime, process, configuration, secret and
@@ -348,8 +348,6 @@ func parseGoTargets(values []string) ([]buildpacks.GoTarget, error) {
 }
 
 func applyBuildpackFlags(cmd *cobra.Command, source *platform.SourceBinding) error {
-	frontend := flagChanged(cmd, "frontend-directory") || flagChanged(cmd, "frontend-script") ||
-		flagChanged(cmd, "frontend-start-script")
 	if flagChanged(cmd, "target") {
 		targets, err := parseGoTargets(flagArray(cmd, "target"))
 		if err != nil {
@@ -357,72 +355,84 @@ func applyBuildpackFlags(cmd *cobra.Command, source *platform.SourceBinding) err
 		}
 		source.GoTargets = targets
 	}
+	frontend := flagChanged(cmd, "frontend-directory") || flagChanged(cmd, "frontend-script") ||
+		flagChanged(cmd, "frontend-start-script")
 	advanced := flagChanged(cmd, "go-version") || flagChanged(cmd, "go-build-flags") ||
 		flagChanged(cmd, "node-version")
-	if frontend || advanced || flagChanged(cmd, "buildpack") || flagChanged(cmd, "keep-file") {
-		if source.Buildpacks == nil {
-			source.Buildpacks = &buildpacks.Settings{}
-		}
-		if flagChanged(cmd, "buildpack") {
-			order := flagArray(cmd, "buildpack")
-			if len(order) == 1 && order[0] == "" {
-				order = []string{}
-			}
-			source.Buildpacks.Order = order
-		}
-		if flagChanged(cmd, "keep-file") {
-			values := flagArray(cmd, "keep-file")
-			if len(values) == 1 && values[0] == "" {
-				values = nil
-			}
-			source.Buildpacks.KeepFiles = values
-		}
-		if frontend {
-			if source.Buildpacks.Frontend == nil {
-				source.Buildpacks.Frontend = &buildpacks.Frontend{}
-			}
-			f := source.Buildpacks.Frontend
-			if flagChanged(cmd, "frontend-directory") {
-				f.Directory = flagString(cmd, "frontend-directory")
-			}
-			if flagChanged(cmd, "frontend-script") {
-				f.Scripts = flagArray(cmd, "frontend-script")
-			}
-			if flagChanged(cmd, "frontend-start-script") {
-				f.StartScript = flagString(cmd, "frontend-start-script")
-			}
-		}
-		if advanced {
-			if source.Buildpacks.Advanced == nil {
-				source.Buildpacks.Advanced = &buildpacks.Advanced{}
-			}
-			a := source.Buildpacks.Advanced
-			if flagChanged(cmd, "go-version") {
-				a.GoVersion = flagString(cmd, "go-version")
-			}
-			if flagChanged(cmd, "go-build-flags") {
-				a.GoBuildFlags = flagString(cmd, "go-build-flags")
-			}
-			if flagChanged(cmd, "node-version") {
-				a.NodeVersion = flagString(cmd, "node-version")
-			}
-		}
-		settings, err := buildpacks.NormalizeSettings(source.Buildpacks)
-		if err != nil {
-			return contract.NewFault(
-				contract.ValidationFailed,
-				"invalid Buildpacks settings",
-				err.Error(),
-			)
-		}
-		source.Buildpacks = settings
+	if !frontend && !advanced && !flagChanged(cmd, "buildpack") && !flagChanged(cmd, "keep-file") {
+		return nil
 	}
+	if source.Buildpacks == nil {
+		source.Buildpacks = &buildpacks.Settings{}
+	}
+	if flagChanged(cmd, "buildpack") {
+		order := flagArray(cmd, "buildpack")
+		if len(order) == 1 && order[0] == "" {
+			order = []string{}
+		}
+		source.Buildpacks.Order = order
+	}
+	if flagChanged(cmd, "keep-file") {
+		values := flagArray(cmd, "keep-file")
+		if len(values) == 1 && values[0] == "" {
+			values = nil
+		}
+		source.Buildpacks.KeepFiles = values
+	}
+	if frontend {
+		applyFrontendFlags(cmd, source.Buildpacks)
+	}
+	if advanced {
+		applyAdvancedBuildpackFlags(cmd, source.Buildpacks)
+	}
+	settings, err := buildpacks.NormalizeSettings(source.Buildpacks)
+	if err != nil {
+		return contract.NewFault(
+			contract.ValidationFailed,
+			"invalid Buildpacks settings",
+			err.Error(),
+		)
+	}
+	source.Buildpacks = settings
 	return nil
+}
+
+func applyFrontendFlags(cmd *cobra.Command, settings *buildpacks.Settings) {
+	if settings.Frontend == nil {
+		settings.Frontend = &buildpacks.Frontend{}
+	}
+	frontend := settings.Frontend
+	if flagChanged(cmd, "frontend-directory") {
+		frontend.Directory = flagString(cmd, "frontend-directory")
+	}
+	if flagChanged(cmd, "frontend-script") {
+		frontend.Scripts = flagArray(cmd, "frontend-script")
+	}
+	if flagChanged(cmd, "frontend-start-script") {
+		frontend.StartScript = flagString(cmd, "frontend-start-script")
+	}
+}
+
+func applyAdvancedBuildpackFlags(cmd *cobra.Command, settings *buildpacks.Settings) {
+	if settings.Advanced == nil {
+		settings.Advanced = &buildpacks.Advanced{}
+	}
+	advanced := settings.Advanced
+	if flagChanged(cmd, "go-version") {
+		advanced.GoVersion = flagString(cmd, "go-version")
+	}
+	if flagChanged(cmd, "go-build-flags") {
+		advanced.GoBuildFlags = flagString(cmd, "go-build-flags")
+	}
+	if flagChanged(cmd, "node-version") {
+		advanced.NodeVersion = flagString(cmd, "node-version")
+	}
 }
 
 // guidedBuildpacks edits an independent source copy using the same canonical validation as flags.
 func guidedBuildpacks(source *platform.SourceBinding) error {
-	var values []string
+	var err error
+	values := make([]string, 0, len(source.GoTargets))
 	for _, target := range source.GoTargets {
 		values = append(values, target.Process+"="+target.Target)
 	}
@@ -438,18 +448,43 @@ func guidedBuildpacks(source *platform.SourceBinding) error {
 	if err != nil {
 		return err
 	}
-	settings := source.Buildpacks
+	settings, err := guidedBuildpackSettings(source.Buildpacks)
+	if err != nil {
+		return err
+	}
+	settings, err = guidedBuildpackFrontend(settings)
+	if err != nil {
+		return err
+	}
+	settings, err = guidedBuildpackAdvanced(settings)
+	if err != nil {
+		return err
+	}
+	settings, err = buildpacks.NormalizeSettings(settings)
+	if err != nil {
+		return contract.NewFault(
+			contract.ValidationFailed,
+			"invalid Buildpacks settings",
+			err.Error(),
+		)
+	}
+	source.Buildpacks = settings
+	return nil
+}
+
+func guidedBuildpackSettings(current *buildpacks.Settings) (*buildpacks.Settings, error) {
+	settings := current
 	var order []string
 	if settings != nil {
 		order = settings.Order
 	}
-	text, err = ui.Input(
+	text, err := ui.Input(
 		"Buildpack order",
 		"Comma-separated fully qualified references; empty uses builder detection",
 		strings.Join(order, ","),
 	)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if settings == nil && text != "" {
 		settings = &buildpacks.Settings{}
@@ -470,7 +505,7 @@ func guidedBuildpacks(source *platform.SourceBinding) error {
 		strings.Join(keepFiles, ","),
 	)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if settings == nil && text != "" {
 		settings = &buildpacks.Settings{}
@@ -481,62 +516,73 @@ func guidedBuildpacks(source *platform.SourceBinding) error {
 			settings.KeepFiles = strings.Split(text, ",")
 		}
 	}
+	return settings, nil
+}
+
+func guidedBuildpackFrontend(settings *buildpacks.Settings) (*buildpacks.Settings, error) {
 	enabled := settings != nil && settings.Frontend != nil
-	enabled, err = ui.YesNoDefault(
+	enabled, err := ui.YesNoDefault(
 		"Configure Node build inputs?",
 		"Optional inputs for a selected Node buildpack",
 		enabled,
 	)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if settings == nil && enabled {
+	if !enabled {
+		if settings != nil {
+			settings.Frontend = nil
+		}
+		return settings, nil
+	}
+	if settings == nil {
 		settings = &buildpacks.Settings{}
 	}
-	if enabled {
-		if settings.Frontend == nil {
-			settings.Frontend = &buildpacks.Frontend{}
-		}
-		f := settings.Frontend
-		f.Directory, err = ui.Input(
-			"Frontend directory",
-			"Relative to the build context; empty uses buildpack default",
-			f.Directory,
-		)
-		if err != nil {
-			return err
-		}
-		text, err = ui.Input(
-			"Frontend scripts",
-			"Comma-separated package script names; empty uses buildpack default",
-			strings.Join(f.Scripts, ","),
-		)
-		if err != nil {
-			return err
-		}
-		f.Scripts = strings.Split(text, ",")
-		f.StartScript, err = ui.Input(
-			"Frontend start script",
-			"Existing npm package script for launch; empty uses buildpack default",
-			f.StartScript,
-		)
-		if err != nil {
-			return err
-		}
-	} else if settings != nil {
-		settings.Frontend = nil
+	if settings.Frontend == nil {
+		settings.Frontend = &buildpacks.Frontend{}
 	}
+	frontend := settings.Frontend
+	frontend.Directory, err = ui.Input(
+		"Frontend directory",
+		"Relative to the build context; empty uses buildpack default",
+		frontend.Directory,
+	)
+	if err != nil {
+		return nil, err
+	}
+	text, err := ui.Input(
+		"Frontend scripts",
+		"Comma-separated package script names; empty uses buildpack default",
+		strings.Join(frontend.Scripts, ","),
+	)
+	if err != nil {
+		return nil, err
+	}
+	frontend.Scripts = strings.Split(text, ",")
+	frontend.StartScript, err = ui.Input(
+		"Frontend start script",
+		"Existing npm package script for launch; empty uses buildpack default",
+		frontend.StartScript,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return settings, nil
+}
+
+func guidedBuildpackAdvanced(settings *buildpacks.Settings) (*buildpacks.Settings, error) {
 	advanced := buildpacks.Advanced{}
 	if settings != nil && settings.Advanced != nil {
 		advanced = *settings.Advanced
 	}
+	var err error
 	advanced.GoVersion, err = ui.Input(
 		"Go version",
 		"Empty uses the buildpack default",
 		advanced.GoVersion,
 	)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	advanced.GoBuildFlags, err = ui.Input(
 		"Go build flags",
@@ -544,7 +590,7 @@ func guidedBuildpacks(source *platform.SourceBinding) error {
 		advanced.GoBuildFlags,
 	)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	advanced.NodeVersion, err = ui.Input(
 		"Node version",
@@ -552,26 +598,19 @@ func guidedBuildpacks(source *platform.SourceBinding) error {
 		advanced.NodeVersion,
 	)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if advanced != (buildpacks.Advanced{}) {
-		if settings == nil {
-			settings = &buildpacks.Settings{}
+	if advanced == (buildpacks.Advanced{}) {
+		if settings != nil {
+			settings.Advanced = nil
 		}
-		settings.Advanced = &advanced
-	} else if settings != nil {
-		settings.Advanced = nil
+		return settings, nil
 	}
-	settings, err = buildpacks.NormalizeSettings(settings)
-	if err != nil {
-		return contract.NewFault(
-			contract.ValidationFailed,
-			"invalid Buildpacks settings",
-			err.Error(),
-		)
+	if settings == nil {
+		settings = &buildpacks.Settings{}
 	}
-	source.Buildpacks = settings
-	return nil
+	settings.Advanced = &advanced
+	return settings, nil
 }
 
 // validateIdempotencyFlag rejects a malformed key before any vault write, so a
@@ -710,33 +749,9 @@ func (a *app) readSetupFromFile(
 	if err != nil {
 		return nil, err
 	}
-
-	appName := definition.App
-	switch mode {
-	case setupApp:
-		if flagChanged(cmd, "name") {
-			flagName := flagString(cmd, "name")
-			if appName != "" && flagName != appName {
-				return nil, contract.NewFault(
-					contract.ValidationFailed,
-					"definition app disagrees with --name",
-					"Use the file's app name, or edit the definition.",
-				)
-			}
-			appName = flagName
-		}
-	case setupEnvironment:
-		if flagChanged(cmd, "app") {
-			flagApp := flagString(cmd, "app")
-			if appName != "" && flagApp != appName {
-				return nil, contract.NewFault(
-					contract.ValidationFailed,
-					"definition app disagrees with --app",
-					"Use the file's app name, or edit the definition.",
-				)
-			}
-			appName = flagApp
-		}
+	appName, err := definitionAppName(cmd, mode, definition.App)
+	if err != nil {
+		return nil, err
 	}
 	if err := platform.ValidateName(appName); err != nil {
 		return nil, contract.NewFault(
@@ -745,102 +760,186 @@ func (a *app) readSetupFromFile(
 			"Set app in the definition or pass the command's app flag.",
 		)
 	}
-	resolvedImageRepository := ""
-	if definition.ImageRepository != nil {
-		normalized, err := platform.NormalizeImageRepository(*definition.ImageRepository)
-		if err != nil {
-			return nil, definitionFault(fmt.Errorf("image_repository: %w", err))
-		}
-		resolvedImageRepository = normalized
+	resolvedImageRepository, err := definitionImageRepository(cmd, definition.ImageRepository)
+	if err != nil {
+		return nil, err
 	}
-	if flagChanged(cmd, "image-repository") {
-		flagRepository, err := platform.NormalizeImageRepository(
-			flagString(cmd, "image-repository"),
-		)
-		if err != nil {
-			return nil, err
+	specs, resourceByEnvironment, err := resolveDefinitionEnvironments(cmd, mode, definition, appName, protection)
+	if err != nil {
+		return nil, err
+	}
+	primary := specs[0]
+	ans := setupAnswersFromDefinition(path, appName, resolvedImageRepository, protection, primary, specs, resourceByEnvironment)
+	deploy, err := definitionDeployChoice(cmd, primary, ans.Domain)
+	if err != nil {
+		return nil, err
+	}
+	ans.Deploy = deploy
+	if len(ans.ResourceSpecs) > 0 || len(ans.AdditionalResourceSpecs["staging"]) > 0 {
+		// Resources are provisioned only after the environment exists. Queuing
+		// a first deploy in the same submission would race an absent resource,
+		// so it is deliberately deferred; the operator deploys once health is
+		// ready.
+		ans.Deploy = false
+	}
+	return ans, nil
+}
+
+func definitionAppName(cmd *cobra.Command, mode setupMode, appName string) (string, error) {
+	switch mode {
+	case setupApp:
+		if !flagChanged(cmd, "name") {
+			return appName, nil
 		}
-		if resolvedImageRepository != "" && resolvedImageRepository != flagRepository {
-			return nil, contract.NewFault(
+		flagName := flagString(cmd, "name")
+		if appName != "" && flagName != appName {
+			return "", contract.NewFault(
 				contract.ValidationFailed,
-				"definition image_repository disagrees with --image-repository",
-				"Use the file's repository, or edit the definition.",
+				"definition app disagrees with --name",
+				"Use the file's app name, or edit the definition.",
 			)
 		}
-		resolvedImageRepository = flagRepository
+		return flagName, nil
+	case setupEnvironment:
+		if !flagChanged(cmd, "app") {
+			return appName, nil
+		}
+		flagApp := flagString(cmd, "app")
+		if appName != "" && flagApp != appName {
+			return "", contract.NewFault(
+				contract.ValidationFailed,
+				"definition app disagrees with --app",
+				"Use the file's app name, or edit the definition.",
+			)
+		}
+		return flagApp, nil
+	default:
+		return appName, nil
 	}
-	addresses := mainNodeAddresses(cmd)
-	resolve := func(name string) (*appdef.Resolved, platform.EnvironmentSpec, []platform.ResourceApplyInput, error) {
-		resolved, err := definition.Resolve(name)
-		if err != nil {
-			return nil, platform.EnvironmentSpec{}, nil, definitionFault(err)
-		}
-		resolved.App = appName
-		spec, err := resolved.CreateSpec(addresses)
-		if err != nil {
-			return nil, platform.EnvironmentSpec{}, nil, definitionFault(err)
-		}
-		resourceSpecs, err := resolved.ResourceApplySpecs()
-		if err != nil {
-			return nil, platform.EnvironmentSpec{}, nil, definitionFault(err)
-		}
-		attachmentNames, attachmentsSet := resolved.ResourceAttachments()
-		if attachmentsSet {
-			spec.Resources = attachmentNames
-		}
-		if protection != nil {
-			spec.Protected = protection
-		} else {
-			value := platform.DefaultEnvironmentProtection(spec.Name)
-			spec.Protected = &value
-		}
-		return resolved, spec, resourceSpecs, nil
-	}
+}
 
+func definitionImageRepository(cmd *cobra.Command, configured *string) (string, error) {
+	resolved := ""
+	if configured != nil {
+		normalized, err := platform.NormalizeImageRepository(*configured)
+		if err != nil {
+			return "", definitionFault(fmt.Errorf("image_repository: %w", err))
+		}
+		resolved = normalized
+	}
+	if !flagChanged(cmd, "image-repository") {
+		return resolved, nil
+	}
+	flagRepository, err := platform.NormalizeImageRepository(flagString(cmd, "image-repository"))
+	if err != nil {
+		return "", err
+	}
+	if resolved != "" && resolved != flagRepository {
+		return "", contract.NewFault(
+			contract.ValidationFailed,
+			"definition image_repository disagrees with --image-repository",
+			"Use the file's repository, or edit the definition.",
+		)
+	}
+	return flagRepository, nil
+}
+
+func resolveDefinitionEnvironments(
+	cmd *cobra.Command,
+	mode setupMode,
+	definition appdef.Definition,
+	appName string,
+	protection *bool,
+) ([]platform.EnvironmentSpec, map[string][]platform.ResourceApplyInput, error) {
+	addresses := mainNodeAddresses(cmd)
+	resolve := func(name string) (platform.EnvironmentSpec, []platform.ResourceApplyInput, error) {
+		return resolveDefinitionEnvironment(definition, appName, addresses, protection, name)
+	}
 	var specs []platform.EnvironmentSpec
-	var resourceByEnvironment = map[string][]platform.ResourceApplyInput{}
+	resourceByEnvironment := map[string][]platform.ResourceApplyInput{}
 	switch mode {
 	case setupApp:
 		for _, name := range []string{"production", "staging"} {
-			_, spec, resourceSpecs, err := resolve(name)
+			spec, resourceSpecs, err := resolve(name)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			specs = append(specs, spec)
 			resourceByEnvironment[name] = resourceSpecs
 		}
 		if err := validateUniqueEnvironmentDomains(specs); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	case setupEnvironment:
 		selected := flagString(cmd, "name")
 		if selected == "" {
-			return nil, contract.NewFault(
+			return nil, nil, contract.NewFault(
 				contract.InputRequired,
 				"an environment is required",
 				"Pass --name; the shared recipe applies to any environment without adding it to the definition.",
 			)
 		}
 		if err := platform.ValidateName(selected); err != nil {
-			return nil, contract.NewFault(
+			return nil, nil, contract.NewFault(
 				contract.ValidationFailed,
 				"definition environment is invalid",
 				err.Error(),
 			)
 		}
-		_, spec, resourceSpecs, err := resolve(selected)
+		spec, resourceSpecs, err := resolve(selected)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		specs = append(specs, spec)
 		resourceByEnvironment[selected] = resourceSpecs
 	}
+	return specs, resourceByEnvironment, nil
+}
 
-	primary := specs[0]
+func resolveDefinitionEnvironment(
+	definition appdef.Definition,
+	appName string,
+	addresses []string,
+	protection *bool,
+	name string,
+) (platform.EnvironmentSpec, []platform.ResourceApplyInput, error) {
+	resolved, err := definition.Resolve(name)
+	if err != nil {
+		return platform.EnvironmentSpec{}, nil, definitionFault(err)
+	}
+	resolved.App = appName
+	spec, err := resolved.CreateSpec(addresses)
+	if err != nil {
+		return platform.EnvironmentSpec{}, nil, definitionFault(err)
+	}
+	resourceSpecs, err := resolved.ResourceApplySpecs()
+	if err != nil {
+		return platform.EnvironmentSpec{}, nil, definitionFault(err)
+	}
+	attachmentNames, attachmentsSet := resolved.ResourceAttachments()
+	if attachmentsSet {
+		spec.Resources = attachmentNames
+	}
+	if protection != nil {
+		spec.Protected = protection
+	} else {
+		value := platform.DefaultEnvironmentProtection(spec.Name)
+		spec.Protected = &value
+	}
+	return spec, resourceSpecs, nil
+}
+
+func setupAnswersFromDefinition(
+	path, appName, imageRepository string,
+	protection *bool,
+	primary platform.EnvironmentSpec,
+	specs []platform.EnvironmentSpec,
+	resourceByEnvironment map[string][]platform.ResourceApplyInput,
+) *setupAnswers {
 	ans := &setupAnswers{
 		App:                     appName,
 		Environment:             primary.Name,
-		ImageRepository:         resolvedImageRepository,
+		ImageRepository:         imageRepository,
 		Node:                    primary.Node,
 		BuildNode:               primary.BuildNode,
 		GitURL:                  primary.Source.URL,
@@ -881,35 +980,25 @@ func (a *app) readSetupFromFile(
 	if primary.Runtime.ReleaseCommand != nil {
 		ans.ReleaseArgv = append([]string(nil), primary.Runtime.ReleaseCommand.Argv...)
 	}
-	interactive := humanInteractive(cmd)
+	return ans
+}
+
+func definitionDeployChoice(cmd *cobra.Command, primary platform.EnvironmentSpec, domain string) (bool, error) {
 	switch {
 	case boolFlag(cmd, "no-deploy"):
-		ans.Deploy = false
-	case interactive && !flagChanged(cmd, "no-deploy"):
+		return false, nil
+	case humanInteractive(cmd) && !flagChanged(cmd, "no-deploy"):
 		if primary.Source.URL == "" {
-			ans.Deploy = false
-			break
+			return false, nil
 		}
-		deploy, err := ui.YesNoDefault(
+		return ui.YesNoDefault(
 			"Request the first deploy?",
 			"The submission queues it from production's new revision; --no-deploy skips it. A first deploy needs a domain.",
-			ans.Domain != "",
+			domain != "",
 		)
-		if err != nil {
-			return nil, err
-		}
-		ans.Deploy = deploy
 	default:
-		ans.Deploy = primary.Source.URL != ""
+		return primary.Source.URL != "", nil
 	}
-	if len(ans.ResourceSpecs) > 0 || len(ans.AdditionalResourceSpecs["staging"]) > 0 {
-		// Resources are provisioned only after the environment exists. Queuing
-		// a first deploy in the same submission would race an absent resource,
-		// so it is deliberately deferred; the operator deploys once health is
-		// ready.
-		ans.Deploy = false
-	}
-	return ans, nil
 }
 
 // validateUniqueEnvironmentDomains refuses a recipe that resolves the same
@@ -969,7 +1058,7 @@ func readDefinitionFile(path string) (appdef.Definition, error) {
 	}
 	raw, err := os.ReadFile(
 		path,
-	) //nolint:gosec // G304: the operator explicitly selected the definition input.
+	)
 	if err != nil {
 		return appdef.Definition{}, contract.NewFault(
 			contract.InputRequired,
@@ -1006,6 +1095,61 @@ func (a *app) readSetup(cmd *cobra.Command, mode setupMode) (*setupAnswers, erro
 		return a.readSetupFromFile(cmd, mode, from)
 	}
 	interactive := humanInteractive(cmd)
+	ans := newSetupAnswers(cmd)
+	if err := validateIdempotencyFlag(cmd); err != nil {
+		return nil, err
+	}
+	keepSecrets := false
+	defer func() {
+		if !keepSecrets {
+			ans.clearSecrets()
+		}
+	}()
+
+	protection, err := setupProtectionFlag(cmd)
+	if err != nil {
+		return nil, err
+	}
+	ans.Protection = protection
+	if err := askSetupTargets(cmd, ans, mode, interactive); err != nil {
+		return nil, err
+	}
+	if err := a.askSetupNodes(cmd, ans, interactive); err != nil {
+		return nil, err
+	}
+
+	if err := a.readSetupSource(cmd, ans, interactive); err != nil {
+		return nil, err
+	}
+
+	if err := askSetupRuntime(cmd, ans, interactive); err != nil {
+		return nil, err
+	}
+	if err := readSetupFormation(cmd, ans, interactive); err != nil {
+		return nil, err
+	}
+	if err := readSetupConfig(cmd, ans, interactive); err != nil {
+		return nil, err
+	}
+	if err := a.readSetupSecretInputs(cmd, ans, interactive); err != nil {
+		return nil, err
+	}
+	if err := askSetupDomain(cmd, ans, interactive); err != nil {
+		return nil, err
+	}
+	ans.Deploy, err = askSetupDeploy(cmd, ans, interactive)
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err := ans.environmentSpec(cmd); err != nil {
+		return nil, err
+	}
+	keepSecrets = true
+	return ans, nil
+}
+
+func newSetupAnswers(cmd *cobra.Command) *setupAnswers {
 	ans := &setupAnswers{
 		Node:            flagString(cmd, "node"),
 		ImageRepository: flagString(cmd, "image-repository"),
@@ -1036,21 +1180,10 @@ func (a *app) readSetup(cmd *cobra.Command, mode setupMode) (*setupAnswers, erro
 	if ans.HealthTimeout == 0 {
 		ans.HealthTimeout = platform.DefaultHealthTimeout
 	}
-	if err := validateIdempotencyFlag(cmd); err != nil {
-		return nil, err
-	}
-	keepSecrets := false
-	defer func() {
-		if !keepSecrets {
-			ans.clearSecrets()
-		}
-	}()
+	return ans
+}
 
-	protection, err := setupProtectionFlag(cmd)
-	if err != nil {
-		return nil, err
-	}
-	ans.Protection = protection
+func askSetupTargets(cmd *cobra.Command, ans *setupAnswers, mode setupMode, interactive bool) error {
 	switch mode {
 	case setupApp:
 		ans.App = flagString(cmd, "name")
@@ -1060,55 +1193,45 @@ func (a *app) readSetup(cmd *cobra.Command, mode setupMode) (*setupAnswers, erro
 		ans.App = flagString(cmd, "app")
 		ans.Environment = flagString(cmd, "name")
 	}
-
 	if ans.App == "" {
 		if !interactive {
 			flag := "--name"
 			if mode == setupEnvironment {
 				flag = "--app"
 			}
-			return nil, contract.NewFault(
+			return contract.NewFault(
 				contract.InputRequired,
 				flag+" is required without a terminal",
 				"Pass "+flag+" with the app name.",
 			)
 		}
-		value, err := askValidated(
-			"App name",
-			"Lowercase letters, digits and inner hyphens",
-			"",
-			platform.ValidateName,
-		)
+		value, err := askValidated("App name", "Lowercase letters, digits and inner hyphens", "", platform.ValidateName)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		ans.App = value
 	}
 	if ans.Environment == "" {
 		if !interactive {
-			return nil, contract.NewFault(
+			return contract.NewFault(
 				contract.InputRequired,
 				"--name is required without a terminal",
 				"Pass --name with the environment name.",
 			)
 		}
-		value, err := askValidated(
-			"Environment name",
-			"For example production or staging",
-			"",
-			platform.ValidateName,
-		)
+		value, err := askValidated("Environment name", "For example production or staging", "", platform.ValidateName)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		ans.Environment = value
 	}
 	if interactive && mode == setupApp {
-		fmt.Fprintln(
-			os.Stderr,
-			ui.Note("app create will also create staging from this recipe; both start protected."),
-		)
+		fmt.Fprintln(os.Stderr, ui.Note("app create will also create staging from this recipe; both start protected."))
 	}
+	return nil
+}
+
+func (a *app) askSetupNodes(cmd *cobra.Command, ans *setupAnswers, interactive bool) error {
 	if interactive && !flagChanged(cmd, "node") {
 		value, err := a.askNode(
 			cmd,
@@ -1121,7 +1244,7 @@ func (a *app) readSetup(cmd *cobra.Command, mode setupMode) (*setupAnswers, erro
 			"",
 		)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		ans.Node = value
 	}
@@ -1137,11 +1260,14 @@ func (a *app) readSetup(cmd *cobra.Command, mode setupMode) (*setupAnswers, erro
 			ans.Node,
 		)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		ans.BuildNode = value
 	}
+	return nil
+}
 
+func (a *app) readSetupSource(cmd *cobra.Command, ans *setupAnswers, interactive bool) error {
 	switch {
 	case ans.GitURL != "":
 		// A Git URL is the only source recipe. Absent means image-only app
@@ -1153,84 +1279,98 @@ func (a *app) readSetup(cmd *cobra.Command, mode setupMode) (*setupAnswers, erro
 			"",
 		)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		ans.GitURL = strings.TrimSpace(value)
 	}
-
-	if ans.GitURL != "" {
-		if err := validateGitURLShape(ans.GitURL); err != nil {
-			return nil, err
-		}
-		if interactive && !flagChanged(cmd, "git-ref") {
-			value, err := ui.Input(
-				"Branch or tag",
-				"Empty uses the repository's default branch",
-				ans.GitRef,
-			)
-			if err != nil {
-				return nil, err
-			}
-			ans.GitRef = value
-		}
-		if err := a.readSetupCredential(cmd, ans, interactive); err != nil {
-			return nil, err
-		}
-		if interactive && !flagChanged(cmd, "builder") {
-			value, err := askValidated(
-				"Buildpacks builder",
-				"Required for Git builds; there is no built-in default",
-				ans.Builder,
-				func(value string) error {
-					if value == "" {
-						return fmt.Errorf("git builds require an explicit builder; there is no built-in default")
-					}
-					return platform.ValidateImage(value)
-				},
-			)
-			if err != nil {
-				return nil, err
-			}
-			ans.Builder = value
-		}
-		if interactive && !flagChanged(cmd, "context-path") {
-			value, err := ui.Input(
-				"Build context path",
-				"Empty builds the repository root",
-				ans.ContextPath,
-			)
-			if err != nil {
-				return nil, err
-			}
-			ans.ContextPath = value
-		}
-		values, err := parseAssignments(flagArray(cmd, "build-env"), "--build-env")
-		if err != nil {
-			return nil, err
-		}
-		ans.BuildEnv = values
-		source := platform.SourceBinding{}
-		if err := applyBuildpackFlags(cmd, &source); err != nil {
-			return nil, err
-		}
-		if interactive && !buildpackFlagsChanged(cmd) {
-			if err := guidedBuildpacks(&source); err != nil {
-				return nil, err
-			}
-		}
-		ans.GoTargets, ans.Buildpacks = source.GoTargets, source.Buildpacks
-	} else {
+	if ans.GitURL == "" {
 		if flagChanged(cmd, "builder") || flagChanged(cmd, "context-path") ||
 			flagChanged(cmd, "build-env") ||
 			buildpackFlagsChanged(cmd) {
-			return nil, contract.NewFault(
+			return contract.NewFault(
 				contract.ValidationFailed,
 				"build settings need a Git source",
 				"Pass --git-url, or omit --builder, --context-path and --build-env for an image-only app.",
 			)
 		}
+		return nil
 	}
+	if err := validateGitURLShape(ans.GitURL); err != nil {
+		return err
+	}
+	return a.readSetupGitSource(cmd, ans, interactive)
+}
 
+func (a *app) readSetupGitSource(cmd *cobra.Command, ans *setupAnswers, interactive bool) error {
+	if interactive && !flagChanged(cmd, "git-ref") {
+		value, err := ui.Input(
+			"Branch or tag",
+			"Empty uses the repository's default branch",
+			ans.GitRef,
+		)
+		if err != nil {
+			return err
+		}
+		ans.GitRef = value
+	}
+	if err := a.readSetupCredential(cmd, ans, interactive); err != nil {
+		return err
+	}
+	if err := askSetupBuilder(cmd, ans, interactive); err != nil {
+		return err
+	}
+	if interactive && !flagChanged(cmd, "context-path") {
+		value, err := ui.Input(
+			"Build context path",
+			"Empty builds the repository root",
+			ans.ContextPath,
+		)
+		if err != nil {
+			return err
+		}
+		ans.ContextPath = value
+	}
+	values, err := parseAssignments(flagArray(cmd, "build-env"), "--build-env")
+	if err != nil {
+		return err
+	}
+	ans.BuildEnv = values
+	source := platform.SourceBinding{}
+	if err := applyBuildpackFlags(cmd, &source); err != nil {
+		return err
+	}
+	if interactive && !buildpackFlagsChanged(cmd) {
+		if err := guidedBuildpacks(&source); err != nil {
+			return err
+		}
+	}
+	ans.GoTargets, ans.Buildpacks = source.GoTargets, source.Buildpacks
+	return nil
+}
+
+func askSetupBuilder(cmd *cobra.Command, ans *setupAnswers, interactive bool) error {
+	if !interactive || flagChanged(cmd, "builder") {
+		return nil
+	}
+	value, err := askValidated(
+		"Buildpacks builder",
+		"Required for Git builds; there is no built-in default",
+		ans.Builder,
+		func(value string) error {
+			if value == "" {
+				return fmt.Errorf("git builds require an explicit builder; there is no built-in default")
+			}
+			return platform.ValidateImage(value)
+		},
+	)
+	if err != nil {
+		return err
+	}
+	ans.Builder = value
+	return nil
+}
+
+func askSetupRuntime(cmd *cobra.Command, ans *setupAnswers, interactive bool) error {
 	if interactive && !flagChanged(cmd, "container-port") && len(flagArray(cmd, "process")) == 0 {
 		port, err := askPort(
 			"Web container port",
@@ -1238,7 +1378,7 @@ func (a *app) readSetup(cmd *cobra.Command, mode setupMode) (*setupAnswers, erro
 			fmt.Sprint(ans.ContainerPort),
 		)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		ans.ContainerPort = port
 	}
@@ -1249,62 +1389,78 @@ func (a *app) readSetup(cmd *cobra.Command, mode setupMode) (*setupAnswers, erro
 			ans.HealthPath,
 		)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		ans.HealthPath = value
 	}
+	return nil
+}
 
+func readSetupFormation(cmd *cobra.Command, ans *setupAnswers, interactive bool) error {
 	if values := flagArray(cmd, "process"); len(values) > 0 {
 		processes, err := parseProcessSpecs(values)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		ans.Processes = processes
-	} else if interactive {
-		ans.Processes = []platform.ProcessSpec{defaultSetupWebProcess(ans.ContainerPort)}
-		if err := readExtraProcesses(ans); err != nil {
-			return nil, err
-		}
+		return nil
 	}
+	if !interactive {
+		return nil
+	}
+	ans.Processes = []platform.ProcessSpec{defaultSetupWebProcess(ans.ContainerPort)}
+	return readExtraProcesses(ans)
+}
 
+func readSetupConfig(cmd *cobra.Command, ans *setupAnswers, interactive bool) error {
 	if values := flagArray(cmd, "config"); len(values) > 0 {
 		config, err := parseAssignments(values, "--config")
 		if err != nil {
-			return nil, err
+			return err
 		}
 		ans.Config = config
-	} else if interactive {
-		if err := readConfigPairs(ans); err != nil {
-			return nil, err
-		}
+		return nil
 	}
+	if !interactive {
+		return nil
+	}
+	return readConfigPairs(ans)
+}
 
+func (a *app) readSetupSecretInputs(cmd *cobra.Command, ans *setupAnswers, interactive bool) error {
 	if values := flagArray(cmd, "secret"); len(values) > 0 {
-		valuesByPath, err := parseSecretFlags(values)
-		if err != nil {
-			return nil, err
-		}
-		for name, path := range valuesByPath {
-			if ans.CredentialName != "" && name == ans.CredentialName {
-				return nil, contract.NewFault(
-					contract.ValidationFailed,
-					"secret name conflicts with the git read credential",
-					"The read credential is not injected into the app; choose another secret name.",
-				)
-			}
-			value, err := readProtectedSecretFile(path)
-			if err != nil {
-				return nil, err
-			}
-			a.registerSecretValue(value)
-			ans.SecretValues[name] = value
-		}
-	} else if interactive {
-		if err := a.readSetupSecrets(ans); err != nil {
-			return nil, err
-		}
+		return a.readSetupSecretFlags(cmd, ans)
 	}
+	if !interactive {
+		return nil
+	}
+	return a.readSetupSecrets(ans)
+}
 
+func (a *app) readSetupSecretFlags(cmd *cobra.Command, ans *setupAnswers) error {
+	valuesByPath, err := parseSecretFlags(flagArray(cmd, "secret"))
+	if err != nil {
+		return err
+	}
+	for name, path := range valuesByPath {
+		if ans.CredentialName != "" && name == ans.CredentialName {
+			return contract.NewFault(
+				contract.ValidationFailed,
+				"secret name conflicts with the git read credential",
+				"The read credential is not injected into the app; choose another secret name.",
+			)
+		}
+		value, err := readProtectedSecretFile(path)
+		if err != nil {
+			return err
+		}
+		a.registerSecretValue(value)
+		ans.SecretValues[name] = value
+	}
+	return nil
+}
+
+func askSetupDomain(cmd *cobra.Command, ans *setupAnswers, interactive bool) error {
 	if interactive && !flagChanged(cmd, "domain") {
 		value, err := ui.Input(
 			"Public domain",
@@ -1312,43 +1468,36 @@ func (a *app) readSetup(cmd *cobra.Command, mode setupMode) (*setupAnswers, erro
 			ans.Domain,
 		)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		ans.Domain = value
 	}
-	if ans.Domain != "" {
-		ans.Domain = strings.ToLower(strings.TrimSuffix(ans.Domain, "."))
-		if err := platform.ValidateDomain(ans.Domain); err != nil {
-			return nil, contract.NewFault(contract.ValidationFailed, "invalid domain", err.Error())
-		}
+	if ans.Domain == "" {
+		return nil
 	}
+	ans.Domain = strings.ToLower(strings.TrimSuffix(ans.Domain, "."))
+	if err := platform.ValidateDomain(ans.Domain); err != nil {
+		return contract.NewFault(contract.ValidationFailed, "invalid domain", err.Error())
+	}
+	return nil
+}
 
+func askSetupDeploy(cmd *cobra.Command, ans *setupAnswers, interactive bool) (bool, error) {
 	switch {
 	case boolFlag(cmd, "no-deploy"):
-		ans.Deploy = false
+		return false, nil
 	case interactive && !flagChanged(cmd, "no-deploy"):
 		if ans.GitURL == "" {
-			ans.Deploy = false
-			break
+			return false, nil
 		}
-		deploy, err := ui.YesNoDefault(
+		return ui.YesNoDefault(
 			"Request the first deploy?",
 			"The submission queues it from the new revision; --no-deploy skips it. A first deploy needs a domain.",
 			ans.Domain != "",
 		)
-		if err != nil {
-			return nil, err
-		}
-		ans.Deploy = deploy
 	default:
-		ans.Deploy = ans.GitURL != ""
+		return ans.GitURL != "", nil
 	}
-
-	if _, err := ans.environmentSpec(cmd); err != nil {
-		return nil, err
-	}
-	keepSecrets = true
-	return ans, nil
 }
 
 func (a *app) readSetupCredential(cmd *cobra.Command, ans *setupAnswers, interactive bool) error {
@@ -1439,12 +1588,81 @@ func readAdditionalProcesses(existing []platform.ProcessSpec) ([]platform.Proces
 	}
 	extras := []platform.ProcessSpec{}
 	for {
-		name, err := ui.Input("Add a process", "A worker or service name; empty to finish", "")
+		process, done, err := askAdditionalProcess(seen)
 		if err != nil {
 			return nil, err
 		}
-		if name == "" {
+		if done {
 			return extras, nil
+		}
+		extras = append(extras, process)
+		seen[process.Name] = true
+	}
+}
+
+func askAdditionalProcess(seen map[string]bool) (platform.ProcessSpec, bool, error) {
+	for {
+		name, done, err := askAdditionalProcessName(seen)
+		if err != nil {
+			return platform.ProcessSpec{}, false, err
+		}
+		if done {
+			return platform.ProcessSpec{}, true, nil
+		}
+		kind, err := ui.Choose(
+			"Process kind",
+			"A worker has no port; a service has a private container port",
+			[][2]string{
+				{"Worker (no port)", "worker"},
+				{"Service (private port only)", "service"},
+			},
+		)
+		if err != nil {
+			return platform.ProcessSpec{}, false, err
+		}
+		line, err := ui.Input("Command", "Executable and quoted arguments; no shell", "")
+		if err != nil {
+			return platform.ProcessSpec{}, false, err
+		}
+		if strings.TrimSpace(line) == "" {
+			fmt.Fprintln(os.Stderr, ui.Warn("A worker or service process needs a command."))
+			continue
+		}
+		port := 0
+		if kind == "service" {
+			port, err = askPort("Service container port", "Reachable privately on the node", "9000")
+			if err != nil {
+				return platform.ProcessSpec{}, false, err
+			}
+		}
+		replicas, err := askReplicas("Replicas", "1")
+		if err != nil {
+			return platform.ProcessSpec{}, false, err
+		}
+		command, args, err := splitCommandLine(line)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, ui.Warn(err.Error()))
+			continue
+		}
+		return platform.ProcessSpec{
+			Name:          name,
+			Kind:          kind,
+			Command:       command,
+			Args:          args,
+			Replicas:      replicas,
+			ContainerPort: port,
+		}, false, nil
+	}
+}
+
+func askAdditionalProcessName(seen map[string]bool) (string, bool, error) {
+	for {
+		name, err := ui.Input("Add a process", "A worker or service name; empty to finish", "")
+		if err != nil {
+			return "", false, err
+		}
+		if name == "" {
+			return "", true, nil
 		}
 		if !setupProcessNamePattern.MatchString(name) {
 			fmt.Fprintln(
@@ -1459,50 +1677,7 @@ func readAdditionalProcesses(existing []platform.ProcessSpec) ([]platform.Proces
 			fmt.Fprintln(os.Stderr, ui.Warn("Use each process name once."))
 			continue
 		}
-		kind, err := ui.Choose(
-			"Process kind",
-			"A worker has no port; a service has a private container port",
-			[][2]string{
-				{"Worker (no port)", "worker"},
-				{"Service (private port only)", "service"},
-			},
-		)
-		if err != nil {
-			return nil, err
-		}
-		line, err := ui.Input("Command", "Executable and quoted arguments; no shell", "")
-		if err != nil {
-			return nil, err
-		}
-		if strings.TrimSpace(line) == "" {
-			fmt.Fprintln(os.Stderr, ui.Warn("A worker or service process needs a command."))
-			continue
-		}
-		port := 0
-		if kind == "service" {
-			port, err = askPort("Service container port", "Reachable privately on the node", "9000")
-			if err != nil {
-				return nil, err
-			}
-		}
-		replicas, err := askReplicas("Replicas", "1")
-		if err != nil {
-			return nil, err
-		}
-		command, args, err := splitCommandLine(line)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, ui.Warn(err.Error()))
-			continue
-		}
-		extras = append(extras, platform.ProcessSpec{
-			Name:          name,
-			Kind:          kind,
-			Command:       command,
-			Args:          args,
-			Replicas:      replicas,
-			ContainerPort: port,
-		})
-		seen[name] = true
+		return name, false, nil
 	}
 }
 
@@ -1609,116 +1784,25 @@ func (ans *setupAnswers) clearSecrets() {
 // environmentSpec turns the answers into the validated first revision of a
 // new environment.
 func (ans *setupAnswers) environmentSpec(cmd *cobra.Command) (platform.EnvironmentSpec, error) {
-	if err := platform.ValidateName(ans.App); err != nil {
+	if err := ans.validateIdentity(); err != nil {
 		return platform.EnvironmentSpec{}, err
 	}
-	if err := platform.ValidateName(ans.Environment); err != nil {
-		return platform.EnvironmentSpec{}, err
-	}
-	if err := platform.ValidateName(ans.Node); err != nil {
-		return platform.EnvironmentSpec{}, err
-	}
-	if ans.BuildNode != "" {
-		if err := platform.ValidateName(ans.BuildNode); err != nil {
-			return platform.EnvironmentSpec{}, err
-		}
-	}
-	source := platform.SourceBinding{}
-	if ans.GitURL != "" {
-		if err := validateGitURLShape(ans.GitURL); err != nil {
-			return platform.EnvironmentSpec{}, err
-		}
-		if ans.Builder != "" {
-			if err := platform.ValidateImage(ans.Builder); err != nil {
-				return platform.EnvironmentSpec{}, err
-			}
-		}
-		if ans.CredentialName != "" {
-			if err := vault.ValidateName(ans.CredentialName); err != nil {
-				return platform.EnvironmentSpec{}, err
-			}
-		}
-		source = platform.SourceBinding{
-			URL: ans.GitURL, Ref: ans.GitRef,
-			CredentialSecretName: ans.CredentialName, ContextPath: ans.ContextPath,
-			Builder: ans.Builder, BuildEnv: ans.BuildEnv,
-			GoTargets: ans.GoTargets, Buildpacks: ans.Buildpacks,
-		}
-	}
-
-	if ans.HealthType != "http" && ans.HealthType != "tcp" {
-		return platform.EnvironmentSpec{}, contract.NewFault(
-			contract.ValidationFailed,
-			"invalid health type",
-			"Use http or tcp.",
-		)
-	}
-	if ans.HealthPath == "" {
-		ans.HealthPath = platform.DefaultHealthPath
-	}
-	if ans.HealthTimeout == 0 {
-		ans.HealthTimeout = platform.DefaultHealthTimeout
-	}
-
-	processes := ans.Processes
-	containerPort := ans.ContainerPort
-	if len(processes) == 0 {
-		if containerPort == 0 {
-			containerPort = platform.DefaultContainerPort
-		}
-		processes = []platform.ProcessSpec{defaultSetupWebProcess(containerPort)}
-	}
-	for _, process := range processes {
-		if process.Kind == "web" && process.ContainerPort > 0 {
-			containerPort = process.ContainerPort
-			break
-		}
-	}
-	if containerPort == 0 {
-		containerPort = platform.DefaultContainerPort
-	}
-
-	secretNames := make([]string, 0, len(ans.SecretValues)+len(ans.SecretNames))
-	seenSecret := map[string]bool{}
-	for _, name := range ans.SecretNames {
-		if err := vault.ValidateName(name); err != nil {
-			return platform.EnvironmentSpec{}, err
-		}
-		if !seenSecret[name] {
-			seenSecret[name] = true
-			secretNames = append(secretNames, name)
-		}
-	}
-	for name := range ans.SecretValues {
-		if err := vault.ValidateName(name); err != nil {
-			return platform.EnvironmentSpec{}, err
-		}
-		if !seenSecret[name] {
-			seenSecret[name] = true
-			secretNames = append(secretNames, name)
-		}
-	}
-	sort.Strings(secretNames)
-
-	var domainAddresses []string
-	domains := append([]platform.DomainDeclaration(nil), ans.Domains...)
-	if len(domains) == 0 && ans.Domain != "" {
-		domains = []platform.DomainDeclaration{{
-			Domain: ans.Domain, Primary: true, CheckPath: ans.DomainCheckPath,
-		}}
-	}
-	if len(domains) > 0 {
-		domainAddresses = mainNodeAddresses(cmd)
-	}
-	releaseCommand, err := commandSpecFromLine(ans.ReleaseCommand)
+	source, err := ans.sourceBinding()
 	if err != nil {
 		return platform.EnvironmentSpec{}, err
 	}
-	if ans.ReleaseArgv != nil {
-		releaseCommand = nil
-		if len(ans.ReleaseArgv) > 0 {
-			releaseCommand = &platform.CommandSpec{Argv: append([]string(nil), ans.ReleaseArgv...)}
-		}
+	if err := ans.applyHealthDefaults(); err != nil {
+		return platform.EnvironmentSpec{}, err
+	}
+	processes, containerPort := ans.processFormation()
+	secretNames, err := ans.secretNameList()
+	if err != nil {
+		return platform.EnvironmentSpec{}, err
+	}
+	domains, domainAddresses := ans.domainDeclarations(cmd)
+	releaseCommand, err := ans.releaseCommand()
+	if err != nil {
+		return platform.EnvironmentSpec{}, err
 	}
 	spec := platform.EnvironmentSpec{
 		Name:          ans.Environment,
@@ -1752,6 +1836,133 @@ func (ans *setupAnswers) environmentSpec(cmd *cobra.Command) (platform.Environme
 		spec.Protected = &value
 	}
 	return spec, nil
+}
+
+func (ans *setupAnswers) validateIdentity() error {
+	if err := platform.ValidateName(ans.App); err != nil {
+		return err
+	}
+	if err := platform.ValidateName(ans.Environment); err != nil {
+		return err
+	}
+	if err := platform.ValidateName(ans.Node); err != nil {
+		return err
+	}
+	if ans.BuildNode == "" {
+		return nil
+	}
+	return platform.ValidateName(ans.BuildNode)
+}
+
+func (ans *setupAnswers) sourceBinding() (platform.SourceBinding, error) {
+	if ans.GitURL == "" {
+		return platform.SourceBinding{}, nil
+	}
+	if err := validateGitURLShape(ans.GitURL); err != nil {
+		return platform.SourceBinding{}, err
+	}
+	if ans.Builder != "" {
+		if err := platform.ValidateImage(ans.Builder); err != nil {
+			return platform.SourceBinding{}, err
+		}
+	}
+	if ans.CredentialName != "" {
+		if err := vault.ValidateName(ans.CredentialName); err != nil {
+			return platform.SourceBinding{}, err
+		}
+	}
+	return platform.SourceBinding{
+		URL: ans.GitURL, Ref: ans.GitRef,
+		CredentialSecretName: ans.CredentialName, ContextPath: ans.ContextPath,
+		Builder: ans.Builder, BuildEnv: ans.BuildEnv,
+		GoTargets: ans.GoTargets, Buildpacks: ans.Buildpacks,
+	}, nil
+}
+
+func (ans *setupAnswers) applyHealthDefaults() error {
+	if ans.HealthType != "http" && ans.HealthType != "tcp" {
+		return contract.NewFault(
+			contract.ValidationFailed,
+			"invalid health type",
+			"Use http or tcp.",
+		)
+	}
+	if ans.HealthPath == "" {
+		ans.HealthPath = platform.DefaultHealthPath
+	}
+	if ans.HealthTimeout == 0 {
+		ans.HealthTimeout = platform.DefaultHealthTimeout
+	}
+	return nil
+}
+
+func (ans *setupAnswers) processFormation() ([]platform.ProcessSpec, int) {
+	processes := ans.Processes
+	containerPort := ans.ContainerPort
+	if len(processes) == 0 {
+		if containerPort == 0 {
+			containerPort = platform.DefaultContainerPort
+		}
+		processes = []platform.ProcessSpec{defaultSetupWebProcess(containerPort)}
+	}
+	for _, process := range processes {
+		if process.Kind == "web" && process.ContainerPort > 0 {
+			containerPort = process.ContainerPort
+			break
+		}
+	}
+	if containerPort == 0 {
+		containerPort = platform.DefaultContainerPort
+	}
+	return processes, containerPort
+}
+
+func (ans *setupAnswers) secretNameList() ([]string, error) {
+	secretNames := make([]string, 0, len(ans.SecretValues)+len(ans.SecretNames))
+	seenSecret := map[string]bool{}
+	for _, name := range ans.SecretNames {
+		if err := vault.ValidateName(name); err != nil {
+			return nil, err
+		}
+		if !seenSecret[name] {
+			seenSecret[name] = true
+			secretNames = append(secretNames, name)
+		}
+	}
+	for name := range ans.SecretValues {
+		if err := vault.ValidateName(name); err != nil {
+			return nil, err
+		}
+		if !seenSecret[name] {
+			seenSecret[name] = true
+			secretNames = append(secretNames, name)
+		}
+	}
+	sort.Strings(secretNames)
+	return secretNames, nil
+}
+
+func (ans *setupAnswers) domainDeclarations(cmd *cobra.Command) ([]platform.DomainDeclaration, []string) {
+	domains := append([]platform.DomainDeclaration(nil), ans.Domains...)
+	if len(domains) == 0 && ans.Domain != "" {
+		domains = []platform.DomainDeclaration{{
+			Domain: ans.Domain, Primary: true, CheckPath: ans.DomainCheckPath,
+		}}
+	}
+	if len(domains) == 0 {
+		return domains, nil
+	}
+	return domains, mainNodeAddresses(cmd)
+}
+
+func (ans *setupAnswers) releaseCommand() (*platform.CommandSpec, error) {
+	if ans.ReleaseArgv != nil {
+		if len(ans.ReleaseArgv) == 0 {
+			return nil, nil
+		}
+		return &platform.CommandSpec{Argv: append([]string(nil), ans.ReleaseArgv...)}, nil
+	}
+	return commandSpecFromLine(ans.ReleaseCommand)
 }
 
 func defaultSetupWebProcess(port int) platform.ProcessSpec {
@@ -1883,67 +2094,82 @@ func parseProcessSpecs(values []string) ([]platform.ProcessSpec, error) {
 			)
 		}
 		seen[name] = true
-		parts := strings.SplitN(rest, ":", 4)
-		kind := strings.ToLower(strings.TrimSpace(parts[0]))
-		if kind != "web" && kind != "worker" && kind != "service" {
-			return nil, contract.NewFault(
-				contract.ValidationFailed,
-				"invalid process kind",
-				"Use web, worker, or service.",
-			)
+		spec, err := parseProcessBody(name, rest)
+		if err != nil {
+			return nil, err
 		}
-		port := 0
-		if len(parts) > 1 && strings.TrimSpace(parts[1]) != "" {
-			value, err := strconv.Atoi(strings.TrimSpace(parts[1]))
-			if err != nil || value < 1 || value > 65535 {
-				hint := "Use a container port from 1 to 65535."
-				if kind == "worker" {
-					hint = "A worker has no port; leave it empty: " + name + "=worker::" + strings.Join(
-						parts[2:],
-						":",
-					)
-				}
-				return nil, contract.NewFault(
-					contract.ValidationFailed,
-					"invalid process port",
-					hint,
-				)
-			}
-			port = value
-		}
-		replicas := 1
-		if len(parts) > 2 && strings.TrimSpace(parts[2]) != "" {
-			value, err := strconv.Atoi(strings.TrimSpace(parts[2]))
-			if err != nil || value < 1 || value > 32 {
-				return nil, contract.NewFault(
-					contract.ValidationFailed,
-					"invalid process replicas",
-					"Use between 1 and 32 replicas.",
-				)
-			}
-			replicas = value
-		}
-		command, args := "", []string{}
-		if len(parts) > 3 {
-			var err error
-			command, args, err = splitCommandLine(parts[3])
-			if err != nil {
-				return nil, err
-			}
-		}
-		out = append(
-			out,
-			platform.ProcessSpec{
-				Name:          name,
-				Kind:          kind,
-				Command:       command,
-				Args:          args,
-				Replicas:      replicas,
-				ContainerPort: port,
-			},
-		)
+		out = append(out, spec)
 	}
 	return out, nil
+}
+
+func parseProcessBody(name, rest string) (platform.ProcessSpec, error) {
+	parts := strings.SplitN(rest, ":", 4)
+	kind := strings.ToLower(strings.TrimSpace(parts[0]))
+	if kind != "web" && kind != "worker" && kind != "service" {
+		return platform.ProcessSpec{}, contract.NewFault(
+			contract.ValidationFailed,
+			"invalid process kind",
+			"Use web, worker, or service.",
+		)
+	}
+	port, err := parseProcessPort(name, kind, parts)
+	if err != nil {
+		return platform.ProcessSpec{}, err
+	}
+	replicas, err := parseProcessReplicas(parts)
+	if err != nil {
+		return platform.ProcessSpec{}, err
+	}
+	command, args := "", []string{}
+	if len(parts) > 3 {
+		command, args, err = splitCommandLine(parts[3])
+		if err != nil {
+			return platform.ProcessSpec{}, err
+		}
+	}
+	return platform.ProcessSpec{
+		Name:          name,
+		Kind:          kind,
+		Command:       command,
+		Args:          args,
+		Replicas:      replicas,
+		ContainerPort: port,
+	}, nil
+}
+
+func parseProcessPort(name, kind string, parts []string) (int, error) {
+	if len(parts) <= 1 || strings.TrimSpace(parts[1]) == "" {
+		return 0, nil
+	}
+	value, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err == nil && value >= 1 && value <= 65535 {
+		return value, nil
+	}
+	hint := "Use a container port from 1 to 65535."
+	if kind == "worker" {
+		hint = "A worker has no port; leave it empty: " + name + "=worker::" + strings.Join(parts[2:], ":")
+	}
+	return 0, contract.NewFault(
+		contract.ValidationFailed,
+		"invalid process port",
+		hint,
+	)
+}
+
+func parseProcessReplicas(parts []string) (int, error) {
+	if len(parts) <= 2 || strings.TrimSpace(parts[2]) == "" {
+		return 1, nil
+	}
+	value, err := strconv.Atoi(strings.TrimSpace(parts[2]))
+	if err != nil || value < 1 || value > 32 {
+		return 0, contract.NewFault(
+			contract.ValidationFailed,
+			"invalid process replicas",
+			"Use between 1 and 32 replicas.",
+		)
+	}
+	return value, nil
 }
 
 // splitCommandLine parses quoting only, without shell expansion or execution.
@@ -1970,65 +2196,72 @@ func commandSpecFromLine(line string) (*platform.CommandSpec, error) {
 }
 
 func parseCommandArgv(line string) ([]string, error) {
-	var fields []string
-	var word strings.Builder
-	var quote rune
-	started, escaped := false, false
+	parser := argvParser{}
 	for _, r := range line {
-		if quote == '\'' {
-			if r == quote {
-				quote = 0
-			} else {
-				word.WriteRune(r)
-			}
-			continue
-		}
-		if escaped {
-			word.WriteRune(r)
-			escaped = false
-			started = true
-			continue
-		}
-		if r == '\\' {
-			escaped = true
-			started = true
-			continue
-		}
-		if quote != 0 {
-			if r == quote {
-				quote = 0
-			} else {
-				word.WriteRune(r)
-			}
-			continue
-		}
-		if r == '\'' || r == '"' {
-			quote = r
-			started = true
-			continue
-		}
-		if unicode.IsSpace(r) {
-			if started {
-				fields = append(fields, word.String())
-				word.Reset()
-				started = false
-			}
-			continue
-		}
-		word.WriteRune(r)
-		started = true
+		parser.feed(r)
 	}
-	if escaped || quote != 0 {
+	return parser.finish()
+}
+
+type argvParser struct {
+	fields  []string
+	word    strings.Builder
+	quote   rune
+	started bool
+	escaped bool
+}
+
+func (p *argvParser) feed(r rune) {
+	switch {
+	case p.quote == '\'':
+		if r == p.quote {
+			p.quote = 0
+		} else {
+			p.word.WriteRune(r)
+		}
+	case p.escaped:
+		p.word.WriteRune(r)
+		p.escaped = false
+		p.started = true
+	case r == '\\':
+		p.escaped = true
+		p.started = true
+	case p.quote != 0:
+		if r == p.quote {
+			p.quote = 0
+		} else {
+			p.word.WriteRune(r)
+		}
+	case r == '\'' || r == '"':
+		p.quote = r
+		p.started = true
+	case unicode.IsSpace(r):
+		p.flush()
+	default:
+		p.word.WriteRune(r)
+		p.started = true
+	}
+}
+
+func (p *argvParser) flush() {
+	if !p.started {
+		return
+	}
+	p.fields = append(p.fields, p.word.String())
+	p.word.Reset()
+	p.started = false
+}
+
+func (p *argvParser) finish() ([]string, error) {
+	if p.escaped || p.quote != 0 {
 		return nil, contract.NewFault(
 			contract.ValidationFailed,
 			"invalid command quoting",
 			"Close all quotes and escape sequences; commands are argv, not shell expressions.",
 		)
 	}
-	if started {
-		fields = append(fields, word.String())
-	}
-	return fields, nil
+	p.flush()
+	return p.fields, nil
 }
 
 func formatCommandArgv(argv []string) string {
@@ -2100,6 +2333,23 @@ func setupPlan(ans *setupAnswers, preview platform.Preview, cmd *cobra.Command) 
 		fmt.Fprintf(&out, "definition: %s\n", ans.From)
 	}
 	fmt.Fprintf(&out, "app: %s\n", ans.App)
+	writeSetupPlanEnvironment(&out, ans)
+	writeSetupPlanSource(&out, ans)
+	writeSetupPlanProcesses(&out, ans)
+	writeSetupPlanConfig(&out, ans)
+	writeSetupPlanDomains(&out, ans, cmd)
+	writeSetupPlanResources(&out, ans)
+	writeSetupPlanDeploy(&out, ans)
+	for _, step := range preview.Steps {
+		fmt.Fprintf(&out, "step: %s\n", step)
+	}
+	for _, warning := range preview.Warnings {
+		fmt.Fprintf(&out, "warning: %s\n", warning)
+	}
+	return output.SafeText(strings.TrimRight(out.String(), "\n"))
+}
+
+func writeSetupPlanEnvironment(out *strings.Builder, ans *setupAnswers) {
 	specs := append([]platform.EnvironmentSpec(nil), ans.PrebuiltSpecs...)
 	if len(specs) > 1 {
 		labels := make([]string, 0, len(specs))
@@ -2110,112 +2360,125 @@ func setupPlan(ans *setupAnswers, preview platform.Preview, cmd *cobra.Command) 
 			}
 			labels = append(labels, spec.Name+" ("+state+")")
 		}
-		fmt.Fprintf(&out, "environments: %s\n", strings.Join(labels, ", "))
+		fmt.Fprintf(out, "environments: %s\n", strings.Join(labels, ", "))
 	} else {
 		fmt.Fprintf(
-			&out,
+			out,
 			"environment: %s (%s)\n",
 			ans.Environment,
 			protectionLabel(ans.Protection, ans.Environment),
 		)
 	}
-	fmt.Fprintf(&out, "node: %s\n", ans.Node)
+	fmt.Fprintf(out, "node: %s\n", ans.Node)
 	if ans.BuildNode != "" {
-		fmt.Fprintf(&out, "builder node: %s\n", ans.BuildNode)
+		fmt.Fprintf(out, "builder node: %s\n", ans.BuildNode)
 	}
-	if ans.GitURL != "" {
-		ref := ans.GitRef
-		if ref == "" {
-			ref = "repository default"
-		}
-		fmt.Fprintf(&out, "source: git %s @ %s\n", ans.GitURL, ref)
-		if ans.CredentialName != "" {
-			fmt.Fprintf(&out, "read credential: %s\n", ans.CredentialName)
-		}
-		if ans.Builder != "" {
-			fmt.Fprintf(&out, "builder: %s\n", ans.Builder)
-		}
-		if ans.ContextPath != "" {
-			fmt.Fprintf(&out, "context path: %s\n", ans.ContextPath)
-		}
-		if len(ans.BuildEnv) > 0 {
-			fmt.Fprintf(
-				&out,
-				"build environment: %s\n",
-				strings.Join(sortedKeys(ans.BuildEnv), ", "),
-			)
-		}
-	} else {
-		fmt.Fprintln(&out, "source: none (deploy explicit artifacts)")
+}
+
+func writeSetupPlanSource(out *strings.Builder, ans *setupAnswers) {
+	if ans.GitURL == "" {
+		fmt.Fprintln(out, "source: none (deploy explicit artifacts)")
+		return
 	}
+	ref := ans.GitRef
+	if ref == "" {
+		ref = "repository default"
+	}
+	fmt.Fprintf(out, "source: git %s @ %s\n", ans.GitURL, ref)
+	if ans.CredentialName != "" {
+		fmt.Fprintf(out, "read credential: %s\n", ans.CredentialName)
+	}
+	if ans.Builder != "" {
+		fmt.Fprintf(out, "builder: %s\n", ans.Builder)
+	}
+	if ans.ContextPath != "" {
+		fmt.Fprintf(out, "context path: %s\n", ans.ContextPath)
+	}
+	if len(ans.BuildEnv) > 0 {
+		fmt.Fprintf(
+			out,
+			"build environment: %s\n",
+			strings.Join(sortedKeys(ans.BuildEnv), ", "),
+		)
+	}
+}
+
+func writeSetupPlanProcesses(out *strings.Builder, ans *setupAnswers) {
 	for _, process := range planProcesses(ans) {
-		fmt.Fprintf(&out, "process: %s\n", process)
+		fmt.Fprintf(out, "process: %s\n", process)
 	}
 	fmt.Fprintf(
-		&out,
+		out,
 		"health: %s %s (%ds timeout)\n",
 		strings.ToUpper(ans.HealthType),
 		ans.HealthPath,
 		ans.HealthTimeout,
 	)
 	if ans.ReleaseCommand != "" {
-		fmt.Fprintf(&out, "release command: %s\n", ans.ReleaseCommand)
+		fmt.Fprintf(out, "release command: %s\n", ans.ReleaseCommand)
 	}
+}
+
+func writeSetupPlanConfig(out *strings.Builder, ans *setupAnswers) {
 	if len(ans.Config) > 0 {
 		for _, key := range sortedKeys(ans.Config) {
-			fmt.Fprintf(&out, "config: %s=%s\n", key, ans.Config[key])
+			fmt.Fprintf(out, "config: %s=%s\n", key, ans.Config[key])
 		}
 	}
 	if len(ans.SecretValues) > 0 || len(ans.SecretNames) > 0 {
-		fmt.Fprintf(&out, "secrets: %s\n", strings.Join(setupSecretNames(ans), ", "))
+		fmt.Fprintf(out, "secrets: %s\n", strings.Join(setupSecretNames(ans), ", "))
 	}
+}
+
+func writeSetupPlanDomains(out *strings.Builder, ans *setupAnswers, cmd *cobra.Command) {
 	if len(ans.Domains) > 0 {
 		for _, domain := range ans.Domains {
 			label := ""
 			if domain.Primary {
 				label = " (primary)"
 			}
-			fmt.Fprintf(&out, "domain: %s%s\n", domain.Domain, label)
+			fmt.Fprintf(out, "domain: %s%s\n", domain.Domain, label)
 			if domain.CheckPath != "" {
-				fmt.Fprintf(&out, "domain check path: %s\n", domain.CheckPath)
+				fmt.Fprintf(out, "domain check path: %s\n", domain.CheckPath)
 			}
-			if record, ok := domainDNSRecord(domain.Domain, cmd); ok {
-				fmt.Fprintf(&out, "DNS record: %s %s %s\n", record.Type, record.Name, record.Value)
-			} else {
-				fmt.Fprintf(
-					&out,
-					"DNS record: point %s at the main node's public IPv4 address\n",
-					domain.Domain,
-				)
-			}
+			writeSetupPlanDNSRecord(out, domain.Domain, cmd)
 		}
-		fmt.Fprintln(&out, "Create them at the DNS provider; a Cloudflare proxy in front is fine.")
-	} else if ans.Domain != "" {
-		fmt.Fprintf(&out, "domain: %s\n", ans.Domain)
-		if ans.DomainCheckPath != "" {
-			fmt.Fprintf(&out, "domain check path: %s\n", ans.DomainCheckPath)
-		}
-		if record, ok := domainDNSRecord(ans.Domain, cmd); ok {
-			fmt.Fprintf(&out, "DNS record: %s %s %s\n", record.Type, record.Name, record.Value)
-		} else {
-			fmt.Fprintf(
-				&out,
-				"DNS record: point %s at the main node's public IPv4 address\n",
-				ans.Domain,
-			)
-		}
-		fmt.Fprintln(&out, "Create it at the DNS provider; a Cloudflare proxy in front is fine.")
-	} else {
-		fmt.Fprintln(&out, "domain: none; add one later with eregion domain add")
+		fmt.Fprintln(out, "Create them at the DNS provider; a Cloudflare proxy in front is fine.")
+		return
 	}
+	if ans.Domain != "" {
+		fmt.Fprintf(out, "domain: %s\n", ans.Domain)
+		if ans.DomainCheckPath != "" {
+			fmt.Fprintf(out, "domain check path: %s\n", ans.DomainCheckPath)
+		}
+		writeSetupPlanDNSRecord(out, ans.Domain, cmd)
+		fmt.Fprintln(out, "Create it at the DNS provider; a Cloudflare proxy in front is fine.")
+		return
+	}
+	fmt.Fprintln(out, "domain: none; add one later with eregion domain add")
+}
+
+func writeSetupPlanDNSRecord(out *strings.Builder, domain string, cmd *cobra.Command) {
+	if record, ok := domainDNSRecord(domain, cmd); ok {
+		fmt.Fprintf(out, "DNS record: %s %s %s\n", record.Type, record.Name, record.Value)
+		return
+	}
+	fmt.Fprintf(
+		out,
+		"DNS record: point %s at the main node's public IPv4 address\n",
+		domain,
+	)
+}
+
+func writeSetupPlanResources(out *strings.Builder, ans *setupAnswers) {
 	attached := map[string]bool{}
 	for _, name := range ans.ResourceNames {
 		attached[name] = true
 	}
 	for _, resource := range ans.ResourceSpecs {
-		fmt.Fprintf(&out, "resource: %s image %s", resource.Name, resource.Image)
+		fmt.Fprintf(out, "resource: %s image %s", resource.Name, resource.Image)
 		if resource.Port > 0 {
-			fmt.Fprintf(&out, " port %d", resource.Port)
+			fmt.Fprintf(out, " port %d", resource.Port)
 		}
 		if attached[resource.Name] {
 			out.WriteString(" (deployment dependency)")
@@ -2229,32 +2492,30 @@ func setupPlan(ans *setupAnswers, preview platform.Preview, cmd *cobra.Command) 
 				names = append(names, key+"="+name)
 			}
 			sort.Strings(names)
-			fmt.Fprintf(&out, "  secret references: %s\n", strings.Join(names, ", "))
+			fmt.Fprintf(out, "  secret references: %s\n", strings.Join(names, ", "))
 		}
 		for _, mount := range resource.Mounts {
-			fmt.Fprintf(&out, "  volume: %s -> %s\n", mount.Name, mount.Destination)
+			fmt.Fprintf(out, "  volume: %s -> %s\n", mount.Name, mount.Destination)
 		}
 	}
+}
+
+func writeSetupPlanDeploy(out *strings.Builder, ans *setupAnswers) {
 	if ans.Deploy {
-		fmt.Fprintln(&out, "first deploy: queued from the revision")
+		fmt.Fprintln(out, "first deploy: queued from the revision")
 		if ans.Domain == "" {
 			fmt.Fprintln(
-				&out,
+				out,
 				"warning: the first deploy has no domain; the deployability gate refuses it until a primary domain is bound",
 			)
 		}
-	} else if len(ans.ResourceSpecs) > 0 {
-		fmt.Fprintln(&out, "first deploy: deferred until declared resources report healthy")
-	} else {
-		fmt.Fprintln(&out, "first deploy: not requested")
+		return
 	}
-	for _, step := range preview.Steps {
-		fmt.Fprintf(&out, "step: %s\n", step)
+	if len(ans.ResourceSpecs) > 0 {
+		fmt.Fprintln(out, "first deploy: deferred until declared resources report healthy")
+		return
 	}
-	for _, warning := range preview.Warnings {
-		fmt.Fprintf(&out, "warning: %s\n", warning)
-	}
-	return output.SafeText(strings.TrimRight(out.String(), "\n"))
+	fmt.Fprintln(out, "first deploy: not requested")
 }
 
 func planProcesses(ans *setupAnswers) []string {
@@ -2396,20 +2657,22 @@ func (a *app) putSecret(
 	cmd *cobra.Command,
 	namespace vault.Namespace,
 	value []byte,
-) (vault.Metadata, error) {
+) error {
 	client, err := a.client(cmd)
 	if err != nil {
-		return vault.Metadata{}, err
+		return err
 	}
 	metadata, err := client.GetSecretMetadata(cmd.Context(), namespace)
 	if err != nil {
 		var fault *contract.Fault
 		if errors.As(err, &fault) && fault.Code == contract.NotFound {
-			return client.SetSecret(cmd.Context(), namespace, value, 0)
+			_, err = client.SetSecret(cmd.Context(), namespace, value, 0)
+			return err
 		}
-		return vault.Metadata{}, err
+		return err
 	}
-	return client.SetSecret(cmd.Context(), namespace, value, metadata.LatestRevision)
+	_, err = client.SetSecret(cmd.Context(), namespace, value, metadata.LatestRevision)
+	return err
 }
 
 // setupSecretNames is the result shape's secret-name list without writing
@@ -2456,35 +2719,48 @@ func (a *app) writeSetupSecretsForEnvironments(
 	written := make([]string, 0, len(ans.SecretValues)+1)
 	seen := map[string]bool{}
 	for _, spec := range specs {
-		if ans.CredentialName != "" && len(ans.CredentialValue) > 0 &&
-			spec.Source.CredentialSecretName == ans.CredentialName {
-			namespace, err := vault.NewNamespace(ans.App, spec.Name, ans.CredentialName)
-			if err != nil {
-				return nil, err
-			}
-			if _, err := a.putSecret(cmd, namespace, ans.CredentialValue); err != nil {
-				return nil, err
-			}
-		}
-		for _, name := range sortedKeysBytes(ans.SecretValues) {
-			if !slices.Contains(spec.SecretNames, name) {
-				continue
-			}
-			namespace, err := vault.NewNamespace(ans.App, spec.Name, name)
-			if err != nil {
-				return nil, err
-			}
-			if _, err := a.putSecret(cmd, namespace, ans.SecretValues[name]); err != nil {
-				return nil, err
-			}
-			key := spec.Name + "\x00" + name
-			if !seen[key] {
-				seen[key] = true
-				written = append(written, name)
-			}
+		if err := a.writeEnvironmentSetupSecrets(cmd, ans, spec, seen, &written); err != nil {
+			return nil, err
 		}
 	}
 	return written, nil
+}
+
+func (a *app) writeEnvironmentSetupSecrets(
+	cmd *cobra.Command,
+	ans *setupAnswers,
+	spec platform.EnvironmentSpec,
+	seen map[string]bool,
+	written *[]string,
+) error {
+	if ans.CredentialName != "" && len(ans.CredentialValue) > 0 &&
+		spec.Source.CredentialSecretName == ans.CredentialName {
+		namespace, err := vault.NewNamespace(ans.App, spec.Name, ans.CredentialName)
+		if err != nil {
+			return err
+		}
+		if err := a.putSecret(cmd, namespace, ans.CredentialValue); err != nil {
+			return err
+		}
+	}
+	for _, name := range sortedKeysBytes(ans.SecretValues) {
+		if !slices.Contains(spec.SecretNames, name) {
+			continue
+		}
+		namespace, err := vault.NewNamespace(ans.App, spec.Name, name)
+		if err != nil {
+			return err
+		}
+		if err := a.putSecret(cmd, namespace, ans.SecretValues[name]); err != nil {
+			return err
+		}
+		key := spec.Name + "\x00" + name
+		if !seen[key] {
+			seen[key] = true
+			*written = append(*written, name)
+		}
+	}
+	return nil
 }
 
 // appExists and environmentExists let the create flows refuse an existing
@@ -2549,33 +2825,33 @@ func urlValues(pairs ...string) map[string][]string {
 func (a *app) readEnvironment(
 	cmd *cobra.Command,
 	app, environment string,
-) (platform.Environment, json.RawMessage, error) {
+) (platform.Environment, error) {
 	if err := platform.ValidateName(app); err != nil {
-		return platform.Environment{}, nil, err
+		return platform.Environment{}, err
 	}
 	if err := platform.ValidateName(environment); err != nil {
-		return platform.Environment{}, nil, err
+		return platform.Environment{}, err
 	}
 	raw, err := a.platformReadInventoryWith(cmd, "environments",
 		urlValues("app", app, "environment", environment, "limit", "1"))
 	if err != nil {
-		return platform.Environment{}, nil, err
+		return platform.Environment{}, err
 	}
 	item, err := platformSelectItem(raw, environment)
 	if err != nil {
 		var fault *contract.Fault
 		if errors.As(err, &fault) && fault.Code == contract.NotFound {
-			return platform.Environment{}, nil, contract.NewFault(contract.NotFound,
+			return platform.Environment{}, contract.NewFault(contract.NotFound,
 				"environment "+app+"/"+environment+" was not found",
 				"List environments with eregion env list --app "+app+".")
 		}
-		return platform.Environment{}, nil, err
+		return platform.Environment{}, err
 	}
 	var env platform.Environment
 	if json.Unmarshal(item, &env) != nil || env.App != app || env.Name != environment {
-		return platform.Environment{}, nil, invalidNodeData("environment")
+		return platform.Environment{}, invalidNodeData("environment")
 	}
-	return env, item, nil
+	return env, nil
 }
 
 func writeProcessTable(processes []platform.ProcessSpec) string {
@@ -2616,56 +2892,6 @@ func environmentDeployability(env platform.Environment) string {
 		missing = strings.Join(env.Deployability.Missing, ",")
 	}
 	return "no (missing: " + missing + "; dns " + env.Deployability.DNS + ")"
-}
-
-func writeEnvironmentStatus(env platform.Environment) string {
-	var out strings.Builder
-	fmt.Fprintf(&out, "Environment %s/%s\n", env.App, env.Name)
-	fmt.Fprintf(&out, "  node: %s\n", env.Node)
-	protection := "unprotected"
-	if env.Protected {
-		protection = "protected (deletion requires the human factor)"
-	}
-	fmt.Fprintf(&out, "  protection: %s\n", protection)
-	if env.Revision != nil {
-		fmt.Fprintf(&out, "  revision: %d (%s)\n", env.Revision.Number, env.Revision.ID)
-		fmt.Fprintf(&out, "  deployable: %s\n", environmentDeployability(env))
-		fmt.Fprintf(&out, "  source: %s\n", describeSource(env.Revision.Source))
-	} else {
-		fmt.Fprintln(&out, "  revision: none")
-	}
-	if env.ServingRelease != "" {
-		fmt.Fprintf(&out, "  serving release: %s\n", env.ServingRelease)
-	} else {
-		fmt.Fprintln(&out, "  serving release: none")
-	}
-	health := env.HealthState
-	if health == "" {
-		health = platform.HealthUnknown
-	}
-	fmt.Fprintf(&out, "  health: %s\n", health)
-	out.WriteString("Processes\n")
-	out.WriteString(writeProcessTable(env.Processes))
-	if env.Revision != nil && len(env.Revision.Config) > 0 {
-		out.WriteString("Config\n")
-		for _, key := range sortedKeys(env.Revision.Config) {
-			fmt.Fprintf(&out, "  %s=%s\n", key, env.Revision.Config[key])
-		}
-	}
-	if env.Revision != nil && len(env.Revision.SecretNames) > 0 {
-		fmt.Fprintf(&out, "Secrets\n  %s\n", strings.Join(env.Revision.SecretNames, ", "))
-	}
-	if len(env.Domains) > 0 {
-		out.WriteString("Domains\n")
-		for _, domain := range env.Domains {
-			label := ""
-			if domain == env.PrimaryDomain {
-				label = " (primary)"
-			}
-			fmt.Fprintf(&out, "  %s%s\n", domain, label)
-		}
-	}
-	return out.String()
 }
 
 // setupEnvironmentResult is the secret-free summary of one environment created
@@ -2739,67 +2965,20 @@ func (a *app) bootstrapDefinitionResources(
 	var ids []contract.OperationID
 	var deferred []deferredDefinitionResource
 	for _, spec := range specs {
-		names := make([]string, 0, len(spec.SecretEnv))
-		seen := map[string]bool{}
-		for _, name := range spec.SecretEnv {
-			if !seen[name] {
-				seen[name] = true
-				names = append(names, name)
-			}
-		}
-		sort.Strings(names)
-		missing := []string{}
-		if len(names) > 0 {
-			client, err := a.client(cmd)
-			if err != nil {
-				return ids, deferred, err
-			}
-			for _, name := range names {
-				metadata, err := client.GetSecretMetadata(
-					cmd.Context(),
-					vault.Namespace{App: spec.App, Environment: spec.Environment, Name: name},
-				)
-				if err != nil {
-					if contract.Classify(err).Code == contract.NotFound {
-						missing = append(missing, name)
-						continue
-					}
-					return ids, deferred, err
-				}
-				if metadata.State != vault.StateActive {
-					missing = append(missing, name)
-				}
-			}
+		names := uniqueSecretNames(spec.SecretEnv)
+		missing, err := a.missingResourceSecrets(cmd, spec, names)
+		if err != nil {
+			return ids, deferred, err
 		}
 		if len(missing) == 0 && !preview {
-			target, err := platform.NewResourceTarget(spec.App, spec.Environment, spec.Name)
+			opID, submitMissing, err := a.submitDefinitionResource(cmd, spec)
 			if err != nil {
 				return ids, deferred, err
 			}
-			op, err := a.submitAccepted(cmd, platform.KindResourceApply, target.String(), spec, "")
-			if err != nil {
-				fault := contract.Classify(err)
-				if fault.Code != contract.PreconditionFailed ||
-					fault.Details["reason"] != "missing_secret_values" {
-					return ids, deferred, err
-				}
-				// RPC decoding may turn a string slice into a generic JSON array.
-				switch values := fault.Details["names"].(type) {
-				case []string:
-					missing = append(missing, values...)
-				case []any:
-					for _, value := range values {
-						if name, ok := value.(string); ok {
-							missing = append(missing, name)
-						}
-					}
-				}
-				if len(missing) == 0 {
-					return ids, deferred, err
-				}
-			} else {
-				ids = append(ids, op.ID)
+			if opID != "" {
+				ids = append(ids, opID)
 			}
+			missing = submitMissing
 		}
 		if len(missing) > 0 {
 			deferred = append(
@@ -2816,101 +2995,189 @@ func (a *app) bootstrapDefinitionResources(
 	return ids, deferred, nil
 }
 
+func uniqueSecretNames(secretEnv map[string]string) []string {
+	names := make([]string, 0, len(secretEnv))
+	seen := map[string]bool{}
+	for _, name := range secretEnv {
+		if !seen[name] {
+			seen[name] = true
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+func (a *app) missingResourceSecrets(cmd *cobra.Command, spec platform.ResourceApplyInput, names []string) ([]string, error) {
+	if len(names) == 0 {
+		return nil, nil
+	}
+	client, err := a.client(cmd)
+	if err != nil {
+		return nil, err
+	}
+	var missing []string
+	for _, name := range names {
+		metadata, err := client.GetSecretMetadata(
+			cmd.Context(),
+			vault.Namespace{App: spec.App, Environment: spec.Environment, Name: name},
+		)
+		if err != nil {
+			if contract.Classify(err).Code == contract.NotFound {
+				missing = append(missing, name)
+				continue
+			}
+			return nil, err
+		}
+		if metadata.State != vault.StateActive {
+			missing = append(missing, name)
+		}
+	}
+	return missing, nil
+}
+
+func (a *app) submitDefinitionResource(cmd *cobra.Command, spec platform.ResourceApplyInput) (contract.OperationID, []string, error) {
+	target, err := platform.NewResourceTarget(spec.App, spec.Environment, spec.Name)
+	if err != nil {
+		return "", nil, err
+	}
+	op, err := a.submitAccepted(cmd, platform.KindResourceApply, target.String(), spec, "")
+	if err == nil {
+		return op.ID, nil, nil
+	}
+	fault := contract.Classify(err)
+	if fault.Code != contract.PreconditionFailed || fault.Details["reason"] != "missing_secret_values" {
+		return "", nil, err
+	}
+	missing := faultSecretNames(fault)
+	if len(missing) == 0 {
+		return "", nil, err
+	}
+	return "", missing, nil
+}
+
+func faultSecretNames(fault *contract.Fault) []string {
+	// RPC decoding may turn a string slice into a generic JSON array.
+	switch values := fault.Details["names"].(type) {
+	case []string:
+		return values
+	case []any:
+		names := make([]string, 0, len(values))
+		for _, value := range values {
+			if name, ok := value.(string); ok {
+				names = append(names, name)
+			}
+		}
+		return names
+	default:
+		return nil
+	}
+}
+
 func (r setupResult) plainText() string {
 	if r.DryRun {
-		var out strings.Builder
-		if r.created == "app" {
-			if len(r.Environments) > 0 {
-				labels := make([]string, 0, len(r.Environments))
-				for _, environment := range r.Environments {
-					state := "unprotected"
-					if environment.Protected {
-						state = "protected"
-					}
-					labels = append(labels, environment.Name+" ("+state+")")
-				}
-				fmt.Fprintf(
-					&out,
-					"Dry run: create app %s with environments %s\n",
-					r.App,
-					strings.Join(labels, ", "),
-				)
-			} else {
-				fmt.Fprintf(
-					&out,
-					"Dry run: create app %s with environment %s\n",
-					r.App,
-					r.Environment,
-				)
-			}
-		} else {
-			fmt.Fprintf(&out, "Dry run: create environment %s/%s\n", r.App, r.Environment)
-		}
-		out.WriteString(r.plan)
-		return strings.TrimRight(out.String(), "\n")
+		return r.dryRunPlainText()
 	}
 	var out strings.Builder
+	r.writeCreatedSummary(&out)
+	r.writeDetails(&out)
+	return out.String()
+}
+
+func (r setupResult) dryRunPlainText() string {
+	var out strings.Builder
 	if r.created == "app" {
-		if r.ImageRepository != "" {
-			fmt.Fprintf(&out, "Image repository: %s\n", r.ImageRepository)
-		}
 		if len(r.Environments) > 0 {
-			labels := make([]string, 0, len(r.Environments))
-			for _, environment := range r.Environments {
-				state := "unprotected"
-				if environment.Protected {
-					state = "protected"
-				}
-				labels = append(labels, environment.Name+" ("+state+")")
-			}
 			fmt.Fprintf(
 				&out,
-				"Created app %s with environments %s on %s.\n",
+				"Dry run: create app %s with environments %s\n",
 				r.App,
-				strings.Join(labels, ", "),
-				r.Node,
+				strings.Join(environmentLabels(r.Environments), ", "),
 			)
 		} else {
 			fmt.Fprintf(
 				&out,
-				"Created app %s with environment %s on %s.\n",
+				"Dry run: create app %s with environment %s\n",
 				r.App,
 				r.Environment,
-				r.Node,
 			)
 		}
 	} else {
+		fmt.Fprintf(&out, "Dry run: create environment %s/%s\n", r.App, r.Environment)
+	}
+	out.WriteString(r.plan)
+	return strings.TrimRight(out.String(), "\n")
+}
+
+func environmentLabels(environments []setupEnvironmentResult) []string {
+	labels := make([]string, 0, len(environments))
+	for _, environment := range environments {
+		state := "unprotected"
+		if environment.Protected {
+			state = "protected"
+		}
+		labels = append(labels, environment.Name+" ("+state+")")
+	}
+	return labels
+}
+
+func (r setupResult) writeCreatedSummary(out *strings.Builder) {
+	if r.created != "app" {
 		state := "unprotected"
 		if r.Protected {
 			state = "protected"
 		}
 		fmt.Fprintf(
-			&out,
+			out,
 			"Created environment %s/%s on %s (%s).\n",
 			r.App,
 			r.Environment,
 			r.Node,
 			state,
 		)
+		return
 	}
-	fmt.Fprintf(&out, "operation: %s\n", r.OperationID)
+	if r.ImageRepository != "" {
+		fmt.Fprintf(out, "Image repository: %s\n", r.ImageRepository)
+	}
+	if len(r.Environments) > 0 {
+		fmt.Fprintf(
+			out,
+			"Created app %s with environments %s on %s.\n",
+			r.App,
+			strings.Join(environmentLabels(r.Environments), ", "),
+			r.Node,
+		)
+		return
+	}
+	fmt.Fprintf(
+		out,
+		"Created app %s with environment %s on %s.\n",
+		r.App,
+		r.Environment,
+		r.Node,
+	)
+}
+
+func (r setupResult) writeDetails(out *strings.Builder) {
+	fmt.Fprintf(out, "operation: %s\n", r.OperationID)
 	if r.FirstDeployOperationID != "" {
-		fmt.Fprintf(&out, "first deploy operation: %s\n", r.FirstDeployOperationID)
+		fmt.Fprintf(out, "first deploy operation: %s\n", r.FirstDeployOperationID)
 	}
 	for _, id := range r.ResolvedResourceIDs {
-		fmt.Fprintf(&out, "resource operation: %s\n", id)
+		fmt.Fprintf(out, "resource operation: %s\n", id)
 	}
 	if r.Deploy {
 		out.WriteString("first deploy: queued from the revision\n")
 	}
 	if r.Domain != "" {
-		fmt.Fprintf(&out, "domain: %s\n", r.Domain)
+		fmt.Fprintf(out, "domain: %s\n", r.Domain)
 		if r.DomainCheckPath != "" {
-			fmt.Fprintf(&out, "domain check path: %s\n", r.DomainCheckPath)
+			fmt.Fprintf(out, "domain check path: %s\n", r.DomainCheckPath)
 		}
 		if r.DNSRecord != nil {
 			fmt.Fprintf(
-				&out,
+				out,
 				"DNS record:\n  %s  %s  %s\n",
 				r.DNSRecord.Type,
 				r.DNSRecord.Name,
@@ -2918,46 +3185,19 @@ func (r setupResult) plainText() string {
 			)
 		} else {
 			fmt.Fprintf(
-				&out,
+				out,
 				"DNS record: point %s at the main node's public IPv4 address\n",
 				r.Domain,
 			)
 		}
 	}
 	for _, warning := range r.Warnings {
-		fmt.Fprintf(&out, "warning: %s\n", warning)
+		fmt.Fprintf(out, "warning: %s\n", warning)
 	}
-	fmt.Fprintf(&out, "next: eregion env status %s %s --json\n", r.App, r.Environment)
+	fmt.Fprintf(out, "next: eregion env status %s %s --json\n", r.App, r.Environment)
 	if r.FirstDeployOperationID != "" {
-		fmt.Fprintf(&out, "follow: eregion operations follow %s\n", r.FirstDeployOperationID)
+		fmt.Fprintf(out, "follow: eregion operations follow %s\n", r.FirstDeployOperationID)
 	}
-	return out.String()
-}
-
-// provisionDefinitionResources accepts one explicit resource apply per
-// declaration after the app/environment exists. It never waits for readiness
-// and never writes secret values; existing resource identities are reapplied
-// with their durable volume ownership preserved.
-func (a *app) provisionDefinitionResources(
-	cmd *cobra.Command,
-	specs []platform.ResourceApplyInput,
-) ([]contract.OperationID, error) {
-	if dryRun(cmd) || len(specs) == 0 {
-		return nil, nil
-	}
-	ids := make([]contract.OperationID, 0, len(specs))
-	for _, spec := range specs {
-		target, err := platform.NewResourceTarget(spec.App, spec.Environment, spec.Name)
-		if err != nil {
-			return ids, err
-		}
-		op, err := a.submitAccepted(cmd, platform.KindResourceApply, target.String(), spec, "")
-		if err != nil {
-			return ids, err
-		}
-		ids = append(ids, op.ID)
-	}
-	return ids, nil
 }
 
 func defaultRepositoryLabel(ans *setupAnswers) string {

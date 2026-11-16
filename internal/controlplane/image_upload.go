@@ -56,66 +56,66 @@ func acquireImageUploadLease(ctx context.Context, config *pgx.ConnConfig, observ
 		return nil, contract.NewFault(contract.Unavailable, "the control database is unavailable", "Retry the upload after the node's control database is reachable.")
 	}
 	session := entities.NewSessionStore(conn)
-	closeWithError := func(cause error) (*ImageUploadLease, error) {
-		_ = session.Close(context.Background())
+	closeWithError := func(ctx context.Context, cause error) (*ImageUploadLease, error) {
+		_ = session.Close(context.WithoutCancel(ctx))
 		return nil, cause
 	}
 	binding, err := VerifyWorkspaceRegistryHost(ctx, session.Workspace(), observed)
 	if err != nil {
-		return closeWithError(err)
+		return closeWithError(ctx, err)
 	}
 	hostLockPath := node.HostLockPath(binding.StateDir)
 	if strings.TrimSpace(hostLockPath) == "" {
-		return closeWithError(contract.NewFault(contract.PreconditionFailed, "the verified registry host lock path is empty", "Restore the bound node state directory before uploading."))
+		return closeWithError(ctx, contract.NewFault(contract.PreconditionFailed, "the verified registry host lock path is empty", "Restore the bound node state directory before uploading."))
 	}
 	initial, err := readImageUploadIdentity(ctx, session, appName)
 	if err != nil {
-		return closeWithError(err)
+		return closeWithError(ctx, err)
 	}
 	if afterInitialRead != nil {
 		if err := afterInitialRead(ctx); err != nil {
-			return closeWithError(err)
+			return closeWithError(ctx, err)
 		}
 	}
 	key := targetLockKey("app/" + appName)
 	var advisory bool
 	if advisory, err = session.TrySessionLock(ctx, key); err != nil {
-		return closeWithError(contract.NewFault(contract.Unavailable, "the application upload lock is unavailable", "Retry after the control database is reachable."))
+		return closeWithError(ctx, contract.NewFault(contract.Unavailable, "the application upload lock is unavailable", "Retry after the control database is reachable."))
 	}
 	if !advisory {
-		return closeWithError(contract.NewFault(contract.Conflict, "the application is being deleted or changed", "Wait for the current application mutation to finish, then retry the upload."))
+		return closeWithError(ctx, contract.NewFault(contract.Conflict, "the application is being deleted or changed", "Wait for the current application mutation to finish, then retry the upload."))
 	}
-	releaseAdvisory := func() {
-		_, _ = session.UnlockSession(context.Background(), key)
+	releaseAdvisory := func(ctx context.Context) {
+		_, _ = session.UnlockSession(context.WithoutCancel(ctx), key)
 	}
 	hostRelease, err := engine.Acquire(ctx, hostLockPath, engine.LockExclusive, 0)
 	if err != nil {
-		releaseAdvisory()
+		releaseAdvisory(ctx)
 		if errors.Is(err, engine.ErrLockHeld) {
-			return closeWithError(contract.NewFault(contract.Unavailable, "another host mutation is running on the node", "Wait for the running build, apply, garbage collection or app deletion to finish, then retry the upload."))
+			return closeWithError(ctx, contract.NewFault(contract.Unavailable, "another host mutation is running on the node", "Wait for the running build, apply, garbage collection or app deletion to finish, then retry the upload."))
 		}
-		return closeWithError(contract.NewFault(contract.Unavailable, "the node host lock is not available", err.Error()))
+		return closeWithError(ctx, contract.NewFault(contract.Unavailable, "the node host lock is not available", err.Error()))
 	}
-	releaseBoth := func() {
+	releaseBoth := func(ctx context.Context) {
 		hostRelease()
-		releaseAdvisory()
+		releaseAdvisory(ctx)
 	}
 	after, err := readImageUploadIdentity(ctx, session, appName)
 	if err != nil {
-		releaseBoth()
-		return closeWithError(err)
+		releaseBoth(ctx)
+		return closeWithError(ctx, err)
 	}
 	if after.AppID != initial.AppID || after.App != initial.App || after.ImageRepository != initial.ImageRepository {
-		releaseBoth()
-		return closeWithError(contract.NewFault(contract.Conflict, "the application was deleted or recreated during upload admission", "The upload was refused before reading the image payload; retry against the current application identity."))
+		releaseBoth(ctx)
+		return closeWithError(ctx, contract.NewFault(contract.Conflict, "the application was deleted or recreated during upload admission", "The upload was refused before reading the image payload; retry against the current application identity."))
 	}
 	if after.ImageRepository == "" {
-		releaseBoth()
-		return closeWithError(contract.NewFault(contract.PreconditionFailed, "application has no image repository", "Recreate the app under the app-level image repository contract before uploading an image."))
+		releaseBoth(ctx)
+		return closeWithError(ctx, contract.NewFault(contract.PreconditionFailed, "application has no image repository", "Recreate the app under the app-level image repository contract before uploading an image."))
 	}
 	if _, err := platform.NormalizeImageRepository(after.ImageRepository); err != nil {
-		releaseBoth()
-		return closeWithError(err)
+		releaseBoth(ctx)
+		return closeWithError(ctx, err)
 	}
 	return &ImageUploadLease{
 		AppID: after.AppID, App: after.App, ImageRepository: after.ImageRepository,

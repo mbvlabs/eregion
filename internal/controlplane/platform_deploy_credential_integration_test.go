@@ -221,6 +221,8 @@ func (t *gitReadTransport) Call(
 			Status: engine.StatusCompleted, ExecutionID: request.Execution.ExecutionID(),
 			Executed: true, Result: result,
 		}, nil
+	case node.MethodObserve, node.MethodInventory:
+		return node.Response{}, fmt.Errorf("unexpected method %q", request.Method)
 	default:
 		return node.Response{}, fmt.Errorf("unexpected method %q", request.Method)
 	}

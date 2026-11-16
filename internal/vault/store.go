@@ -71,21 +71,8 @@ func (s *Store) Set(ctx context.Context, tx SecretTx, namespace Namespace, value
 	ciphertextHash := CiphertextSHA256(ciphertext)
 	revisionHash := RevisionHash(namespace, revision, keyID, ciphertext)
 
-	if create {
-		if err := tx.InsertSecretNamespace(ctx, namespace, actor); err != nil {
-			if contract.Classify(err).Code == contract.Conflict {
-				return Metadata{}, revisionConflict(0, 0)
-			}
-			return Metadata{}, err
-		}
-	} else {
-		updated, err := tx.AdvanceSecretNamespace(ctx, namespace, expectedRevision, revision, actor)
-		if err != nil {
-			return Metadata{}, databaseFault(err)
-		}
-		if !updated {
-			return Metadata{}, revisionConflict(expectedRevision, latest)
-		}
+	if err := applySecretRevision(ctx, tx, namespace, revision, expectedRevision, latest, create, actor); err != nil {
+		return Metadata{}, err
 	}
 	if err := tx.InsertSecretRevision(ctx, namespace, SecretRevisionInput{
 		Namespace: namespace, Revision: revision, KeyID: keyID, Ciphertext: ciphertext,
@@ -277,7 +264,7 @@ func (s *Store) Resolve(ctx context.Context, actor contract.Actor, app, environm
 	if err := ValidateEnvironment(environment); err != nil {
 		return Resolution{}, err
 	}
-	if revisions != nil && len(revisions) > MaxSecretsPerEnvironment {
+	if len(revisions) > MaxSecretsPerEnvironment {
 		return Resolution{}, contract.NewFault(contract.ValidationFailed, "too many pinned secrets", "Pin at most 128 secret revisions for one environment.")
 	}
 	var (
@@ -297,30 +284,11 @@ func (s *Store) Resolve(ctx context.Context, actor contract.Actor, app, environm
 	refs := make(map[string]RevisionRef, MaxSecretsPerEnvironment)
 	total := 0
 	for _, row := range rows {
-		namespace := row.Namespace
-		if row.State != StateActive {
-			return Resolution{}, contract.NewFault(contract.PreconditionFailed, "pinned secret revision is archived", "Rotate the secret to a new revision or remove it from the deployment's pinned set.")
-		}
-		plaintext, ref, err := decryptStored(s.ring, row)
+		var err error
+		total, err = resolveStoredRow(s.ring, row, values, refs, total)
 		if err != nil {
 			return Resolution{}, err
 		}
-		if len(plaintext) > MaxValueBytes {
-			clearBytes(plaintext)
-			return Resolution{}, contract.NewFault(contract.PreconditionFailed, "stored secret exceeds the supported bound", "Replace the secret with a value no larger than 32768 bytes.")
-		}
-		total += len(plaintext)
-		if total > MaxResolveBytes {
-			clearBytes(plaintext)
-			return Resolution{}, contract.NewFault(contract.PreconditionFailed, "resolved secrets exceed the injection bound", "Reduce the number or size of secrets pinned for one environment.")
-		}
-		if len(values) >= MaxSecretsPerEnvironment {
-			clearBytes(plaintext)
-			return Resolution{}, contract.NewFault(contract.PreconditionFailed, "resolved secret count exceeds the injection bound", "Archive unused secrets or pin at most 128 names for one environment.")
-		}
-		values[namespace.Name] = string(plaintext)
-		clearBytes(plaintext)
-		refs[namespace.Name] = ref
 	}
 	if revisions != nil && len(refs) != len(revisions) {
 		missing := make([]string, 0)
@@ -335,6 +303,35 @@ func (s *Store) Resolve(ctx context.Context, actor contract.Actor, app, environm
 		return Resolution{}, fault
 	}
 	return Resolution{Values: values, Revisions: refs, Digest: resolutionDigest(app, environment, refs)}, nil
+}
+
+// resolveStoredRow authenticates and decrypts one stored revision, enforcing
+// the per-value, total, and count bounds before adding it to the result.
+func resolveStoredRow(ring *KeyRing, row StoredCiphertext, values map[string]string, refs map[string]RevisionRef, total int) (int, error) {
+	if row.State != StateActive {
+		return total, contract.NewFault(contract.PreconditionFailed, "pinned secret revision is archived", "Rotate the secret to a new revision or remove it from the deployment's pinned set.")
+	}
+	plaintext, ref, err := decryptStored(ring, row)
+	if err != nil {
+		return total, err
+	}
+	if len(plaintext) > MaxValueBytes {
+		clearBytes(plaintext)
+		return total, contract.NewFault(contract.PreconditionFailed, "stored secret exceeds the supported bound", "Replace the secret with a value no larger than 32768 bytes.")
+	}
+	total += len(plaintext)
+	if total > MaxResolveBytes {
+		clearBytes(plaintext)
+		return total, contract.NewFault(contract.PreconditionFailed, "resolved secrets exceed the injection bound", "Reduce the number or size of secrets pinned for one environment.")
+	}
+	if len(values) >= MaxSecretsPerEnvironment {
+		clearBytes(plaintext)
+		return total, contract.NewFault(contract.PreconditionFailed, "resolved secret count exceeds the injection bound", "Archive unused secrets or pin at most 128 names for one environment.")
+	}
+	values[row.Namespace.Name] = string(plaintext)
+	clearBytes(plaintext)
+	refs[row.Namespace.Name] = ref
+	return total, nil
 }
 
 func decryptStored(ring *KeyRing, stored StoredCiphertext) ([]byte, RevisionRef, error) {
@@ -382,10 +379,32 @@ func resolutionDigest(app, environment string, refs map[string]RevisionRef) stri
 	return hex.EncodeToString(hash.Sum(nil))
 }
 
-func revisionConflict(expected, current uint64) *contract.Fault {
+func revisionConflict(expected, current uint64) *contract.FaultError {
 	fault := contract.NewFault(contract.Conflict, "secret revision does not match", "Read the secret metadata and retry the mutation with its latest revision.")
 	fault.Details = map[string]any{"expected_revision": expected, "current_revision": current}
 	return fault
+}
+
+// applySecretRevision writes the namespace pointer for one already-sealed
+// revision: first state for a new namespace, or the locked CAS update.
+func applySecretRevision(ctx context.Context, tx SecretTx, namespace Namespace, revision, expectedRevision, latest uint64, create bool, actor contract.Actor) error {
+	if !create {
+		updated, err := tx.AdvanceSecretNamespace(ctx, namespace, expectedRevision, revision, actor)
+		if err != nil {
+			return databaseFault(err)
+		}
+		if !updated {
+			return revisionConflict(expectedRevision, latest)
+		}
+		return nil
+	}
+	if err := tx.InsertSecretNamespace(ctx, namespace, actor); err != nil {
+		if contract.Classify(err).Code == contract.Conflict {
+			return revisionConflict(0, 0)
+		}
+		return err
+	}
+	return nil
 }
 
 // nextRevision is the CAS decision used under the row lock. expected 0 creates
@@ -406,13 +425,13 @@ func nextRevision(exists bool, latest, expected uint64) (uint64, bool, error) {
 	return latest + 1, false, nil
 }
 
-func notFound(namespace Namespace) *contract.Fault {
+func notFound(namespace Namespace) *contract.FaultError {
 	fault := contract.NewFault(contract.NotFound, "secret was not found", "List metadata for the app and environment, then use the exact secret name.")
 	fault.Details = map[string]any{"app": namespace.App, "environment": namespace.Environment, "name": namespace.Name}
 	return fault
 }
 
-func databaseFault(err error) *contract.Fault {
+func databaseFault(err error) *contract.FaultError {
 	fault := contract.NewFault(contract.Unavailable, "secret storage is unavailable", "Check PostgreSQL connectivity and schema readiness; re-read metadata before retrying a mutation.")
 	fault.Cause = err
 	return fault

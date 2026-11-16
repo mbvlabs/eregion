@@ -34,7 +34,7 @@ func DefaultNodeConfigPath() string {
 // LoadNodeFile reads the node configuration. A missing file is an error: a
 // node RPC must not invent the node identity or a public hostname.
 func LoadNodeFile(path string) (NodeConfig, error) {
-	raw, err := os.ReadFile(path) //nolint:gosec // G304: the fixed node configuration path.
+	raw, err := os.ReadFile(path) //nolint:gosec // G703: this reads the fixed node configuration path supplied by the host operator.
 	if err != nil {
 		return NodeConfig{}, contract.NewFault(contract.PreconditionFailed, "the node configuration is not readable", err.Error())
 	}
@@ -53,7 +53,7 @@ func HostKeySummary() (string, error) {
 	if len(matches) == 0 {
 		return "", errors.New("no SSH host public key is installed")
 	}
-	raw, err := os.ReadFile(matches[0]) //nolint:gosec // G304: fixed /etc/ssh public key files.
+	raw, err := os.ReadFile(matches[0])
 	if err != nil {
 		return "", err
 	}

@@ -174,6 +174,22 @@ func (m Model) renderInsightsPane(width, height int) string {
 		return ""
 	}
 	lines := []string{m.dim().Render("TARGETS")}
+	targetBudget := m.insightTargetBudget(height)
+	for index, target := range m.view.Targets {
+		if index >= targetBudget {
+			lines = append(lines, m.dim().Render(fmt.Sprintf("… %d more target(s)", len(m.view.Targets)-targetBudget)))
+			break
+		}
+		lines = append(lines, m.targetLine(target))
+	}
+	lines = append(lines, m.renderHealthLines(width)...)
+	if m.view.Cleanup.Observed {
+		lines = append(lines, m.cleanupLine(width))
+	}
+	return fitLines(strings.Join(lines, "\n"), width, height)
+}
+
+func (m Model) insightTargetBudget(height int) int {
 	healthBlock := 0
 	if len(m.view.Health) > 0 {
 		healthBlock = 2 + len(m.view.Health)
@@ -186,55 +202,62 @@ func (m Model) renderInsightsPane(width, height int) string {
 	if fit := height - 1 - healthBlock - cleanupBlock; fit < targetBudget {
 		targetBudget = max(0, fit-1)
 	}
-	for index, target := range m.view.Targets {
-		if index >= targetBudget {
-			lines = append(lines, m.dim().Render(fmt.Sprintf("… %d more target(s)", len(m.view.Targets)-targetBudget)))
-			break
-		}
-		symbol := m.glyphs.stage(target.Status)
-		label := target.Role.String()
-		if target.Label != "" && target.Label != string(target.Role) {
-			label = target.Label
-		}
-		line := fmt.Sprintf("%s %-22s %s", symbol, truncate(label, 22), target.Status)
-		lines = append(lines, m.stateStyle(stageState(target.Status)).Render(line))
+	return targetBudget
+}
+
+func (m Model) targetLine(target viewer.DeploymentTarget) string {
+	symbol := m.glyphs.stage(target.Status)
+	label := target.Role.String()
+	if target.Label != "" && target.Label != string(target.Role) {
+		label = target.Label
 	}
-	if len(m.view.Health) > 0 {
-		lines = append(lines, "", m.dim().Render("HEALTH OBSERVATIONS"))
-		for _, observation := range m.view.Health {
-			state := "passed"
-			style := m.okStyle()
-			if !observation.Passed {
-				state, style = "failed", m.risk()
-			}
-			probes := "checks not reported"
-			if observation.Checks > 0 {
-				probes = fmt.Sprintf("%d probe(s)", observation.Checks)
-			}
-			deadline := ""
-			if observation.TimeoutSeconds > 0 {
-				deadline = fmt.Sprintf("%s%ds deadline", m.glyphs.separator(), observation.TimeoutSeconds)
-			}
-			target := ""
-			if observation.Target != "" {
-				target = observation.Target + m.glyphs.separator()
-			}
-			detail := observation.Detail
-			if detail == "" {
-				detail = "no detail"
-			}
-			line := fmt.Sprintf("%s %s%s%s%s%s%s", state, probes, deadline, m.glyphs.separator(), target, detail, m.glyphs.separator()+observation.At.UTC().Format("15:04:05"))
-			lines = append(lines, style.Render(truncate(line, width)))
-		}
+	line := fmt.Sprintf("%s %-22s %s", symbol, truncate(label, 22), target.Status)
+	return m.stateStyle(stageState(target.Status)).Render(line)
+}
+
+func (m Model) renderHealthLines(width int) []string {
+	if len(m.view.Health) == 0 {
+		return nil
 	}
-	if m.view.Cleanup.Observed {
-		style := m.okStyle()
-		if m.view.Cleanup.Status == viewer.StageFailed {
-			style = m.risk()
-		}
-		lines = append(lines, style.Render(truncate(viewer.DefaultClean(m.view.CleanupLine()), width)))
+	lines := []string{"", m.dim().Render("HEALTH OBSERVATIONS")}
+	for _, observation := range m.view.Health {
+		lines = append(lines, m.healthObservationLine(observation, width))
 	}
-	return fitLines(strings.Join(lines, "\n"), width, height)
+	return lines
+}
+
+func (m Model) healthObservationLine(observation viewer.HealthObservation, width int) string {
+	state := "passed"
+	style := m.okStyle()
+	if !observation.Passed {
+		state, style = "failed", m.risk()
+	}
+	probes := "checks not reported"
+	if observation.Checks > 0 {
+		probes = fmt.Sprintf("%d probe(s)", observation.Checks)
+	}
+	deadline := ""
+	if observation.TimeoutSeconds > 0 {
+		deadline = fmt.Sprintf("%s%ds deadline", m.glyphs.separator(), observation.TimeoutSeconds)
+	}
+	target := ""
+	if observation.Target != "" {
+		target = observation.Target + m.glyphs.separator()
+	}
+	detail := observation.Detail
+	if detail == "" {
+		detail = "no detail"
+	}
+	line := fmt.Sprintf("%s %s%s%s%s%s%s", state, probes, deadline, m.glyphs.separator(), target, detail, m.glyphs.separator()+observation.At.UTC().Format("15:04:05"))
+	return style.Render(truncate(line, width))
+}
+
+func (m Model) cleanupLine(width int) string {
+	style := m.okStyle()
+	if m.view.Cleanup.Status == viewer.StageFailed {
+		style = m.risk()
+	}
+	return style.Render(truncate(viewer.DefaultClean(m.view.CleanupLine()), width))
 }
 
 func (m Model) renderEventsPane(width, height int) string {

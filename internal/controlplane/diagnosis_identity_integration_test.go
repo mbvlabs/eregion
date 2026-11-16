@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/api"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/operations"
@@ -32,6 +33,43 @@ func TestIntegrationDiagnosisKeepsRecordedImageIDWhileObservingRuntimeIdentity(t
 	configID := "sha256:" + strings.Repeat("a", 64)
 	runtimeID := "sha256:" + strings.Repeat("c", 64)
 	canonical := "registry.example/identity@" + manifest
+	ids := seedDiagnosisIdentityFixture(t, ctx, pool, configID, canonical)
+
+	var resolvedImage, observedImageID string
+	s.diagnosisImageResolver = func(_ context.Context, image string) (string, string) {
+		resolvedImage = image
+		return runtimeID, ""
+	}
+	s.diagnosisImageObserver = func(_ context.Context, imageID string) (*platform.DiagnosisImage, string) {
+		observedImageID = imageID
+		return &platform.DiagnosisImage{
+			ImageID:      imageID,
+			Buildpacks:   []platform.DiagnosisBuildpack{},
+			ProcessTypes: []string{},
+			Layers:       []platform.DiagnosisLayer{},
+		}, ""
+	}
+
+	app := api.AppService{Operations: s}
+	report, err := app.Diagnose(ctx, operations.OperatorAuthority(testActor), ids.operationID, 0, 1000, "fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertDiagnosisIdentityReport(t, ctx, pool, report, ids.releaseID, manifest, configID, runtimeID, canonical, resolvedImage, observedImageID)
+}
+
+type diagnosisIdentityIDs struct {
+	releaseID   platform.ReleaseID
+	operationID contract.OperationID
+}
+
+func seedDiagnosisIdentityFixture(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	configID, canonical string,
+) diagnosisIdentityIDs {
+	t.Helper()
 	appID, err := platform.NewAppID()
 	if err != nil {
 		t.Fatal(err)
@@ -84,27 +122,18 @@ func TestIntegrationDiagnosisKeepsRecordedImageIDWhileObservingRuntimeIdentity(t
 		deploymentID, operationID, appID, envID, releaseID, revisionID); err != nil {
 		t.Fatal(err)
 	}
+	return diagnosisIdentityIDs{releaseID: releaseID, operationID: operationID}
+}
 
-	var resolvedImage, observedImageID string
-	s.diagnosisImageResolver = func(_ context.Context, image string) (string, string) {
-		resolvedImage = image
-		return runtimeID, ""
-	}
-	s.diagnosisImageObserver = func(_ context.Context, imageID string) (*platform.DiagnosisImage, string) {
-		observedImageID = imageID
-		return &platform.DiagnosisImage{
-			ImageID:      imageID,
-			Buildpacks:   []platform.DiagnosisBuildpack{},
-			ProcessTypes: []string{},
-			Layers:       []platform.DiagnosisLayer{},
-		}, ""
-	}
-
-	app := api.AppService{Operations: s}
-	report, err := app.Diagnose(ctx, operations.OperatorAuthority(testActor), operationID, 0, 1000, "fixture")
-	if err != nil {
-		t.Fatal(err)
-	}
+func assertDiagnosisIdentityReport(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	report platform.Diagnosis,
+	releaseID platform.ReleaseID,
+	manifest, configID, runtimeID, canonical, resolvedImage, observedImageID string,
+) {
+	t.Helper()
 	if report.Release == nil {
 		t.Fatal("diagnosis did not project the recorded release")
 	}

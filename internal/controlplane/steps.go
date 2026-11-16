@@ -153,8 +153,7 @@ func (s *Service) beginStep(ctx context.Context, id contract.OperationID, attemp
 
 // ackStep records a completed effect at most once. Only the transaction that
 // changes the step row from running/failed to completed appends progress.
-func (s *Service) ackStep(ctx context.Context, id contract.OperationID, attempt uint32, step, inputsHash, executionID string, result json.RawMessage, total int) (bool, error) {
-	acked := false
+func (s *Service) ackStep(ctx context.Context, id contract.OperationID, attempt uint32, step, inputsHash, executionID string, result json.RawMessage, total int) error {
 	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
 		record, found, err := tx.Steps().GetForUpdate(ctx, id, step)
 		if err != nil {
@@ -179,7 +178,6 @@ func (s *Service) ackStep(ctx context.Context, id contract.OperationID, attempt 
 		if err := tx.Operations().SetCompletedSteps(ctx, id, completed); err != nil {
 			return err
 		}
-		acked = true
 		// Cleanup and setup steps can run beyond the planned count; the
 		// measured total never falls below what has completed.
 		if int(completed) > total {
@@ -187,24 +185,17 @@ func (s *Service) ackStep(ctx context.Context, id contract.OperationID, attempt 
 		}
 		return appendEvent(ctx, tx, op, contract.Event{
 			Kind:     "progress",
-			Progress: &contract.Progress{Current: uint64(completed), Total: uint64(total), Unit: "steps"},
+			Progress: &contract.Progress{Current: uint64(completed), Total: uint64(total), Unit: "steps"}, //nolint:gosec // G115: step counts are non-negative database counters.
 			Message:  "Node effect acknowledged durably.",
 		})
 	})
 	if err != nil {
-		return false, err
+		return err
 	}
 	if !owned {
-		return false, errNotOwned
+		return errNotOwned
 	}
-	return acked, nil
-}
-
-func nullableJSON(raw json.RawMessage) any {
-	if len(raw) == 0 || string(raw) == "null" {
-		return nil
-	}
-	return raw
+	return nil
 }
 
 // failStep records a failed node step without touching a completed one. The
@@ -231,8 +222,8 @@ func (s *Service) failStep(ctx context.Context, id contract.OperationID, attempt
 
 // finishSucceeded records terminal success without rewriting an existing terminal
 // state. All step effects are already acknowledged when this is called.
-func (s *Service) finishSucceeded(ctx context.Context, id contract.OperationID, attempt uint32) (contract.Operation, error) {
-	op, owned, err := s.mutateOwned(ctx, id, attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
+func (s *Service) finishSucceeded(ctx context.Context, id contract.OperationID, attempt uint32) error {
+	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
 		if op.State == contract.Succeeded {
 			return nil
 		}
@@ -244,18 +235,18 @@ func (s *Service) finishSucceeded(ctx context.Context, id contract.OperationID, 
 		return transition(ctx, tx, op, contract.Succeeded, "", "Diagnostic operation succeeded; node-local marker effects were acknowledged.")
 	})
 	if err != nil {
-		return op, err
+		return err
 	}
 	if !owned {
-		return op, errNotOwned
+		return errNotOwned
 	}
-	return op, nil
+	return nil
 }
 
 // finishCancelled acknowledges cancellation at a step boundary. If every effect
 // was already acknowledged, success is the honest result.
-func (s *Service) finishCancelled(ctx context.Context, id contract.OperationID, attempt uint32, total int) (contract.Operation, error) {
-	op, owned, err := s.mutateOwned(ctx, id, attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
+func (s *Service) finishCancelled(ctx context.Context, id contract.OperationID, attempt uint32, total int) error {
+	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
 		if op.State.Terminal() {
 			return nil
 		}
@@ -275,12 +266,12 @@ func (s *Service) finishCancelled(ctx context.Context, id contract.OperationID, 
 		return transition(ctx, tx, op, contract.Canceled, "", "Cancellation acknowledged at a node step boundary; completed effects were not rolled back.")
 	})
 	if err != nil {
-		return op, err
+		return err
 	}
 	if !owned {
-		return op, errNotOwned
+		return errNotOwned
 	}
-	return op, nil
+	return nil
 }
 
 func markIncompleteSteps(ctx context.Context, tx *entities.StoreTx, id contract.OperationID, code contract.Code, message string) error {
@@ -320,7 +311,7 @@ func (s *Service) operationState(ctx context.Context, id contract.OperationID) (
 
 // recordRecoveredStep makes a node-side completed effect visible in operation
 // history without claiming that this attempt re-ran it.
-func (s *Service) recordRecoveredStep(ctx context.Context, id contract.OperationID, attempt uint32, step, inputsHash string, status node.Response) error {
+func (s *Service) recordRecoveredStep(ctx context.Context, id contract.OperationID, attempt uint32, step string, status node.Response) error {
 	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
 		return appendEvent(ctx, tx, op, contract.Event{
 			Kind:        "step",
@@ -345,27 +336,7 @@ func (s *Service) appendNodeEvents(ctx context.Context, id contract.OperationID,
 	}
 	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
 		for _, event := range events {
-			kind := "log"
-			if event.Kind == "warning" {
-				kind = "warning"
-			}
-			message := s.redaction.RedactPreservingLength(event.Message)
-			if len(message) > 4096 {
-				const marker = " [clipped after redaction]"
-				end := 4096 - len(marker)
-				for end > 0 && !utf8.RuneStart(message[end]) {
-					end--
-				}
-				message = message[:end] + marker
-			}
-			if event.Kind == "step" {
-				kind = "step"
-			}
-			contractEvent := contract.Event{Kind: kind, Stage: event.Step, Step: event.Step, Message: message}
-			if kind == "step" {
-				contractEvent.ExecutionID = event.ExecutionID
-			}
-			if err := appendEvent(ctx, tx, op, contractEvent); err != nil {
+			if err := appendEvent(ctx, tx, op, s.nodeContractEvent(event)); err != nil {
 				return err
 			}
 		}
@@ -378,6 +349,30 @@ func (s *Service) appendNodeEvents(ctx context.Context, id contract.OperationID,
 		return errNotOwned
 	}
 	return nil
+}
+
+func (s *Service) nodeContractEvent(event node.Event) contract.Event {
+	kind := "log"
+	if event.Kind == "warning" {
+		kind = "warning"
+	}
+	message := s.redaction.RedactPreservingLength(event.Message)
+	if len(message) > 4096 {
+		const marker = " [clipped after redaction]"
+		end := 4096 - len(marker)
+		for end > 0 && !utf8.RuneStart(message[end]) {
+			end--
+		}
+		message = message[:end] + marker
+	}
+	if event.Kind == "step" {
+		kind = "step"
+	}
+	contractEvent := contract.Event{Kind: kind, Stage: event.Step, Step: event.Step, Message: message}
+	if kind == "step" {
+		contractEvent.ExecutionID = event.ExecutionID
+	}
+	return contractEvent
 }
 
 // reconcileCompletedSteps acknowledges node effects that completed but whose
@@ -410,7 +405,7 @@ func (s *Service) reconcileCompletedSteps(ctx context.Context, id contract.Opera
 		if status.Status != engine.StatusCompleted {
 			continue
 		}
-		if _, err := s.ackStep(ctx, id, attempt, record.Step, record.InputsHash, status.ExecutionID, status.Result, input.Steps); err != nil {
+		if err := s.ackStep(ctx, id, attempt, record.Step, record.InputsHash, status.ExecutionID, status.Result, input.Steps); err != nil {
 			return false, err
 		}
 	}

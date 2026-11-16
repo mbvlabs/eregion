@@ -50,7 +50,7 @@ func TestIntegrationEntitiesOperationHistoryParity(t *testing.T) {
 
 	foreignCI := contract.Actor{Kind: "ci", Subject: "foreign-ci"}
 	foreignWebhook := contract.Actor{Kind: "webhook", Subject: "foreign-webhook"}
-	fixtures := []operationHistoryFixture{
+	fixtures := seedOperationHistoryFixtures(t, ctx, store, []operationHistoryFixture{
 		{kind: "diagnostic.test", target: "control-plane", actor: testActor, key: "own", state: contract.Queued},
 		{kind: "diagnostic.test", target: "control-plane", actor: testActor, key: "own-running", state: contract.Running},
 		{kind: "platform.deploy", target: "env/demo/staging", actor: foreignCI, key: "ci-env", state: contract.Running},
@@ -58,31 +58,7 @@ func TestIntegrationEntitiesOperationHistoryParity(t *testing.T) {
 		{kind: "platform.deploy", target: "app/demo", actor: foreignCI, key: "app-wide", state: contract.Queued},
 		{kind: "platform.deploy", target: "env/demo/production", actor: foreignCI, key: "prod-env", state: contract.Queued},
 		{kind: "platform.build", target: "build/build-1", actor: foreignCI, key: "build-env", state: contract.Queued},
-	}
-	for index := range fixtures {
-		fixtures[index].id = mustOperationID(t)
-		fixture := &fixtures[index]
-		if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
-			inserted, err := tx.Operations().Insert(ctx, entities.OperationInsert{
-				ID: fixture.id,
-				Key: entities.OperationKey{
-					Kind: fixture.kind, Target: fixture.target, Actor: fixture.actor,
-					IdempotencyKey: fixture.key,
-				},
-				InputHash: "parity-" + fixture.key,
-				Input:     json.RawMessage(`{"app":"demo"}`),
-			})
-			if err != nil || !inserted {
-				t.Fatalf("insert %s = %v err %v", fixture.key, inserted, err)
-			}
-			if fixture.state != contract.Queued {
-				return tx.Operations().SetState(ctx, fixture.id, fixture.state, "")
-			}
-			return nil
-		}); err != nil {
-			t.Fatal(err)
-		}
-	}
+	})
 	if _, err := pool.Exec(ctx, `INSERT INTO eregion_platform_builds
         (id, operation_id, app_id, environment_id, source, commit_sha, state, error_code, error, created_at)
         VALUES ('build-1',$1,'app-demo','env-demo-staging','{}','0123456789abcdef0123456789abcdef01234567','queued','','',clock_timestamp())`,
@@ -90,13 +66,7 @@ func TestIntegrationEntitiesOperationHistoryParity(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	type branch struct {
-		name   string
-		filter entities.OperationFilter
-		raw    operations.ListQuery
-		all    bool
-	}
-	branches := []branch{
+	checkOperationHistoryBranches(t, ctx, store, service, []operationHistoryBranch{
 		{
 			name:   "actor-only",
 			filter: entities.OperationFilter{Actor: testActor, Limit: 200},
@@ -123,7 +93,48 @@ func TestIntegrationEntitiesOperationHistoryParity(t *testing.T) {
 			filter: entities.OperationFilter{Actor: testActor, App: "demo", Environment: "staging", State: string(contract.Running), Limit: 200},
 			raw:    operations.ListQuery{App: "demo", Environment: "staging", State: string(contract.Running), Limit: 200},
 		},
+	})
+	checkOperationHistoryPolicy(t, ctx, store, fixtures)
+}
+
+type operationHistoryBranch struct {
+	name   string
+	filter entities.OperationFilter
+	raw    operations.ListQuery
+	all    bool
+}
+
+func seedOperationHistoryFixtures(t *testing.T, ctx context.Context, store *entities.Store, fixtures []operationHistoryFixture) []operationHistoryFixture {
+	t.Helper()
+	for index := range fixtures {
+		fixtures[index].id = mustOperationID(t)
+		fixture := &fixtures[index]
+		if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
+			inserted, err := tx.Operations().Insert(ctx, entities.OperationInsert{
+				ID: fixture.id,
+				Key: entities.OperationKey{
+					Kind: fixture.kind, Target: fixture.target, Actor: fixture.actor,
+					IdempotencyKey: fixture.key,
+				},
+				InputHash: "parity-" + fixture.key,
+				Input:     json.RawMessage(`{"app":"demo"}`),
+			})
+			if err != nil || !inserted {
+				t.Fatalf("insert %s = %v err %v", fixture.key, inserted, err)
+			}
+			if fixture.state != contract.Queued {
+				return tx.Operations().SetState(ctx, fixture.id, fixture.state, "")
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
 	}
+	return fixtures
+}
+
+func checkOperationHistoryBranches(t *testing.T, ctx context.Context, store *entities.Store, service *Service, branches []operationHistoryBranch) {
+	t.Helper()
 	for _, branch := range branches {
 		t.Run(branch.name, func(t *testing.T) {
 			typed, err := store.Operations().List(ctx, branch.filter)
@@ -151,8 +162,10 @@ func TestIntegrationEntitiesOperationHistoryParity(t *testing.T) {
 			}
 		})
 	}
+}
 
-	// Explicit policy assertions independent of the raw comparison.
+func checkOperationHistoryPolicy(t *testing.T, ctx context.Context, store *entities.Store, fixtures []operationHistoryFixture) {
+	t.Helper()
 	actorOnly, err := store.Operations().List(ctx, entities.OperationFilter{Actor: testActor, Limit: 200})
 	if err != nil || len(actorOnly) != 2 {
 		t.Fatalf("actor-only items = %v err %v", operationIDs(actorOnly), err)
@@ -215,7 +228,7 @@ func TestIntegrationEntitiesTypedInputAndIdentityPattern(t *testing.T) {
 	second := mustOperationID(t)
 	other := mustOperationID(t)
 	input := json.RawMessage(`{"steps":2}`)
-	key := func(id contract.OperationID, suffix string) entities.OperationKey {
+	key := func(suffix string) entities.OperationKey {
 		return entities.OperationKey{
 			Kind: "platform.retention_prune", Target: "node/parity", Actor: testActor,
 			IdempotencyKey: "daily-" + suffix,
@@ -224,7 +237,7 @@ func TestIntegrationEntitiesTypedInputAndIdentityPattern(t *testing.T) {
 	for _, fixture := range []struct {
 		id  contract.OperationID
 		key entities.OperationKey
-	}{{first, key(first, "one")}, {second, key(second, "two")}} {
+	}{{first, key("one")}, {second, key("two")}} {
 		if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
 			inserted, err := tx.Operations().Insert(ctx, entities.OperationInsert{
 				ID: fixture.id, Key: fixture.key, InputHash: "retention", Input: input,
@@ -311,6 +324,11 @@ func TestIntegrationEntitiesTransactionIdentityForShareLocks(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	checkShareLockConflict(t, ctx, store, id, key)
+}
+
+func checkShareLockConflict(t *testing.T, ctx context.Context, store *entities.Store, id contract.OperationID, key entities.OperationKey) {
+	t.Helper()
 	holderReady := make(chan struct{})
 	competingDone := make(chan struct{})
 	holderDone := make(chan error, 1)
@@ -356,7 +374,8 @@ func TestIntegrationEntitiesTransactionIdentityForShareLocks(t *testing.T) {
 	}
 	var jobID int64
 	var bound bool
-	if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
+	var err error
+	if err = store.WithinTx(ctx, func(tx *entities.StoreTx) error {
 		if _, found, err := tx.Operations().Lock(ctx, id); err != nil || !found {
 			return err
 		}

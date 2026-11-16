@@ -140,6 +140,23 @@ func normalizeNodeEnroll(target Target, raw json.RawMessage) (ActionInput, error
 		}
 		return &input, nil
 	}
+	roles, err := normalizeEnrollRoles(&input)
+	if err != nil {
+		return nil, err
+	}
+	if err := normalizeEnrollIdentity(&input); err != nil {
+		return nil, err
+	}
+	if err := normalizeEnrollBuild(&input, roles); err != nil {
+		return nil, err
+	}
+	if err := normalizePrivateNetwork(input.PrivateNetwork); err != nil {
+		return nil, err
+	}
+	return &input, nil
+}
+
+func normalizeEnrollRoles(input *NodeEnrollInput) ([]string, error) {
 	roles, err := validateRoles(input.Roles)
 	if err != nil {
 		return nil, err
@@ -152,26 +169,34 @@ func normalizeNodeEnroll(target Target, raw json.RawMessage) (ActionInput, error
 	if err != nil || host == "" || port == "" || strings.ContainsAny(input.Address, " \t\r\n/@") {
 		return nil, invalid("node address", "Use the SSH host:port without credentials or whitespace.")
 	}
+	return roles, nil
+}
+
+func normalizeEnrollIdentity(input *NodeEnrollInput) error {
 	if input.User == "" {
 		input.User = DefaultSSHUser
 	}
 	if !sshUserPattern.MatchString(input.User) {
-		return nil, invalid("ssh user", "Use a plain unprivileged account name.")
+		return invalid("ssh user", "Use a plain unprivileged account name.")
 	}
 	if input.User == "root" {
-		return nil, invalid("ssh user", "The control plane never connects as root; use the unprivileged node account.")
+		return invalid("ssh user", "The control plane never connects as root; use the unprivileged node account.")
 	}
 	key, fingerprint, err := ParseHostKey(input.HostKey)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if input.HostKeyFingerprint != "" && input.HostKeyFingerprint != fingerprint {
-		return nil, invalid("host key fingerprint", "The fingerprint does not match the supplied host key; verify the key out of band.")
+		return invalid("host key fingerprint", "The fingerprint does not match the supplied host key; verify the key out of band.")
 	}
 	input.HostKey, input.HostKeyFingerprint = key, fingerprint
 	if input.IdentityFingerprint != "" && !fingerprintPattern.MatchString(input.IdentityFingerprint) {
-		return nil, invalid("identity fingerprint", "Use the SHA256:<base64> fingerprint printed by eregion node-agent identity.")
+		return invalid("identity fingerprint", "Use the SHA256:<base64> fingerprint printed by eregion node-agent identity.")
 	}
+	return nil
+}
+
+func normalizeEnrollBuild(input *NodeEnrollInput, roles []string) error {
 	hasBuilder := false
 	for _, role := range roles {
 		hasBuilder = hasBuilder || role == RoleBuilder
@@ -180,23 +205,28 @@ func normalizeNodeEnroll(target Target, raw json.RawMessage) (ActionInput, error
 		input.BuildConcurrency = 1
 	}
 	if input.BuildConcurrency < 1 || input.BuildConcurrency > MaxBuildConcurrency {
-		return nil, invalid("build concurrency", "Use 1–16 concurrent builds.")
+		return invalid("build concurrency", "Use 1–16 concurrent builds.")
 	}
 	if !hasBuilder && (input.BuildConcurrency != 1 || input.BuildUser != "") {
-		return nil, invalid("build settings", "Build concurrency and build user apply only to nodes with the builder role.")
+		return invalid("build settings", "Build concurrency and build user apply only to nodes with the builder role.")
 	}
 	if input.BuildUser != "" && !sshUserPattern.MatchString(input.BuildUser) {
-		return nil, invalid("build user", "Use a plain account name.")
+		return invalid("build user", "Use a plain account name.")
 	}
-	if input.PrivateNetwork != nil {
-		if input.PrivateNetwork.SSHPort < 0 || input.PrivateNetwork.SSHPort > 65535 {
-			return nil, invalid("private network ssh port", "Use a port from 1 to 65535, or omit it.")
-		}
-		if endpointHost, endpointPort, err := net.SplitHostPort(input.PrivateNetwork.Endpoint); err != nil || endpointHost == "" || endpointPort == "" || strings.ContainsAny(input.PrivateNetwork.Endpoint, " \t\r\n/@") {
-			return nil, invalid("private network endpoint", "Use the node's public WireGuard host:port (UDP).")
-		}
+	return nil
+}
+
+func normalizePrivateNetwork(network *PrivateNetworkInput) error {
+	if network == nil {
+		return nil
 	}
-	return &input, nil
+	if network.SSHPort < 0 || network.SSHPort > 65535 {
+		return invalid("private network ssh port", "Use a port from 1 to 65535, or omit it.")
+	}
+	if endpointHost, endpointPort, err := net.SplitHostPort(network.Endpoint); err != nil || endpointHost == "" || endpointPort == "" || strings.ContainsAny(network.Endpoint, " \t\r\n/@") {
+		return invalid("private network endpoint", "Use the node's public WireGuard host:port (UDP).")
+	}
+	return nil
 }
 
 func normalizeNodeReconcile(target Target, raw json.RawMessage) (ActionInput, error) {

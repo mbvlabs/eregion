@@ -1,8 +1,8 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
-	"errors"
 	"os"
 	"strings"
 	"sync"
@@ -57,7 +57,11 @@ func (a *app) nodeClientForAccess(cmd *cobra.Command, current host.WorkspaceAcce
 	if current.SSH == nil {
 		return nil, contract.NewFault(contract.PreconditionFailed, "workspace "+current.Name+" has no SSH route", "Log in with a current protected export, or re-run server init.")
 	}
-	remote, err := routeRemote(current.SSH, false)
+	routeCtx := context.Background()
+	if cmd != nil && cmd.Context() != nil {
+		routeCtx = cmd.Context()
+	}
+	remote, err := routeRemote(routeCtx, current.SSH, false)
 	if err != nil {
 		return nil, contract.NewFault(contract.ValidationFailed, "the workspace SSH route is not usable", err.Error())
 	}
@@ -186,19 +190,6 @@ func rejectWorkspaceSelection(cmd *cobra.Command, action string) error {
 			"Unset EREGION_WORKSPACE for this command.")
 	}
 	return nil
-}
-
-func workspaceLookupError(selector string, err error) error {
-	if selector == "" {
-		return err
-	}
-	var fault *contract.Fault
-	if errors.As(err, &fault) && fault.Code == contract.NotFound {
-		named := contract.NewFault(contract.NotFound, "workspace "+selector+" was not found", "List saved workspaces with eregion workspace list.")
-		named.Details = map[string]any{"workspace": selector}
-		return named
-	}
-	return err
 }
 
 func (a *app) workspaceCommandSpecs() []spec {

@@ -30,7 +30,7 @@ type DeleteStep struct {
 
 func buildDeleteStep(exec engine.Execution, raw json.RawMessage) (engine.Step, error) {
 	var payload DeletePayload
-	if err := decodePayload(exec, raw, &payload); err != nil {
+	if err := decodePayload(raw, &payload); err != nil {
 		return nil, err
 	}
 	if payload.Step != exec.Step {

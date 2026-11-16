@@ -25,30 +25,7 @@ func TestIntegrationPointerValidationAndDeletionFence(t *testing.T) {
 	release := make(chan struct{})
 	pending := make(chan error, 1)
 	go func() {
-		pending <- s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
-			app, err := lockPointerEnvironmentTx(ctx, tx, envID)
-			if err != nil {
-				return err
-			}
-			if err := lockRevisionPointerTx(ctx, tx, envID, revision); err != nil {
-				return err
-			}
-			if err := lockRevisionPointerTx(ctx, tx, "env_ffffffffffffffffffffffffffffffff", revision); contract.Classify(err).Code != contract.Unavailable {
-				t.Errorf("cross-environment revision: %v", err)
-			}
-			if err := lockReleasePointerTx(ctx, tx, app, envID, "rel_ffffffffffffffffffffffffffffffff"); contract.Classify(err).Code != contract.Unavailable {
-				t.Errorf("missing release: %v", err)
-			}
-			if err := lockServingPointersTx(ctx, tx, envID, "rel_ffffffffffffffffffffffffffffffff", "dep_ffffffffffffffffffffffffffffffff"); contract.Classify(err).Code != contract.Unavailable {
-				t.Errorf("missing serving target: %v", err)
-			}
-			if err := setReleaseBuildPointerTx(ctx, tx, envID, "rel_ffffffffffffffffffffffffffffffff", "bld_ffffffffffffffffffffffffffffffff"); contract.Classify(err).Code != contract.Unavailable {
-				t.Errorf("missing release/build target: %v", err)
-			}
-			close(locked)
-			<-release
-			return errors.New("fixture rollback")
-		})
+		pending <- runPointerIntegrityTx(t, ctx, s, envID, revision, locked, release)
 	}()
 	<-locked
 	deleteCtx, cancel := context.WithTimeout(ctx, 150*time.Millisecond)
@@ -61,4 +38,39 @@ func TestIntegrationPointerValidationAndDeletionFence(t *testing.T) {
 	if err := <-pending; err == nil {
 		t.Fatal("fixture transaction committed unexpectedly")
 	}
+}
+
+func runPointerIntegrityTx(
+	t *testing.T,
+	ctx context.Context,
+	s *Service,
+	envID platform.EnvironmentID,
+	revision platform.RevisionID,
+	locked, release chan struct{},
+) error {
+	t.Helper()
+	return s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		app, err := lockPointerEnvironmentTx(ctx, tx, envID)
+		if err != nil {
+			return err
+		}
+		if err := lockRevisionPointerTx(ctx, tx, envID, revision); err != nil {
+			return err
+		}
+		if err := lockRevisionPointerTx(ctx, tx, "env_ffffffffffffffffffffffffffffffff", revision); contract.Classify(err).Code != contract.Unavailable {
+			t.Errorf("cross-environment revision: %v", err)
+		}
+		if err := lockReleasePointerTx(ctx, tx, app, envID, "rel_ffffffffffffffffffffffffffffffff"); contract.Classify(err).Code != contract.Unavailable {
+			t.Errorf("missing release: %v", err)
+		}
+		if err := lockServingPointersTx(ctx, tx, envID, "rel_ffffffffffffffffffffffffffffffff", "dep_ffffffffffffffffffffffffffffffff"); contract.Classify(err).Code != contract.Unavailable {
+			t.Errorf("missing serving target: %v", err)
+		}
+		if err := setReleaseBuildPointerTx(ctx, tx, envID, "rel_ffffffffffffffffffffffffffffffff", "bld_ffffffffffffffffffffffffffffffff"); contract.Classify(err).Code != contract.Unavailable {
+			t.Errorf("missing release/build target: %v", err)
+		}
+		close(locked)
+		<-release
+		return errors.New("fixture rollback")
+	})
 }

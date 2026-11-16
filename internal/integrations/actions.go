@@ -105,9 +105,9 @@ type grantInput struct {
 func (i grantInput) Target() platform.Target { return i.target }
 func (i grantInput) Preview() any {
 	return map[string]any{
-		"subject": i.GrantSpec.Subject,
-		"device":  i.GrantSpec.DeviceID,
-		"routes":  i.GrantSpec.Routes,
+		"subject": i.Subject,
+		"device":  i.DeviceID,
+		"routes":  i.Routes,
 		"note":    "Access grants are audited; secrets stay in secret references.",
 	}
 }
@@ -412,42 +412,9 @@ func (p dnsInventory) Read(ctx context.Context, query platform.InventoryQuery) (
 		return nil, contract.NewFault(contract.InputRequired, "Cloudflare DNS is not configured on this control plane", "Configure a provider credential with eregion dns configure --provider cloudflare; the DNS inventory does not guess a zone.")
 	}
 	limit := boundedLimit(query.Limit)
-	routes := make([]DNSRoute, 0)
-	for _, zone := range zones {
-		raw, err := p.credentials.DNSCredential(ctx, DNSProviderCloudflare, zone.ZoneID)
-		if err != nil {
-			return nil, err
-		}
-		client, err := NewCloudflare(CloudflareConfig{
-			APIToken: strings.TrimRight(string(raw), "\r\n"),
-			ZoneID:   zone.ZoneID, ZoneName: zone.ZoneName,
-			BaseURL: p.baseURL, HTTPClient: p.client,
-		})
-		clearBytes(raw)
-		if err != nil {
-			return nil, err
-		}
-		records, err := client.ListRecords(ctx)
-		if err != nil {
-			return nil, err
-		}
-		for _, record := range records {
-			route := DNSRoute{
-				ZoneID: zone.ZoneID, Zone: zone.ZoneName, ID: record.ID, Name: record.Name,
-				Type: record.Type, Content: record.Content, TTL: record.TTL,
-				Proxied: record.Proxied, Comment: record.Comment,
-			}
-			if managed(record) {
-				route.ManagedBy = "eregion"
-			}
-			routes = append(routes, route)
-			if len(routes) >= limit {
-				break
-			}
-		}
-		if len(routes) >= limit {
-			break
-		}
+	routes, err := p.collectRoutes(ctx, zones, limit)
+	if err != nil {
+		return nil, err
 	}
 	sort.Slice(routes, func(i, j int) bool {
 		if routes[i].Zone == routes[j].Zone {
@@ -462,4 +429,57 @@ func (p dnsInventory) Read(ctx context.Context, query platform.InventoryQuery) (
 		routes = routes[:limit]
 	}
 	return platform.Inventory{Collection: InventoryCollectionDNS, Items: routes, Limit: limit}, nil
+}
+
+func (p dnsInventory) collectRoutes(ctx context.Context, zones []DNSZone, limit int) ([]DNSRoute, error) {
+	routes := make([]DNSRoute, 0)
+	for _, zone := range zones {
+		zoneRoutes, err := p.zoneRoutes(ctx, zone)
+		if err != nil {
+			return nil, err
+		}
+		for _, route := range zoneRoutes {
+			routes = append(routes, route)
+			if len(routes) >= limit {
+				break
+			}
+		}
+		if len(routes) >= limit {
+			break
+		}
+	}
+	return routes, nil
+}
+
+func (p dnsInventory) zoneRoutes(ctx context.Context, zone DNSZone) ([]DNSRoute, error) {
+	raw, err := p.credentials.DNSCredential(ctx, DNSProviderCloudflare, zone.ZoneID)
+	if err != nil {
+		return nil, err
+	}
+	client, err := NewCloudflare(CloudflareConfig{
+		APIToken: strings.TrimRight(string(raw), "\r\n"),
+		ZoneID:   zone.ZoneID, ZoneName: zone.ZoneName,
+		BaseURL: p.baseURL, HTTPClient: p.client,
+	})
+	clearBytes(raw)
+	if err != nil {
+		return nil, err
+	}
+	records, err := client.ListRecords(ctx)
+	if err != nil {
+		return nil, err
+	}
+	routes := make([]DNSRoute, 0, len(records))
+	for _, record := range records {
+		route := DNSRoute{
+			ZoneID: zone.ZoneID, Zone: zone.ZoneName, ID: record.ID, Name: record.Name,
+			Type: record.Type, Content: record.Content, TTL: record.TTL,
+			Proxied: record.Proxied, Comment: record.Comment,
+		}
+		if managed(record) {
+			route.ManagedBy = "eregion"
+		}
+		routes = append(routes, route)
+	}
+	return routes, nil
 }

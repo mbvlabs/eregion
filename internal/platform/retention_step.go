@@ -91,58 +91,21 @@ func parseRegistryArtifactReference(reference string) (repository, digest string
 
 func buildRetentionRemoveStep(exec engine.Execution, raw json.RawMessage) (engine.Step, error) {
 	var payload RetentionRemovePayload
-	if err := decodePayload(exec, raw, &payload); err != nil {
+	if err := decodePayload(raw, &payload); err != nil {
 		return nil, err
 	}
 	if payload.Step != exec.Step {
 		return nil, fmt.Errorf("step ID %q does not match the payload step %q", exec.Step, payload.Step)
 	}
 	kind := retention.ItemKind(payload.Kind)
-	switch kind {
-	case retention.ItemRelease, retention.ItemImage, retention.ItemDanglingImage:
-		if err := ValidateImage(payload.Reference); err != nil {
-			return nil, err
-		}
-	case retention.ItemRegistryArtifact:
-		repository, digest, err := parseRegistryArtifactReference(payload.Reference)
-		if err != nil {
-			return nil, err
-		}
-		if !registryRepositoryPattern.MatchString(repository) {
-			return nil, fmt.Errorf("invalid registry repository %q", repository)
-		}
-		if !registryDigestPattern.MatchString(digest) {
-			return nil, fmt.Errorf("invalid registry digest %q", digest)
-		}
-	case retention.ItemBuildpackCache:
-		if !cacheVolumePattern.MatchString(payload.Reference) {
-			return nil, errors.New("only an eregion build/launch cache or legacy pack cache volume can be pruned")
-		}
-	case retention.ItemContainer:
-		if !containerNamePattern.MatchString(payload.Reference) {
-			return nil, errors.New("invalid container name")
-		}
-	default:
-		return nil, fmt.Errorf("unknown retention item kind %q", payload.Kind)
+	if err := validateRetentionReference(kind, payload.Reference); err != nil {
+		return nil, err
 	}
-	if payload.App != "" {
-		if err := ValidateName(payload.App); err != nil {
-			return nil, err
-		}
+	if err := validateRetentionScope(payload.App, payload.Environment); err != nil {
+		return nil, err
 	}
-	if payload.Environment != "" {
-		if err := ValidateName(payload.Environment); err != nil {
-			return nil, err
-		}
-	}
-	if kind == retention.ItemRegistryArtifact {
-		address, err := normalizeRegistryAddress(payload.Registry)
-		if err != nil {
-			return nil, err
-		}
-		payload.Registry = address
-	} else {
-		payload.Registry = ""
+	if err := normalizeRetentionRegistry(kind, &payload); err != nil {
+		return nil, err
 	}
 	if expected := RetentionRemoveStepID(kind, payload.Reference); payload.Step != expected {
 		// The step ID is derived from the item, so a mismatched ID would make
@@ -150,6 +113,64 @@ func buildRetentionRemoveStep(exec engine.Execution, raw json.RawMessage) (engin
 		return nil, fmt.Errorf("step ID %q does not match the item identity %q", payload.Step, expected)
 	}
 	return &RetentionRemoveStep{exec: exec, payload: payload}, nil
+}
+
+func validateRetentionReference(kind retention.ItemKind, reference string) error {
+	switch kind {
+	case retention.ItemRelease, retention.ItemImage, retention.ItemDanglingImage:
+		return ValidateImage(reference)
+	case retention.ItemRegistryArtifact:
+		repository, digest, err := parseRegistryArtifactReference(reference)
+		if err != nil {
+			return err
+		}
+		if !registryRepositoryPattern.MatchString(repository) {
+			return fmt.Errorf("invalid registry repository %q", repository)
+		}
+		if !registryDigestPattern.MatchString(digest) {
+			return fmt.Errorf("invalid registry digest %q", digest)
+		}
+		return nil
+	case retention.ItemBuildpackCache:
+		if !cacheVolumePattern.MatchString(reference) {
+			return errors.New("only an eregion build/launch cache or legacy pack cache volume can be pruned")
+		}
+		return nil
+	case retention.ItemContainer:
+		if !containerNamePattern.MatchString(reference) {
+			return errors.New("invalid container name")
+		}
+		return nil
+	case retention.ItemRegistrySkipped, retention.ItemRegistryGC, retention.ItemImageSkipped, retention.ItemCacheSkipped:
+		return fmt.Errorf("retention item kind %q is a diagnostic, not a removal", kind)
+	default:
+		return fmt.Errorf("unknown retention item kind %q", kind)
+	}
+}
+
+func validateRetentionScope(app, environment string) error {
+	if app != "" {
+		if err := ValidateName(app); err != nil {
+			return err
+		}
+	}
+	if environment != "" {
+		return ValidateName(environment)
+	}
+	return nil
+}
+
+func normalizeRetentionRegistry(kind retention.ItemKind, payload *RetentionRemovePayload) error {
+	if kind != retention.ItemRegistryArtifact {
+		payload.Registry = ""
+		return nil
+	}
+	address, err := normalizeRegistryAddress(payload.Registry)
+	if err != nil {
+		return err
+	}
+	payload.Registry = address
+	return nil
 }
 
 // normalizeRegistryAddress validates a loopback registry endpoint. A retention
@@ -197,6 +218,9 @@ func (s *RetentionRemoveStep) dockerCheckArgs() []string {
 		return []string{"docker", "image", "inspect", "--format", "{{.Id}}", s.payload.Reference}
 	case retention.ItemBuildpackCache:
 		return []string{"docker", "volume", "inspect", "--format", "{{.Name}}", s.payload.Reference}
+	case retention.ItemRegistryArtifact, retention.ItemRegistrySkipped, retention.ItemRegistryGC,
+		retention.ItemImageSkipped, retention.ItemCacheSkipped, retention.ItemContainer:
+		return nil
 	}
 	return nil
 }
@@ -315,12 +339,15 @@ func (s *RetentionRemoveStep) skipResult(reason string) engine.ApplyResult {
 
 func (s *RetentionRemoveStep) Apply(ctx context.Context, rt engine.Runtime, report engine.Reporter) (engine.ApplyResult, error) {
 	kind := retention.ItemKind(s.payload.Kind)
-	if kind == retention.ItemRegistryArtifact {
-		return s.applyRegistryDelete(ctx, report)
-	}
 	switch kind {
+	case retention.ItemRegistryArtifact:
+		return s.applyRegistryDelete(ctx, report)
 	case retention.ItemRelease, retention.ItemImage, retention.ItemDanglingImage:
 		return s.applyImageRemoval(ctx, rt, report)
+	case retention.ItemRegistrySkipped, retention.ItemRegistryGC, retention.ItemImageSkipped, retention.ItemCacheSkipped:
+		return engine.ApplyResult{}, fmt.Errorf("%w: retention item kind %q is a diagnostic, not a removal", engine.ErrPermanent, s.payload.Kind)
+	case retention.ItemContainer, retention.ItemBuildpackCache:
+		// Handled by the Docker mutation switch below.
 	}
 	runCtx, cancel := context.WithTimeout(ctx, retentionDockerTimeout)
 	defer cancel()
@@ -344,6 +371,10 @@ func (s *RetentionRemoveStep) Apply(ctx context.Context, rt engine.Runtime, repo
 		argv = []string{"docker", "rm", "--force", container.ID}
 	case retention.ItemBuildpackCache:
 		argv = []string{"docker", "volume", "rm", s.payload.Reference}
+	case retention.ItemRelease, retention.ItemRegistryArtifact, retention.ItemRegistrySkipped,
+		retention.ItemRegistryGC, retention.ItemImage, retention.ItemImageSkipped,
+		retention.ItemCacheSkipped, retention.ItemDanglingImage:
+		return engine.ApplyResult{}, fmt.Errorf("%w: unknown retention item kind %q", engine.ErrPermanent, s.payload.Kind)
 	default:
 		return engine.ApplyResult{}, fmt.Errorf("%w: unknown retention item kind %q", engine.ErrPermanent, s.payload.Kind)
 	}
@@ -378,55 +409,53 @@ func (s *RetentionRemoveStep) applyImageRemoval(ctx context.Context, rt engine.R
 		return engine.ApplyResult{}, err
 	}
 	if !exists {
-		return engine.ApplyResult{Result: map[string]any{
-			"kind": s.payload.Kind, "reference": s.payload.Reference, "already_gone": true,
-		}}, nil
+		return s.alreadyGoneResult(), nil
 	}
-
 	if len(tags) == 0 {
-		_, stderr, err := runArgv(runCtx, []string{"docker", "image", "rm", s.payload.Reference}, nil, rt, s.ID(), report)
-		if err != nil {
-			if alreadyGoneString(stderr) {
-				return engine.ApplyResult{Result: map[string]any{
-					"kind": s.payload.Kind, "reference": s.payload.Reference, "already_gone": true,
-				}}, nil
-			}
-			if reason := retentionDockerConflict(stderr); reason != "" {
-				return s.skipResult(reason), nil
-			}
-			return engine.ApplyResult{}, retentionCommandError("remove "+s.payload.Kind+" "+s.payload.Reference, err, stderr)
-		}
-		return engine.ApplyResult{Result: map[string]any{
-			"kind": s.payload.Kind, "reference": s.payload.Reference, "removed": true,
-		}}, nil
+		return s.removeUntaggedImage(runCtx, rt, report)
 	}
+	return s.removeImageTags(runCtx, rt, report, target, tags)
+}
 
+func (s *RetentionRemoveStep) alreadyGoneResult() engine.ApplyResult {
+	return engine.ApplyResult{Result: map[string]any{
+		"kind": s.payload.Kind, "reference": s.payload.Reference, "already_gone": true,
+	}}
+}
+
+func (s *RetentionRemoveStep) removeUntaggedImage(ctx context.Context, rt engine.Runtime, report engine.Reporter) (engine.ApplyResult, error) {
+	_, stderr, err := runArgv(ctx, []string{"docker", "image", "rm", s.payload.Reference}, nil, rt, s.ID(), report)
+	if err != nil {
+		if alreadyGoneString(stderr) {
+			return s.alreadyGoneResult(), nil
+		}
+		if reason := retentionDockerConflict(stderr); reason != "" {
+			return s.skipResult(reason), nil
+		}
+		return engine.ApplyResult{}, retentionCommandError("remove "+s.payload.Kind+" "+s.payload.Reference, err, stderr)
+	}
+	return engine.ApplyResult{Result: map[string]any{
+		"kind": s.payload.Kind, "reference": s.payload.Reference, "removed": true,
+	}}, nil
+}
+
+func (s *RetentionRemoveStep) removeImageTags(ctx context.Context, rt engine.Runtime, report engine.Reporter, target string, tags []string) (engine.ApplyResult, error) {
 	removedTags := make([]string, 0, len(tags))
 	movedTags := make([]string, 0, len(tags))
 	for _, tag := range tags {
-		currentID, found, err := s.imageIDForReference(runCtx, rt, tag)
+		removed, moved, skipReason, err := s.removeImageTag(ctx, rt, report, target, tag)
 		if err != nil {
 			return engine.ApplyResult{}, err
 		}
-		if !found {
-			// The tag disappeared after the observation; nothing to remove.
-			continue
+		if skipReason != "" {
+			return s.skipResult(skipReason), nil
 		}
-		if normalizeImageID(currentID) != target {
+		if removed {
+			removedTags = append(removedTags, tag)
+		}
+		if moved {
 			movedTags = append(movedTags, tag)
-			continue
 		}
-		_, stderr, err := runArgv(runCtx, []string{"docker", "image", "rm", tag}, nil, rt, s.ID(), report)
-		if err != nil {
-			if alreadyGoneString(stderr) {
-				continue
-			}
-			if reason := retentionDockerConflict(stderr); reason != "" {
-				return s.skipResult(reason), nil
-			}
-			return engine.ApplyResult{}, retentionCommandError("remove image tag "+tag, err, stderr)
-		}
-		removedTags = append(removedTags, tag)
 	}
 	if len(movedTags) > 0 {
 		return s.skipResult("image tag(s) no longer resolve to " + target + ": " + strings.Join(movedTags, ", ")), nil
@@ -434,10 +463,39 @@ func (s *RetentionRemoveStep) applyImageRemoval(ctx context.Context, rt engine.R
 	if len(removedTags) == 0 {
 		return s.skipResult("no current tag resolves to image " + target), nil
 	}
+	return s.checkRemainingImageTags(ctx, rt, removedTags)
+}
+
+func (s *RetentionRemoveStep) removeImageTag(ctx context.Context, rt engine.Runtime, report engine.Reporter, target, tag string) (bool, bool, string, error) {
+	currentID, found, err := s.imageIDForReference(ctx, rt, tag)
+	if err != nil {
+		return false, false, "", err
+	}
+	if !found {
+		// The tag disappeared after the observation; nothing to remove.
+		return false, false, "", nil
+	}
+	if normalizeImageID(currentID) != target {
+		return false, true, "", nil
+	}
+	_, stderr, err := runArgv(ctx, []string{"docker", "image", "rm", tag}, nil, rt, s.ID(), report)
+	if err != nil {
+		if alreadyGoneString(stderr) {
+			return false, false, "", nil
+		}
+		if reason := retentionDockerConflict(stderr); reason != "" {
+			return false, false, reason, nil
+		}
+		return false, false, "", retentionCommandError("remove image tag "+tag, err, stderr)
+	}
+	return true, false, "", nil
+}
+
+func (s *RetentionRemoveStep) checkRemainingImageTags(ctx context.Context, rt engine.Runtime, removedTags []string) (engine.ApplyResult, error) {
 	// Untagging the last repository tag normally deletes the image, but a
 	// digest-only reference or a reference added concurrently can keep it
 	// alive. Report that honestly instead of claiming the bytes were freed.
-	remainingTags, stillPresent, err := s.imageRepoTags(runCtx, rt)
+	remainingTags, stillPresent, err := s.imageRepoTags(ctx, rt)
 	if err != nil {
 		return engine.ApplyResult{}, err
 	}
@@ -616,11 +674,11 @@ func (s *RetentionRemoveStep) registryManifestExists(ctx context.Context) (bool,
 func (s *RetentionRemoveStep) applyRegistryDelete(ctx context.Context, report engine.Reporter) (engine.ApplyResult, error) {
 	endpoint, err := s.registryURL()
 	if err != nil {
-		return engine.ApplyResult{}, fmt.Errorf("%w: %s", engine.ErrPermanent, err)
+		return engine.ApplyResult{}, fmt.Errorf("%w: %w", engine.ErrPermanent, err)
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodDelete, endpoint, nil)
 	if err != nil {
-		return engine.ApplyResult{}, fmt.Errorf("%w: %s", engine.ErrPermanent, err)
+		return engine.ApplyResult{}, fmt.Errorf("%w: %w", engine.ErrPermanent, err)
 	}
 	request.Header.Set("Accept", registryManifestAccept)
 	response, err := retentionRegistryHTTPClient.Do(request)
@@ -681,7 +739,7 @@ func RetentionGCStepID(generation int) string {
 
 func buildRetentionGCStep(exec engine.Execution, raw json.RawMessage) (engine.Step, error) {
 	var payload RetentionGCPayload
-	if err := decodePayload(exec, raw, &payload); err != nil {
+	if err := decodePayload(raw, &payload); err != nil {
 		return nil, err
 	}
 	if payload.Step != exec.Step {
@@ -845,7 +903,7 @@ func (s *RetentionGCStep) Apply(ctx context.Context, rt engine.Runtime, report e
 	// effects, taking their effect locks nonblockingly to avoid reversing the
 	// normal effect -> host lock order.
 	sweepCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-	err := sweepCompletedBuildNetworks(sweepCtx, rt, s.ID(), report)
+	err := sweepCompletedBuildNetworks(sweepCtx, rt, s.ID())
 	cancel()
 	if err != nil && report != nil {
 		report(engine.Event{Kind: "warning", Step: s.ID(), Message: "completed build network sweep was incomplete"})

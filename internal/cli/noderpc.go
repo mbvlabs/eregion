@@ -505,7 +505,7 @@ func (n *nodeClient) progress(event rpc.EventBody) {
 	if event.Step != "" && message != event.Step {
 		message = event.Step + ": " + message
 	}
-	fmt.Fprintln(n.stderr, message)
+	_, _ = fmt.Fprintln(n.stderr, message)
 }
 
 func (n *nodeClient) SetSecret(ctx context.Context, namespace vault.Namespace, value []byte, expectedRevision uint64) (vault.Metadata, error) {
@@ -804,121 +804,146 @@ func invalidNodeData(what string) *contract.Fault {
 // human loading line. It uses only the request params, so it never invents a
 // server status.
 func waitLabel(method string, params any) string {
-	appName := func(filters map[string][]string) string {
-		if values := filters["app"]; len(values) > 0 {
-			return values[0]
-		}
-		return ""
+	if label, ok := waitLabelForParams(method, params); ok {
+		return label
 	}
-	switch p := params.(type) {
-	case rpcInventoryParams:
-		switch p.Collection {
-		case "apps":
-			if app := appName(p.Filters); app != "" {
-				return "Reading app " + app + "…"
-			}
-			return "Reading apps…"
-		case "environments":
-			if app := appName(p.Filters); app != "" {
-				return "Reading environments for " + app + "…"
-			}
-			return "Reading environments…"
-		case "domains":
-			return "Reading domains…"
-		case "releases":
-			return "Reading releases…"
-		case "builds":
-			return "Reading builds…"
-		}
-		return "Reading " + p.Collection + "…"
-	case rpcSecretParams:
-		switch method {
-		case methodSecretSet:
-			return "Writing secret " + p.Name + "…"
-		case methodSecretArchive:
-			return "Archiving secret " + p.Name + "…"
-		case methodSecretExport:
-			return "Exporting secret " + p.Name + "…"
-		default:
-			return "Reading secret " + p.Name + "…"
-		}
-	case rpcSecretListParams:
-		return "Reading secrets…"
-	case rpcSubmitParams:
-		if method == methodTest {
-			return "Testing…"
-		}
-		return "Submitting…"
-	case rpcOperationParams:
-		switch method {
-		case methodGet:
-			return "Reading operation…"
-		case methodEvents:
-			return "Reading events…"
-		case methodCancel:
-			return "Cancelling…"
-		}
-	case rpcEventsParams:
-		return "Reading events…"
-	case rpcWorkloadParams:
-		if p.Environment != "" {
-			return "Reading workloads for " + p.App + "/" + p.Environment + "…"
-		}
-		return "Reading workloads…"
-	case rpcLogParams:
-		return "Reading logs…"
-	case rpcOperationsListParams:
-		return "Reading operations…"
-	case rpcInstallParams:
-		return "Installing the node build…"
-	case rpcProtectInitParams:
-		return "Preparing two-factor setup…"
-	case rpcTokenCreateParams:
-		return "Minting token…"
-	case rpcTokenRevokeParams:
-		return "Revoking token…"
-	case rpcImagePushParams:
-		return "Pushing image…"
-	}
-	switch method {
-	case methodReady:
-		return "Checking readiness…"
-	case methodHostPlan:
-		return "Planning host changes…"
-	case methodHostApply:
-		return "Applying host changes…"
-	case methodHostDoctor:
-		return "Running doctor…"
-	case methodHostStatus:
-		return "Reading server status…"
-	case methodProtectConfirm:
-		return "Confirming two-factor setup…"
-	case methodProtectStatus:
-		return "Reading two-factor status…"
-	case methodTokenList:
-		return "Reading tokens…"
-	case methodHandoffExport:
-		return "Exporting the handoff…"
-	case methodNodeInfo:
-		return "Reading the node…"
-	case methodRetentionInventory:
-		return "Reading retention inventory…"
-	case methodRetentionPlan:
-		return "Planning disk retention…"
-	case methodRetentionShow:
-		return "Reading retention policy…"
-	case methodRetentionSet:
-		return "Writing the retention policy…"
-	case methodMetricsShow:
-		return "Reading node metrics…"
-	case methodMetricsEndpoint:
-		return "Reading the telemetry endpoint…"
-	case methodMetricsRotate:
-		return "Rotating the telemetry credential…"
-	case methodVersion:
-		return "Checking the node version…"
+	if label, ok := waitLabelForMethod(method); ok {
+		return label
 	}
 	return "Waiting for the node…"
+}
+
+func waitLabelForParams(method string, params any) (string, bool) {
+	switch p := params.(type) {
+	case rpcInventoryParams:
+		return inventoryWaitLabel(p), true
+	case rpcSecretParams:
+		return secretWaitLabel(method, p), true
+	case rpcSecretListParams:
+		return "Reading secrets…", true
+	case rpcSubmitParams:
+		if method == methodTest {
+			return "Testing…", true
+		}
+		return "Submitting…", true
+	case rpcOperationParams:
+		return operationWaitLabel(method)
+	case rpcEventsParams:
+		return "Reading events…", true
+	case rpcWorkloadParams:
+		if p.Environment != "" {
+			return "Reading workloads for " + p.App + "/" + p.Environment + "…", true
+		}
+		return "Reading workloads…", true
+	case rpcLogParams:
+		return "Reading logs…", true
+	case rpcOperationsListParams:
+		return "Reading operations…", true
+	case rpcInstallParams:
+		return "Installing the node build…", true
+	case rpcProtectInitParams:
+		return "Preparing two-factor setup…", true
+	case rpcTokenCreateParams:
+		return "Minting token…", true
+	case rpcTokenRevokeParams:
+		return "Revoking token…", true
+	case rpcImagePushParams:
+		return "Pushing image…", true
+	}
+	return "", false
+}
+
+func inventoryWaitLabel(p rpcInventoryParams) string {
+	app := ""
+	if values := p.Filters["app"]; len(values) > 0 {
+		app = values[0]
+	}
+	switch p.Collection {
+	case "apps":
+		if app != "" {
+			return "Reading app " + app + "…"
+		}
+		return "Reading apps…"
+	case "environments":
+		if app != "" {
+			return "Reading environments for " + app + "…"
+		}
+		return "Reading environments…"
+	case "domains":
+		return "Reading domains…"
+	case "releases":
+		return "Reading releases…"
+	case "builds":
+		return "Reading builds…"
+	}
+	return "Reading " + p.Collection + "…"
+}
+
+func secretWaitLabel(method string, p rpcSecretParams) string {
+	switch method {
+	case methodSecretSet:
+		return "Writing secret " + p.Name + "…"
+	case methodSecretArchive:
+		return "Archiving secret " + p.Name + "…"
+	case methodSecretExport:
+		return "Exporting secret " + p.Name + "…"
+	default:
+		return "Reading secret " + p.Name + "…"
+	}
+}
+
+func operationWaitLabel(method string) (string, bool) {
+	switch method {
+	case methodGet:
+		return "Reading operation…", true
+	case methodEvents:
+		return "Reading events…", true
+	case methodCancel:
+		return "Cancelling…", true
+	}
+	return "", false
+}
+
+func waitLabelForMethod(method string) (string, bool) {
+	switch method {
+	case methodReady:
+		return "Checking readiness…", true
+	case methodHostPlan:
+		return "Planning host changes…", true
+	case methodHostApply:
+		return "Applying host changes…", true
+	case methodHostDoctor:
+		return "Running doctor…", true
+	case methodHostStatus:
+		return "Reading server status…", true
+	case methodProtectConfirm:
+		return "Confirming two-factor setup…", true
+	case methodProtectStatus:
+		return "Reading two-factor status…", true
+	case methodTokenList:
+		return "Reading tokens…", true
+	case methodHandoffExport:
+		return "Exporting the handoff…", true
+	case methodNodeInfo:
+		return "Reading the node…", true
+	case methodRetentionInventory:
+		return "Reading retention inventory…", true
+	case methodRetentionPlan:
+		return "Planning disk retention…", true
+	case methodRetentionShow:
+		return "Reading retention policy…", true
+	case methodRetentionSet:
+		return "Writing the retention policy…", true
+	case methodMetricsShow:
+		return "Reading node metrics…", true
+	case methodMetricsEndpoint:
+		return "Reading the telemetry endpoint…", true
+	case methodMetricsRotate:
+		return "Rotating the telemetry credential…", true
+	case methodVersion:
+		return "Checking the node version…", true
+	}
+	return "", false
 }
 
 func (n *nodeClient) call(ctx context.Context, method string, params any, opts rpcCallOptions) (json.RawMessage, error) {
@@ -1063,7 +1088,7 @@ func (n *nodeClient) installOwnBuild(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	raw, err := os.ReadFile(executable) //nolint:gosec // G304: the running operator binary.
+	raw, err := os.ReadFile(executable)
 	if err != nil {
 		return err
 	}
@@ -1078,7 +1103,7 @@ func (n *nodeClient) installFetchedNodeBuild(ctx context.Context, nodeArch strin
 	if err != nil {
 		return err
 	}
-	raw, err := os.ReadFile(path) //nolint:gosec // G304: the release client's verified cached artifact.
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		return contract.NewFault(contract.Unavailable, "the verified node binary is not readable", err.Error())
 	}
@@ -1099,7 +1124,7 @@ func (n *nodeClient) installUploadedBuild(ctx context.Context, raw []byte) error
 	if err := n.remote.Upload(ctx, dir, files); err != nil {
 		return contract.NewFault(contract.Unavailable, "could not upload the node binary", err.Error())
 	}
-	defer func() { _ = n.remote.Remove(context.Background(), dir) }()
+	defer func() { _ = n.remote.Remove(context.WithoutCancel(ctx), dir) }()
 	_, err = n.callRaw(ctx, methodUpgradeInstall, rpcInstallParams{Path: dir + "/eregion", SHA256: hex.EncodeToString(sum[:])}, rpcCallOptions{})
 	return err
 }
@@ -1140,12 +1165,9 @@ func (n *nodeClient) callRaw(ctx context.Context, method string, params any, opt
 		_ = pw.CloseWithError(io.EOF)
 		runErr <- err
 	}()
-	result, got, parseErr := readRPCResult(pr, opts.OnEvent)
+	result, got := readRPCResult(pr, opts.OnEvent)
 	err = <-runErr
 	if got {
-		if parseErr != nil {
-			return nil, parseErr
-		}
 		if !result.OK {
 			if result.Error != nil {
 				return nil, result.Error
@@ -1175,29 +1197,38 @@ func (n *nodeClient) remoteTarget() string {
 	return n.route.User + "@" + n.route.Address
 }
 
-func readRPCResult(r io.Reader, onEvent func(rpc.EventBody)) (rpc.Result, bool, error) {
+func readRPCResult(r io.Reader, onEvent func(rpc.EventBody)) (rpc.Result, bool) {
 	reader := bufio.NewReaderSize(r, 256*1024)
 	for {
 		line, err := reader.ReadBytes('\n')
-		if len(bytes.TrimSpace(line)) > 0 {
-			var envelope struct {
-				rpc.Result
-				Event *rpc.EventBody `json:"event"`
-			}
-			if jerr := json.Unmarshal(line, &envelope); jerr == nil {
-				if envelope.Type == "result" {
-					_, _ = io.Copy(io.Discard, reader)
-					return envelope.Result, true, nil
-				}
-				if envelope.Type == "event" && envelope.Event != nil && onEvent != nil {
-					onEvent(*envelope.Event)
-				}
-			}
+		if result, ok := parseRPCResultLine(line, reader, onEvent); ok {
+			return result, true
 		}
 		if err != nil {
-			return rpc.Result{}, false, nil
+			return rpc.Result{}, false
 		}
 	}
+}
+
+func parseRPCResultLine(line []byte, reader *bufio.Reader, onEvent func(rpc.EventBody)) (rpc.Result, bool) {
+	if len(bytes.TrimSpace(line)) == 0 {
+		return rpc.Result{}, false
+	}
+	var envelope struct {
+		rpc.Result
+		Event *rpc.EventBody `json:"event"`
+	}
+	if json.Unmarshal(line, &envelope) != nil {
+		return rpc.Result{}, false
+	}
+	if envelope.Type == "result" {
+		_, _ = io.Copy(io.Discard, reader)
+		return envelope.Result, true
+	}
+	if envelope.Type == "event" && envelope.Event != nil && onEvent != nil {
+		onEvent(*envelope.Event)
+	}
+	return rpc.Result{}, false
 }
 
 type rpcTail struct {
@@ -1272,79 +1303,15 @@ func serveNodeRPC(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer
 	if request.Stream && request.Method != methodImagePush {
 		return writeRPCResult(stdout, nil, contract.NewFault(contract.Usage, "method does not accept a streamed payload", "Omit \"stream\" unless the method documents a payload."))
 	}
-	for _, value := range request.Secrets {
-		registry.Add(value)
-	}
-	if request.Method == methodCloudflareConfigure {
-		if decoded, err := base64Decode(request.Secrets[rpcCloudflareTokenSecret]); err == nil && len(decoded) > 0 {
-			registry.Add(string(decoded))
-			clearBytes(decoded)
-		}
-	}
-	if request.Method == methodSubmit {
-		if decoded, err := decodeWebhookSecret(request.Secrets[rpcWebhookSecretKey]); err == nil && len(decoded) > 0 {
-			registry.Add(string(decoded))
-			clearBytes(decoded)
-		}
-	}
+	registerNodeRPCSecrets(registry, request)
 	if os.Geteuid() != 0 {
 		return writeRPCResult(stdout, nil, contract.NewFault(contract.PreconditionFailed, "eregion node rpc must run as root", "Run it through sudo -n /usr/local/bin/eregion node rpc."))
 	}
-	if request.Method == methodVersion {
-		return writeRPCResult(stdout, rpcVersionResult{
-			Version: buildinfo.Version, Commit: buildinfo.Commit, OS: runtime.GOOS, Arch: runtime.GOARCH,
-		}, nil)
+	if code, handled := dispatchNodeRPCBeforeVersion(ctx, request, stdout); handled {
+		return code
 	}
-	if request.Method == methodUpgradeInstall {
-		var params rpcInstallParams
-		if err := decodeRPCParams(request.Params, &params); err != nil {
-			return writeRPCResult(stdout, nil, err)
-		}
-		if err := installNodeBinary(ctx, params); err != nil {
-			return writeRPCResult(stdout, nil, err)
-		}
-		return writeRPCResult(stdout, map[string]bool{"installed": true}, nil)
-	}
-	if err := checkNodeClientVersion(request); err != nil {
-		return writeRPCResult(stdout, nil, err)
-	}
-	if request.Method == methodFollow {
-		if _, err := validateFollowRPC(request); err != nil {
-			return writeRPCResult(stdout, nil, err)
-		}
-	}
-	if isHostMethod(request.Method) {
-		data, err := dispatchHostMethod(ctx, request, stdout, registry)
-		return writeRPCResult(stdout, data, err)
-	}
-	// Docker observations and log streaming do not need the control database.
-	if request.Method == methodWorkloads {
-		var params rpcWorkloadParams
-		if err := decodeRPCParams(request.Params, &params); err != nil {
-			return writeRPCResult(stdout, nil, err)
-		}
-		data, err := observeNodeWorkloads(ctx, params)
-		return writeRPCResult(stdout, data, err)
-	}
-	if request.Method == methodLogs {
-		var params rpcLogParams
-		if err := decodeRPCParams(request.Params, &params); err != nil {
-			return writeRPCResult(stdout, nil, err)
-		}
-		data, err := streamNodeLogs(ctx, params, stdout, registry)
-		return writeRPCResult(stdout, data, err)
-	}
-	// The human factor, token store and handoff exist without the control
-	// database: a recovery export must work while PostgreSQL is unreachable.
-	if data, handled, err := dispatchLocalMethod(ctx, request, payload, stdout); handled {
-		registerRPCMethodSecrets(registry, request.Method, data)
-		return writeRPCResult(stdout, data, err)
-	}
-	// The vault export is verified here, inside the same request that returns
-	// the value, and before the control database is opened so a recovery
-	// export still needs its factor while PostgreSQL is unreachable.
-	if err := guardLocalFactor(protect.NewStore(), request); err != nil {
-		return writeRPCResult(stdout, nil, err)
+	if code, handled := dispatchNodeRPCLocal(ctx, request, payload, stdout, registry); handled {
+		return code
 	}
 
 	logger := slog.New(slog.NewTextHandler(safeLogWriter{out: stderr, registry: registry}, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -1362,6 +1329,93 @@ func serveNodeRPC(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer
 		return writeRPCResult(stdout, nil, err)
 	}
 	return writeRPCResult(stdout, data, nil)
+}
+
+// registerNodeRPCSecrets adds request secrets that must be redacted from every
+// diagnostic line emitted while the request runs.
+func registerNodeRPCSecrets(registry *secrets.Registry, request rpc.Request) {
+	for _, value := range request.Secrets {
+		registry.Add(value)
+	}
+	switch request.Method {
+	case methodCloudflareConfigure:
+		if decoded, err := base64Decode(request.Secrets[rpcCloudflareTokenSecret]); err == nil && len(decoded) > 0 {
+			registry.Add(string(decoded))
+			clearBytes(decoded)
+		}
+	case methodSubmit:
+		if decoded, err := decodeWebhookSecret(request.Secrets[rpcWebhookSecretKey]); err == nil && len(decoded) > 0 {
+			registry.Add(string(decoded))
+			clearBytes(decoded)
+		}
+	}
+}
+
+// dispatchNodeRPCBeforeVersion handles methods answered before the node client
+// build is checked against the caller.
+func dispatchNodeRPCBeforeVersion(ctx context.Context, request rpc.Request, stdout io.Writer) (int, bool) {
+	if request.Method == methodVersion {
+		return writeRPCResult(stdout, rpcVersionResult{
+			Version: buildinfo.Version, Commit: buildinfo.Commit, OS: runtime.GOOS, Arch: runtime.GOARCH,
+		}, nil), true
+	}
+	if request.Method == methodUpgradeInstall {
+		var params rpcInstallParams
+		if err := decodeRPCParams(request.Params, &params); err != nil {
+			return writeRPCResult(stdout, nil, err), true
+		}
+		if err := installNodeBinary(ctx, params); err != nil {
+			return writeRPCResult(stdout, nil, err), true
+		}
+		return writeRPCResult(stdout, map[string]bool{"installed": true}, nil), true
+	}
+	if err := checkNodeClientVersion(request); err != nil {
+		return writeRPCResult(stdout, nil, err), true
+	}
+	if request.Method == methodFollow {
+		if _, err := validateFollowRPC(request); err != nil {
+			return writeRPCResult(stdout, nil, err), true
+		}
+	}
+	return 0, false
+}
+
+// dispatchNodeRPCLocal handles methods that need no control-plane database.
+func dispatchNodeRPCLocal(ctx context.Context, request rpc.Request, payload io.Reader, stdout io.Writer, registry *secrets.Registry) (int, bool) {
+	if isHostMethod(request.Method) {
+		data, err := dispatchHostMethod(ctx, request, stdout, registry)
+		return writeRPCResult(stdout, data, err), true
+	}
+	// Docker observations and log streaming do not need the control database.
+	if request.Method == methodWorkloads {
+		var params rpcWorkloadParams
+		if err := decodeRPCParams(request.Params, &params); err != nil {
+			return writeRPCResult(stdout, nil, err), true
+		}
+		data, err := observeNodeWorkloads(ctx, params)
+		return writeRPCResult(stdout, data, err), true
+	}
+	if request.Method == methodLogs {
+		var params rpcLogParams
+		if err := decodeRPCParams(request.Params, &params); err != nil {
+			return writeRPCResult(stdout, nil, err), true
+		}
+		data, err := streamNodeLogs(ctx, params, stdout, registry)
+		return writeRPCResult(stdout, data, err), true
+	}
+	// The human factor, token store and handoff exist without the control
+	// database: a recovery export must work while PostgreSQL is unreachable.
+	if data, handled, err := dispatchLocalMethod(ctx, request, payload, stdout); handled {
+		registerRPCMethodSecrets(registry, request.Method, data)
+		return writeRPCResult(stdout, data, err), true
+	}
+	// The vault export is verified here, inside the same request that returns
+	// the value, and before the control database is opened so a recovery
+	// export still needs its factor while PostgreSQL is unreachable.
+	if err := guardLocalFactor(protect.NewStore(), request); err != nil {
+		return writeRPCResult(stdout, nil, err), true
+	}
+	return 0, false
 }
 
 // openNodeApp has already performed the full readiness check. Reuse that
@@ -1403,155 +1457,202 @@ func registerRPCMethodSecrets(registry *secrets.Registry, method string, data an
 // dispatchLocalMethod handles node-local requests that need no control-plane
 // pool. The boolean reports whether the method was handled.
 func dispatchLocalMethod(ctx context.Context, request rpc.Request, payload io.Reader, out io.Writer) (any, bool, error) {
+	switch {
+	case isLocalProtectMethod(request.Method):
+		data, err := dispatchLocalProtect(request)
+		return data, true, err
+	case isLocalTokenMethod(request.Method):
+		data, err := dispatchLocalToken(request)
+		return data, true, err
+	case isLocalMetricsMethod(request.Method):
+		data, err := dispatchLocalMetrics(ctx, request)
+		return data, true, err
+	case request.Method == methodNodeInfo:
+		data, err := dispatchLocalNodeInfo(ctx, request)
+		return data, true, err
+	case request.Method == methodImagePush:
+		data, err := dispatchLocalImagePush(ctx, request, payload, out)
+		return data, true, err
+	case request.Method == methodHandoffExport:
+		data, err := dispatchLocalHandoff(ctx, request)
+		return data, true, err
+	default:
+		return nil, false, nil
+	}
+}
+
+func isLocalProtectMethod(method string) bool {
+	switch method {
+	case methodProtectInit, methodProtectConfirm, methodProtectStatus:
+		return true
+	}
+	return false
+}
+
+func isLocalTokenMethod(method string) bool {
+	switch method {
+	case methodTokenCreate, methodTokenList, methodTokenRevoke:
+		return true
+	}
+	return false
+}
+
+func isLocalMetricsMethod(method string) bool {
+	switch method {
+	case methodMetricsShow, methodMetricsEndpoint, methodMetricsRotate:
+		return true
+	}
+	return false
+}
+
+func dispatchLocalProtect(request rpc.Request) (any, error) {
 	switch request.Method {
 	case methodProtectInit:
 		var params rpcProtectInitParams
 		if err := decodeRPCParams(request.Params, &params); err != nil {
-			return nil, true, err
+			return nil, err
 		}
-		setup, err := protect.NewStore().Init(params.Rotate, params.Label, request.Secrets[protect.CodeSecret])
-		return setup, true, err
+		return protect.NewStore().Init(params.Rotate, params.Label, request.Secrets[protect.CodeSecret])
 	case methodProtectConfirm:
 		if err := decodeRPCParams(request.Params, &struct{}{}); err != nil {
-			return nil, true, err
+			return nil, err
 		}
-		status, err := protect.NewStore().Confirm(request.Secrets[protect.CodeSecret])
-		return status, true, err
-	case methodProtectStatus:
+		return protect.NewStore().Confirm(request.Secrets[protect.CodeSecret])
+	default:
 		if err := decodeRPCParams(request.Params, &struct{}{}); err != nil {
-			return nil, true, err
+			return nil, err
 		}
-		status, err := protect.NewStore().Status()
-		return status, true, err
+		return protect.NewStore().Status()
+	}
+}
+
+func dispatchLocalToken(request rpc.Request) (any, error) {
+	switch request.Method {
 	case methodTokenCreate:
 		var params rpcTokenCreateParams
 		if err := decodeRPCParams(request.Params, &params); err != nil {
-			return nil, true, err
+			return nil, err
 		}
 		if err := protect.NewStore().Verify(request.Secrets[protect.CodeSecret]); err != nil {
-			return nil, true, err
+			return nil, err
 		}
-		issued, err := tokens.Create(authFilePath(), tokens.CreateRequest{
+		return tokens.Create(authFilePath(), tokens.CreateRequest{
 			App: params.App, Environment: params.Environment, Name: params.Name,
 			TTL: time.Duration(params.TTLSeconds) * time.Second,
 		}, time.Now())
-		if err != nil {
-			return nil, true, err
-		}
-		// The API watches the token store, so the new hash authenticates on
-		// its next request without an eregion-api.service restart.
-		return issued, true, nil
 	case methodTokenList:
 		if err := decodeRPCParams(request.Params, &struct{}{}); err != nil {
-			return nil, true, err
+			return nil, err
 		}
 		list, err := tokens.List(authFilePath())
 		if err != nil {
-			return nil, true, err
+			return nil, err
 		}
-		return map[string]any{"tokens": list}, true, nil
-	case methodTokenRevoke:
+		return map[string]any{"tokens": list}, nil
+	default:
 		var params rpcTokenRevokeParams
 		if err := decodeRPCParams(request.Params, &params); err != nil {
-			return nil, true, err
+			return nil, err
 		}
 		if params.Confirm != params.Name {
-			return nil, true, contract.NewFault(contract.ConfirmationRequired, "token revocation requires exact name confirmation", "Pass --confirm "+params.Name+" after checking eregion token list.")
-		}
-		metadata, err := tokens.Revoke(authFilePath(), params.Name)
-		if err != nil {
-			return nil, true, err
+			return nil, contract.NewFault(contract.ConfirmationRequired, "token revocation requires exact name confirmation", "Pass --confirm "+params.Name+" after checking eregion token list.")
 		}
 		// The API watches the token store, so the revocation applies on its
 		// next request without an eregion-api.service restart.
-		return metadata, true, nil
+		return tokens.Revoke(authFilePath(), params.Name)
+	}
+}
+
+func dispatchLocalMetrics(ctx context.Context, request rpc.Request) (any, error) {
+	switch request.Method {
 	case methodMetricsShow:
 		if err := decodeRPCParams(request.Params, &struct{}{}); err != nil {
-			return nil, true, err
+			return nil, err
 		}
-		snapshot, err := collectNodeMetrics(ctx)
-		return snapshot, true, err
+		return collectNodeMetrics(ctx)
 	case methodMetricsEndpoint:
 		if err := decodeRPCParams(request.Params, &struct{}{}); err != nil {
-			return nil, true, err
+			return nil, err
 		}
-		info, err := host.TelemetryEndpointInfo()
-		return info, true, err
-	case methodMetricsRotate:
+		return host.TelemetryEndpointInfo()
+	default:
 		if err := decodeRPCParams(request.Params, &struct{}{}); err != nil {
-			return nil, true, err
+			return nil, err
 		}
-		rotation, err := host.RotateTelemetryCredential(ctx, request.Confirm, request.DryRun, request.Secrets["metrics.htpasswd"])
-		return rotation, true, err
-	case methodNodeInfo:
-		if err := decodeRPCParams(request.Params, &struct{}{}); err != nil {
-			return nil, true, err
-		}
-		config, err := host.LoadNodeFile(host.DefaultNodeConfigPath())
-		if err != nil {
-			return nil, true, err
-		}
-		if strings.TrimSpace(config.Hostname) == "" {
-			return nil, true, contract.NewFault(contract.PreconditionFailed, "the node has no recorded main hostname", "Run eregion apply to record it before using CI or push-to-deploy URLs.")
-		}
-		workspace, workspaceErr := readNodeWorkspace(ctx)
-		result := rpcNodeInfoResult{Node: config.Node, Hostname: config.Hostname, Platform: host.PlatformSummary(), Workspace: workspace}
-		if workspaceErr != nil {
-			// The node name remains available for read-only UI labels, but the
-			// workspace read is explicitly unknown rather than unconfigured.
-			result.WorkspaceError = contract.Classify(workspaceErr).Message
-		}
-		return result, true, nil
-	case methodImagePush:
-		var params rpcImagePushParams
-		if err := decodeRPCParams(request.Params, &params); err != nil {
-			return nil, true, err
-		}
-		if !request.Stream {
-			return nil, true, contract.NewFault(contract.InputRequired, "image.push requires a streamed image payload", "Set \"stream\": true and send a docker save tar on stdin after the request line.")
-		}
-		result, err := pushNodeImage(ctx, params, payload, out)
-		return result, true, err
-	case methodHandoffExport:
-		if err := decodeRPCParams(request.Params, &struct{}{}); err != nil {
-			return nil, true, err
-		}
-		if err := protect.NewStore().Verify(request.Secrets[protect.CodeSecret]); err != nil {
-			return nil, true, err
-		}
-		config, err := host.LoadNodeFile(host.DefaultNodeConfigPath())
-		if err != nil {
-			return nil, true, err
-		}
-		if strings.TrimSpace(config.Hostname) == "" {
-			return nil, true, contract.NewFault(contract.PreconditionFailed, "the node has no recorded main hostname", "Run eregion apply to record it before re-exporting the handoff.")
-		}
-		hostKey, err := host.HostKeySummary()
-		if err != nil {
-			return nil, true, contract.NewFault(contract.PreconditionFailed, "the node's SSH host key is not readable", err.Error())
-		}
-		if err := host.LoadServiceEnv(host.ServiceEnvPath); err != nil {
-			return nil, true, contract.NewFault(contract.Unavailable, "the node service configuration is not readable", err.Error())
-		}
-		dsn := os.Getenv("EREGION_DATABASE_URL")
-		if strings.TrimSpace(dsn) == "" {
-			return nil, true, contract.NewFault(contract.InputRequired, "the node has no control database URL", "Check "+host.ServiceEnvPath+" on the node.")
-		}
-		workspace, err := readWorkspaceFromDSN(ctx, dsn)
-		if err != nil {
-			return nil, true, err
-		}
-		keyring, err := os.ReadFile(filepath.Join(host.DefaultLayout().ConfigDir, host.VaultKeyringName)) //nolint:gosec // G304: the fixed root-only keyring path.
-		if err != nil {
-			return nil, true, contract.NewFault(contract.PreconditionFailed, "the node's vault keyring is not readable", "Check "+host.VaultKeyringName+" under the configuration directory.")
-		}
-		return rpcHandoffExportResult{
-			Node: config.Node, Hostname: config.Hostname, Platform: host.PlatformSummary(),
-			SSHHostKey: hostKey, DatabaseURL: dsn, VaultKeyring: strings.TrimSpace(string(keyring)),
-			Workspace: workspace,
-		}, true, nil
+		return host.RotateTelemetryCredential(ctx, request.Confirm, request.DryRun, request.Secrets["metrics.htpasswd"])
 	}
-	return nil, false, nil
+}
+
+func dispatchLocalNodeInfo(ctx context.Context, request rpc.Request) (any, error) {
+	if err := decodeRPCParams(request.Params, &struct{}{}); err != nil {
+		return nil, err
+	}
+	config, err := host.LoadNodeFile(host.DefaultNodeConfigPath())
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(config.Hostname) == "" {
+		return nil, contract.NewFault(contract.PreconditionFailed, "the node has no recorded main hostname", "Run eregion apply to record it before using CI or push-to-deploy URLs.")
+	}
+	workspace, workspaceErr := readNodeWorkspace(ctx)
+	result := rpcNodeInfoResult{Node: config.Node, Hostname: config.Hostname, Platform: host.PlatformSummary(), Workspace: workspace}
+	if workspaceErr != nil {
+		// The node name remains available for read-only UI labels, but the
+		// workspace read is explicitly unknown rather than unconfigured.
+		result.WorkspaceError = contract.Classify(workspaceErr).Message
+	}
+	return result, nil
+}
+
+func dispatchLocalImagePush(ctx context.Context, request rpc.Request, payload io.Reader, out io.Writer) (any, error) {
+	var params rpcImagePushParams
+	if err := decodeRPCParams(request.Params, &params); err != nil {
+		return nil, err
+	}
+	if !request.Stream {
+		return nil, contract.NewFault(contract.InputRequired, "image.push requires a streamed image payload", "Set \"stream\": true and send a docker save tar on stdin after the request line.")
+	}
+	return pushNodeImage(ctx, params, payload, out)
+}
+
+func dispatchLocalHandoff(ctx context.Context, request rpc.Request) (any, error) {
+	if err := decodeRPCParams(request.Params, &struct{}{}); err != nil {
+		return nil, err
+	}
+	if err := protect.NewStore().Verify(request.Secrets[protect.CodeSecret]); err != nil {
+		return nil, err
+	}
+	config, err := host.LoadNodeFile(host.DefaultNodeConfigPath())
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(config.Hostname) == "" {
+		return nil, contract.NewFault(contract.PreconditionFailed, "the node has no recorded main hostname", "Run eregion apply to record it before re-exporting the handoff.")
+	}
+	hostKey, err := host.HostKeySummary()
+	if err != nil {
+		return nil, contract.NewFault(contract.PreconditionFailed, "the node's SSH host key is not readable", err.Error())
+	}
+	if err := host.LoadServiceEnv(host.ServiceEnvPath); err != nil {
+		return nil, contract.NewFault(contract.Unavailable, "the node service configuration is not readable", err.Error())
+	}
+	dsn := os.Getenv("EREGION_DATABASE_URL")
+	if strings.TrimSpace(dsn) == "" {
+		return nil, contract.NewFault(contract.InputRequired, "the node has no control database URL", "Check "+host.ServiceEnvPath+" on the node.")
+	}
+	workspace, err := readWorkspaceFromDSN(ctx, dsn)
+	if err != nil {
+		return nil, err
+	}
+	keyring, err := os.ReadFile(filepath.Join(host.DefaultLayout().ConfigDir, host.VaultKeyringName))
+	if err != nil {
+		return nil, contract.NewFault(contract.PreconditionFailed, "the node's vault keyring is not readable", "Check "+host.VaultKeyringName+" under the configuration directory.")
+	}
+	return rpcHandoffExportResult{
+		Node: config.Node, Hostname: config.Hostname, Platform: host.PlatformSummary(),
+		SSHHostKey: hostKey, DatabaseURL: dsn, VaultKeyring: strings.TrimSpace(string(keyring)),
+		Workspace: workspace,
+	}, nil
 }
 
 // readNodeWorkspace reads the authoritative identity from the node's service
@@ -1636,7 +1737,7 @@ func openNodeApp(ctx context.Context, logger *slog.Logger, registry *secrets.Reg
 		}
 		registryHostIdentity = &identity
 	}
-	run, err := controlplane.New(store, logger, controlplane.WorkerConfig{
+	run, err := controlplane.New(store, logger, controlplane.WorkerConfig{ //nolint:contextcheck // Runtime construction owns its initialization context; request context governs subsequent work.
 		Concurrency: 0, SecretResolver: resolver, LocalNodeName: os.Getenv("EREGION_NODE_NAME"),
 		Redaction: registry, Vault: parts.Vault,
 		RegistryEndpoint:     registryEndpoint,
@@ -1678,6 +1779,48 @@ func checkNodeClientVersion(request rpc.Request) error {
 	return fault
 }
 
+type nodeMethodGroup int
+
+const (
+	nodeMethodUnknown nodeMethodGroup = iota
+	nodeMethodBuildConcurrency
+	nodeMethodSubmit
+	nodeMethodOperation
+	nodeMethodRetention
+	nodeMethodSecret
+	nodeMethodCloudflare
+	nodeMethodDefinition
+	nodeMethodMisc
+)
+
+var nodeMethodGroups = map[string]nodeMethodGroup{
+	methodBuildConcurrencyGet: nodeMethodBuildConcurrency,
+	methodBuildConcurrencySet: nodeMethodBuildConcurrency,
+	methodTest:                nodeMethodSubmit,
+	methodSubmit:              nodeMethodSubmit,
+	methodGet:                 nodeMethodOperation,
+	methodDiagnose:            nodeMethodOperation,
+	methodEvents:              nodeMethodOperation,
+	methodCancel:              nodeMethodOperation,
+	methodInventory:           nodeMethodMisc,
+	methodRetentionPlan:       nodeMethodRetention,
+	methodRetentionShow:       nodeMethodRetention,
+	methodRetentionSet:        nodeMethodRetention,
+	methodOperationsList:      nodeMethodMisc,
+	methodSecretSet:           nodeMethodSecret,
+	methodSecretArchive:       nodeMethodSecret,
+	methodSecretMetadata:      nodeMethodSecret,
+	methodSecretList:          nodeMethodSecret,
+	methodSecretExport:        nodeMethodSecret,
+	methodCloudflareConfigure: nodeMethodCloudflare,
+	methodCloudflareStatus:    nodeMethodCloudflare,
+	methodDefinitionDNSGet:    nodeMethodDefinition,
+	methodDefinitionPlan:      nodeMethodDefinition,
+	methodDefinitionApply:     nodeMethodDefinition,
+	methodDefinitionDNSSet:    nodeMethodDefinition,
+	methodReady:               nodeMethodMisc,
+}
+
 func dispatchNodeMethod(ctx context.Context, app api.AppService, request rpc.Request) (any, error) {
 	actor, err := nodeOperator(request)
 	if err != nil {
@@ -1687,16 +1830,43 @@ func dispatchNodeMethod(ctx context.Context, app api.AppService, request rpc.Req
 	// cancellation may open any operation, not only submissions by this actor.
 	// Submissions keep the operator actor for the audit trail.
 	authority := operations.OperatorAuthority(actor)
-	switch request.Method {
-	case methodBuildConcurrencyGet, methodBuildConcurrencySet:
+	switch nodeMethodGroups[request.Method] {
+	case nodeMethodBuildConcurrency:
 		return dispatchBuildConcurrency(ctx, app, actor, request)
+	case nodeMethodSubmit:
+		return dispatchNodeSubmit(ctx, app, request, actor)
+	case nodeMethodOperation:
+		return dispatchNodeOperation(ctx, app, request, authority)
+	case nodeMethodRetention:
+		return dispatchNodeRetention(ctx, app, request)
+	case nodeMethodSecret:
+		return dispatchNodeSecret(ctx, app, request, actor)
+	case nodeMethodCloudflare:
+		return dispatchNodeCloudflare(ctx, app, request, actor)
+	case nodeMethodDefinition:
+		return dispatchNodeDefinition(ctx, app, request, actor)
+	case nodeMethodMisc:
+		return dispatchNodeMisc(ctx, app, request, actor, authority)
+	case nodeMethodUnknown:
+		return nil, unknownNodeMethod(request.Method)
+	default:
+		return nil, unknownNodeMethod(request.Method)
+	}
+}
+
+func unknownNodeMethod(method string) error {
+	return contract.NewFault(contract.Usage, "unknown node RPC method "+method, "Use a method supported by this node build.")
+}
+
+func dispatchNodeSubmit(ctx context.Context, app api.AppService, request rpc.Request, actor contract.Actor) (any, error) {
+	switch request.Method {
 	case methodTest:
 		var params rpcSubmitParams
 		if err := decodeRPCParams(request.Params, &params); err != nil {
 			return nil, err
 		}
 		return app.SubmitDiagnostic(ctx, actor, params.Input, request.IdempotencyKey, request.DryRun)
-	case methodSubmit:
+	default:
 		var params rpcSubmitParams
 		if err := decodeRPCParams(request.Params, &params); err != nil {
 			return nil, err
@@ -1730,13 +1900,14 @@ func dispatchNodeMethod(ctx context.Context, app api.AppService, request rpc.Req
 			Operation: receipt.Operation, Replay: receipt.Replay,
 			WebhookSecretActivated: receipt.WebhookSecretActivated,
 		}, nil
+	}
+}
+
+func dispatchNodeOperation(ctx context.Context, app api.AppService, request rpc.Request, authority operations.Authority) (any, error) {
+	switch request.Method {
 	case methodGet:
-		var params rpcOperationParams
-		if err := decodeRPCParams(request.Params, &params); err != nil {
-			return nil, err
-		}
-		id := contract.OperationID(params.OperationID)
-		if err := id.Validate(); err != nil {
+		id, err := decodeOperationID(request.Params)
+		if err != nil {
 			return nil, err
 		}
 		return app.GetOperation(ctx, authority, id)
@@ -1764,44 +1935,32 @@ func dispatchNodeMethod(ctx context.Context, app api.AppService, request rpc.Req
 		}
 		return app.OperationEvents(ctx, authority, contract.Cursor{OperationID: id, After: params.After}, params.Limit)
 	case methodCancel:
-		var params rpcOperationParams
-		if err := decodeRPCParams(request.Params, &params); err != nil {
-			return nil, err
-		}
-		id := contract.OperationID(params.OperationID)
-		if err := id.Validate(); err != nil {
+		id, err := decodeOperationID(request.Params)
+		if err != nil {
 			return nil, err
 		}
 		return app.CancelOperation(ctx, authority, id)
-	case methodInventory:
-		var params rpcInventoryParams
-		if err := decodeRPCParams(request.Params, &params); err != nil {
-			return nil, err
-		}
-		query, err := params.query()
-		if err != nil {
-			return nil, err
-		}
-		return app.Inventory(ctx, actor, query)
+	default:
+		return nil, unknownNodeMethod(request.Method)
+	}
+}
+
+func decodeOperationID(raw json.RawMessage) (contract.OperationID, error) {
+	var params rpcOperationParams
+	if err := decodeRPCParams(raw, &params); err != nil {
+		return "", err
+	}
+	id := contract.OperationID(params.OperationID)
+	if err := id.Validate(); err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+func dispatchNodeRetention(ctx context.Context, app api.AppService, request rpc.Request) (any, error) {
+	switch request.Method {
 	case methodRetentionPlan:
-		var params rpcRetentionPlanParams
-		if err := decodeRPCParams(request.Params, &params); err != nil {
-			return nil, err
-		}
-		if app.Retention == nil {
-			return nil, contract.NewFault(contract.Unavailable, "retention is not configured on this node", "Start the control-plane service on the node.")
-		}
-		inventory, localNode, err := observeLocalRetentionInventory(ctx)
-		if err != nil {
-			return nil, err
-		}
-		if params.Node != "" && localNode != "" && params.Node != localNode {
-			return nil, contract.NewFault(contract.PreconditionFailed, "the retention plan names another node", "Plan the node this request is connected to, or run the plan from its worker.")
-		}
-		if params.Node == "" {
-			params.Node = localNode
-		}
-		return app.Retention.RetentionPlanWithInventory(ctx, params.Node, params.App, params.Environment, inventory)
+		return dispatchNodeRetentionPlan(ctx, app, request)
 	case methodRetentionShow:
 		var params rpcRetentionShowParams
 		if err := decodeRPCParams(request.Params, &params); err != nil {
@@ -1823,74 +1982,122 @@ func dispatchNodeMethod(ctx context.Context, app api.AppService, request rpc.Req
 			return nil, err
 		}
 		return app.Retention.RetentionShow(ctx, "", "")
-	case methodOperationsList:
-		var params rpcOperationsListParams
-		if err := decodeRPCParams(request.Params, &params); err != nil {
-			return nil, err
-		}
-		query := operations.ListQuery{App: params.App, Environment: params.Environment, State: params.State, Limit: params.Limit}
-		return app.ListOperations(ctx, authority, query)
+	default:
+		return nil, unknownNodeMethod(request.Method)
+	}
+}
+
+func dispatchNodeRetentionPlan(ctx context.Context, app api.AppService, request rpc.Request) (any, error) {
+	var params rpcRetentionPlanParams
+	if err := decodeRPCParams(request.Params, &params); err != nil {
+		return nil, err
+	}
+	if app.Retention == nil {
+		return nil, contract.NewFault(contract.Unavailable, "retention is not configured on this node", "Start the control-plane service on the node.")
+	}
+	inventory, localNode, err := observeLocalRetentionInventory(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if params.Node != "" && localNode != "" && params.Node != localNode {
+		return nil, contract.NewFault(contract.PreconditionFailed, "the retention plan names another node", "Plan the node this request is connected to, or run the plan from its worker.")
+	}
+	if params.Node == "" {
+		params.Node = localNode
+	}
+	return app.Retention.RetentionPlanWithInventory(ctx, params.Node, params.App, params.Environment, inventory)
+}
+
+func dispatchNodeSecret(ctx context.Context, app api.AppService, request rpc.Request, actor contract.Actor) (any, error) {
+	switch request.Method {
 	case methodSecretSet:
-		var params rpcSecretParams
-		if err := decodeRPCParams(request.Params, &params); err != nil {
-			return nil, err
-		}
-		value, err := base64Decode(request.Secrets["value_base64"])
-		if err != nil {
-			return nil, contract.NewFault(contract.ValidationFailed, "invalid secret value encoding", "Send value_base64 as standard base64.")
-		}
-		defer clearBytes(value)
-		namespace, err := vault.NewNamespace(params.App, params.Environment, params.Name)
-		if err != nil {
-			return nil, err
-		}
-		return api.SetSecretValue(ctx, app.Vault, actor, namespace, value, params.ExpectedRevision)
+		return dispatchNodeSecretSet(ctx, app, request, actor)
 	case methodSecretArchive:
-		var params rpcSecretParams
-		if err := decodeRPCParams(request.Params, &params); err != nil {
-			return nil, err
-		}
-		namespace, err := vault.NewNamespace(params.App, params.Environment, params.Name)
-		if err != nil {
-			return nil, err
-		}
-		return api.ArchiveSecretValue(ctx, app.Vault, actor, namespace, params.ExpectedRevision)
+		return dispatchNodeSecretArchive(ctx, app, request, actor)
 	case methodSecretMetadata:
-		var params rpcSecretParams
-		if err := decodeRPCParams(request.Params, &params); err != nil {
-			return nil, err
-		}
-		namespace, err := vault.NewNamespace(params.App, params.Environment, params.Name)
-		if err != nil {
-			return nil, err
-		}
-		return api.GetSecretMetadata(ctx, app.Vault, namespace)
+		return dispatchNodeSecretMetadata(ctx, app, request)
 	case methodSecretList:
-		var params rpcSecretListParams
-		if err := decodeRPCParams(request.Params, &params); err != nil {
-			return nil, err
-		}
-		metadata, err := api.ListSecretMetadata(ctx, app.Vault, params.App, params.Environment, params.Limit)
-		if err != nil {
-			return nil, err
-		}
-		return map[string]any{"secrets": metadata}, nil
+		return dispatchNodeSecretList(ctx, app, request)
 	case methodSecretExport:
-		var params rpcSecretParams
-		if err := decodeRPCParams(request.Params, &params); err != nil {
-			return nil, err
-		}
-		namespace, err := vault.NewNamespace(params.App, params.Environment, params.Name)
-		if err != nil {
-			return nil, err
-		}
-		metadata, value, err := api.ExportSecretValue(ctx, app.Vault, namespace)
-		if err != nil {
-			return nil, err
-		}
-		encoded := base64Encode(value)
-		clearBytes(value)
-		return rpcSecretExportResult{Secret: metadata, ValueBase64: encoded}, nil
+		return dispatchNodeSecretExport(ctx, app, request)
+	default:
+		return nil, unknownNodeMethod(request.Method)
+	}
+}
+
+func dispatchNodeSecretSet(ctx context.Context, app api.AppService, request rpc.Request, actor contract.Actor) (any, error) {
+	var params rpcSecretParams
+	if err := decodeRPCParams(request.Params, &params); err != nil {
+		return nil, err
+	}
+	value, err := base64Decode(request.Secrets["value_base64"])
+	if err != nil {
+		return nil, contract.NewFault(contract.ValidationFailed, "invalid secret value encoding", "Send value_base64 as standard base64.")
+	}
+	defer clearBytes(value)
+	namespace, err := vault.NewNamespace(params.App, params.Environment, params.Name)
+	if err != nil {
+		return nil, err
+	}
+	return api.SetSecretValue(ctx, app.Vault, actor, namespace, value, params.ExpectedRevision)
+}
+
+func dispatchNodeSecretArchive(ctx context.Context, app api.AppService, request rpc.Request, actor contract.Actor) (any, error) {
+	var params rpcSecretParams
+	if err := decodeRPCParams(request.Params, &params); err != nil {
+		return nil, err
+	}
+	namespace, err := vault.NewNamespace(params.App, params.Environment, params.Name)
+	if err != nil {
+		return nil, err
+	}
+	return api.ArchiveSecretValue(ctx, app.Vault, actor, namespace, params.ExpectedRevision)
+}
+
+func dispatchNodeSecretMetadata(ctx context.Context, app api.AppService, request rpc.Request) (any, error) {
+	var params rpcSecretParams
+	if err := decodeRPCParams(request.Params, &params); err != nil {
+		return nil, err
+	}
+	namespace, err := vault.NewNamespace(params.App, params.Environment, params.Name)
+	if err != nil {
+		return nil, err
+	}
+	return api.GetSecretMetadata(ctx, app.Vault, namespace)
+}
+
+func dispatchNodeSecretList(ctx context.Context, app api.AppService, request rpc.Request) (any, error) {
+	var params rpcSecretListParams
+	if err := decodeRPCParams(request.Params, &params); err != nil {
+		return nil, err
+	}
+	metadata, err := api.ListSecretMetadata(ctx, app.Vault, params.App, params.Environment, params.Limit)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"secrets": metadata}, nil
+}
+
+func dispatchNodeSecretExport(ctx context.Context, app api.AppService, request rpc.Request) (any, error) {
+	var params rpcSecretParams
+	if err := decodeRPCParams(request.Params, &params); err != nil {
+		return nil, err
+	}
+	namespace, err := vault.NewNamespace(params.App, params.Environment, params.Name)
+	if err != nil {
+		return nil, err
+	}
+	metadata, value, err := api.ExportSecretValue(ctx, app.Vault, namespace)
+	if err != nil {
+		return nil, err
+	}
+	encoded := base64Encode(value)
+	clearBytes(value)
+	return rpcSecretExportResult{Secret: metadata, ValueBase64: encoded}, nil
+}
+
+func dispatchNodeCloudflare(ctx context.Context, app api.AppService, request rpc.Request, actor contract.Actor) (any, error) {
+	switch request.Method {
 	case methodCloudflareConfigure:
 		var params rpcCloudflareConfigureParams
 		if err := decodeRPCParams(request.Params, &params); err != nil {
@@ -1916,6 +2123,13 @@ func dispatchNodeMethod(ctx context.Context, app api.AppService, request rpc.Req
 			return nil, err
 		}
 		return map[string]any{"credentials": metadata}, nil
+	default:
+		return nil, unknownNodeMethod(request.Method)
+	}
+}
+
+func dispatchNodeDefinition(ctx context.Context, app api.AppService, request rpc.Request, actor contract.Actor) (any, error) {
+	switch request.Method {
 	case methodDefinitionDNSGet:
 		return app.GetDefinitionDNSPolicy(ctx, actor)
 	case methodDefinitionPlan:
@@ -1942,13 +2156,37 @@ func dispatchNodeMethod(ctx context.Context, app api.AppService, request rpc.Req
 			return nil, contract.NewFault(contract.Usage, "definition DNS policy has no dry-run mutation", "Read the policy with cloudflare status; set it with an exact expected revision.")
 		}
 		return app.SetDefinitionDNSPolicy(ctx, actor, params)
+	default:
+		return nil, unknownNodeMethod(request.Method)
+	}
+}
+
+func dispatchNodeMisc(ctx context.Context, app api.AppService, request rpc.Request, actor contract.Actor, authority operations.Authority) (any, error) {
+	switch request.Method {
+	case methodInventory:
+		var params rpcInventoryParams
+		if err := decodeRPCParams(request.Params, &params); err != nil {
+			return nil, err
+		}
+		query, err := params.query()
+		if err != nil {
+			return nil, err
+		}
+		return app.Inventory(ctx, actor, query)
+	case methodOperationsList:
+		var params rpcOperationsListParams
+		if err := decodeRPCParams(request.Params, &params); err != nil {
+			return nil, err
+		}
+		query := operations.ListQuery{App: params.App, Environment: params.Environment, State: params.State, Limit: params.Limit}
+		return app.ListOperations(ctx, authority, query)
 	case methodReady:
 		if err := app.Ready(ctx); err != nil {
 			return nil, err
 		}
 		return map[string]bool{"ready": true}, nil
 	default:
-		return nil, contract.NewFault(contract.Usage, "unknown node RPC method "+request.Method, "Use a method supported by this node build.")
+		return nil, unknownNodeMethod(request.Method)
 	}
 }
 
@@ -2023,11 +2261,11 @@ func installNodeBinary(ctx context.Context, params rpcInstallParams) error {
 	if _, err := hex.DecodeString(params.SHA256); err != nil {
 		return contract.NewFault(contract.ValidationFailed, "the binary checksum is malformed", "Push the binary through eregion --auto-upgrade-nodes.")
 	}
-	source, err := os.Open(params.Path) //nolint:gosec // G304: bounded to /tmp/eregion-* above.
+	source, err := os.Open(params.Path)
 	if err != nil {
 		return contract.NewFault(contract.PreconditionFailed, "the uploaded binary is not readable", "Push the binary again.")
 	}
-	defer source.Close()
+	defer func() { _ = source.Close() }()
 	info, err := source.Stat()
 	if err != nil || !info.Mode().IsRegular() {
 		return contract.NewFault(contract.PreconditionFailed, "the uploaded binary is not a regular file", "Push the binary again.")
@@ -2053,7 +2291,7 @@ func installNodeBinary(ctx context.Context, params rpcInstallParams) error {
 	if err := verifyReleaseUpload(ctx, &release.Client{}, filepath.Dir(params.Path), got, buildinfo.Channel, runtime.GOARCH); err != nil {
 		return err
 	}
-	if err := os.Chmod(stagePath, 0o755); err != nil {
+	if err := os.Chmod(stagePath, 0o755); err != nil { //nolint:gosec // G302: the installed node binary must be executable.
 		return contract.NewFault(contract.PreconditionFailed, "could not make the node binary executable", "Check /usr/local/bin permissions.")
 	}
 	if os.Geteuid() == 0 {
@@ -2131,11 +2369,11 @@ func readReleaseDeclaration(uploadDir string) (releaseDeclaration, error) {
 	if !linked.Mode().IsRegular() || linked.Size() > releaseDeclarationMaxBytes {
 		return releaseDeclaration{}, unsafe
 	}
-	file, err := os.Open(path) //nolint:gosec // G304: a checked regular file inside the /tmp/eregion-* upload directory.
+	file, err := os.Open(path)
 	if err != nil {
 		return releaseDeclaration{}, missing
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	info, err := file.Stat()
 	if err != nil || !os.SameFile(linked, info) {
 		return releaseDeclaration{}, unsafe

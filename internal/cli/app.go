@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-	"sort"
-	"strings"
 
 	"github.com/mbvlabs/eregion/internal/appdef"
 	"github.com/mbvlabs/eregion/internal/cli/ui"
@@ -93,7 +91,7 @@ func (a *app) appSpecs() []spec {
 			{
 				use:  "export <app> <environment>",
 				meta: export,
-				args: platformTwoNames("app", "environment"),
+				args: platformTwoNames(),
 				flags: func(cmd *cobra.Command) {
 					cmd.Flags().String("out", "", "Write the definition to this new file instead of stdout")
 					cmd.Flags().Bool("inspect", false, "Export a non-applicable inspection snapshot with unsupported metadata")
@@ -195,11 +193,61 @@ func (a *app) appCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 		return result{}, setupPromptError("app create", err)
 	}
 	defer ans.clearSecrets()
+	specs, err := a.appCreateSpecs(cmd, ans)
+	if err != nil {
+		return result{}, err
+	}
+	spec := specs[0]
+	follow := !boolFlag(cmd, "detach") && (streamsNDJSON(cmd) || (interactive && ans.Deploy && followsByDefault(cmd)))
+	if err := validateFollowRequest(cmd, follow); err != nil {
+		return result{}, err
+	}
+	input := platform.AppCreateInput{Name: ans.App, ImageRepository: ans.ImageRepository, Environments: specs, Deploy: ans.Deploy}
+	if err := a.checkAppCreateConflict(cmd, ans.App); err != nil {
+		return result{}, err
+	}
+	preview, resourceSpecs, deferred, plan, err := a.appCreatePlan(cmd, ans, input, interactive)
+	if err != nil {
+		return result{}, err
+	}
+	if err := confirmAppCreate(ans, interactive, dryRun(cmd)); err != nil {
+		return result{}, err
+	}
+	summary := newAppCreateSummary(ans, spec, specs, preview, deferred, cmd)
+	if dryRun(cmd) {
+		summary.DryRun, summary.Preview, summary.plan = true, &preview, plan
+		if interactive {
+			return result{streamed: true}, nil
+		}
+		return result{data: summary, plain: summary.plainText()}, nil
+	}
+	if err := a.prepareAppCreateSecrets(cmd, ans, specs, preview, &summary); err != nil {
+		return result{}, err
+	}
+	op, err := a.submitAccepted(cmd, platform.KindAppCreate, platform.PlatformTarget().String(), input, "")
+	if err != nil {
+		return result{}, err
+	}
+	summary.OperationID = op.ID
+	summary.FirstDeployOperationID = op.FirstDeployOperationID
+	if err := a.submitAppCreateResources(cmd, resourceSpecs, op.ID, &summary); err != nil {
+		return result{}, err
+	}
+	if interactive {
+		return a.appCreateInteractiveResult(cmd, ans, spec, summary, op)
+	}
+	if streamsNDJSON(cmd) && !boolFlag(cmd, "detach") {
+		return a.appCreateNDJSONResult(cmd, ans, op)
+	}
+	return result{data: summary, plain: summary.plainText()}, nil
+}
+
+func (a *app) appCreateSpecs(cmd *cobra.Command, ans *setupAnswers) ([]platform.EnvironmentSpec, error) {
 	specs := append([]platform.EnvironmentSpec(nil), ans.PrebuiltSpecs...)
 	if len(specs) == 0 {
 		production, err := ans.environmentSpec(cmd)
 		if err != nil {
-			return result{}, err
+			return nil, err
 		}
 		staging := cloneEnvironmentSpec(production)
 		staging.Name = "staging"
@@ -208,50 +256,58 @@ func (a *app) appCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 		specs = []platform.EnvironmentSpec{production, staging}
 	}
 	if len(specs) != 2 || specs[0].Name != "production" || specs[1].Name != "staging" {
-		return result{}, contract.NewFault(contract.Internal, "app creation did not resolve production and staging", "Report the command and binary version.")
+		return nil, contract.NewFault(contract.Internal, "app creation did not resolve production and staging", "Report the command and binary version.")
 	}
 	if err := validateUniqueEnvironmentDomains(specs); err != nil {
-		return result{}, err
+		return nil, err
 	}
-	specs, err = applyGitHubAuthToSpecs(cmd, ans, specs)
+	specs, err := applyGitHubAuthToSpecs(cmd, ans, specs)
 	if err != nil {
-		return result{}, err
+		return nil, err
 	}
 	if err := validateEnvironmentGitCredentialRoles(specs); err != nil {
-		return result{}, err
+		return nil, err
 	}
 	ans.PrebuiltSpecs = specs
-	spec := specs[0]
-	follow := !boolFlag(cmd, "detach") && (streamsNDJSON(cmd) || (interactive && ans.Deploy && followsByDefault(cmd)))
-	if err := validateFollowRequest(cmd, follow); err != nil {
-		return result{}, err
-	}
-	input := platform.AppCreateInput{Name: ans.App, ImageRepository: ans.ImageRepository, Environments: specs, Deploy: ans.Deploy}
+	return specs, nil
+}
 
+func (a *app) checkAppCreateConflict(cmd *cobra.Command, appName string) error {
 	if err := validateIdempotencyFlag(cmd); err != nil {
-		return result{}, err
+		return err
 	}
-	if key, _ := cmd.Flags().GetString("idempotency-key"); key == "" {
-		// A named key reaches preview first: preview knows whether it replays
-		// an accepted submission and must skip the same conflict checks.
-		exists, err := a.appExists(cmd, ans.App)
-		if err != nil {
-			return result{}, err
-		}
-		if exists {
-			return result{}, contract.NewFault(contract.Conflict, "app "+ans.App+" already exists", "Choose another name, or inspect it with eregion app status "+ans.App+".")
-		}
+	key, _ := cmd.Flags().GetString("idempotency-key")
+	if key != "" {
+		return nil
 	}
+	// A named key reaches preview first: preview knows whether it replays
+	// an accepted submission and must skip the same conflict checks.
+	exists, err := a.appExists(cmd, appName)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+	return contract.NewFault(contract.Conflict, "app "+appName+" already exists", "Choose another name, or inspect it with eregion app status "+appName+".")
+}
+
+func (a *app) appCreatePlan(
+	cmd *cobra.Command,
+	ans *setupAnswers,
+	input platform.AppCreateInput,
+	interactive bool,
+) (platform.Preview, []platform.ResourceApplyInput, []deferredDefinitionResource, string, error) {
 	preview, err := a.previewAction(cmd, platform.KindAppCreate, platform.PlatformTarget().String(), input)
 	if err != nil {
-		return result{}, err
+		return platform.Preview{}, nil, nil, "", err
 	}
-	resourceSpecs := appResourceSpecs(ans, specs)
+	resourceSpecs := appResourceSpecs(ans, ans.PrebuiltSpecs)
 	var deferred []deferredDefinitionResource
 	if dryRun(cmd) && !preview.Replay {
 		_, deferred, err = a.bootstrapDefinitionResources(cmd, resourceSpecs, true)
 		if err != nil {
-			return result{}, err
+			return platform.Preview{}, nil, nil, "", err
 		}
 		for _, item := range deferred {
 			preview.Warnings = append(preview.Warnings, item.warning())
@@ -262,16 +318,31 @@ func (a *app) appCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, ui.PanelFit("Plan for app "+ans.App, plan, 80))
 	}
-	dry := dryRun(cmd)
-	if interactive && !dry {
-		ok, err := ui.YesNoDefault("Create app "+ans.App+" now?", "The app, its first environment and first revision are accepted in one submission; a requested first deploy is queued from it.", true)
-		if err != nil {
-			return result{}, setupPromptError("app create", err)
-		}
-		if !ok {
-			return result{}, contract.NewFault(contract.Cancelled, "app creation was not confirmed", "Nothing was written; the plan above is unchanged.")
-		}
+	return preview, resourceSpecs, deferred, plan, nil
+}
+
+func confirmAppCreate(ans *setupAnswers, interactive, dry bool) error {
+	if !interactive || dry {
+		return nil
 	}
+	ok, err := ui.YesNoDefault("Create app "+ans.App+" now?", "The app, its first environment and first revision are accepted in one submission; a requested first deploy is queued from it.", true)
+	if err != nil {
+		return setupPromptError("app create", err)
+	}
+	if !ok {
+		return contract.NewFault(contract.Cancelled, "app creation was not confirmed", "Nothing was written; the plan above is unchanged.")
+	}
+	return nil
+}
+
+func newAppCreateSummary(
+	ans *setupAnswers,
+	spec platform.EnvironmentSpec,
+	specs []platform.EnvironmentSpec,
+	preview platform.Preview,
+	deferred []deferredDefinitionResource,
+	cmd *cobra.Command,
+) setupResult {
 	summary := setupResult{
 		App: ans.App, ImageRepository: defaultRepositoryLabel(ans), Environment: ans.Environment, Protected: protectedSpec(spec), Environments: summarizeEnvironmentSpecs(specs),
 		Node: spec.Node, Source: spec.Source, Processes: spec.Processes, ConfigKeys: sortedKeys(spec.Config),
@@ -288,104 +359,118 @@ func (a *app) appCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 		summary.Warnings = append(summary.Warnings, "A first deploy was not queued because the definition declares managed resources; wait for resource health, then run `eregion deploy "+ans.App+" "+ans.Environment+"`.")
 	}
 	summary.SecretNames = setupSecretNames(ans)
-	if dry {
-		summary.DryRun, summary.Preview, summary.plan = true, &preview, plan
-		if interactive {
-			return result{streamed: true}, nil
-		}
-		return result{data: summary, plain: summary.plainText()}, nil
-	}
+	return summary
+}
 
+func (a *app) prepareAppCreateSecrets(
+	cmd *cobra.Command,
+	ans *setupAnswers,
+	specs []platform.EnvironmentSpec,
+	preview platform.Preview,
+	summary *setupResult,
+) error {
 	if preview.Replay {
 		// The original submission already wrote the values; a replay only
 		// needs the same accepted operation.
 		summary.SecretNames = setupSecretNames(ans)
-	} else {
-		if err := a.fillGitHubAuthCredential(cmd, ans); err != nil {
-			return result{}, err
-		}
-		if _, err := a.writeSetupSecretsForEnvironments(cmd, ans, specs); err != nil {
-			return result{}, err
-		}
-		summary.SecretNames = setupSecretNames(ans)
+		return nil
 	}
-	op, err := a.submitAccepted(cmd, platform.KindAppCreate, platform.PlatformTarget().String(), input, "")
+	if err := a.fillGitHubAuthCredential(cmd, ans); err != nil {
+		return err
+	}
+	if _, err := a.writeSetupSecretsForEnvironments(cmd, ans, specs); err != nil {
+		return err
+	}
+	summary.SecretNames = setupSecretNames(ans)
+	return nil
+}
+
+func (a *app) submitAppCreateResources(
+	cmd *cobra.Command,
+	resourceSpecs []platform.ResourceApplyInput,
+	operationID contract.OperationID,
+	summary *setupResult,
+) error {
+	if len(resourceSpecs) == 0 {
+		return nil
+	}
+	resourceIDs, deferred, err := a.bootstrapDefinitionResources(cmd, resourceSpecs, false)
 	if err != nil {
-		return result{}, err
+		return resourceAfterAcceptedFault(err, operationID)
 	}
-	summary.OperationID = op.ID
-	summary.FirstDeployOperationID = op.FirstDeployOperationID
-	if len(resourceSpecs) > 0 {
-		resourceIDs, deferred, err := a.bootstrapDefinitionResources(cmd, resourceSpecs, false)
-		if err != nil {
-			return result{}, resourceAfterAcceptedFault(err, op.ID)
-		}
-		summary.ResolvedResourceIDs = resourceIDs
-		summary.DeferredResources = deferred
-		for _, item := range deferred {
-			summary.Warnings = append(summary.Warnings, item.warning())
-		}
-		if len(resourceIDs) > 0 {
-			summary.Warnings = append(summary.Warnings, "Managed resources were accepted for provisioning; they are not ready until their health checks pass, and the first deploy waits for attached resources.")
-		}
+	summary.ResolvedResourceIDs = resourceIDs
+	summary.DeferredResources = deferred
+	for _, item := range deferred {
+		summary.Warnings = append(summary.Warnings, item.warning())
 	}
-	if interactive {
-		if ans.Deploy && followsByDefault(cmd) {
-			client, err := a.client(cmd)
-			if err != nil {
-				return result{}, err
-			}
-			return a.followGuidedCreate(cmd, client, op, "env/"+ans.App+"/"+ans.Environment, a.deployOutcome(ans.App, ans.Environment))
-		}
-		fmt.Fprintln(os.Stderr, "")
-		rows := [][2]string{
-			{"environment", ans.Environment},
-			{"node", ans.Node},
-			{"source", describeSource(spec.Source)},
-			{"operation", string(op.ID)},
-		}
-		if ans.Deploy {
-			rows = append(rows, [2]string{"first deploy", "queued from the revision"})
-			if summary.FirstDeployOperationID != "" {
-				rows = append(rows, [2]string{"first deploy operation", string(summary.FirstDeployOperationID)})
-			}
-		}
-		if ans.Domain != "" {
-			rows = append(rows, [2]string{"domain", ans.Domain})
-			dns := "point " + ans.Domain + " at the main node's public IPv4 address"
-			if summary.DNSRecord != nil {
-				dns = summary.DNSRecord.Type + " " + summary.DNSRecord.Name + " " + summary.DNSRecord.Value
-			}
-			rows = append(rows, [2]string{"DNS record", dns})
-		}
-		for _, id := range summary.ResolvedResourceIDs {
-			rows = append(rows, [2]string{"resource operation", string(id)})
-		}
-		footer := []string{
-			ui.Dim("the revision is desired state, not a running deployment"),
-			ui.Dim("next:"),
-			"  " + ui.Code("eregion env status "+ans.App+" "+ans.Environment+" --json"),
-		}
-		for _, item := range summary.DeferredResources {
-			footer = append(footer, item.warning())
-		}
-		if summary.FirstDeployOperationID != "" {
-			footer = append(footer, "  "+ui.Code("eregion operations follow "+string(summary.FirstDeployOperationID)))
-		}
-		fmt.Fprintln(os.Stderr, ui.Card("App "+ans.App+" created", rows, footer))
-		return result{streamed: true}, nil
+	if len(resourceIDs) > 0 {
+		summary.Warnings = append(summary.Warnings, "Managed resources were accepted for provisioning; they are not ready until their health checks pass, and the first deploy waits for attached resources.")
 	}
-	if streamsNDJSON(cmd) && !boolFlag(cmd, "detach") {
+	return nil
+}
+
+func (a *app) appCreateInteractiveResult(
+	cmd *cobra.Command,
+	ans *setupAnswers,
+	spec platform.EnvironmentSpec,
+	summary setupResult,
+	op contract.Operation,
+) (result, error) {
+	if ans.Deploy && followsByDefault(cmd) {
 		client, err := a.client(cmd)
 		if err != nil {
 			return result{}, err
 		}
-		if ans.Deploy && op.FirstDeployOperationID != "" {
-			return a.followGuidedCreate(cmd, client, op, "env/"+ans.App+"/"+ans.Environment, a.deployOutcome(ans.App, ans.Environment))
-		}
-		return a.followAccepted(cmd, client, op)
+		return a.followGuidedCreate(cmd, client, op, "env/"+ans.App+"/"+ans.Environment, a.deployOutcome(ans.App, ans.Environment))
 	}
-	return result{data: summary, plain: summary.plainText()}, nil
+	fmt.Fprintln(os.Stderr, "")
+	rows := [][2]string{
+		{"environment", ans.Environment},
+		{"node", ans.Node},
+		{"source", describeSource(spec.Source)},
+		{"operation", string(op.ID)},
+	}
+	if ans.Deploy {
+		rows = append(rows, [2]string{"first deploy", "queued from the revision"})
+		if summary.FirstDeployOperationID != "" {
+			rows = append(rows, [2]string{"first deploy operation", string(summary.FirstDeployOperationID)})
+		}
+	}
+	if ans.Domain != "" {
+		rows = append(rows, [2]string{"domain", ans.Domain})
+		dns := "point " + ans.Domain + " at the main node's public IPv4 address"
+		if summary.DNSRecord != nil {
+			dns = summary.DNSRecord.Type + " " + summary.DNSRecord.Name + " " + summary.DNSRecord.Value
+		}
+		rows = append(rows, [2]string{"DNS record", dns})
+	}
+	for _, id := range summary.ResolvedResourceIDs {
+		rows = append(rows, [2]string{"resource operation", string(id)})
+	}
+	footer := []string{
+		ui.Dim("the revision is desired state, not a running deployment"),
+		ui.Dim("next:"),
+		"  " + ui.Code("eregion env status "+ans.App+" "+ans.Environment+" --json"),
+	}
+	for _, item := range summary.DeferredResources {
+		footer = append(footer, item.warning())
+	}
+	if summary.FirstDeployOperationID != "" {
+		footer = append(footer, "  "+ui.Code("eregion operations follow "+string(summary.FirstDeployOperationID)))
+	}
+	fmt.Fprintln(os.Stderr, ui.Card("App "+ans.App+" created", rows, footer))
+	return result{streamed: true}, nil
+}
+
+func (a *app) appCreateNDJSONResult(cmd *cobra.Command, ans *setupAnswers, op contract.Operation) (result, error) {
+	client, err := a.client(cmd)
+	if err != nil {
+		return result{}, err
+	}
+	if ans.Deploy && op.FirstDeployOperationID != "" {
+		return a.followGuidedCreate(cmd, client, op, "env/"+ans.App+"/"+ans.Environment, a.deployOutcome(ans.App, ans.Environment))
+	}
+	return a.followAccepted(cmd, client, op)
 }
 
 // definitionDomainState refuses a file export/apply that would omit a domain
@@ -412,7 +497,7 @@ func definitionDomainState(current platform.Environment, bindings []platform.Dom
 
 func (a *app) appExport(cmd *cobra.Command, args []string) (result, error) {
 	appName, environment := args[0], args[1]
-	current, _, err := a.readEnvironment(cmd, appName, environment)
+	current, err := a.readEnvironment(cmd, appName, environment)
 	if err != nil {
 		return result{}, err
 	}
@@ -430,7 +515,7 @@ func (a *app) appExport(cmd *cobra.Command, args []string) (result, error) {
 	if err := definitionDomainState(current, domains); err != nil {
 		return result{}, err
 	}
-	_, resources, _, err := a.resourceInventory(cmd, appName, environment)
+	resources, _, err := a.resourceInventory(cmd, appName, environment)
 	if err != nil {
 		return result{}, err
 	}
@@ -522,18 +607,6 @@ func revisionLabel(environment platform.Environment) string {
 		return "-"
 	}
 	return fmt.Sprintf("%d (%s)", environment.Revision.Number, environment.Revision.ID)
-}
-
-func processesLabel(environment platform.Environment) string {
-	if len(environment.Processes) == 0 {
-		return "-"
-	}
-	parts := make([]string, 0, len(environment.Processes))
-	for _, process := range environment.Processes {
-		parts = append(parts, fmt.Sprintf("%s:%d", process.Name, process.Replicas))
-	}
-	sort.Strings(parts)
-	return strings.Join(parts, " ")
 }
 
 func boolLabel(value bool) string {

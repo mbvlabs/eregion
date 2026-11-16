@@ -61,24 +61,24 @@ func field(label, value, hint string, required bool) *formField {
 	return &formField{label: label, value: value, hint: hint, placeholder: hint, required: required}
 }
 
-func (m Model) formContext() (app, environment, node string) {
+func (m Model) formContext() (app, environment string) {
 	item, ok := m.selectedItem()
 	if !ok {
-		return "", "", ""
+		return "", ""
 	}
 	switch m.tab {
-	case Fleet:
-		node = item.Data["name"]
 	case Apps:
 		app = item.Data["name"]
 	case Envs:
-		app, environment, node = item.Data["app"], item.Data["environment"], item.Data["node"]
+		app, environment = item.Data["app"], item.Data["environment"]
+	case Fleet, Releases, Deployments, tabCount:
+		// The node label was never consumed by guided forms.
 	}
-	return app, environment, node
+	return app, environment
 }
 
 func (m Model) newDeployForm() *formState {
-	app, environment, _ := m.formContext()
+	app, environment := m.formContext()
 	release := ""
 	if item, ok := m.selectedItem(); ok && m.tab == Envs {
 		release = item.Data["desired_release"]
@@ -96,7 +96,7 @@ func (m Model) newDeployForm() *formState {
 }
 
 func (m Model) newRollbackForm() *formState {
-	app, environment, _ := m.formContext()
+	app, environment := m.formContext()
 	if m.tab != Envs || app == "" || environment == "" {
 		m.notice = "Select an environment before planning a rollback."
 		return nil
@@ -121,6 +121,8 @@ func (m Model) handleFormKey(message tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			if form.confirmPhrase == "" {
 				return m.detach()
 			}
+		case formEdit:
+			// q is a normal character while editing a field.
 		}
 	}
 	switch form.phase {
@@ -144,8 +146,9 @@ func (m Model) handleFormKey(message tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			form.errText = "wait for the dry-run to finish, or detach; the request cannot be cancelled"
 		}
 		return m, nil
+	case formEdit:
+		// Field editing continues below.
 	}
-	// formEdit
 	switch pressed {
 	case "esc":
 		m.form = nil
@@ -303,81 +306,89 @@ func (m Model) submitCommand(action Action, revision int) tea.Cmd {
 }
 
 func (form *formState) action() (Action, int, error) {
-	value := func(name string) string {
-		for _, item := range form.fields {
-			if item.label == name {
-				return strings.TrimSpace(item.value)
-			}
-		}
-		return ""
-	}
-	fieldIndex := func(name string) int {
-		for index, item := range form.fields {
-			if item.label == name {
-				return index
-			}
-		}
-		return -1
-	}
 	switch form.kind {
 	case platform.KindDeploy:
-		app, environment, release := value("app"), value("environment"), value("release")
-		if app == "" || environment == "" || release == "" {
-			for _, label := range []string{"app", "environment", "release"} {
-				if value(label) == "" {
-					return Action{}, fieldIndex(label), requiredValue(label, "", fieldIndex(label))
-				}
-			}
-		}
-		if err := platform.ValidateName(app); err != nil {
-			return Action{}, fieldIndex("app"), err
-		}
-		if err := platform.ValidateName(environment); err != nil {
-			return Action{}, fieldIndex("environment"), err
-		}
-		releaseID := platform.ReleaseID(release)
-		if err := releaseID.Validate(); err != nil {
-			return Action{}, fieldIndex("release"), err
-		}
-		raw, _ := json.Marshal(platform.DeployInput{App: app, Environment: environment, ReleaseID: releaseID})
-		return Action{
-			Kind: form.kind, Target: "env/" + app + "/" + environment, Input: raw, IdempotencyKey: form.key,
-			Title: form.title, ConfirmPhrase: environment,
-		}, -1, nil
+		return form.deployAction()
 	case platform.KindRollback:
-		app, environment, release := value("app"), value("environment"), value("to release")
-		if app == "" || environment == "" {
-			for _, label := range []string{"app", "environment"} {
-				if value(label) == "" {
-					return Action{}, fieldIndex(label), requiredValue(label, "", fieldIndex(label))
-				}
-			}
-		}
-		if err := platform.ValidateName(app); err != nil {
-			return Action{}, fieldIndex("app"), err
-		}
-		if err := platform.ValidateName(environment); err != nil {
-			return Action{}, fieldIndex("environment"), err
-		}
-		input := platform.RollbackInput{App: app, Environment: environment}
-		if release != "" {
-			input.ToReleaseID = platform.ReleaseID(release)
-			if err := input.ToReleaseID.Validate(); err != nil {
-				return Action{}, fieldIndex("to release"), err
-			}
-		}
-		raw, _ := json.Marshal(input)
-		return Action{
-			Kind: form.kind, Target: "env/" + app + "/" + environment, Input: raw, IdempotencyKey: form.key,
-			Title: form.title, ConfirmPhrase: app + "/" + environment, Confirm: app + "/" + environment,
-		}, -1, nil
+		return form.rollbackAction()
 	}
 	return Action{}, -1, contract.NewFault(contract.Internal, "unsupported guided form", "Use a documented form; this is a binary defect.")
 }
 
-func requiredValue(label, value string, _ int) error {
-	if value == "" {
-		return contract.NewFault(contract.InputRequired, label+" is required", "Type a value for "+label+".")
+func (form *formState) deployAction() (Action, int, error) {
+	app, environment, release := form.value("app"), form.value("environment"), form.value("release")
+	if index, err := form.missingField([]string{"app", "environment", "release"}); err != nil {
+		return Action{}, index, err
 	}
-	return nil
+	if err := platform.ValidateName(app); err != nil {
+		return Action{}, form.fieldIndex("app"), err
+	}
+	if err := platform.ValidateName(environment); err != nil {
+		return Action{}, form.fieldIndex("environment"), err
+	}
+	releaseID := platform.ReleaseID(release)
+	if err := releaseID.Validate(); err != nil {
+		return Action{}, form.fieldIndex("release"), err
+	}
+	raw, _ := json.Marshal(platform.DeployInput{App: app, Environment: environment, ReleaseID: releaseID})
+	return Action{
+		Kind: form.kind, Target: "env/" + app + "/" + environment, Input: raw, IdempotencyKey: form.key,
+		Title: form.title, ConfirmPhrase: environment,
+	}, -1, nil
+}
+
+func (form *formState) rollbackAction() (Action, int, error) {
+	app, environment, release := form.value("app"), form.value("environment"), form.value("to release")
+	if index, err := form.missingField([]string{"app", "environment"}); err != nil {
+		return Action{}, index, err
+	}
+	if err := platform.ValidateName(app); err != nil {
+		return Action{}, form.fieldIndex("app"), err
+	}
+	if err := platform.ValidateName(environment); err != nil {
+		return Action{}, form.fieldIndex("environment"), err
+	}
+	input := platform.RollbackInput{App: app, Environment: environment}
+	if release != "" {
+		input.ToReleaseID = platform.ReleaseID(release)
+		if err := input.ToReleaseID.Validate(); err != nil {
+			return Action{}, form.fieldIndex("to release"), err
+		}
+	}
+	raw, _ := json.Marshal(input)
+	return Action{
+		Kind: form.kind, Target: "env/" + app + "/" + environment, Input: raw, IdempotencyKey: form.key,
+		Title: form.title, ConfirmPhrase: app + "/" + environment, Confirm: app + "/" + environment,
+	}, -1, nil
+}
+
+func (form *formState) value(name string) string {
+	for _, item := range form.fields {
+		if item.label == name {
+			return strings.TrimSpace(item.value)
+		}
+	}
+	return ""
+}
+
+func (form *formState) fieldIndex(name string) int {
+	for index, item := range form.fields {
+		if item.label == name {
+			return index
+		}
+	}
+	return -1
+}
+
+func (form *formState) missingField(labels []string) (int, error) {
+	for _, label := range labels {
+		if form.value(label) == "" {
+			return form.fieldIndex(label), requiredValue(label)
+		}
+	}
+	return -1, nil
+}
+
+func requiredValue(label string) error {
+	return contract.NewFault(contract.InputRequired, label+" is required", "Type a value for "+label+".")
 }

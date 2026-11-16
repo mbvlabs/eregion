@@ -71,6 +71,10 @@ func (a *app) diagnose(cmd *cobra.Command, args []string) (result, error) {
 	if json.Unmarshal(raw, &report) != nil || report.Schema != "eregion/diagnosis/v1" || report.Operation.ID != id {
 		return result{}, invalidNodeData("diagnosis")
 	}
+	return result{data: report, plain: renderDiagnosis(id, report)}, nil
+}
+
+func renderDiagnosis(id contract.OperationID, report platform.Diagnosis) string {
 	var plain strings.Builder
 	fmt.Fprintf(&plain, "Operation %s: %s (%s)\n", id, report.Operation.State, report.Operation.Kind)
 	if report.Operation.ErrorCode != "" {
@@ -101,38 +105,9 @@ func (a *app) diagnose(cmd *cobra.Command, args []string) (result, error) {
 		plain.WriteString("Recorded release build settings:\n")
 		writeDiagnosisBuild(&plain, *report.RecordedBuild)
 	}
-	if report.Image != nil {
-		fmt.Fprintf(&plain, "Image observation: %s; metadata labels %d; declared layers %d\n", report.Image.ImageID, report.Image.MetadataLabelsPresent, report.Image.DeclaredLayerCount)
-		for _, bp := range report.Image.Buildpacks {
-			fmt.Fprintf(&plain, "  buildpack %s %s\n", bp.ID, bp.Version)
-		}
-		for _, layer := range report.Image.Layers {
-			fmt.Fprintf(&plain, "  declared layer %s/%s\n", layer.Buildpack, layer.Name)
-		}
-		fmt.Fprintf(&plain, "  process types: %s\n  %s\n", strings.Join(report.Image.ProcessTypes, ", "), report.Image.Note)
-	}
-	if report.LiveCandidate != nil {
-		fmt.Fprintf(&plain, "Live candidate (truncated=%t unavailable=%t):\n", report.LiveCandidate.Truncated, report.LiveCandidate.Unavailable)
-		for _, observation := range report.LiveCandidate.Observations {
-			fmt.Fprintf(&plain, "  %s/%s state=%s running=%t oom=%t health=%s observed=%s", observation.Process, observation.Replica, observation.State, observation.Running, observation.OOMKilled, observation.Health, observation.ObservedAt.Format(time.RFC3339))
-			if observation.ExitCode != nil {
-				fmt.Fprintf(&plain, " exit=%d", *observation.ExitCode)
-			}
-			fmt.Fprintln(&plain)
-		}
-		for _, line := range report.LiveCandidate.Lines {
-			fmt.Fprintf(&plain, "  %s/%s %s: %s\n", line.Process, line.Replica, line.Timestamp.Format("2006-01-02T15:04:05Z07:00"), line.Message)
-		}
-	}
-	for _, event := range report.Events {
-		if event.Message != "" {
-			if event.CandidateDiagnostic != nil {
-				fmt.Fprintf(&plain, "captured candidate %s/%s [%s]: %s\n", event.CandidateDiagnostic.Process, event.CandidateDiagnostic.Replica, event.CandidateDiagnostic.Status, event.Message)
-			} else {
-				fmt.Fprintf(&plain, "%s %s: %s\n", event.Kind, event.Stage, event.Message)
-			}
-		}
-	}
+	writeDiagnosisImage(&plain, report.Image)
+	writeDiagnosisLiveCandidate(&plain, report.LiveCandidate)
+	writeDiagnosisEvents(&plain, report.Events)
 	fmt.Fprintf(&plain, "Event cursor: %d; more history: %t; history unavailable: %t\n", report.Cursor.After, report.HasMore, report.HistoryUnavailable)
 	if report.HasMore {
 		fmt.Fprintf(&plain, "Continue: eregion diagnose %s --after %d\n", id, report.Cursor.After)
@@ -140,7 +115,51 @@ func (a *app) diagnose(cmd *cobra.Command, args []string) (result, error) {
 	for _, reason := range report.Unavailable {
 		fmt.Fprintf(&plain, "Unavailable: %s\n", reason)
 	}
-	return result{data: report, plain: plain.String()}, nil
+	return plain.String()
+}
+
+func writeDiagnosisImage(out *strings.Builder, image *platform.DiagnosisImage) {
+	if image == nil {
+		return
+	}
+	fmt.Fprintf(out, "Image observation: %s; metadata labels %d; declared layers %d\n", image.ImageID, image.MetadataLabelsPresent, image.DeclaredLayerCount)
+	for _, bp := range image.Buildpacks {
+		fmt.Fprintf(out, "  buildpack %s %s\n", bp.ID, bp.Version)
+	}
+	for _, layer := range image.Layers {
+		fmt.Fprintf(out, "  declared layer %s/%s\n", layer.Buildpack, layer.Name)
+	}
+	fmt.Fprintf(out, "  process types: %s\n  %s\n", strings.Join(image.ProcessTypes, ", "), image.Note)
+}
+
+func writeDiagnosisLiveCandidate(out *strings.Builder, candidate *platform.CandidateDiagnosticResult) {
+	if candidate == nil {
+		return
+	}
+	fmt.Fprintf(out, "Live candidate (truncated=%t unavailable=%t):\n", candidate.Truncated, candidate.Unavailable)
+	for _, observation := range candidate.Observations {
+		fmt.Fprintf(out, "  %s/%s state=%s running=%t oom=%t health=%s observed=%s", observation.Process, observation.Replica, observation.State, observation.Running, observation.OOMKilled, observation.Health, observation.ObservedAt.Format(time.RFC3339))
+		if observation.ExitCode != nil {
+			fmt.Fprintf(out, " exit=%d", *observation.ExitCode)
+		}
+		fmt.Fprintln(out)
+	}
+	for _, line := range candidate.Lines {
+		fmt.Fprintf(out, "  %s/%s %s: %s\n", line.Process, line.Replica, line.Timestamp.Format("2006-01-02T15:04:05Z07:00"), line.Message)
+	}
+}
+
+func writeDiagnosisEvents(out *strings.Builder, events []contract.Event) {
+	for _, event := range events {
+		if event.Message == "" {
+			continue
+		}
+		if event.CandidateDiagnostic != nil {
+			fmt.Fprintf(out, "captured candidate %s/%s [%s]: %s\n", event.CandidateDiagnostic.Process, event.CandidateDiagnostic.Replica, event.CandidateDiagnostic.Status, event.Message)
+			continue
+		}
+		fmt.Fprintf(out, "%s %s: %s\n", event.Kind, event.Stage, event.Message)
+	}
 }
 
 func writeDiagnosisRevision(out *strings.Builder, label string, r *platform.DiagnosisRevision) {

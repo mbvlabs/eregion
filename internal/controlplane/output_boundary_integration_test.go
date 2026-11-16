@@ -15,6 +15,19 @@ import (
 )
 
 func TestIntegrationOutputBoundary(t *testing.T) {
+	op, event := seedOutputBoundaryOperation(t)
+	reg := &secrets.Registry{}
+	reg.Add("a", "stdout", "status")
+	var buf bytes.Buffer
+	w := output.Writer{Out: &buf, Mode: output.JSON, Secrets: reg}
+	assertOutputOperationBoundary(t, op, w, &buf)
+	assertOutputStreamBoundary(t, op, event, reg, &buf)
+	assertOutputListAndFollowBoundary(t, op, w, &buf)
+	assertOutputFaultBoundary(t, op, w, &buf)
+}
+
+func seedOutputBoundaryOperation(t *testing.T) (contract.Operation, contract.Event) {
+	t.Helper()
 	pool, _ := testPool(t, true)
 	run := testRuntime(t, pool, 0)
 	ctx := context.Background()
@@ -46,10 +59,11 @@ func TestIntegrationOutputBoundary(t *testing.T) {
 	op.LatestResult = event.Result
 	op.LatestResult.Data = json.RawMessage(`{"status":"stdout","number":9007199254740993}`)
 	op.LastSequence = 9007199254740993
-	reg := &secrets.Registry{}
-	reg.Add("a", "stdout", "status")
-	var buf bytes.Buffer
-	w := output.Writer{Out: &buf, Mode: output.JSON, Secrets: reg}
+	return op, event
+}
+
+func assertOutputOperationBoundary(t *testing.T, op contract.Operation, w output.Writer, buf *bytes.Buffer) {
+	t.Helper()
 	if err := w.Write(contract.Success("operations get", op, nil), ""); err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +84,11 @@ func TestIntegrationOutputBoundary(t *testing.T) {
 		t.Fatalf("source-sanitized data changed: %s", buf.String())
 	}
 	buf.Reset()
-	stream := output.NewStream(&buf, reg)
+}
+
+func assertOutputStreamBoundary(t *testing.T, op contract.Operation, event contract.Event, reg *secrets.Registry, buf *bytes.Buffer) {
+	t.Helper()
+	stream := output.NewStream(buf, reg)
 	if err := stream.Event(event); err != nil {
 		t.Fatal(err)
 	}
@@ -111,6 +129,10 @@ func TestIntegrationOutputBoundary(t *testing.T) {
 		t.Fatalf("stream result boundary: %s %v", lines[2], err)
 	}
 	buf.Reset()
+}
+
+func assertOutputListAndFollowBoundary(t *testing.T, op contract.Operation, w output.Writer, buf *bytes.Buffer) {
+	t.Helper()
 	if err := w.Write(contract.Success("operations list", operations.ListPage{Items: []contract.Operation{op}, Limit: 1}, nil), ""); err != nil {
 		t.Fatal(err)
 	}
@@ -132,13 +154,17 @@ func TestIntegrationOutputBoundary(t *testing.T) {
 		t.Fatalf("follow boundary: %s %v", buf.String(), err)
 	}
 	buf.Reset()
+}
+
+func assertOutputFaultBoundary(t *testing.T, op contract.Operation, w output.Writer, buf *bytes.Buffer) {
+	t.Helper()
 	known := map[string]any{"operation_id": string(op.ID), "state": op.State, "result": op.LatestResult, "cursor": "9007199254740993"}
 	details := make(map[string]any)
 	for k, v := range known {
 		details[k] = v
 	}
 	details["stdout"] = "status"
-	fault := &contract.Fault{Code: contract.PreconditionFailed, Message: "stdout", Details: details, FollowDetails: &contract.FollowFaultDetails{Values: known}}
+	fault := &contract.FaultError{Code: contract.PreconditionFailed, Message: "stdout", Details: details, FollowDetails: &contract.FollowFaultDetails{Values: known}}
 	if err := w.Write(contract.Failure("follow", fault), ""); err != nil {
 		t.Fatal(err)
 	}

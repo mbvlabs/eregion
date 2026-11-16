@@ -2,8 +2,11 @@
 
 package host
 
-import "errors"
+import (
+	"context"
+	"errors"
+)
 
-func spawnDetached(string) error {
+func spawnDetached(context.Context, string) error {
 	return errors.New("the commit-confirm watchdog requires a Unix host")
 }

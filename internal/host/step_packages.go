@@ -69,11 +69,12 @@ func (s *packagesStep) Inputs() ([]byte, error) {
 }
 
 func (s *packagesStep) Check(ctx context.Context, _ engine.Runtime) (engine.CheckResult, error) {
-	var lines []string
-	for _, name := range s.packages() {
+	packages := s.packages()
+	lines := make([]string, 0, len(packages))
+	for _, name := range packages {
 		lines = append(lines, fmt.Sprintf(`if dpkg-query -W -f='${db:Status-Abbrev}' %s 2>/dev/null | grep -q '^ii'; then echo %s:ok; else echo %s:missing; fi`, name, name, name))
 	}
-	output, err := checkOutput(ctx, engine.Runtime{}, s.exec, strings.Join(lines, "\n"))
+	output, err := checkOutput(ctx, s.exec, strings.Join(lines, "\n"))
 	if err != nil {
 		return engine.CheckResult{}, err
 	}
@@ -119,8 +120,9 @@ func (s *packagesStep) Apply(ctx context.Context, runtime engine.Runtime, report
 }
 
 func (s *packagesStep) Diff(context.Context, engine.Runtime) ([]string, error) {
-	var out []string
-	for _, name := range s.packages() {
+	packages := s.packages()
+	out := make([]string, 0, len(packages))
+	for _, name := range packages {
 		out = append(out, "+ apt package "+name)
 	}
 	return out, nil

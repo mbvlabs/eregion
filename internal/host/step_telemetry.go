@@ -246,68 +246,108 @@ func (s *telemetryStep) Inputs() ([]byte, error) {
 }
 
 func (s *telemetryStep) Check(ctx context.Context, _ engine.Runtime) (engine.CheckResult, error) {
-	output, err := checkOutput(ctx, engine.Runtime{}, s.exec, firewallCheckScript())
+	output, err := checkOutput(ctx, s.exec, firewallCheckScript())
 	if err != nil {
 		return engine.CheckResult{}, err
 	}
-	if strings.Contains(output, "firewall:legacy") {
-		return incomplete("the legacy WireGuard telemetry firewall rule is still present")
-	}
-	if strings.Contains(output, "firewall:error") {
-		return incomplete("the legacy WireGuard telemetry firewall state could not be read")
+	if result := telemetryFirewallIncomplete(output); result != nil {
+		return *result, nil
 	}
 	if s.hostname() == "" {
-		legacy, err := checkOutput(ctx, engine.Runtime{}, s.exec, s.serviceStateScript())
+		return s.checkUnconfigured(ctx)
+	}
+	configured, caddy, result, err := s.checkTelemetryFiles()
+	if err != nil || result != nil {
 		if err != nil {
 			return engine.CheckResult{}, err
 		}
-		if strings.Contains(legacy, "systemctl:unavailable") {
-			return incomplete("the legacy telemetry service state could not be observed")
-		}
-		if strings.Contains(legacy, "enabled:yes") || strings.Contains(legacy, "active:yes") {
-			return incomplete("the legacy telemetry service is still enabled or active although the node has no public hostname")
-		}
-		return complete("the public telemetry endpoint is unconfigured: the node has no public hostname; there is no WireGuard fallback listener")
+		return *result, nil
 	}
+	return s.checkTelemetryRuntime(ctx, caddy, configured)
+}
+
+func telemetryFirewallIncomplete(output string) *engine.CheckResult {
+	switch {
+	case strings.Contains(output, "firewall:legacy"):
+		result, _ := incomplete("the legacy WireGuard telemetry firewall rule is still present")
+		return &result
+	case strings.Contains(output, "firewall:error"):
+		result, _ := incomplete("the legacy WireGuard telemetry firewall state could not be read")
+		return &result
+	}
+	return nil
+}
+
+func (s *telemetryStep) checkUnconfigured(ctx context.Context) (engine.CheckResult, error) {
+	legacy, err := checkOutput(ctx, s.exec, s.serviceStateScript())
+	if err != nil {
+		return engine.CheckResult{}, err
+	}
+	if strings.Contains(legacy, "systemctl:unavailable") {
+		return incomplete("the legacy telemetry service state could not be observed")
+	}
+	if strings.Contains(legacy, "enabled:yes") || strings.Contains(legacy, "active:yes") {
+		return incomplete("the legacy telemetry service is still enabled or active although the node has no public hostname")
+	}
+	return complete("the public telemetry endpoint is unconfigured: the node has no public hostname; there is no WireGuard fallback listener")
+}
+
+func (s *telemetryStep) checkTelemetryFiles() (bool, string, *engine.CheckResult, error) {
 	dir, targets, caddy := s.paths()
 	if err := validateTelemetryDir(dir); err != nil {
-		return incomplete(err.Error())
+		result, _ := incomplete(err.Error())
+		return false, caddy, &result, nil
 	}
-	if ok, mode, err := sameFileContent(targets, s.targets()); err != nil {
-		return engine.CheckResult{}, err
-	} else if !ok {
-		return incomplete("the telemetry discovery document differs")
-	} else if mode != 0o640 {
-		return incomplete(fmt.Sprintf("%s has mode %04o; want 0640", targets, mode))
+	if result, err := checkFileMode(targets, s.targets(), 0o640, "the telemetry discovery document differs"); err != nil || result != nil {
+		return false, caddy, result, err
 	}
-	if ok, mode, err := sameFileContent(s.unitPath(), s.unit()); err != nil {
-		return engine.CheckResult{}, err
-	} else if !ok {
-		return incomplete("the telemetry service unit differs")
-	} else if mode != 0o644 {
-		return incomplete(fmt.Sprintf("%s has mode %04o; want 0644", s.unitPath(), mode))
+	if result, err := checkFileMode(s.unitPath(), s.unit(), 0o644, "the telemetry service unit differs"); err != nil || result != nil {
+		return false, caddy, result, err
 	}
 	// A missing Caddyfile means no credential has been configured yet. Apply
 	// installs the prerequisites; `metrics rotate` is the explicit step that
 	// enables the gateway.
-	configured := false
-	if raw, mode, exists, err := fileState(caddy); err != nil {
-		return engine.CheckResult{}, err
-	} else if exists {
-		if mode != 0o640 {
-			return incomplete(fmt.Sprintf("%s has mode %04o; want 0640", caddy, mode))
-		}
-		hash, err := extractTelemetryHash(raw)
-		if err != nil {
-			return incomplete("the loopback telemetry gateway configuration is malformed and cannot be safely described")
-		}
-		if !bytes.Equal(raw, telemetryCaddyfile(hash)) {
-			return incomplete("the loopback telemetry gateway configuration differs")
-		}
-		configured = true
+	raw, mode, exists, err := fileState(caddy)
+	if err != nil {
+		return false, caddy, nil, err
 	}
-	script := s.checkScript(caddy)
-	output, err = checkOutput(ctx, engine.Runtime{}, s.exec, script)
+	if !exists {
+		return false, caddy, nil, nil
+	}
+	if mode != 0o640 {
+		result, _ := incomplete(fmt.Sprintf("%s has mode %04o; want 0640", caddy, mode))
+		return false, caddy, &result, nil
+	}
+	hash, err := extractTelemetryHash(raw)
+	if err != nil {
+		result, _ := incomplete("the loopback telemetry gateway configuration is malformed and cannot be safely described")
+		return false, caddy, &result, nil
+	}
+	if !bytes.Equal(raw, telemetryCaddyfile(hash)) {
+		result, _ := incomplete("the loopback telemetry gateway configuration differs")
+		return false, caddy, &result, nil
+	}
+	return true, caddy, nil, nil
+}
+
+func checkFileMode(path string, desired []byte, mode os.FileMode, differsDetail string) (*engine.CheckResult, error) {
+	ok, actual, err := sameFileContent(path, desired)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		result, _ := incomplete(differsDetail)
+		return &result, nil
+	}
+	if actual != mode {
+		result, _ := incomplete(fmt.Sprintf("%s has mode %04o; want %04o", path, actual, mode))
+		return &result, nil
+	}
+	return nil, nil
+}
+
+func (s *telemetryStep) checkTelemetryRuntime(ctx context.Context, caddy string, configured bool) (engine.CheckResult, error) {
+	output, err := checkOutput(ctx, s.exec, s.checkScript(caddy))
 	if err != nil {
 		return engine.CheckResult{}, err
 	}
@@ -464,7 +504,7 @@ fi`, TelemetryService)
 }
 
 func (s *telemetryStep) readServiceState(ctx context.Context) (telemetryServiceState, error) {
-	output, err := checkOutput(ctx, engine.Runtime{}, s.exec, s.serviceStateScript())
+	output, err := checkOutput(ctx, s.exec, s.serviceStateScript())
 	if err != nil {
 		return telemetryServiceState{}, interruptedError(ctx, err)
 	}
@@ -514,7 +554,7 @@ func (s *telemetryStep) migrateManagedLocked(ctx context.Context, caddyExists bo
 	if err := writeFile(targets, s.targets(), 0o640, "root", "caddy"); err != nil {
 		return err
 	}
-	if err := writePublicFile(s.unitPath(), s.unit(), "root", "root"); err != nil {
+	if err := writePublicFile(s.unitPath(), s.unit(), "root"); err != nil {
 		return err
 	}
 	if caddyExists {
@@ -696,49 +736,77 @@ func parseManagedCaddyTree(raw []byte) ([]*managedCaddyNode, error) {
 		return nil, fmt.Errorf("managed telemetry configuration is too large")
 	}
 	root := &managedCaddyNode{}
-	stack := []*managedCaddyNode{root}
-	header := false
-	sawContent := false
+	state := caddyParseState{stack: []*managedCaddyNode{root}}
 	for _, line := range strings.Split(string(raw), "\n") {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" {
-			continue
-		}
-		if strings.HasPrefix(trimmed, "#") {
-			if !sawContent && !header && strings.HasPrefix(trimmed, "# managed by eregion") {
-				header = true
-				continue
-			}
-			return nil, fmt.Errorf("managed telemetry configuration has an unsupported comment")
-		}
-		if !header {
-			return nil, fmt.Errorf("managed telemetry configuration has no managed header")
-		}
-		sawContent = true
-		if trimmed == "}" {
-			if len(stack) == 1 {
-				return nil, fmt.Errorf("managed telemetry configuration has an unmatched closing brace")
-			}
-			stack = stack[:len(stack)-1]
-			continue
-		}
-		opening := strings.HasSuffix(trimmed, "{")
-		if opening {
-			trimmed = strings.TrimSpace(strings.TrimSuffix(trimmed, "{"))
-		} else if strings.ContainsAny(trimmed, "{}") {
-			return nil, fmt.Errorf("managed telemetry configuration has invalid brace placement")
-		}
-		node := &managedCaddyNode{tokens: strings.Fields(trimmed)}
-		parent := stack[len(stack)-1]
-		parent.children = append(parent.children, node)
-		if opening {
-			stack = append(stack, node)
+		state.parseLine(line)
+		if state.err != nil {
+			return nil, state.err
 		}
 	}
-	if !header || len(stack) != 1 {
+	if !state.header || len(state.stack) != 1 {
 		return nil, fmt.Errorf("managed telemetry configuration has unbalanced blocks")
 	}
 	return root.children, nil
+}
+
+type caddyParseState struct {
+	stack      []*managedCaddyNode
+	header     bool
+	sawContent bool
+	err        error
+}
+
+func (s *caddyParseState) parseLine(line string) {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return
+	}
+	if strings.HasPrefix(trimmed, "#") {
+		s.parseComment(trimmed)
+		return
+	}
+	if !s.header {
+		s.err = fmt.Errorf("managed telemetry configuration has no managed header")
+		return
+	}
+	s.sawContent = true
+	if trimmed == "}" {
+		s.closeBlock()
+		return
+	}
+	s.parseBlock(trimmed)
+}
+
+func (s *caddyParseState) parseComment(trimmed string) {
+	if !s.sawContent && !s.header && strings.HasPrefix(trimmed, "# managed by eregion") {
+		s.header = true
+		return
+	}
+	s.err = fmt.Errorf("managed telemetry configuration has an unsupported comment")
+}
+
+func (s *caddyParseState) closeBlock() {
+	if len(s.stack) == 1 {
+		s.err = fmt.Errorf("managed telemetry configuration has an unmatched closing brace")
+		return
+	}
+	s.stack = s.stack[:len(s.stack)-1]
+}
+
+func (s *caddyParseState) parseBlock(trimmed string) {
+	opening := strings.HasSuffix(trimmed, "{")
+	if opening {
+		trimmed = strings.TrimSpace(strings.TrimSuffix(trimmed, "{"))
+	} else if strings.ContainsAny(trimmed, "{}") {
+		s.err = fmt.Errorf("managed telemetry configuration has invalid brace placement")
+		return
+	}
+	node := &managedCaddyNode{tokens: strings.Fields(trimmed)}
+	parent := s.stack[len(s.stack)-1]
+	parent.children = append(parent.children, node)
+	if opening {
+		s.stack = append(s.stack, node)
+	}
 }
 
 func managedTokens(node *managedCaddyNode, want ...string) bool {
@@ -761,55 +829,78 @@ func validateManagedReverseProxy(node *managedCaddyNode, upstream string) error 
 	if !managedTokens(node, "reverse_proxy", upstream) {
 		return fmt.Errorf("managed telemetry configuration has an unsupported metrics upstream")
 	}
-	rewrite, authorization, cookie, transports := 0, 0, 0, 0
-	var transport *managedCaddyNode
-	for _, child := range node.children {
-		switch {
-		case managedLeaf(child, "rewrite", "/metrics"):
-			rewrite++
-			if rewrite != 1 {
-				return fmt.Errorf("managed telemetry configuration has a duplicate proxy rewrite")
-			}
-		case managedLeaf(child, "header_up", "-Authorization"):
-			authorization++
-			if authorization != 1 {
-				return fmt.Errorf("managed telemetry configuration has a duplicate proxy header")
-			}
-		case managedLeaf(child, "header_up", "-Cookie"):
-			cookie++
-			if cookie != 1 {
-				return fmt.Errorf("managed telemetry configuration has a duplicate proxy header")
-			}
-		case managedTokens(child, "transport", "http"):
-			transports++
-			if transports != 1 {
-				return fmt.Errorf("managed telemetry configuration has a duplicate proxy transport")
-			}
-			transport = child
-		default:
-			return fmt.Errorf("managed telemetry configuration has an unsupported proxy directive")
-		}
-	}
-	if rewrite != 1 || authorization != 1 || cookie != 1 {
-		return fmt.Errorf("managed telemetry configuration is missing the metrics proxy contract")
+	transport, err := validateProxyDirectives(node.children)
+	if err != nil {
+		return err
 	}
 	if transport == nil {
 		return nil
 	}
-	dial, response, read := false, false, false
+	return validateProxyTransport(transport)
+}
+
+func validateProxyDirectives(children []*managedCaddyNode) (*managedCaddyNode, error) {
+	counts := map[string]int{}
+	var transport *managedCaddyNode
+	for _, child := range children {
+		directive, ok := proxyDirective(child)
+		if !ok {
+			return nil, fmt.Errorf("managed telemetry configuration has an unsupported proxy directive")
+		}
+		counts[directive]++
+		if counts[directive] > 1 {
+			return nil, proxyDuplicateError(directive)
+		}
+		if directive == "transport" {
+			transport = child
+		}
+	}
+	if counts["rewrite"] != 1 || counts["authorization"] != 1 || counts["cookie"] != 1 {
+		return nil, fmt.Errorf("managed telemetry configuration is missing the metrics proxy contract")
+	}
+	return transport, nil
+}
+
+func proxyDirective(child *managedCaddyNode) (string, bool) {
+	switch {
+	case managedLeaf(child, "rewrite", "/metrics"):
+		return "rewrite", true
+	case managedLeaf(child, "header_up", "-Authorization"):
+		return "authorization", true
+	case managedLeaf(child, "header_up", "-Cookie"):
+		return "cookie", true
+	case managedTokens(child, "transport", "http"):
+		return "transport", true
+	}
+	return "", false
+}
+
+func proxyDuplicateError(directive string) error {
+	switch directive {
+	case "rewrite":
+		return fmt.Errorf("managed telemetry configuration has a duplicate proxy rewrite")
+	case "authorization", "cookie":
+		return fmt.Errorf("managed telemetry configuration has a duplicate proxy header")
+	default:
+		return fmt.Errorf("managed telemetry configuration has a duplicate proxy transport")
+	}
+}
+
+func validateProxyTransport(transport *managedCaddyNode) error {
+	counts := map[string]int{}
 	for _, child := range transport.children {
 		switch {
 		case managedLeaf(child, "dial_timeout", "2s"):
-			dial = true
+			counts["dial"]++
 		case managedLeaf(child, "response_header_timeout", "15s"):
-			response = true
+			counts["response"]++
 		case managedLeaf(child, "read_timeout", "30s"):
-			read = true
+			counts["read"]++
 		default:
 			return fmt.Errorf("managed telemetry configuration has an unsupported transport directive")
 		}
 	}
-	if !dial || !response || !read || len(transport.children) != 3 {
+	if counts["dial"] != 1 || counts["response"] != 1 || counts["read"] != 1 || len(transport.children) != 3 {
 		return fmt.Errorf("managed telemetry configuration is missing a proxy timeout")
 	}
 	return nil
@@ -825,22 +916,42 @@ func extractTelemetryHash(raw []byte) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if len(children) != 2 || !managedTokens(children[0]) || len(children[0].children) == 0 {
-		return "", fmt.Errorf("managed telemetry configuration has an unsupported root layout")
+	options, site, err := telemetryLayout(children)
+	if err != nil {
+		return "", err
 	}
-	options, site := children[0], children[1]
+	siteHost, err := telemetrySiteHost(site)
+	if err != nil {
+		return "", err
+	}
+	if err := validateTelemetryOptions(options); err != nil {
+		return "", err
+	}
+	return validateTelemetrySite(site, siteHost)
+}
+
+func telemetryLayout(children []*managedCaddyNode) (*managedCaddyNode, *managedCaddyNode, error) {
+	if len(children) != 2 || !managedTokens(children[0]) || len(children[0].children) == 0 {
+		return nil, nil, fmt.Errorf("managed telemetry configuration has an unsupported root layout")
+	}
+	return children[0], children[1], nil
+}
+
+func telemetrySiteHost(site *managedCaddyNode) (string, error) {
 	if len(site.tokens) != 1 {
 		return "", fmt.Errorf("managed telemetry configuration has an unsupported site")
 	}
-	siteHost := ""
 	switch site.tokens[0] {
 	case "http://" + telemetry.GatewayListenAddress:
-		siteHost = telemetry.GatewayHost
+		return telemetry.GatewayHost, nil
 	case "http://" + access.NodeAddress + ":" + telemetry.Port:
-		siteHost = access.NodeAddress
+		return access.NodeAddress, nil
 	default:
 		return "", fmt.Errorf("managed telemetry configuration has an unsupported listener")
 	}
+}
+
+func validateTelemetryOptions(options *managedCaddyNode) error {
 	admin, autoHTTPS := false, false
 	for _, child := range options.children {
 		switch {
@@ -849,74 +960,126 @@ func extractTelemetryHash(raw []byte) (string, error) {
 		case managedLeaf(child, "auto_https", "off"):
 			autoHTTPS = true
 		default:
-			return "", fmt.Errorf("managed telemetry configuration has an unsupported global option")
+			return fmt.Errorf("managed telemetry configuration has an unsupported global option")
 		}
 	}
 	if !admin || !autoHTTPS || len(options.children) != 2 {
-		return "", fmt.Errorf("managed telemetry configuration is missing a global option")
+		return fmt.Errorf("managed telemetry configuration is missing a global option")
 	}
-	bind := false
-	hash := ""
-	basicBlocks := 0
-	discoveryHandlers, metricsHandlers, apiHandlers, workerHandlers, fallbackHandlers := 0, 0, 0, 0, 0
+	return nil
+}
+
+type telemetrySiteState struct {
+	bind      bool
+	hash      string
+	basicAuth int
+	discovery int
+	metrics   int
+	api       int
+	worker    int
+	fallback  int
+}
+
+func validateTelemetrySite(site *managedCaddyNode, siteHost string) (string, error) {
+	state := telemetrySiteState{}
 	for _, child := range site.children {
-		switch {
-		case len(child.tokens) == 2 && child.tokens[0] == "bind":
-			if child.tokens[1] != siteHost || len(child.children) != 0 || bind {
-				return "", fmt.Errorf("managed telemetry configuration has an unsupported bind")
-			}
-			bind = true
-		case managedTokens(child, "basic_auth"):
-			basicBlocks++
-			if len(child.children) != 1 || len(child.children[0].tokens) != 2 ||
-				child.children[0].tokens[0] != telemetry.Username ||
-				!telemetry.ValidHash(child.children[0].tokens[1]) || len(child.children[0].children) != 0 {
-				return "", fmt.Errorf("managed telemetry configuration has an invalid metrics principal")
-			}
-			hash = child.children[0].tokens[1]
-		case managedTokens(child, "handle", telemetry.GatewayDiscoveryPath):
-			discoveryHandlers++
-			if len(child.children) != 2 || !managedLeaf(child.children[0], "root", "*", TelemetryDir) ||
-				!managedLeaf(child.children[1], "file_server") {
-				return "", fmt.Errorf("managed telemetry configuration has an unsupported discovery handler")
-			}
-		case managedTokens(child, "handle", telemetry.GatewayMetricsPath):
-			metricsHandlers++
-			if len(child.children) != 1 {
-				return "", fmt.Errorf("managed telemetry configuration has an unsupported metrics handler")
-			}
-			if err := validateManagedReverseProxy(child.children[0], NodeExporterLoopbackAddress); err != nil {
-				return "", err
-			}
-		case managedTokens(child, "handle", telemetry.GatewayAPIMetricsPath):
-			apiHandlers++
-			if len(child.children) != 1 {
-				return "", fmt.Errorf("invalid API metrics handler")
-			}
-			if err := validateManagedReverseProxy(child.children[0], processmetrics.APIAddress); err != nil {
-				return "", err
-			}
-		case managedTokens(child, "handle", telemetry.GatewayWorkerMetricsPath):
-			workerHandlers++
-			if len(child.children) != 1 {
-				return "", fmt.Errorf("invalid worker metrics handler")
-			}
-			if err := validateManagedReverseProxy(child.children[0], processmetrics.WorkerAddress); err != nil {
-				return "", err
-			}
-		case managedTokens(child, "handle"):
-			fallbackHandlers++
-			if len(child.children) != 1 || !managedLeaf(child.children[0], "respond", "404") {
-				return "", fmt.Errorf("managed telemetry configuration has an unsupported fallback")
-			}
-		default:
+		directive, ok := telemetrySiteDirective(child)
+		if !ok {
 			return "", fmt.Errorf("managed telemetry configuration has an unsupported site directive")
 		}
+		if err := state.apply(child, directive, siteHost); err != nil {
+			return "", err
+		}
 	}
-	if !bind || basicBlocks != 1 || hash == "" || discoveryHandlers != 1 || metricsHandlers != 1 || apiHandlers > 1 || workerHandlers > 1 || fallbackHandlers != 1 {
+	if !state.bind || state.basicAuth != 1 || state.hash == "" || state.discovery != 1 ||
+		state.metrics != 1 || state.api > 1 || state.worker > 1 || state.fallback != 1 {
 		return "", fmt.Errorf("managed telemetry configuration is missing a required contract")
 	}
-	return hash, nil
+	return state.hash, nil
+}
+
+func (state *telemetrySiteState) apply(child *managedCaddyNode, directive, siteHost string) error {
+	switch directive {
+	case "bind":
+		if child.tokens[1] != siteHost || len(child.children) != 0 || state.bind {
+			return fmt.Errorf("managed telemetry configuration has an unsupported bind")
+		}
+		state.bind = true
+	case "basic_auth":
+		state.basicAuth++
+		principal, err := validateBasicAuth(child)
+		if err != nil {
+			return err
+		}
+		state.hash = principal
+	case "discovery":
+		state.discovery++
+		return validateDiscoveryHandler(child)
+	case "metrics":
+		state.metrics++
+		return validateMetricsHandler(child, NodeExporterLoopbackAddress, "the metrics handler")
+	case "api":
+		state.api++
+		return validateMetricsHandler(child, processmetrics.APIAddress, "API metrics handler")
+	case "worker":
+		state.worker++
+		return validateMetricsHandler(child, processmetrics.WorkerAddress, "worker metrics handler")
+	case "fallback":
+		state.fallback++
+		return validateFallbackHandler(child)
+	}
+	return nil
+}
+
+func telemetrySiteDirective(child *managedCaddyNode) (string, bool) {
+	switch {
+	case len(child.tokens) == 2 && child.tokens[0] == "bind":
+		return "bind", true
+	case managedTokens(child, "basic_auth"):
+		return "basic_auth", true
+	case managedTokens(child, "handle", telemetry.GatewayDiscoveryPath):
+		return "discovery", true
+	case managedTokens(child, "handle", telemetry.GatewayMetricsPath):
+		return "metrics", true
+	case managedTokens(child, "handle", telemetry.GatewayAPIMetricsPath):
+		return "api", true
+	case managedTokens(child, "handle", telemetry.GatewayWorkerMetricsPath):
+		return "worker", true
+	case managedTokens(child, "handle"):
+		return "fallback", true
+	}
+	return "", false
+}
+
+func validateBasicAuth(child *managedCaddyNode) (string, error) {
+	if len(child.children) != 1 || len(child.children[0].tokens) != 2 ||
+		child.children[0].tokens[0] != telemetry.Username ||
+		!telemetry.ValidHash(child.children[0].tokens[1]) || len(child.children[0].children) != 0 {
+		return "", fmt.Errorf("managed telemetry configuration has an invalid metrics principal")
+	}
+	return child.children[0].tokens[1], nil
+}
+
+func validateDiscoveryHandler(child *managedCaddyNode) error {
+	if len(child.children) != 2 || !managedLeaf(child.children[0], "root", "*", TelemetryDir) ||
+		!managedLeaf(child.children[1], "file_server") {
+		return fmt.Errorf("managed telemetry configuration has an unsupported discovery handler")
+	}
+	return nil
+}
+
+func validateMetricsHandler(child *managedCaddyNode, upstream, name string) error {
+	if len(child.children) != 1 {
+		return fmt.Errorf("managed telemetry configuration has an unsupported %s", name)
+	}
+	return validateManagedReverseProxy(child.children[0], upstream)
+}
+
+func validateFallbackHandler(child *managedCaddyNode) error {
+	if len(child.children) != 1 || !managedLeaf(child.children[0], "respond", "404") {
+		return fmt.Errorf("managed telemetry configuration has an unsupported fallback")
+	}
+	return nil
 }
 
 // telemetryCaddyfile is the loopback-only dedicated gateway. The bcrypt hash is

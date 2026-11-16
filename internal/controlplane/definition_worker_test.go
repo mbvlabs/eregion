@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/entities"
 )
@@ -69,6 +70,12 @@ func TestIntegrationDefinitionDrainReservesUntilChildSettles(t *testing.T) {
 	if err := runPlatformAttempt(ctx, s, child, 1); err != nil {
 		t.Fatalf("settle cancelling child: %v", err)
 	}
+	assertDefinitionDrainSettled(t, ctx, pool, s, parent, child, op)
+}
+
+func assertDefinitionDrainSettled(t *testing.T, ctx context.Context, pool *pgxpool.Pool, s *Service, parent, child contract.OperationID, op contract.Operation) {
+	t.Helper()
+	var state contract.State
 	if err := pool.QueryRow(ctx, `SELECT state FROM eregion_operations WHERE id=$1`, child).Scan(&state); err != nil || state != contract.Canceled {
 		t.Fatalf("settled child state=%q err=%v", state, err)
 	}
@@ -76,6 +83,7 @@ func TestIntegrationDefinitionDrainReservesUntilChildSettles(t *testing.T) {
 		t.Fatalf("finish parent drain: %v", err)
 	}
 	var code contract.Code
+	var unfinished bool
 	if err := pool.QueryRow(ctx, `SELECT o.state,o.error_code,r.finished_at IS NULL FROM eregion_operations o JOIN eregion_definition_runs r ON r.operation_id=o.id WHERE o.id=$1`, parent).Scan(&state, &code, &unfinished); err != nil || state != contract.Canceled || code != "" || unfinished {
 		t.Fatalf("parent state=%q error_code=%q reservation retained=%t err=%v", state, code, unfinished, err)
 	}

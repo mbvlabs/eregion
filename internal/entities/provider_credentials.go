@@ -271,7 +271,7 @@ func providerTimestamp(value pgtype.Timestamptz) (time.Time, error) {
 	return value.Time.UTC(), nil
 }
 
-func providerCorrupt(message string) *contract.Fault {
+func providerCorrupt(message string) *contract.FaultError {
 	return contract.NewFault(contract.Unavailable, message, "Restore the provider credential from backup; do not infer state from a malformed row.")
 }
 

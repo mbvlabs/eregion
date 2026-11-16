@@ -23,7 +23,7 @@ import (
 // Run executes one node-agent subcommand and returns the process exit code.
 func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "usage: eregion node-agent <serve|task|compact|identity|version|access>")
+		_, _ = fmt.Fprintln(stderr, "usage: eregion node-agent <serve|task|compact|identity|version|access>")
 		return 2
 	}
 	switch args[0] {
@@ -40,7 +40,7 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	case "access":
 		return report(stderr, access.Run(args[1:], stdout, stderr))
 	default:
-		fmt.Fprintf(stderr, "unknown node command %q\n", args[0])
+		_, _ = fmt.Fprintf(stderr, "unknown node command %q\n", args[0])
 		return 2
 	}
 }
@@ -49,7 +49,7 @@ func report(stderr io.Writer, err error) int {
 	if err == nil {
 		return 0
 	}
-	fmt.Fprintf(stderr, "eregion node-agent: %v\n", err)
+	_, _ = fmt.Fprintf(stderr, "eregion node-agent: %v\n", err)
 	return 1
 }
 
@@ -72,10 +72,10 @@ func versionCommand(args []string, stdout io.Writer) error {
 		if err != nil {
 			return fmt.Errorf("build information could not be rendered: %w", err)
 		}
-		fmt.Fprintln(stdout, string(raw))
+		_, _ = fmt.Fprintln(stdout, string(raw))
 		return nil
 	}
-	fmt.Fprintf(stdout, "eregion node-agent %s\ncommit: %s\nplatform: %s/%s\ngo: %s\ndirty: %t\n",
+	_, _ = fmt.Fprintf(stdout, "eregion node-agent %s\ncommit: %s\nplatform: %s/%s\ngo: %s\ndirty: %t\n",
 		info.Version, info.Commit, info.OS, info.Arch, info.Go, info.Dirty)
 	return nil
 }
@@ -123,7 +123,7 @@ func compactCommand(args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(stdout, "removed %d journal tasks\n", removed)
+	_, _ = fmt.Fprintf(stdout, "removed %d journal tasks\n", removed)
 	return nil
 }
 
@@ -142,6 +142,6 @@ func identityCommand(args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintln(stdout, fingerprint)
+	_, _ = fmt.Fprintln(stdout, fingerprint)
 	return nil
 }

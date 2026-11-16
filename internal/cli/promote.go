@@ -37,7 +37,7 @@ func (a *app) envPromoteSpec() spec {
 	return spec{
 		use:   "promote <app> <environment>",
 		meta:  meta,
-		args:  platformTwoNames("app", "environment"),
+		args:  platformTwoNames(),
 		flags: addDeliveryFlags,
 		run:   a.envPromoteCommand,
 	}

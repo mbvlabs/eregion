@@ -64,13 +64,7 @@ func Compact(ctx context.Context, stateDir string, retention Retention) (int, er
 
 // selectTasks returns the journal keys that fall outside the retention window.
 func selectTasks(journal *Journal, retention Retention) []string {
-	terminal := make([]string, 0, len(journal.Tasks))
-	for key, task := range journal.Tasks {
-		if task.Status == TaskRunning {
-			continue
-		}
-		terminal = append(terminal, key)
-	}
+	terminal := terminalTaskKeys(journal)
 	sort.Slice(terminal, func(i, j int) bool {
 		left, right := journal.Tasks[terminal[i]], journal.Tasks[terminal[j]]
 		if left.CompletedAt != right.CompletedAt {
@@ -79,13 +73,28 @@ func selectTasks(journal *Journal, retention Retention) []string {
 		return terminal[i] < terminal[j]
 	})
 	cutoff := time.Now().UTC().Add(-retention.MaxAge)
+	drop := terminalExpiredKeys(journal, terminal, retention, cutoff)
+	return append(drop, runningExpiredKeys(journal, retention, cutoff)...)
+}
+
+// terminalTaskKeys returns every task key that is not a live running task.
+func terminalTaskKeys(journal *Journal) []string {
+	terminal := make([]string, 0, len(journal.Tasks))
+	for key, task := range journal.Tasks {
+		if task.Status == TaskRunning {
+			continue
+		}
+		terminal = append(terminal, key)
+	}
+	return terminal
+}
+
+// terminalExpiredKeys returns terminal tasks outside the retention window.
+func terminalExpiredKeys(journal *Journal, terminal []string, retention Retention, cutoff time.Time) []string {
 	var drop []string
 	for index, key := range terminal {
 		task := journal.Tasks[key]
-		if index < retention.Keep {
-			continue
-		}
-		if retention.MaxAge <= 0 {
+		if index < retention.Keep || retention.MaxAge <= 0 {
 			continue
 		}
 		completed, err := time.Parse(time.RFC3339Nano, task.CompletedAt)
@@ -98,10 +107,18 @@ func selectTasks(journal *Journal, retention Retention) []string {
 			drop = append(drop, key)
 		}
 	}
-	// A running task whose owner is long gone would keep the journal growing
-	// forever. It is dropped only when it is older than the retention window.
+	return drop
+}
+
+// runningExpiredKeys drops a running task whose owner is long gone, so the
+// journal does not grow without bound.
+func runningExpiredKeys(journal *Journal, retention Retention, cutoff time.Time) []string {
+	if retention.MaxAge <= 0 {
+		return nil
+	}
+	var drop []string
 	for key, task := range journal.Tasks {
-		if task.Status != TaskRunning || retention.MaxAge <= 0 {
+		if task.Status != TaskRunning {
 			continue
 		}
 		started, err := time.Parse(time.RFC3339Nano, task.StartedAt)

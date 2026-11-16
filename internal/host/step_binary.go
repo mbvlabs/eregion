@@ -88,7 +88,7 @@ func (s *binaryStep) Apply(_ context.Context, _ engine.Runtime, _ engine.Reporte
 	}
 	var installed []string
 	for _, spec := range specs {
-		raw, err := os.ReadFile(spec.Source) //nolint:gosec // G304: operator-provided binary.
+		raw, err := os.ReadFile(spec.Source)
 		if err != nil {
 			return engine.ApplyResult{}, err
 		}

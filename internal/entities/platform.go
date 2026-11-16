@@ -3,6 +3,7 @@ package entities
 import (
 	"encoding/json"
 	"errors"
+	"math"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -102,13 +103,6 @@ func platformTimePtr(value pgtype.Timestamptz) *time.Time {
 	return &at
 }
 
-func platformNullableTime(value pgtype.Timestamptz) any {
-	if !value.Valid {
-		return nil
-	}
-	return value.Time.UTC()
-}
-
 func platformInt(value int64) (int, error) {
 	converted := int(value)
 	if int64(converted) != value {
@@ -139,11 +133,10 @@ func platformUint64FromInt32(value int32) (uint64, error) {
 }
 
 func platformInt64(value uint64) (int64, error) {
-	converted := int64(value)
-	if converted < 0 || uint64(converted) != value {
+	if value > math.MaxInt64 {
 		return 0, ErrPlatformCorrupt
 	}
-	return converted, nil
+	return int64(value), nil
 }
 
 func platformJSONMap(raw json.RawMessage) (map[string]string, error) {
@@ -177,10 +170,6 @@ func platformText(value pgtype.Text) string {
 		return ""
 	}
 	return value.String
-}
-
-func platformOptionalInt64(value int) (int64, error) {
-	return int64(value), nil
 }
 
 var ErrPlatformLeaseUncertain = errors.New("entities: platform session lease unlock is uncertain")

@@ -3,7 +3,7 @@ package transport
 import (
 	"bytes"
 	"crypto/hmac"
-	"crypto/sha1"
+	"crypto/sha1" // #nosec G505 -- OpenSSH hashed known_hosts entries are HMAC-SHA1 by format.
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -98,7 +98,7 @@ func HostID(address string) string { return knownhosts.Normalize(address) }
 //     address, so a hashed known_hosts file pins its node like a plain one.
 func LoadHostKeys(path string) (*HostKeys, error) {
 	keys := NewHostKeys()
-	raw, err := os.ReadFile(path) //nolint:gosec // G304: the operator's known_hosts file.
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return keys, nil
@@ -114,28 +114,37 @@ func LoadHostKeys(path string) (*HostKeys, error) {
 		if err != nil {
 			return nil, fmt.Errorf("parse %s: %w", path, err)
 		}
-		switch marker {
-		case "":
-			for _, host := range hosts {
-				if err := keys.addHost(host, key); err != nil {
-					return nil, fmt.Errorf("parse %s: %w", path, err)
-				}
-			}
-		case "revoked":
-			for _, host := range hosts {
-				if err := keys.revokeHost(host, key); err != nil {
-					return nil, fmt.Errorf("parse %s: %w", path, err)
-				}
-			}
-		case "cert-authority":
-			// A CA host certificate is out of scope for a pinned host key.
-			// The line is skipped and never becomes a plain pin.
-		default:
-			return nil, fmt.Errorf("parse %s: unsupported known_hosts marker %q", path, marker)
+		if err := keys.applyKnownHostEntry(path, marker, hosts, key); err != nil {
+			return nil, err
 		}
 		rest = next
 	}
 	return keys, nil
+}
+
+// applyKnownHostEntry applies one parsed known_hosts line. CA entries are
+// deliberately skipped: a host certificate is out of scope for a pinned key.
+func (h *HostKeys) applyKnownHostEntry(path, marker string, hosts []string, key ssh.PublicKey) error {
+	switch marker {
+	case "":
+		for _, host := range hosts {
+			if err := h.addHost(host, key); err != nil {
+				return fmt.Errorf("parse %s: %w", path, err)
+			}
+		}
+	case "revoked":
+		for _, host := range hosts {
+			if err := h.revokeHost(host, key); err != nil {
+				return fmt.Errorf("parse %s: %w", path, err)
+			}
+		}
+	case "cert-authority":
+		// A CA host certificate is out of scope for a pinned host key.
+		// The line is skipped and never becomes a plain pin.
+	default:
+		return fmt.Errorf("parse %s: unsupported known_hosts marker %q", path, marker)
+	}
+	return nil
 }
 
 // addHost pins a key for a known_hosts name. A hashed name is matched

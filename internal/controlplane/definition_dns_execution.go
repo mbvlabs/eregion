@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"math"
 	"net"
 	"reflect"
 	"sort"
@@ -83,7 +84,7 @@ func lockDefinitionDNSCredentialTx(ctx context.Context, tx *entities.StoreTx, sn
 	if err != nil {
 		return unavailable(err)
 	}
-	if !found || expected == 0 || int64(current) != expected {
+	if !found || expected <= 0 || current > math.MaxInt64 || int64(current) != expected {
 		return definitionDNSConflict()
 	}
 	return nil
@@ -97,152 +98,179 @@ func loadDefinitionDNSChildTx(ctx context.Context, tx *entities.StoreTx, child c
 }
 
 func loadDefinitionDNSChildTxMode(ctx context.Context, tx *entities.StoreTx, child contract.OperationID, recovery bool) (*definitionDNSChild, error) {
+	journal, target, found, err := lockDefinitionDNSChildJournalTx(ctx, tx, child)
+	if err != nil || !found {
+		return nil, err
+	}
+	d, err := definitionDNSChildJournal(journal, target, recovery)
+	if err != nil {
+		return nil, err
+	}
+	if d.Plan, err = definitionDNSChildPlan(journal.DNSPlan, d, journal.StepKind); err != nil {
+		return nil, err
+	}
+	if d.Cleanup, err = definitionDNSChildCleanup(journal.DNSCleanup, d, journal.StepKind); err != nil {
+		return nil, err
+	}
+	if d.Progress, d.progressJSON, err = definitionDNSChildProgress(journal.DNSProgress); err != nil {
+		return nil, err
+	}
+	d.childID = child
+	return &d, nil
+}
+
+// lockDefinitionDNSChildJournalTx locks the child journal in the established
+// target, parent, run, step, child order and returns its joined snapshot.
+func lockDefinitionDNSChildJournalTx(ctx context.Context, tx *entities.StoreTx, child contract.OperationID) (entities.DefinitionDNSJournal, entities.DefinitionDNSChildTarget, bool, error) {
 	// The unlocked lookup only chooses which target to lock; the locked journal
 	// and approved input below revalidate it. Never lock a child before its
 	// app/environment: the parent sequencer and admission take those first.
 	targetInfo, found, err := tx.DefinitionDNS().ChildTarget(ctx, child)
 	if err != nil {
-		return nil, unavailable(err)
+		return entities.DefinitionDNSJournal{}, targetInfo, false, unavailable(err)
 	}
 	if !found {
 		exists, err := tx.DefinitionSteps().ChildExists(ctx, child)
 		if err != nil {
-			return nil, unavailable(err)
+			return entities.DefinitionDNSJournal{}, targetInfo, false, unavailable(err)
 		}
 		if exists {
-			return nil, definitionDNSConflict()
+			return entities.DefinitionDNSJournal{}, targetInfo, false, definitionDNSConflict()
 		}
-		return nil, nil
+		return entities.DefinitionDNSJournal{}, targetInfo, false, nil
 	}
-	app, environment := targetInfo.App, targetInfo.Environment
-	environmentID, parentID, ordinal := targetInfo.EnvironmentID, targetInfo.ParentID, targetInfo.Ordinal
-	if err := lockDefinitionTargetTx(ctx, tx, app, environment); err != nil {
-		return nil, err
+	if err := lockDefinitionTargetTx(ctx, tx, targetInfo.App, targetInfo.Environment); err != nil {
+		return entities.DefinitionDNSJournal{}, targetInfo, false, err
 	}
 	// Parent polling takes parent, run, then step. Explicit single-row locks
 	// preserve that order regardless of the planner's join order; the child is
 	// last. Re-read all relationships below after the locks are held.
-	if _, found, err := tx.Operations().Lock(ctx, parentID); err != nil {
-		return nil, unavailable(err)
+	if _, found, err := tx.Operations().Lock(ctx, targetInfo.ParentID); err != nil {
+		return entities.DefinitionDNSJournal{}, targetInfo, false, unavailable(err)
 	} else if !found {
-		return nil, definitionDNSConflict()
+		return entities.DefinitionDNSJournal{}, targetInfo, false, definitionDNSConflict()
 	}
-	if _, found, err := tx.DefinitionRuns().Lock(ctx, parentID); err != nil {
-		return nil, unavailable(err)
+	if _, found, err := tx.DefinitionRuns().Lock(ctx, targetInfo.ParentID); err != nil {
+		return entities.DefinitionDNSJournal{}, targetInfo, false, unavailable(err)
 	} else if !found {
-		return nil, definitionDNSConflict()
+		return entities.DefinitionDNSJournal{}, targetInfo, false, definitionDNSConflict()
 	}
-	if _, found, err := tx.DefinitionSteps().Lock(ctx, parentID, ordinal); err != nil {
-		return nil, unavailable(err)
+	if _, found, err := tx.DefinitionSteps().Lock(ctx, targetInfo.ParentID, targetInfo.Ordinal); err != nil {
+		return entities.DefinitionDNSJournal{}, targetInfo, false, unavailable(err)
 	} else if !found {
-		return nil, definitionDNSConflict()
+		return entities.DefinitionDNSJournal{}, targetInfo, false, definitionDNSConflict()
 	}
 	if _, found, err := tx.Operations().Lock(ctx, child); err != nil {
-		return nil, unavailable(err)
+		return entities.DefinitionDNSJournal{}, targetInfo, false, unavailable(err)
 	} else if !found {
-		return nil, definitionDNSConflict()
+		return entities.DefinitionDNSJournal{}, targetInfo, false, definitionDNSConflict()
 	}
-	journal, found, err := tx.DefinitionDNS().LoadJournal(ctx, parentID, ordinal, child)
+	journal, found, err := tx.DefinitionDNS().LoadJournal(ctx, targetInfo.ParentID, targetInfo.Ordinal, child)
 	if err != nil {
-		return nil, unavailable(err)
+		return entities.DefinitionDNSJournal{}, targetInfo, false, unavailable(err)
 	}
 	if !found {
-		return nil, definitionDNSConflict()
+		return entities.DefinitionDNSJournal{}, targetInfo, false, definitionDNSConflict()
 	}
+	return journal, targetInfo, true, nil
+}
+
+func definitionDNSChildJournal(journal entities.DefinitionDNSJournal, target entities.DefinitionDNSChildTarget, recovery bool) (definitionDNSChild, error) {
 	d := definitionDNSChild{
 		ParentID: journal.ParentID, Ordinal: journal.Ordinal,
 		EnvironmentID: journal.EnvironmentID, DomainID: journal.DomainID,
 		AllocatedID: journal.AllocatedDomainID, Progress: nil, progressJSON: journal.DNSProgress,
 	}
-	var approved, input, opInput, plan, cleanup []byte
-	var progress []byte
-	var kind, target, opKind, opTarget, inputHash, parentKind, parentTarget string
-	var parentState, childState contract.State
-	var parentActor, childActor contract.Actor
-	var finished bool
-	approved = journal.Approved
-	kind, target, input = journal.StepKind, journal.StepTarget, journal.StepInput
-	plan, cleanup, progress = journal.DNSPlan, journal.DNSCleanup, journal.DNSProgress
-	parentKind, parentTarget = journal.ParentKind, journal.ParentTarget
-	parentActor, parentState = journal.ParentActor, journal.ParentState
-	opKind, opTarget = journal.ChildKind, journal.ChildTarget
-	childActor, childState = journal.ChildActor, journal.ChildState
-	inputHash, opInput, finished = journal.ChildInputHash, journal.ChildInput, journal.Finished
-	d.ParentState = parentState
-	d.Kind, d.Target, d.Actor, d.InputHash = kind, target, childActor, inputHash
+	if err := definitionDNSChildJournalIdentity(&d, journal, recovery); err != nil {
+		return d, err
+	}
+	if err := definitionDNSChildJournalInput(&d, journal, target); err != nil {
+		return d, err
+	}
+	return d, nil
+}
+
+func definitionDNSChildJournalIdentity(d *definitionDNSChild, journal entities.DefinitionDNSJournal, recovery bool) error {
+	d.ParentState = journal.ParentState
+	d.Kind, d.Target, d.Actor, d.InputHash = journal.StepKind, journal.StepTarget, journal.ChildActor, journal.ChildInputHash
 	d.Approved = definitionApprovedRun{}
-	if json.Unmarshal(approved, &d.Approved) != nil {
-		return nil, definitionDNSConflict()
+	if json.Unmarshal(journal.Approved, &d.Approved) != nil {
+		return definitionDNSConflict()
 	}
-	parentAllowed := parentState == contract.Running || parentState == contract.Queued || (recovery && parentState == contract.Cancelling)
-	childAllowed := childState == contract.Running || childState == contract.Queued || (recovery && childState == contract.Cancelling)
-	if parentKind != "platform.definition.apply" || parentTarget != target || kind != opKind || target != opTarget || parentActor != childActor || finished || !parentAllowed || !childAllowed {
-		return nil, definitionDNSConflict()
+	parentAllowed := journal.ParentState == contract.Running || journal.ParentState == contract.Queued || (recovery && journal.ParentState == contract.Cancelling)
+	childAllowed := journal.ChildState == contract.Running || journal.ChildState == contract.Queued || (recovery && journal.ChildState == contract.Cancelling)
+	if journal.ParentKind != "platform.definition.apply" || journal.ParentTarget != journal.StepTarget || journal.StepKind != journal.ChildKind || journal.StepTarget != journal.ChildTarget || journal.ParentActor != journal.ChildActor || journal.Finished || !parentAllowed || !childAllowed {
+		return definitionDNSConflict()
 	}
-	if err := requireCloudflareOperator(childActor); err != nil {
-		return nil, err
+	if err := requireCloudflareOperator(journal.ChildActor); err != nil {
+		return err
 	}
-	if kind != platform.KindDomainAdd && kind != platform.KindDomainRemove {
-		return nil, definitionDNSConflict()
+	if journal.StepKind != platform.KindDomainAdd && journal.StepKind != platform.KindDomainRemove {
+		return definitionDNSConflict()
 	}
-	n, err := platform.Default().Normalize(kind, target, input)
-	if err != nil || hashInput(n.Canonical) != inputHash {
-		return nil, definitionDNSConflict()
+	return nil
+}
+
+func definitionDNSChildJournalInput(d *definitionDNSChild, journal entities.DefinitionDNSJournal, target entities.DefinitionDNSChildTarget) error {
+	n, err := platform.Default().Normalize(journal.StepKind, journal.StepTarget, journal.StepInput)
+	if err != nil || hashInput(n.Canonical) != journal.ChildInputHash {
+		return definitionDNSConflict()
 	}
-	on, err := platform.Default().Normalize(opKind, opTarget, opInput)
-	if err != nil || hashInput(on.Canonical) != inputHash || !reflect.DeepEqual(n.Canonical, on.Canonical) {
-		return nil, definitionDNSConflict()
+	on, err := platform.Default().Normalize(journal.ChildKind, journal.ChildTarget, journal.ChildInput)
+	if err != nil || hashInput(on.Canonical) != journal.ChildInputHash || !reflect.DeepEqual(n.Canonical, on.Canonical) {
+		return definitionDNSConflict()
 	}
 	in, ok := n.Input.(*platform.DomainInput)
 	if !ok || d.DomainID == "" || (d.AllocatedID != "" && d.AllocatedID != d.DomainID) {
-		return nil, definitionDNSConflict()
+		return definitionDNSConflict()
 	}
 	d.Input = *in
-	d.Kind, d.Target, d.Actor, d.InputHash = kind, target, childActor, inputHash
-	d.ParentState = parentState
-	if d.ParentID != parentID || d.Ordinal != ordinal || d.EnvironmentID != environmentID || in.App != app || in.Environment != environment || d.Approved.Snapshot.EnvironmentID != d.EnvironmentID || d.Approved.Plan.App != in.App || d.Approved.Plan.Environment != in.Environment {
+	d.Kind, d.Target, d.Actor, d.InputHash = journal.StepKind, journal.StepTarget, journal.ChildActor, journal.ChildInputHash
+	d.ParentState = journal.ParentState
+	if d.ParentID != target.ParentID || d.Ordinal != target.Ordinal || d.EnvironmentID != target.EnvironmentID || in.App != target.App || in.Environment != target.Environment || d.Approved.Snapshot.EnvironmentID != d.EnvironmentID || d.Approved.Plan.App != in.App || d.Approved.Plan.Environment != in.Environment {
+		return definitionDNSConflict()
+	}
+	return nil
+}
+
+func definitionDNSChildPlan(raw json.RawMessage, d definitionDNSChild, kind string) (*integrations.DefinitionDNSPlan, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, nil
+	}
+	var p integrations.DefinitionDNSPlan
+	if json.Unmarshal(raw, &p) != nil || p.DomainID != string(d.DomainID) || p.Host != d.Input.Domain || kind != platform.KindDomainAdd {
 		return nil, definitionDNSConflict()
 	}
-	if len(plan) != 0 && string(plan) != "null" {
-		var p integrations.DefinitionDNSPlan
-		if json.Unmarshal(plan, &p) != nil || p.DomainID != string(d.DomainID) || p.Host != in.Domain || kind != platform.KindDomainAdd {
-			return nil, definitionDNSConflict()
+	for _, approvedPlan := range d.Approved.Plan.DNS {
+		if reflect.DeepEqual(approvedPlan, p) {
+			return &p, nil
 		}
-		found := false
-		for _, approvedPlan := range d.Approved.Plan.DNS {
-			if reflect.DeepEqual(approvedPlan, p) {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return nil, definitionDNSConflict()
-		}
-		d.Plan = &p
 	}
-	if len(cleanup) != 0 && string(cleanup) != "null" {
-		var p integrations.DomainDNSPlan
-		if json.Unmarshal(cleanup, &p) != nil || p.DomainID != string(d.DomainID) || p.Host != in.Domain || kind != platform.KindDomainRemove {
-			return nil, definitionDNSConflict()
-		}
-		found := false
-		for _, approvedPlan := range d.Approved.Plan.DNSCleanup {
-			if reflect.DeepEqual(approvedPlan, p) {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return nil, definitionDNSConflict()
-		}
-		d.Cleanup = &p
+	return nil, definitionDNSConflict()
+}
+
+func definitionDNSChildCleanup(raw json.RawMessage, d definitionDNSChild, kind string) (*integrations.DomainDNSPlan, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, nil
 	}
-	if len(progress) > maxDefinitionDNSProgressBytes || json.Unmarshal(progress, &d.Progress) != nil || d.Progress == nil {
+	var p integrations.DomainDNSPlan
+	if json.Unmarshal(raw, &p) != nil || p.DomainID != string(d.DomainID) || p.Host != d.Input.Domain || kind != platform.KindDomainRemove {
 		return nil, definitionDNSConflict()
 	}
-	d.progressJSON = progress
-	d.childID = child
-	return &d, nil
+	for _, approvedPlan := range d.Approved.Plan.DNSCleanup {
+		if reflect.DeepEqual(approvedPlan, p) {
+			return &p, nil
+		}
+	}
+	return nil, definitionDNSConflict()
+}
+
+func definitionDNSChildProgress(raw json.RawMessage) ([]integrations.DefinitionDNSProgress, json.RawMessage, error) {
+	var progress []integrations.DefinitionDNSProgress
+	if len(raw) > maxDefinitionDNSProgressBytes || json.Unmarshal(raw, &progress) != nil || progress == nil {
+		return nil, nil, definitionDNSConflict()
+	}
+	return progress, raw, nil
 }
 
 // definitionDNSChild opens and releases a short transaction before provider IO.
@@ -270,111 +298,132 @@ func (s *Service) definitionDNSChildMode(ctx context.Context, child contract.Ope
 // never repeats provider writes. An unresolved intent keeps both operations
 // nonterminal and is retried with bounded read-only probes.
 func (w *platformWorker) stopDefinitionDNSChild(ctx context.Context, op contract.Operation, attempt uint32) (bool, error) {
-	wait := func() (bool, error) {
-		recordCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		defer cancel()
-		_, _, _ = w.service.mutateOwned(recordCtx, op.ID, attempt, func(tx *entities.StoreTx, current *contract.Operation) error {
-			recorded, err := tx.Operations().EventStageExists(recordCtx, op.ID, "dns_outcome_unknown")
-			if err != nil {
-				return err
-			}
-			if !recorded && !current.State.Terminal() {
-				return appendEvent(recordCtx, tx, current, contract.Event{Kind: "warning", Stage: "dns_outcome_unknown", Message: "DNS outcome remains unknown; read-only recovery retains the child and parent reservation."})
-			}
-			return nil
-		})
-		return true, river.JobSnooze(30 * time.Second)
-	}
 	step, err := w.service.definitionDNSChildMode(ctx, op.ID, true)
 	if err != nil {
-		return wait()
+		return w.definitionDNSChildWait(ctx, op, attempt)
 	}
 	if step == nil {
 		return false, nil
 	}
 	if step.Plan == nil && step.Cleanup == nil {
-		if step.Input.DNSMode == integrations.DomainDNSModeCloudflare {
-			return wait()
-		}
-		if step.Kind == platform.KindDomainRemove {
-			ledger, err := w.service.loadDomainDNSLedger(ctx, step.Input.App, step.Input.Environment, step.Input.Domain)
-			if err != nil || ledger != nil {
-				return wait()
-			}
-		}
-		return false, nil
-	}
-	finish := func() (bool, error) {
-		exhausted, err := w.service.entities.Operations().EventStageExists(ctx, op.ID, "dns_recovery_exhausted")
-		if err != nil {
-			return wait()
-		}
-		if exhausted {
-			err = w.service.failPlatformOperation(ctx, op.ID, attempt, contract.Unavailable, "Definition DNS worker stopped; read-only recovery resolved its pending provider effect.")
-		} else {
-			err = w.service.cancelPlatform(ctx, op.ID, attempt, "Definition DNS child stopped after read-only recovery; completed effects were retained.")
-		}
-		if err != nil {
-			return wait()
-		}
-		return true, nil
+		return w.definitionDNSStopUnresolved(ctx, op, attempt, step)
 	}
 	ledger, err := w.service.loadDomainDNSLedger(ctx, step.Input.App, step.Input.Environment, step.Input.Domain)
 	if err != nil {
-		return wait()
+		return w.definitionDNSChildWait(ctx, op, attempt)
 	}
 	if ledger == nil && step.Cleanup != nil {
-		return finish() // The terminal guard requires durable cleanup proof.
+		return w.definitionDNSChildFinish(ctx, op, attempt) // The terminal guard requires durable cleanup proof.
 	}
 	if ledger == nil || ledger.LastOperationID != op.ID {
-		return wait()
+		return w.definitionDNSChildWait(ctx, op, attempt)
 	}
 	if step.Plan != nil {
-		store := newDefinitionDNSProgressStore(w.service, op, attempt, *ledger, step)
-		store.recovery = true
-		entries, err := store.Load(ctx)
-		if err != nil {
-			return wait()
+		if err := w.definitionDNSRecoverPlan(ctx, op, attempt, ledger, step); err != nil {
+			return w.definitionDNSChildWait(ctx, op, attempt)
 		}
-		knownRejection := strings.TrimPrefix(ledger.LastError, "definitive write rejection: ")
-		definitive := knownRejection != ledger.LastError && definitionDefinitiveRejection(knownRejection)
-		if len(entries) > 0 && entries[len(entries)-1].Result == nil && !definitive {
-			request := integrations.DomainDNSRequest{ZoneID: ledger.ZoneID, ZoneName: ledger.ZoneName, DomainID: string(ledger.DomainID), Ownership: ledger.Ownership, Host: ledger.Domain, Addresses: ledger.DesiredOrigins, Proxied: ledger.DesiredProxied}
-			probeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-			err := w.service.domainDNS.ResolveApprovedDefinitionDNS(probeCtx, op.Actor, op.ID, request, *step.Plan, store)
-			cancel()
-			if err != nil {
-				return wait()
-			}
-		}
-	} else if len(step.Cleanup.Changes) != 0 && !(ledger.State == domainDNSStateCleanupFailed && definitionCleanupDefinitiveRejection(ledger.CleanupError, *step.Cleanup)) {
-		// Cleanup has no per-record intent. Only an exact read proving every
-		// approved owned record absent can resolve an interrupted cleanup.
-		if w.service.domainDNS == nil || w.service.domainDNS.AuthorizeWrite(ctx, op.Actor) != nil {
-			return wait()
-		}
-		request := integrations.DomainDNSRequest{ZoneID: ledger.ZoneID, ZoneName: ledger.ZoneName, DomainID: string(ledger.DomainID), Ownership: ledger.Ownership, Host: ledger.Domain}
-		probeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-		_, err := w.service.checkDefinitionDNSCleanupAuthority(probeCtx, op, attempt, *ledger, step, true)
-		var current integrations.DomainDNSPlan
-		if err == nil {
-			current, err = w.service.domainDNS.PlanRemove(probeCtx, request)
-		}
-		if err == nil {
-			_, err = w.service.checkDefinitionDNSCleanupAuthority(probeCtx, op, attempt, *ledger, step, true)
-		}
-		cancel()
-		if err != nil || validateDefinitionDNSCleanup(*step.Cleanup, current) != nil || len(current.Changes) != 0 {
-			return wait()
-		}
-		if err := w.service.domainDNS.AuthorizeWrite(ctx, op.Actor); err != nil {
-			return wait()
-		}
-		if err := w.service.recordDefinitionDNSCleanupResolution(ctx, op, attempt, *ledger, step, current); err != nil {
-			return wait()
+	} else if definitionDNSCleanupNeedsReadback(step, *ledger) {
+		if err := w.definitionDNSRecoverCleanup(ctx, op, attempt, *ledger, step); err != nil {
+			return w.definitionDNSChildWait(ctx, op, attempt)
 		}
 	}
-	return finish()
+	return w.definitionDNSChildFinish(ctx, op, attempt)
+}
+
+func (w *platformWorker) definitionDNSChildWait(ctx context.Context, op contract.Operation, attempt uint32) (bool, error) {
+	recordCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	_, _, _ = w.service.mutateOwned(recordCtx, op.ID, attempt, func(tx *entities.StoreTx, current *contract.Operation) error {
+		recorded, err := tx.Operations().EventStageExists(recordCtx, op.ID, "dns_outcome_unknown")
+		if err != nil {
+			return err
+		}
+		if !recorded && !current.State.Terminal() {
+			return appendEvent(recordCtx, tx, current, contract.Event{Kind: "warning", Stage: "dns_outcome_unknown", Message: "DNS outcome remains unknown; read-only recovery retains the child and parent reservation."})
+		}
+		return nil
+	})
+	return true, river.JobSnooze(30 * time.Second)
+}
+
+func (w *platformWorker) definitionDNSChildFinish(ctx context.Context, op contract.Operation, attempt uint32) (bool, error) {
+	exhausted, err := w.service.entities.Operations().EventStageExists(ctx, op.ID, "dns_recovery_exhausted")
+	if err != nil {
+		return w.definitionDNSChildWait(ctx, op, attempt)
+	}
+	if exhausted {
+		err = w.service.failPlatformOperation(ctx, op.ID, attempt, contract.Unavailable, "Definition DNS worker stopped; read-only recovery resolved its pending provider effect.")
+	} else {
+		err = w.service.cancelPlatform(ctx, op.ID, attempt, "Definition DNS child stopped after read-only recovery; completed effects were retained.")
+	}
+	if err != nil {
+		return w.definitionDNSChildWait(ctx, op, attempt)
+	}
+	return true, nil
+}
+
+func (w *platformWorker) definitionDNSStopUnresolved(ctx context.Context, op contract.Operation, attempt uint32, step *definitionDNSChild) (bool, error) {
+	if step.Input.DNSMode == integrations.DomainDNSModeCloudflare {
+		return w.definitionDNSChildWait(ctx, op, attempt)
+	}
+	if step.Kind == platform.KindDomainRemove {
+		ledger, err := w.service.loadDomainDNSLedger(ctx, step.Input.App, step.Input.Environment, step.Input.Domain)
+		if err != nil || ledger != nil {
+			return w.definitionDNSChildWait(ctx, op, attempt)
+		}
+	}
+	return false, nil
+}
+
+func (w *platformWorker) definitionDNSRecoverPlan(ctx context.Context, op contract.Operation, attempt uint32, ledger *domainDNSLedger, step *definitionDNSChild) error {
+	store := newDefinitionDNSProgressStore(w.service, op, attempt, *ledger, step)
+	store.recovery = true
+	entries, err := store.Load(ctx)
+	if err != nil {
+		return err
+	}
+	knownRejection := strings.TrimPrefix(ledger.LastError, "definitive write rejection: ")
+	definitive := knownRejection != ledger.LastError && definitionDefinitiveRejection(knownRejection)
+	if len(entries) == 0 || entries[len(entries)-1].Result != nil || definitive {
+		return nil
+	}
+	request := integrations.DomainDNSRequest{ZoneID: ledger.ZoneID, ZoneName: ledger.ZoneName, DomainID: string(ledger.DomainID), Ownership: ledger.Ownership, Host: ledger.Domain, Addresses: ledger.DesiredOrigins, Proxied: ledger.DesiredProxied}
+	probeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	return w.service.domainDNS.ResolveApprovedDefinitionDNS(probeCtx, op.Actor, op.ID, request, *step.Plan, store)
+}
+
+func definitionDNSCleanupNeedsReadback(step *definitionDNSChild, ledger domainDNSLedger) bool {
+	if len(step.Cleanup.Changes) == 0 {
+		return false
+	}
+	return ledger.State != domainDNSStateCleanupFailed || !definitionCleanupDefinitiveRejection(ledger.CleanupError, *step.Cleanup)
+}
+
+func (w *platformWorker) definitionDNSRecoverCleanup(ctx context.Context, op contract.Operation, attempt uint32, ledger domainDNSLedger, step *definitionDNSChild) error {
+	// Cleanup has no per-record intent. Only an exact read proving every
+	// approved owned record absent can resolve an interrupted cleanup.
+	if w.service.domainDNS == nil || w.service.domainDNS.AuthorizeWrite(ctx, op.Actor) != nil {
+		return definitionDNSConflict()
+	}
+	request := integrations.DomainDNSRequest{ZoneID: ledger.ZoneID, ZoneName: ledger.ZoneName, DomainID: string(ledger.DomainID), Ownership: ledger.Ownership, Host: ledger.Domain}
+	probeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	_, err := w.service.checkDefinitionDNSCleanupAuthority(probeCtx, op, attempt, ledger, step, true)
+	var current integrations.DomainDNSPlan
+	if err == nil {
+		current, err = w.service.domainDNS.PlanRemove(probeCtx, request)
+	}
+	if err == nil {
+		_, err = w.service.checkDefinitionDNSCleanupAuthority(probeCtx, op, attempt, ledger, step, true)
+	}
+	if err != nil || validateDefinitionDNSCleanup(*step.Cleanup, current) != nil || len(current.Changes) != 0 {
+		return definitionDNSConflict()
+	}
+	if err := w.service.domainDNS.AuthorizeWrite(ctx, op.Actor); err != nil {
+		return err
+	}
+	return w.service.recordDefinitionDNSCleanupResolution(ctx, op, attempt, ledger, step, current)
 }
 
 func (s *Service) recordDefinitionDNSCleanupResolution(ctx context.Context, op contract.Operation, attempt uint32, ledger domainDNSLedger, expected *definitionDNSChild, observed integrations.DomainDNSPlan) error {
@@ -382,47 +431,8 @@ func (s *Service) recordDefinitionDNSCleanupResolution(ctx context.Context, op c
 }
 func (s *Service) recordDefinitionDNSCleanupResolutionTx(ctx context.Context, op contract.Operation, attempt uint32, ledger domainDNSLedger, expected *definitionDNSChild, observed integrations.DomainDNSPlan) error {
 	err := s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
-		step, err := loadDefinitionDNSChildTxMode(ctx, tx, op.ID, true)
-		if err != nil {
+		if err := definitionDNSCleanupResolutionTx(ctx, tx, op, attempt, ledger, expected, observed); err != nil {
 			return err
-		}
-		if step == nil || step.ParentID != expected.ParentID || step.Ordinal != expected.Ordinal || step.Actor != op.Actor || step.Cleanup == nil || !reflect.DeepEqual(step.Cleanup, expected.Cleanup) || len(observed.Changes) != 0 || validateDefinitionDNSCleanup(*step.Cleanup, observed) != nil {
-			return definitionDNSConflict()
-		}
-		currentOp, found, err := tx.Operations().Get(ctx, op.ID)
-		if err != nil || !found {
-			return unavailable(err)
-		}
-		if currentOp.State != contract.Cancelling || currentOp.Attempt != attempt {
-			return definitionDNSConflict()
-		}
-		current, err := lockDefinitionDNSLedgerTx(ctx, tx, ledger.DomainID, step.EnvironmentID)
-		if err != nil {
-			return err
-		}
-		if current.LastOperationID != op.ID || current.Generation != ledger.Generation || current.Domain != ledger.Domain || current.ZoneID != ledger.ZoneID || current.ZoneName != ledger.ZoneName || current.Ownership != ledger.Ownership || current.Provider != "cloudflare" {
-			return definitionDNSConflict()
-		}
-		policy, err := lockedDefinitionDNSPolicy(ctx, tx)
-		if err != nil {
-			return err
-		}
-		if policy.Revision != step.Approved.Snapshot.Policy.Revision {
-			return definitionDNSConflict()
-		}
-		if err := lockDefinitionDNSCredentialTx(ctx, tx, step.Approved.Snapshot, ledger.ZoneID); err != nil {
-			return err
-		}
-		if diagnostic := definitionSafeProviderDiagnostic(current.CleanupError); diagnostic != "" {
-			recorded, err := tx.Operations().EventStageExists(ctx, op.ID, "dns_prior_provider_failure")
-			if err != nil {
-				return unavailable(err)
-			}
-			if !recorded {
-				if err := appendEvent(ctx, tx, &currentOp, contract.Event{Kind: "warning", Stage: "dns_prior_provider_failure", Message: diagnostic}); err != nil {
-					return err
-				}
-			}
 		}
 		rows, err := tx.Platform().DomainDNS().MarkCleanupVerifiedForGeneration(ctx, ledger.DomainID, op.ID, ledger.Generation)
 		if err != nil {
@@ -438,6 +448,61 @@ func (s *Service) recordDefinitionDNSCleanupResolutionTx(ctx context.Context, op
 			return unavailable(err)
 		}
 		return err
+	}
+	return nil
+}
+
+func definitionDNSCleanupResolutionTx(ctx context.Context, tx *entities.StoreTx, op contract.Operation, attempt uint32, ledger domainDNSLedger, expected *definitionDNSChild, observed integrations.DomainDNSPlan) error {
+	step, err := loadDefinitionDNSChildTxMode(ctx, tx, op.ID, true)
+	if err != nil {
+		return err
+	}
+	if step == nil || step.ParentID != expected.ParentID || step.Ordinal != expected.Ordinal || step.Actor != op.Actor || step.Cleanup == nil || !reflect.DeepEqual(step.Cleanup, expected.Cleanup) || len(observed.Changes) != 0 || validateDefinitionDNSCleanup(*step.Cleanup, observed) != nil {
+		return definitionDNSConflict()
+	}
+	currentOp, found, err := tx.Operations().Get(ctx, op.ID)
+	if err != nil || !found {
+		return unavailable(err)
+	}
+	if currentOp.State != contract.Cancelling || currentOp.Attempt != attempt {
+		return definitionDNSConflict()
+	}
+	current, err := lockDefinitionDNSLedgerTx(ctx, tx, ledger.DomainID, step.EnvironmentID)
+	if err != nil {
+		return err
+	}
+	if current.LastOperationID != op.ID || current.Generation != ledger.Generation || current.Domain != ledger.Domain || current.ZoneID != ledger.ZoneID || current.ZoneName != ledger.ZoneName || current.Ownership != ledger.Ownership || current.Provider != "cloudflare" {
+		return definitionDNSConflict()
+	}
+	policy, err := lockedDefinitionDNSPolicy(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if policy.Revision != step.Approved.Snapshot.Policy.Revision {
+		return definitionDNSConflict()
+	}
+	if err := lockDefinitionDNSCredentialTx(ctx, tx, step.Approved.Snapshot, ledger.ZoneID); err != nil {
+		return err
+	}
+	// Diagnostics must use the row locked in this transaction: cleanup_error
+	// can change without changing the generation checked above.
+	if err := recordDefinitionDNSPriorDiagnosticTx(ctx, tx, currentOp, current); err != nil {
+		return err
+	}
+	return nil
+}
+
+func recordDefinitionDNSPriorDiagnosticTx(ctx context.Context, tx *entities.StoreTx, op contract.Operation, ledger domainDNSLedger) error {
+	if diagnostic := definitionSafeProviderDiagnostic(ledger.CleanupError); diagnostic != "" {
+		recorded, err := tx.Operations().EventStageExists(ctx, op.ID, "dns_prior_provider_failure")
+		if err != nil {
+			return unavailable(err)
+		}
+		if !recorded {
+			if err := appendEvent(ctx, tx, &op, contract.Event{Kind: "warning", Stage: "dns_prior_provider_failure", Message: diagnostic}); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
@@ -496,25 +561,13 @@ func (s *Service) latchDefinitionDNSRecovery(ctx context.Context, id contract.Op
 func (s *Service) requeueDefinitionDNSRecovery(ctx context.Context, id contract.OperationID) (bool, error) {
 	handled := false
 	err := s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
-		jobID, hasJob, err := tx.Operations().JobID(ctx, id)
+		jobID, hasJob, jobHandled, err := definitionDNSRecoveryJobTx(ctx, tx, id)
 		if err != nil {
-			return unavailable(err)
+			return err
 		}
-		if hasJob {
-			state, found, err := tx.RiverJobs().GetForUpdate(ctx, jobID)
-			if err != nil {
-				return unavailable(err)
-			}
-			if !found {
-				hasJob = false
-			} else if state != "discarded" && state != "completed" && state != "cancelled" {
-				linked, err := tx.DefinitionDNS().LinkedCleanupPending(ctx, id)
-				if err != nil {
-					return unavailable(err)
-				}
-				handled = linked
-				return nil
-			}
+		if jobHandled {
+			handled = true
+			return nil
 		}
 		op, found, err := tx.Operations().Lock(ctx, id)
 		if err != nil || !found {
@@ -524,22 +577,7 @@ func (s *Service) requeueDefinitionDNSRecovery(ctx context.Context, id contract.
 		if err != nil || !handled {
 			return err
 		}
-		if !hasJob {
-			created, err := tx.Jobs().EnqueuePlatform(ctx, op)
-			if err != nil {
-				return unavailable(err)
-			}
-			jobID, hasJob = created, true
-			if err := tx.Operations().SetJob(ctx, id, created); err != nil {
-				return unavailable(err)
-			}
-		}
-		if hasJob {
-			if _, err := tx.RiverJobs().Snooze(ctx, jobID, op.Attempt, 30); err != nil {
-				return unavailable(err)
-			}
-		}
-		return nil
+		return ensureDefinitionDrainJobTx(ctx, tx, id, op, jobID, hasJob, 30)
 	})
 	if err != nil {
 		if entities.IsBeginFailure(err) || entities.IsCommitFailure(err) {
@@ -548,6 +586,31 @@ func (s *Service) requeueDefinitionDNSRecovery(ctx context.Context, id contract.
 		return handled, err
 	}
 	return handled, nil
+}
+
+func definitionDNSRecoveryJobTx(ctx context.Context, tx *entities.StoreTx, id contract.OperationID) (int64, bool, bool, error) {
+	jobID, hasJob, err := tx.Operations().JobID(ctx, id)
+	if err != nil {
+		return jobID, false, false, unavailable(err)
+	}
+	if !hasJob {
+		return jobID, false, false, nil
+	}
+	state, found, err := tx.RiverJobs().GetForUpdate(ctx, jobID)
+	if err != nil {
+		return jobID, false, false, unavailable(err)
+	}
+	if !found {
+		return jobID, false, false, nil
+	}
+	if state == "discarded" || state == "completed" || state == "cancelled" {
+		return jobID, true, false, nil
+	}
+	linked, err := tx.DefinitionDNS().LinkedCleanupPending(ctx, id)
+	if err != nil {
+		return jobID, true, false, unavailable(err)
+	}
+	return jobID, true, linked, nil
 }
 
 // guardDefinitionDNSTerminalTx runs while the operation row is locked. An
@@ -571,6 +634,10 @@ func guardDefinitionDNSTerminalTx(ctx context.Context, tx *entities.StoreTx, op 
 		}
 		return nil
 	}
+	return guardDefinitionDNSLinkedTerminalTx(ctx, tx, op, cleanupState)
+}
+
+func guardDefinitionDNSLinkedTerminalTx(ctx context.Context, tx *entities.StoreTx, op *contract.Operation, cleanupState entities.DefinitionCleanupState) error {
 	progress, plan, cleanup, input, approvedRun := cleanupState.DNSProgress, cleanupState.DNSPlan, cleanupState.DNSCleanup, cleanupState.Input, cleanupState.Approved
 	domainID, ledgerState := string(cleanupState.DomainID), cleanupState.State
 	ledgerError, cleanupError := cleanupState.LastError, cleanupState.CleanupError
@@ -585,91 +652,155 @@ func guardDefinitionDNSTerminalTx(ctx context.Context, tx *entities.StoreTx, op 
 		return definitionDNSConflict()
 	}
 	if !hasPlan && !hasCleanup {
-		var entries []integrations.DefinitionDNSProgress
-		var domain platform.DomainInput
-		if json.Unmarshal(progress, &entries) != nil || entries == nil || len(entries) != 0 || json.Unmarshal(input, &domain) != nil || domain.DNSMode == integrations.DomainDNSModeCloudflare ||
-			(op.Kind == platform.KindDomainRemove && ledgerOwner == string(op.ID)) ||
-			ledgerState == domainDNSStatePending || ledgerState == domainDNSStateFailed || ledgerState == domainDNSStateCleanupPending || ledgerState == domainDNSStateCleanupFailed {
-			return definitionDNSConflict()
-		}
-		return nil
+		return guardDefinitionDNSNoPlanTerminalTx(progress, input, op, ledgerOwner, ledgerState)
 	}
 	if hasCleanup && !hasPlan && ledgerOwner == "" && op.Kind == platform.KindDomainRemove {
-		var entries []integrations.DefinitionDNSProgress
-		var approved integrations.DomainDNSPlan
-		if json.Unmarshal(progress, &entries) != nil || entries == nil || len(entries) != 0 || json.Unmarshal(cleanup, &approved) != nil || approved.DomainID != domainID {
-			return definitionDNSConflict()
-		}
-		found := false
-		for _, candidate := range run.Plan.DNSCleanup {
-			if reflect.DeepEqual(candidate, approved) {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return definitionDNSConflict()
-		}
-		verified, err := tx.DefinitionDNS().CleanupVerifiedWithoutLink(ctx, op.ID)
+		verified, err := guardDefinitionDNSUnlinkedCleanupTx(ctx, tx, op, progress, cleanup, domainID, run)
 		if err != nil {
-			return unavailable(err)
+			return err
 		}
 		if verified {
 			return nil
 		}
+		return definitionDNSUnresolvedFault()
 	}
+	return guardDefinitionDNSOwnedTerminalTx(progress, plan, cleanup, op, hasPlan, hasCleanup, ledgerOwner, domainID, ledgerState, ledgerError, cleanupError, run)
+}
+
+func guardDefinitionDNSNoPlanTerminalTx(progress, input []byte, op *contract.Operation, ledgerOwner, ledgerState string) error {
+	if !definitionDNSNoPlanCleanupValid(progress, input, op.Kind, ledgerOwner, op.ID, ledgerState) {
+		return definitionDNSConflict()
+	}
+	return nil
+}
+
+func guardDefinitionDNSOwnedTerminalTx(progress, plan, cleanup []byte, op *contract.Operation, hasPlan, hasCleanup bool, ledgerOwner, domainID, ledgerState, ledgerError, cleanupError string, run definitionApprovedRun) error {
 	if ledgerOwner != string(op.ID) {
-		return contract.NewFault(contract.Unavailable, "definition DNS recovery is unresolved", "Retain the child and parent reservation.")
+		return definitionDNSUnresolvedFault()
 	}
-	var entries []integrations.DefinitionDNSProgress
-	if json.Unmarshal(progress, &entries) != nil || entries == nil {
-		return contract.NewFault(contract.Unavailable, "definition DNS recovery is unresolved", "Retain the child and parent reservation.")
+	entries, err := definitionDNSTerminalEntries(progress)
+	if err != nil {
+		return err
 	}
 	if hasPlan {
-		var approved integrations.DefinitionDNSPlan
-		if json.Unmarshal(plan, &approved) != nil || validateDefinitionDNSProgress(approved, entries) != nil {
-			return definitionDNSConflict()
-		}
-		found := false
-		for _, candidate := range run.Plan.DNS {
-			if reflect.DeepEqual(candidate, approved) && approved.DomainID == domainID {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return definitionDNSConflict()
-		}
-		for _, entry := range entries {
-			if entry.Result != nil && !integrations.DefinitionDNSObserved(entry, approved.Ownership) {
-				return definitionDNSConflict()
-			}
-		}
-		if len(entries) > 0 && entries[len(entries)-1].Result == nil {
-			rejection := strings.TrimPrefix(ledgerError, "definitive write rejection: ")
-			if rejection == ledgerError || !definitionDefinitiveRejection(rejection) {
-				return contract.NewFault(contract.Unavailable, "approved DNS write outcome remains unknown", "Retain the child and parent reservation.")
-			}
+		if err := guardDefinitionDNSPlanTerminalTx(plan, entries, ledgerError, domainID, run); err != nil {
+			return err
 		}
 	}
 	if hasCleanup {
-		var approved integrations.DomainDNSPlan
-		if json.Unmarshal(cleanup, &approved) != nil || (len(approved.Changes) > 0 && ledgerState != domainDNSStateCleanupVerified &&
-			!(ledgerState == domainDNSStateCleanupFailed && definitionCleanupDefinitiveRejection(cleanupError, approved))) {
-			return contract.NewFault(contract.Unavailable, "approved DNS cleanup outcome remains unknown", "Retain the child and parent reservation.")
-		}
-		found := false
-		for _, candidate := range run.Plan.DNSCleanup {
-			if reflect.DeepEqual(candidate, approved) && approved.DomainID == domainID {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return definitionDNSConflict()
+		if err := guardDefinitionDNSCleanupTerminalTx(cleanup, ledgerState, cleanupError, domainID, run); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+func definitionDNSUnresolvedFault() *contract.FaultError {
+	return contract.NewFault(contract.Unavailable, "definition DNS recovery is unresolved", "Retain the child and parent reservation.")
+}
+
+func definitionDNSNoPlanCleanupValid(progress, input []byte, kind, ledgerOwner string, opID contract.OperationID, ledgerState string) bool {
+	if kind == platform.KindDomainRemove && ledgerOwner == string(opID) {
+		return false
+	}
+	var entries []integrations.DefinitionDNSProgress
+	if json.Unmarshal(progress, &entries) != nil || entries == nil || len(entries) != 0 {
+		return false
+	}
+	var domain platform.DomainInput
+	if json.Unmarshal(input, &domain) != nil || domain.DNSMode == integrations.DomainDNSModeCloudflare {
+		return false
+	}
+	switch ledgerState {
+	case domainDNSStatePending, domainDNSStateFailed, domainDNSStateCleanupPending, domainDNSStateCleanupFailed:
+		return false
+	}
+	return true
+}
+
+func guardDefinitionDNSUnlinkedCleanupTx(ctx context.Context, tx *entities.StoreTx, op *contract.Operation, progress, cleanup []byte, domainID string, run definitionApprovedRun) (bool, error) {
+	var entries []integrations.DefinitionDNSProgress
+	var approved integrations.DomainDNSPlan
+	if json.Unmarshal(progress, &entries) != nil || entries == nil || len(entries) != 0 || json.Unmarshal(cleanup, &approved) != nil || approved.DomainID != domainID {
+		return false, definitionDNSConflict()
+	}
+	if !definitionRunHasCleanup(run.Plan.DNSCleanup, approved) {
+		return false, definitionDNSConflict()
+	}
+	verified, err := tx.DefinitionDNS().CleanupVerifiedWithoutLink(ctx, op.ID)
+	if err != nil {
+		return false, unavailable(err)
+	}
+	return verified, nil
+}
+
+func definitionDNSTerminalEntries(progress []byte) ([]integrations.DefinitionDNSProgress, error) {
+	var entries []integrations.DefinitionDNSProgress
+	if json.Unmarshal(progress, &entries) != nil || entries == nil {
+		return nil, contract.NewFault(contract.Unavailable, "definition DNS recovery is unresolved", "Retain the child and parent reservation.")
+	}
+	return entries, nil
+}
+
+func guardDefinitionDNSPlanTerminalTx(plan []byte, entries []integrations.DefinitionDNSProgress, ledgerError, domainID string, run definitionApprovedRun) error {
+	var approved integrations.DefinitionDNSPlan
+	if json.Unmarshal(plan, &approved) != nil || validateDefinitionDNSProgress(approved, entries) != nil {
+		return definitionDNSConflict()
+	}
+	if approved.DomainID != domainID || !definitionRunHasDNS(run.Plan.DNS, approved) {
+		return definitionDNSConflict()
+	}
+	for _, entry := range entries {
+		if entry.Result != nil && !integrations.DefinitionDNSObserved(entry, approved.Ownership) {
+			return definitionDNSConflict()
+		}
+	}
+	if len(entries) > 0 && entries[len(entries)-1].Result == nil {
+		rejection := strings.TrimPrefix(ledgerError, "definitive write rejection: ")
+		if rejection == ledgerError || !definitionDefinitiveRejection(rejection) {
+			return contract.NewFault(contract.Unavailable, "approved DNS write outcome remains unknown", "Retain the child and parent reservation.")
+		}
+	}
+	return nil
+}
+
+func guardDefinitionDNSCleanupTerminalTx(cleanup []byte, ledgerState, cleanupError, domainID string, run definitionApprovedRun) error {
+	var approved integrations.DomainDNSPlan
+	if json.Unmarshal(cleanup, &approved) != nil {
+		return contract.NewFault(contract.Unavailable, "approved DNS cleanup outcome remains unknown", "Retain the child and parent reservation.")
+	}
+	if !definitionDNSCleanupResolved(approved, ledgerState, cleanupError) {
+		return contract.NewFault(contract.Unavailable, "approved DNS cleanup outcome remains unknown", "Retain the child and parent reservation.")
+	}
+	if approved.DomainID != domainID || !definitionRunHasCleanup(run.Plan.DNSCleanup, approved) {
+		return definitionDNSConflict()
+	}
+	return nil
+}
+
+func definitionDNSCleanupResolved(approved integrations.DomainDNSPlan, ledgerState, cleanupError string) bool {
+	if len(approved.Changes) == 0 || ledgerState == domainDNSStateCleanupVerified {
+		return true
+	}
+	return ledgerState == domainDNSStateCleanupFailed && definitionCleanupDefinitiveRejection(cleanupError, approved)
+}
+
+func definitionRunHasDNS(plans []integrations.DefinitionDNSPlan, approved integrations.DefinitionDNSPlan) bool {
+	for _, candidate := range plans {
+		if reflect.DeepEqual(candidate, approved) {
+			return true
+		}
+	}
+	return false
+}
+
+func definitionRunHasCleanup(plans []integrations.DomainDNSPlan, approved integrations.DomainDNSPlan) bool {
+	for _, candidate := range plans {
+		if reflect.DeepEqual(candidate, approved) {
+			return true
+		}
+	}
+	return false
 }
 
 // definitionDNSProgressStore fences every access to the captured child attempt
@@ -763,47 +894,15 @@ func (p *definitionDNSProgressStore) withLocked(ctx context.Context, fn func(*en
 		return err
 	}
 	err := p.service.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
-		d, err := loadDefinitionDNSChildTxMode(ctx, tx, p.child.ID, p.recovery)
+		d, err := p.lockProgressChildTx(ctx, tx)
 		if err != nil {
 			return err
 		}
-		if d == nil || d.ParentID != p.parentID || d.Ordinal != p.ordinal || d.Plan == nil || d.DomainID != p.ledger.DomainID {
-			return definitionDNSConflict()
-		}
-		currentOp, found, err := tx.Operations().Get(ctx, p.child.ID)
-		if err != nil || !found {
-			return unavailable(err)
-		}
-		state, attempt, actor := currentOp.State, currentOp.Attempt, currentOp.Actor
-		if actor != p.child.Actor || (state != contract.Running && !(p.recovery && state == contract.Cancelling)) || (!p.recovery && d.ParentState == contract.Cancelling) || attempt != p.attempt {
-			return definitionDNSConflict()
-		}
-		ledger, err := lockDefinitionDNSLedgerTx(ctx, tx, d.DomainID, d.EnvironmentID)
+		ledger, err := p.lockProgressLedgerTx(ctx, tx, d)
 		if err != nil {
 			return err
 		}
-		environmentID, found, err := tx.Platform().Domains().EnvironmentIDByID(ctx, d.DomainID)
-		if err != nil || !found {
-			return unavailable(err)
-		}
-		if environmentID != d.EnvironmentID {
-			return definitionDNSConflict()
-		}
-		if ledger.Generation != p.ledger.Generation || ledger.LastOperationID != p.child.ID || ledger.App != d.Input.App || ledger.Environment != d.Input.Environment || ledger.Domain != d.Input.Domain || ledger.ZoneID != d.Plan.ZoneID || ledger.ZoneName != d.Plan.Zone || ledger.Ownership != d.Plan.Ownership || ledger.Ownership != integrations.DomainDNSOwnership(string(d.DomainID), ledger.ZoneID) || ledger.Provider != "cloudflare" || !definitionDNSPlanMatchesLedger(*d.Plan, ledger) {
-			return definitionDNSConflict()
-		}
-		policy, err := lockedDefinitionDNSPolicy(ctx, tx)
-		if err != nil {
-			return err
-		}
-		approvedPolicy := d.Approved.Snapshot.Policy
-		if !reflect.DeepEqual(policy, approvedPolicy) || !policy.Enabled || (policy.ProxyMode != "proxied" && policy.ProxyMode != "dns-only") || policy.ZoneID != ledger.ZoneID || policy.ZoneName != ledger.ZoneName || !reflect.DeepEqual(policy.Origins, ledger.DesiredOrigins) || (policy.ProxyMode == "proxied") != ledger.DesiredProxied || d.Input.DNSMode != "cloudflare" || d.Input.DNSZone != ledger.ZoneID || d.Input.DNSProxied == nil || *d.Input.DNSProxied != ledger.DesiredProxied || !reflect.DeepEqual(d.Input.DNSOrigins, ledger.DesiredOrigins) {
-			return definitionDNSConflict()
-		}
-		if err := lockDefinitionDNSCredentialTx(ctx, tx, d.Approved.Snapshot, ledger.ZoneID); err != nil {
-			return err
-		}
-		if err := validateDefinitionDNSProgress(*d.Plan, d.Progress); err != nil {
+		if err := p.validateProgressLedgerTx(ctx, tx, d, ledger); err != nil {
 			return err
 		}
 		return fn(tx, d)
@@ -815,6 +914,83 @@ func (p *definitionDNSProgressStore) withLocked(ctx context.Context, fn func(*en
 		return err
 	}
 	return nil
+}
+
+func (p *definitionDNSProgressStore) lockProgressChildTx(ctx context.Context, tx *entities.StoreTx) (*definitionDNSChild, error) {
+	d, err := loadDefinitionDNSChildTxMode(ctx, tx, p.child.ID, p.recovery)
+	if err != nil {
+		return nil, err
+	}
+	if d == nil || d.ParentID != p.parentID || d.Ordinal != p.ordinal || d.Plan == nil || d.DomainID != p.ledger.DomainID {
+		return nil, definitionDNSConflict()
+	}
+	currentOp, found, err := tx.Operations().Get(ctx, p.child.ID)
+	if err != nil || !found {
+		return nil, unavailable(err)
+	}
+	state, attempt, actor := currentOp.State, currentOp.Attempt, currentOp.Actor
+	if actor != p.child.Actor || !definitionDNSChildRunnable(state, p.recovery) || (!p.recovery && d.ParentState == contract.Cancelling) || attempt != p.attempt {
+		return nil, definitionDNSConflict()
+	}
+	return d, nil
+}
+
+func definitionDNSChildRunnable(state contract.State, recovery bool) bool {
+	if recovery {
+		return state == contract.Running || state == contract.Cancelling
+	}
+	return state == contract.Running
+}
+
+func (p *definitionDNSProgressStore) lockProgressLedgerTx(ctx context.Context, tx *entities.StoreTx, d *definitionDNSChild) (domainDNSLedger, error) {
+	ledger, err := lockDefinitionDNSLedgerTx(ctx, tx, d.DomainID, d.EnvironmentID)
+	if err != nil {
+		return domainDNSLedger{}, err
+	}
+	environmentID, found, err := tx.Platform().Domains().EnvironmentIDByID(ctx, d.DomainID)
+	if err != nil || !found {
+		return domainDNSLedger{}, unavailable(err)
+	}
+	if environmentID != d.EnvironmentID {
+		return domainDNSLedger{}, definitionDNSConflict()
+	}
+	return ledger, nil
+}
+
+func (p *definitionDNSProgressStore) validateProgressLedgerTx(ctx context.Context, tx *entities.StoreTx, d *definitionDNSChild, ledger domainDNSLedger) error {
+	if ledger.Generation != p.ledger.Generation || ledger.LastOperationID != p.child.ID || !definitionDNSProgressLedgerMatches(d, ledger) {
+		return definitionDNSConflict()
+	}
+	policy, err := lockedDefinitionDNSPolicy(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if !definitionDNSProgressPolicyMatches(d, policy, ledger) {
+		return definitionDNSConflict()
+	}
+	if err := lockDefinitionDNSCredentialTx(ctx, tx, d.Approved.Snapshot, ledger.ZoneID); err != nil {
+		return err
+	}
+	return validateDefinitionDNSProgress(*d.Plan, d.Progress)
+}
+
+func definitionDNSProgressLedgerMatches(d *definitionDNSChild, ledger domainDNSLedger) bool {
+	if ledger.App != d.Input.App || ledger.Environment != d.Input.Environment || ledger.Domain != d.Input.Domain || ledger.ZoneID != d.Plan.ZoneID || ledger.ZoneName != d.Plan.Zone || ledger.Ownership != d.Plan.Ownership || ledger.Provider != "cloudflare" {
+		return false
+	}
+	return ledger.Ownership == integrations.DomainDNSOwnership(string(d.DomainID), ledger.ZoneID) && definitionDNSPlanMatchesLedger(*d.Plan, ledger)
+}
+
+func definitionDNSProgressPolicyMatches(d *definitionDNSChild, policy api.DefinitionDNSPolicy, ledger domainDNSLedger) bool {
+	approvedPolicy := d.Approved.Snapshot.Policy
+	return reflect.DeepEqual(policy, approvedPolicy) && policy.Enabled &&
+		(policy.ProxyMode == "proxied" || policy.ProxyMode == "dns-only") &&
+		policy.ZoneID == ledger.ZoneID && policy.ZoneName == ledger.ZoneName &&
+		reflect.DeepEqual(policy.Origins, ledger.DesiredOrigins) &&
+		(policy.ProxyMode == "proxied") == ledger.DesiredProxied &&
+		d.Input.DNSMode == "cloudflare" && d.Input.DNSZone == ledger.ZoneID &&
+		d.Input.DNSProxied != nil && *d.Input.DNSProxied == ledger.DesiredProxied &&
+		reflect.DeepEqual(d.Input.DNSOrigins, ledger.DesiredOrigins)
 }
 
 func (p *definitionDNSProgressStore) Load(ctx context.Context) ([]integrations.DefinitionDNSProgress, error) {
@@ -900,43 +1076,8 @@ func (s *Service) checkDefinitionDNSCleanupAuthority(ctx context.Context, op con
 	var step *definitionDNSChild
 	err := s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
 		var err error
-		step, err = loadDefinitionDNSChildTxMode(ctx, tx, op.ID, recovery)
-		if err != nil {
-			return err
-		}
-		if step == nil || step.ParentID != expected.ParentID || step.Ordinal != expected.Ordinal || step.Actor != op.Actor || step.Cleanup == nil || step.DomainID != ledger.DomainID || step.Cleanup.ZoneID != ledger.ZoneID || step.Cleanup.Zone != ledger.ZoneName || step.Cleanup.Host != ledger.Domain || step.Cleanup.Ownership != ledger.Ownership || ledger.Ownership != integrations.DomainDNSOwnership(string(ledger.DomainID), ledger.ZoneID) {
-			return definitionDNSConflict()
-		}
-		currentOp, found, err := tx.Operations().Get(ctx, op.ID)
-		if err != nil || !found {
-			return unavailable(err)
-		}
-		state, currentAttempt := currentOp.State, currentOp.Attempt
-		if (state != contract.Running && !(recovery && state == contract.Cancelling)) || currentAttempt != attempt {
-			return definitionDNSConflict()
-		}
-		if state == contract.Running && step.ParentState == contract.Cancelling {
-			return definitionDNSConflict()
-		}
-		current, err := lockDefinitionDNSLedgerTx(ctx, tx, ledger.DomainID, step.EnvironmentID)
-		if err != nil {
-			return err
-		}
-		environmentID, found, err := tx.Platform().Domains().EnvironmentIDByID(ctx, ledger.DomainID)
-		if err != nil || !found {
-			return unavailable(err)
-		}
-		if environmentID != step.EnvironmentID || current.LastOperationID != op.ID || current.Generation != ledger.Generation || current.App != step.Input.App || current.Environment != step.Input.Environment || current.Domain != ledger.Domain || current.ZoneID != ledger.ZoneID || current.ZoneName != ledger.ZoneName || current.Ownership != ledger.Ownership || current.Provider != "cloudflare" {
-			return definitionDNSConflict()
-		}
-		policy, err := lockedDefinitionDNSPolicy(ctx, tx)
-		if err != nil {
-			return err
-		}
-		if policy.Revision != step.Approved.Snapshot.Policy.Revision {
-			return definitionDNSConflict()
-		}
-		return lockDefinitionDNSCredentialTx(ctx, tx, step.Approved.Snapshot, ledger.ZoneID)
+		step, err = checkDefinitionDNSCleanupAuthorityTx(ctx, tx, op, attempt, ledger, expected, recovery)
+		return err
 	})
 	if err != nil {
 		if entities.IsBeginFailure(err) || entities.IsCommitFailure(err) {
@@ -945,6 +1086,66 @@ func (s *Service) checkDefinitionDNSCleanupAuthority(ctx context.Context, op con
 		return nil, err
 	}
 	return step, nil
+}
+
+func checkDefinitionDNSCleanupAuthorityTx(ctx context.Context, tx *entities.StoreTx, op contract.Operation, attempt uint32, ledger domainDNSLedger, expected *definitionDNSChild, recovery bool) (*definitionDNSChild, error) {
+	step, err := loadDefinitionDNSChildTxMode(ctx, tx, op.ID, recovery)
+	if err != nil {
+		return nil, err
+	}
+	if !definitionDNSCleanupChildMatches(step, expected, op, ledger) {
+		return nil, definitionDNSConflict()
+	}
+	currentOp, found, err := tx.Operations().Get(ctx, op.ID)
+	if err != nil || !found {
+		return nil, unavailable(err)
+	}
+	state, currentAttempt := currentOp.State, currentOp.Attempt
+	if !definitionDNSChildRunnable(state, recovery) || currentAttempt != attempt {
+		return nil, definitionDNSConflict()
+	}
+	if state == contract.Running && step.ParentState == contract.Cancelling {
+		return nil, definitionDNSConflict()
+	}
+	current, err := lockDefinitionDNSLedgerTx(ctx, tx, ledger.DomainID, step.EnvironmentID)
+	if err != nil {
+		return nil, err
+	}
+	environmentID, found, err := tx.Platform().Domains().EnvironmentIDByID(ctx, ledger.DomainID)
+	if err != nil || !found {
+		return nil, unavailable(err)
+	}
+	if environmentID != step.EnvironmentID || !definitionDNSCleanupLedgerMatches(step, ledger, current, op.ID) {
+		return nil, definitionDNSConflict()
+	}
+	policy, err := lockedDefinitionDNSPolicy(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	if policy.Revision != step.Approved.Snapshot.Policy.Revision {
+		return nil, definitionDNSConflict()
+	}
+	if err := lockDefinitionDNSCredentialTx(ctx, tx, step.Approved.Snapshot, ledger.ZoneID); err != nil {
+		return nil, err
+	}
+	return step, nil
+}
+
+func definitionDNSCleanupChildMatches(step, expected *definitionDNSChild, op contract.Operation, ledger domainDNSLedger) bool {
+	if step == nil || step.ParentID != expected.ParentID || step.Ordinal != expected.Ordinal || step.Actor != op.Actor || step.Cleanup == nil || step.DomainID != ledger.DomainID {
+		return false
+	}
+	return step.Cleanup.ZoneID == ledger.ZoneID && step.Cleanup.Zone == ledger.ZoneName &&
+		step.Cleanup.Host == ledger.Domain && step.Cleanup.Ownership == ledger.Ownership &&
+		ledger.Ownership == integrations.DomainDNSOwnership(string(ledger.DomainID), ledger.ZoneID)
+}
+
+func definitionDNSCleanupLedgerMatches(step *definitionDNSChild, ledger, current domainDNSLedger, opID contract.OperationID) bool {
+	return current.LastOperationID == opID && current.Generation == ledger.Generation &&
+		current.App == step.Input.App && current.Environment == step.Input.Environment &&
+		current.Domain == ledger.Domain && current.ZoneID == ledger.ZoneID &&
+		current.ZoneName == ledger.ZoneName && current.Ownership == ledger.Ownership &&
+		current.Provider == "cloudflare"
 }
 
 func (p *definitionDNSProgressStore) Intent(ctx context.Context, entry integrations.DefinitionDNSProgress) error {

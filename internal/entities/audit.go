@@ -37,7 +37,7 @@ func (a *AuditStore) Record(ctx context.Context, entry integrations.AuditEntry) 
 		return tx.Audit().Record(ctx, entry)
 	})
 	if err != nil {
-		var fault *contract.Fault
+		var fault *contract.FaultError
 		if errors.As(err, &fault) {
 			return fault
 		}
@@ -88,7 +88,7 @@ func nextAuditID(last int64) (int64, error) {
 	return last + 1, nil
 }
 
-func auditUnavailable(cause error) *contract.Fault {
+func auditUnavailable(cause error) *contract.FaultError {
 	fault := contract.NewFault(contract.Unavailable, "durable integration audit is unavailable", "Repair database connectivity before performing the action.")
 	fault.Cause = cause
 	return fault

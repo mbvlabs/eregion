@@ -42,52 +42,77 @@ type ReleaseCommandStep struct {
 
 func buildReleaseCommandStep(exec engine.Execution, raw json.RawMessage) (engine.Step, error) {
 	var payload ReleaseCommandPayload
-	if err := decodePayload(exec, raw, &payload); err != nil {
+	if err := decodePayload(raw, &payload); err != nil {
 		return nil, err
 	}
 	if payload.Step != exec.Step {
 		return nil, fmt.Errorf("step ID %q does not match the payload step %q", exec.Step, payload.Step)
 	}
-	if !containerNamePattern.MatchString(payload.Name) {
-		return nil, errors.New("invalid release command container name")
-	}
-	if !containerNamePattern.MatchString(payload.Network) {
-		return nil, errors.New("invalid release command network")
-	}
-	if err := ValidateImage(payload.Image); err != nil {
+	if err := validateReleaseCommandPayload(&payload); err != nil {
 		return nil, err
 	}
-	if len(payload.Command) == 0 || len(payload.Command) > 129 {
-		return nil, errors.New("release command needs 1–129 arguments")
+	return &ReleaseCommandStep{exec: exec, payload: payload}, nil
+}
+
+func validateReleaseCommandPayload(payload *ReleaseCommandPayload) error {
+	if !containerNamePattern.MatchString(payload.Name) {
+		return errors.New("invalid release command container name")
 	}
-	for _, arg := range payload.Command {
-		if len(arg) > 4096 || strings.ContainsAny(arg, "\x00\r\n") {
-			return nil, errors.New("release command argument is too long or contains a control character")
-		}
+	if !containerNamePattern.MatchString(payload.Network) {
+		return errors.New("invalid release command network")
 	}
-	for key, value := range payload.Labels {
-		if err := validateLabelKey(key); err != nil {
-			return nil, err
-		}
-		if len(value) > 128 || strings.ContainsAny(value, "\x00\r\n") {
-			return nil, fmt.Errorf("container label %q has an invalid value", key)
-		}
+	if err := ValidateImage(payload.Image); err != nil {
+		return err
+	}
+	if err := validateReleaseCommandArgs(payload.Command); err != nil {
+		return err
+	}
+	if err := validateReleaseCommandLabels(payload.Labels); err != nil {
+		return err
 	}
 	if payload.TimeoutSeconds == 0 {
 		payload.TimeoutSeconds = 120
 	}
 	if payload.TimeoutSeconds < 1 || payload.TimeoutSeconds > 600 {
-		return nil, errors.New("release command timeout must be 1–600 seconds")
+		return errors.New("release command timeout must be 1–600 seconds")
 	}
+	return validateReleaseCommandEnv(payload)
+}
+
+func validateReleaseCommandArgs(command []string) error {
+	if len(command) == 0 || len(command) > 129 {
+		return errors.New("release command needs 1–129 arguments")
+	}
+	for _, arg := range command {
+		if len(arg) > 4096 || strings.ContainsAny(arg, "\x00\r\n") {
+			return errors.New("release command argument is too long or contains a control character")
+		}
+	}
+	return nil
+}
+
+func validateReleaseCommandLabels(labels map[string]string) error {
+	for key, value := range labels {
+		if err := validateLabelKey(key); err != nil {
+			return err
+		}
+		if len(value) > 128 || strings.ContainsAny(value, "\x00\r\n") {
+			return fmt.Errorf("container label %q has an invalid value", key)
+		}
+	}
+	return nil
+}
+
+func validateReleaseCommandEnv(payload *ReleaseCommandPayload) error {
 	if err := validateEnv(payload.Env, "release command environment"); err != nil {
-		return nil, err
+		return err
 	}
 	for _, key := range payload.SecretEnvKeys {
 		if !envKeyPattern.MatchString(key) {
-			return nil, errors.New("invalid release command secret environment key")
+			return errors.New("invalid release command secret environment key")
 		}
 	}
-	return &ReleaseCommandStep{exec: exec, payload: payload}, nil
+	return nil
 }
 
 func (s *ReleaseCommandStep) ID() string { return s.payload.Step }

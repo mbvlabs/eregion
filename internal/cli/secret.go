@@ -118,7 +118,7 @@ func (a *app) setSecret(cmd *cobra.Command, _ []string) (result, error) {
 	}
 	defer clearSecretBytes(value)
 	a.secrets.Add(string(value))
-	env, _, err := a.readEnvironment(cmd, namespace.App, namespace.Environment)
+	env, err := a.readEnvironment(cmd, namespace.App, namespace.Environment)
 	if err != nil {
 		return result{}, err
 	}
@@ -297,7 +297,7 @@ func readProtectedSecretFile(path string) ([]byte, error) {
 	if err != nil {
 		return nil, contract.NewFault(contract.PreconditionFailed, "secret input file could not be opened", "Check ownership and permissions.")
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	opened, err := file.Stat()
 	if err != nil || !os.SameFile(info, opened) || !opened.Mode().IsRegular() || opened.Mode().Perm()&0o077 != 0 {
 		return nil, contract.NewFault(contract.PreconditionFailed, "secret input file changed while it was opened", "Replace the file atomically and retry.")

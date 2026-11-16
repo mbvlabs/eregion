@@ -90,47 +90,69 @@ func (s *Service) acquireDeploymentOwner(ctx context.Context, dep platform.Deplo
 	if has {
 		return s.renewDeploymentOwner(ctx, owner, dep, attempt)
 	}
-
-	route, routeHas, err := s.stepRecord(ctx, dep.OperationID, deploymentRouteStep)
+	phase, target, restoreRelease, restoreDeployment, err := s.deploymentOwnerStart(ctx, dep, env)
 	if err != nil {
 		return deploymentOwner{}, false, err
 	}
-	public, publicHas, err := s.stepRecord(ctx, dep.OperationID, deploymentPublicStep)
-	if err != nil {
-		return deploymentOwner{}, false, err
-	}
-	_, restoreHas, err := s.stepRecord(ctx, dep.OperationID, deploymentRestoreRouteStep)
-	if err != nil {
-		return deploymentOwner{}, false, err
-	}
-	routeCompleted := routeHas && route.State == "completed"
-	publicCompleted := publicHas && public.State == "completed"
-	restoreRelease, restoreDeployment := frozenPredecessor(dep, env, routeCompleted)
-
-	phase := deploymentOwnerPrepared
-	target := restoreDeployment
-	evidence := routeHas || publicHas || restoreHas
-	if routeCompleted && publicCompleted && !restoreHas {
-		phase = deploymentOwnerServing
-		target = dep.ID
-	} else if evidence {
-		// A route that started or completed without a completed verification is
-		// intent, not proof. Generic route writers point at the frozen
-		// predecessor until recovery writes and acknowledges the restore.
-		phase = deploymentOwnerRestoring
-	}
-
 	owner = deploymentOwner{
 		EnvironmentID: env.ID, OperationID: dep.OperationID, DeploymentID: dep.ID,
 		Attempt: attempt, Phase: phase, RouteTarget: target,
 		RestoreReleaseID: restoreRelease, RestoreDeploymentID: restoreDeployment,
 	}
+	raced, err := s.insertDeploymentOwner(ctx, dep, owner)
+	if err != nil {
+		return deploymentOwner{}, false, err
+	}
+	if !raced {
+		return owner, true, nil
+	}
+	owner, has, err = s.deploymentOwnerByEnvironment(ctx, s.entities.Platform().Owners(), env.ID)
+	if err != nil {
+		return owner, false, err
+	}
+	if !has {
+		return deploymentOwner{}, false, unavailable()
+	}
+	return s.renewDeploymentOwner(ctx, owner, dep, attempt)
+}
+
+// deploymentOwnerStart derives route intent from exact step evidence. A route
+// that started or completed without a completed verification is intent, not
+// proof, so it restores the frozen predecessor before any switch.
+func (s *Service) deploymentOwnerStart(ctx context.Context, dep platform.Deployment, env platform.Environment) (deploymentOwnerPhase, platform.DeploymentID, platform.ReleaseID, platform.DeploymentID, error) {
+	route, routeHas, err := s.stepRecord(ctx, dep.OperationID, deploymentRouteStep)
+	if err != nil {
+		return "", "", "", "", err
+	}
+	public, publicHas, err := s.stepRecord(ctx, dep.OperationID, deploymentPublicStep)
+	if err != nil {
+		return "", "", "", "", err
+	}
+	_, restoreHas, err := s.stepRecord(ctx, dep.OperationID, deploymentRestoreRouteStep)
+	if err != nil {
+		return "", "", "", "", err
+	}
+	routeCompleted := routeHas && route.State == "completed"
+	publicCompleted := publicHas && public.State == "completed"
+	restoreRelease, restoreDeployment := frozenPredecessor(dep, env, routeCompleted)
+	phase := deploymentOwnerPrepared
+	target := restoreDeployment
+	if routeCompleted && publicCompleted && !restoreHas {
+		return deploymentOwnerServing, dep.ID, restoreRelease, restoreDeployment, nil
+	}
+	if routeHas || publicHas || restoreHas {
+		phase = deploymentOwnerRestoring
+	}
+	return phase, target, restoreRelease, restoreDeployment, nil
+}
+
+func (s *Service) insertDeploymentOwner(ctx context.Context, dep platform.Deployment, owner deploymentOwner) (bool, error) {
 	var raced bool
-	err = s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+	err := s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
 		inserted, err := tx.Platform().Owners().Insert(ctx, entities.OwnerInsert{
-			EnvironmentID: env.ID, OperationID: dep.OperationID, DeploymentID: dep.ID,
-			Attempt: attempt, Phase: string(phase), RouteTarget: target,
-			RestoreRelease: restoreRelease, RestoreDeployment: restoreDeployment,
+			EnvironmentID: owner.EnvironmentID, OperationID: owner.OperationID, DeploymentID: owner.DeploymentID,
+			Attempt: owner.Attempt, Phase: string(owner.Phase), RouteTarget: owner.RouteTarget,
+			RestoreRelease: owner.RestoreReleaseID, RestoreDeployment: owner.RestoreDeploymentID,
 		})
 		if err != nil {
 			return unavailable(err)
@@ -143,21 +165,11 @@ func (s *Service) acquireDeploymentOwner(ctx context.Context, dep platform.Deplo
 	})
 	if err != nil {
 		if entities.IsBeginFailure(err) || entities.IsCommitFailure(err) {
-			return deploymentOwner{}, false, unavailable(err)
+			return false, unavailable(err)
 		}
-		return deploymentOwner{}, false, err
+		return false, err
 	}
-	if raced {
-		owner, has, err = s.deploymentOwnerByEnvironment(ctx, s.entities.Platform().Owners(), env.ID)
-		if err != nil {
-			return owner, false, err
-		}
-		if !has {
-			return deploymentOwner{}, false, unavailable()
-		}
-		return s.renewDeploymentOwner(ctx, owner, dep, attempt)
-	}
-	return owner, true, nil
+	return raced, nil
 }
 
 func bindDeploymentPredecessor(ctx context.Context, tx *entities.StoreTx, dep platform.Deployment, owner deploymentOwner) error {
@@ -321,36 +333,18 @@ func (s *Service) settleTerminalDeploymentOwner(ctx context.Context, owner deplo
 			"deployment owner's restore target is its candidate deployment",
 			"Ownership is retained; inspect and repair the inconsistent owner before retrying terminal recovery.")
 	}
-
 	if op != nil && op.State == contract.Succeeded && hasDep && env.ServingDeploymentID == owner.DeploymentID {
-		owner, err := s.setDeploymentOwnerRoute(ctx, owner, owner.DeploymentID, deploymentOwnerServing, owner.Attempt)
-		if err != nil {
-			return err
-		}
-		if err := s.syncRoutes(ctx); err != nil {
-			return err
-		}
-		return s.releaseServedDeploymentOwner(ctx, owner)
+		return s.settleServingDeploymentOwner(ctx, owner)
 	}
-
 	routeAlreadySafe := (owner.Phase == deploymentOwnerPrepared || owner.Phase == deploymentOwnerRestored) &&
 		owner.RouteTarget == owner.RestoreDeploymentID &&
 		env.ServingDeploymentID == owner.RestoreDeploymentID
 	if !routeAlreadySafe {
-		owner, err := s.setDeploymentOwnerRoute(ctx, owner, owner.RestoreDeploymentID, deploymentOwnerRestoring, owner.Attempt)
+		restored, err := s.restoreTerminalOwnerRoute(ctx, owner, env)
 		if err != nil {
 			return err
 		}
-		if err := s.writeRoutesForDeployment(ctx, env, owner.RestoreDeploymentID); err != nil {
-			return err
-		}
-		if err := s.recordDeploymentRestoreServing(ctx, env, owner.RestoreReleaseID, owner.RestoreDeploymentID); err != nil {
-			return err
-		}
-		owner, err = s.setDeploymentOwnerRoute(ctx, owner, owner.RestoreDeploymentID, deploymentOwnerRestored, owner.Attempt)
-		if err != nil {
-			return err
-		}
+		owner = restored
 	}
 	if hasDep && dep.ID != owner.RestoreDeploymentID {
 		// The terminal operation cannot run its normal cleanup steps. Record
@@ -362,6 +356,31 @@ func (s *Service) settleTerminalDeploymentOwner(ctx context.Context, owner deplo
 		}
 	}
 	return s.releaseRestoredDeploymentOwner(ctx, owner)
+}
+
+func (s *Service) settleServingDeploymentOwner(ctx context.Context, owner deploymentOwner) error {
+	owner, err := s.setDeploymentOwnerRoute(ctx, owner, owner.DeploymentID, deploymentOwnerServing, owner.Attempt)
+	if err != nil {
+		return err
+	}
+	if err := s.syncRoutes(ctx); err != nil {
+		return err
+	}
+	return s.releaseServedDeploymentOwner(ctx, owner)
+}
+
+func (s *Service) restoreTerminalOwnerRoute(ctx context.Context, owner deploymentOwner, env platform.Environment) (deploymentOwner, error) {
+	owner, err := s.setDeploymentOwnerRoute(ctx, owner, owner.RestoreDeploymentID, deploymentOwnerRestoring, owner.Attempt)
+	if err != nil {
+		return owner, err
+	}
+	if err := s.writeRoutesForDeployment(ctx, env, owner.RestoreDeploymentID); err != nil {
+		return owner, err
+	}
+	if err := s.recordDeploymentRestoreServing(ctx, env, owner.RestoreReleaseID, owner.RestoreDeploymentID); err != nil {
+		return owner, err
+	}
+	return s.setDeploymentOwnerRoute(ctx, owner, owner.RestoreDeploymentID, deploymentOwnerRestored, owner.Attempt)
 }
 
 // ownerAllowsSuccess treats the owner phase and route target as authoritative.
@@ -486,10 +505,8 @@ func (s *Service) cleanupInstancesForDeployment(ctx context.Context, env platfor
 	return out, nil
 }
 
-func (s *Service) persistDeploymentCleanupInstances(ctx context.Context, env platform.Environment, dep platform.Deployment, instances []platform.DeploymentInstance, reason string, attempt uint32) error {
-	if reason == "candidate" {
-		s.captureCandidateDiagnostics(ctx, env, dep, attempt)
-	}
+func (s *Service) persistDeploymentCleanupInstances(ctx context.Context, env platform.Environment, dep platform.Deployment, instances []platform.DeploymentInstance, attempt uint32) error {
+	s.captureCandidateDiagnostics(ctx, env, dep, attempt)
 	if len(instances) == 0 {
 		var err error
 		instances, err = s.cleanupInstancesForDeployment(ctx, env, dep)
@@ -512,7 +529,7 @@ func (s *Service) persistDeploymentCleanupInstances(ctx context.Context, env pla
 		if instance.Name == "" {
 			continue
 		}
-		if err := s.ensureContainerCleanup(ctx, instance.Name, env.ID, nodeName, dep.ID, reason,
+		if err := s.ensureContainerCleanup(ctx, instance.Name, env.ID, nodeName, dep.ID, "candidate",
 			contract.NewFault(contract.Unavailable, "deployment cleanup intent", "The maintenance cleanup retries after the serving state is terminal.")); err != nil {
 			failures = append(failures, fmt.Errorf("record cleanup for %s: %w", instance.Name, err))
 		}
@@ -520,12 +537,12 @@ func (s *Service) persistDeploymentCleanupInstances(ctx context.Context, env pla
 	return errors.Join(failures...)
 }
 
-func (s *Service) persistDeploymentCleanupIntent(ctx context.Context, env platform.Environment, dep platform.Deployment, reason string, attempt uint32) error {
-	return s.persistDeploymentCleanupInstances(ctx, env, dep, dep.Instances, reason, attempt)
+func (s *Service) persistDeploymentCleanupIntent(ctx context.Context, env platform.Environment, dep platform.Deployment, attempt uint32) error {
+	return s.persistDeploymentCleanupInstances(ctx, env, dep, dep.Instances, attempt)
 }
 
 func (s *Service) recordDeploymentCleanupCandidates(ctx context.Context, env platform.Environment, dep platform.Deployment, attempt uint32) error {
-	return s.persistDeploymentCleanupIntent(ctx, env, dep, "candidate", attempt)
+	return s.persistDeploymentCleanupIntent(ctx, env, dep, attempt)
 }
 
 func (s *Service) resolveAmbiguousDeploymentOwner(ctx context.Context, owner deploymentOwner, env platform.Environment) error {
@@ -538,53 +555,15 @@ func (s *Service) resolveAmbiguousDeploymentOwner(ctx context.Context, owner dep
 	if err := s.recordDeploymentRestoreServing(ctx, env, owner.RestoreReleaseID, owner.RestoreDeploymentID); err != nil {
 		return err
 	}
-
-	rows, err := s.entities.Operations().ListActiveDeploymentsForEnvironment(ctx, env.ID)
+	active, err := s.ambiguousActiveDeployments(ctx, env.ID)
 	if err != nil {
-		return unavailable(fmt.Errorf("list ambiguous active deployments: %w", err))
+		return err
 	}
-	type activeDeployment struct {
-		id         contract.OperationID
-		attempt    uint32
-		state      contract.State
-		deployment platform.DeploymentID
+	if err := s.recordAmbiguousCleanup(ctx, env, owner, active); err != nil {
+		return err
 	}
-	active := make([]activeDeployment, 0, len(rows))
-	for _, item := range rows {
-		active = append(active, activeDeployment{
-			id: item.ID, attempt: item.Attempt, state: item.State, deployment: item.DeploymentID,
-		})
-	}
-	var recordFailures, lookupFailures []error
-	for _, item := range active {
-		dep, depErr := s.deploymentByID(ctx, item.deployment)
-		if depErr != nil {
-			lookupFailures = append(lookupFailures, fmt.Errorf("read ambiguous deployment %s: %w", item.deployment, depErr))
-			continue
-		}
-		if dep.ID != owner.RestoreDeploymentID {
-			if err := s.recordDeploymentCleanupCandidates(ctx, env, dep, item.attempt); err != nil {
-				recordFailures = append(recordFailures, fmt.Errorf("record cleanup for %s: %w", item.id, err))
-			}
-		}
-	}
-	if len(lookupFailures) > 0 {
-		return errors.Join(lookupFailures...)
-	}
-	if len(recordFailures) > 0 {
-		return errors.Join(recordFailures...)
-	}
-	for _, item := range active {
-		if item.state == contract.Cancelling {
-			err = s.cancelPlatform(ctx, item.id, item.attempt,
-				"Legacy ambiguous deployment ownership was recovered conservatively; the recorded serving route was restored and candidate containers were retained for guarded cleanup.")
-		} else {
-			err = s.failPlatformOperation(ctx, item.id, item.attempt, contract.Conflict,
-				"Legacy ambiguous deployment ownership was recovered conservatively; the recorded serving route was restored and candidate containers were retained for guarded cleanup.")
-		}
-		if err != nil && !errors.Is(err, errNotOwned) && !errors.Is(err, errOperationTerminal) {
-			return fmt.Errorf("settle ambiguous operation %s: %w", item.id, err)
-		}
+	if err := s.settleAmbiguousDeployments(ctx, active); err != nil {
+		return err
 	}
 	if len(active) > 0 {
 		remaining, err := s.entities.Operations().CountActiveDeploymentsForEnvironment(ctx, env.ID)
@@ -597,6 +576,65 @@ func (s *Service) resolveAmbiguousDeploymentOwner(ctx context.Context, owner dep
 	}
 	if _, err := s.entities.Platform().Owners().ClearAmbiguous(ctx, env.ID); err != nil {
 		return unavailable(fmt.Errorf("delete ambiguous owner: %w", err))
+	}
+	return nil
+}
+
+type ambiguousActiveDeployment struct {
+	id         contract.OperationID
+	attempt    uint32
+	state      contract.State
+	deployment platform.DeploymentID
+}
+
+func (s *Service) ambiguousActiveDeployments(ctx context.Context, environmentID platform.EnvironmentID) ([]ambiguousActiveDeployment, error) {
+	rows, err := s.entities.Operations().ListActiveDeploymentsForEnvironment(ctx, environmentID)
+	if err != nil {
+		return nil, unavailable(fmt.Errorf("list ambiguous active deployments: %w", err))
+	}
+	active := make([]ambiguousActiveDeployment, 0, len(rows))
+	for _, item := range rows {
+		active = append(active, ambiguousActiveDeployment{
+			id: item.ID, attempt: item.Attempt, state: item.State, deployment: item.DeploymentID,
+		})
+	}
+	return active, nil
+}
+
+func (s *Service) recordAmbiguousCleanup(ctx context.Context, env platform.Environment, owner deploymentOwner, active []ambiguousActiveDeployment) error {
+	var recordFailures, lookupFailures []error
+	for _, item := range active {
+		dep, err := s.deploymentByID(ctx, item.deployment)
+		if err != nil {
+			lookupFailures = append(lookupFailures, fmt.Errorf("read ambiguous deployment %s: %w", item.deployment, err))
+			continue
+		}
+		if dep.ID == owner.RestoreDeploymentID {
+			continue
+		}
+		if err := s.recordDeploymentCleanupCandidates(ctx, env, dep, item.attempt); err != nil {
+			recordFailures = append(recordFailures, fmt.Errorf("record cleanup for %s: %w", item.id, err))
+		}
+	}
+	if len(lookupFailures) > 0 {
+		return errors.Join(lookupFailures...)
+	}
+	return errors.Join(recordFailures...)
+}
+
+func (s *Service) settleAmbiguousDeployments(ctx context.Context, active []ambiguousActiveDeployment) error {
+	for _, item := range active {
+		var err error
+		if item.state == contract.Cancelling {
+			err = s.cancelPlatform(ctx, item.id, item.attempt,
+				"Legacy ambiguous deployment ownership was recovered conservatively; the recorded serving route was restored and candidate containers were retained for guarded cleanup.")
+		} else {
+			err = s.failPlatformOperation(ctx, item.id, item.attempt, contract.Conflict,
+				"Legacy ambiguous deployment ownership was recovered conservatively; the recorded serving route was restored and candidate containers were retained for guarded cleanup.")
+		}
+		if err != nil && !errors.Is(err, errNotOwned) && !errors.Is(err, errOperationTerminal) {
+			return fmt.Errorf("settle ambiguous operation %s: %w", item.id, err)
+		}
 	}
 	return nil
 }

@@ -196,6 +196,7 @@ func (l *LockStore) q() *query.Queries {
 // acquired on it. Release never returns a connection whose unlock is uncertain
 // to the pool.
 type SessionLease struct {
+	ctx        context.Context
 	conn       *pgxpool.Conn
 	keys       []int64
 	once       sync.Once
@@ -211,7 +212,7 @@ func (l *SessionLease) Release() error {
 		if l.conn == nil {
 			return
 		}
-		l.releaseErr = releaseSessionKeys(l.conn, l.keys)
+		l.releaseErr = releaseSessionKeys(l.ctx, l.conn, l.keys)
 		l.keys = nil
 		l.conn = nil
 		l.released = true
@@ -219,14 +220,14 @@ func (l *SessionLease) Release() error {
 	return l.releaseErr
 }
 
-func releaseSessionKeys(conn *pgxpool.Conn, keys []int64) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+func releaseSessionKeys(ctx context.Context, conn *pgxpool.Conn, keys []int64) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 	defer cancel()
 	q := query.New(conn)
 	for index := len(keys) - 1; index >= 0; index-- {
 		unlocked, err := q.ReleasePlatformSessionLock(ctx, keys[index])
 		if err != nil || !unlocked {
-			discardConn(conn)
+			discardConn(ctx, conn)
 			return fmt.Errorf("%w: session unlock failed", ErrPlatformLeaseUncertain)
 		}
 	}
@@ -234,15 +235,15 @@ func releaseSessionKeys(conn *pgxpool.Conn, keys []int64) error {
 	return nil
 }
 
-func discardConn(conn *pgxpool.Conn) {
+func discardConn(ctx context.Context, conn *pgxpool.Conn) {
 	raw := conn.Hijack()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 	defer cancel()
 	_ = raw.Close(ctx)
 }
 
-func rollbackLeaseTx(tx pgx.Tx) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+func rollbackLeaseTx(ctx context.Context, tx pgx.Tx) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 	defer cancel()
 	_ = tx.Rollback(ctx)
 }
@@ -259,12 +260,12 @@ func (l *LockStore) AcquireTargets(ctx context.Context, keys []int64) (*SessionL
 	held := make([]int64, 0, len(keys))
 	for _, key := range uniqueKeys(keys) {
 		if err := q.AcquirePlatformSessionLock(ctx, key); err != nil {
-			discardConn(conn)
+			discardConn(ctx, conn)
 			return nil, fmt.Errorf("%w: session acquisition failed", ErrPlatformLeaseUncertain)
 		}
 		held = append(held, key)
 	}
-	return &SessionLease{conn: conn, keys: held}, nil
+	return &SessionLease{ctx: ctx, conn: conn, keys: held}, nil
 }
 
 func (l *LockStore) TryTargets(ctx context.Context, keys []int64) (*SessionLease, bool, error) {
@@ -280,18 +281,18 @@ func (l *LockStore) TryTargets(ctx context.Context, keys []int64) (*SessionLease
 	for _, key := range uniqueKeys(keys) {
 		acquired, err := q.TryPlatformSessionLock(ctx, key)
 		if err != nil {
-			discardConn(conn)
+			discardConn(ctx, conn)
 			return nil, false, fmt.Errorf("%w: session acquisition failed", ErrPlatformLeaseUncertain)
 		}
 		if !acquired {
-			if err := releaseSessionKeys(conn, held); err != nil {
+			if err := releaseSessionKeys(ctx, conn, held); err != nil {
 				return nil, false, err
 			}
 			return nil, false, nil
 		}
 		held = append(held, key)
 	}
-	return &SessionLease{conn: conn, keys: held}, true, nil
+	return &SessionLease{ctx: ctx, conn: conn, keys: held}, true, nil
 }
 
 func (l *LockStore) AcquireImageUpload(ctx context.Context, key int64) (*SessionLease, bool, error) {
@@ -948,7 +949,7 @@ func (s *NodeStore) ProbeBuildSlots(ctx context.Context, name string, max int) (
 	txq := query.New(tx)
 	row, err := txq.LockPlatformNodeBuildConcurrency(ctx, name)
 	if err != nil {
-		rollbackLeaseTx(tx)
+		rollbackLeaseTx(ctx, tx)
 		conn.Release()
 		if errors.Is(err, pgx.ErrNoRows) {
 			return BuildSlotProbe{}, ErrPlatformPointerIntegrity
@@ -957,25 +958,15 @@ func (s *NodeStore) ProbeBuildSlots(ctx context.Context, name string, max int) (
 	}
 	limit, err := platformInt(row.BuildConcurrency)
 	if err != nil {
-		rollbackLeaseTx(tx)
+		rollbackLeaseTx(ctx, tx)
 		conn.Release()
 		return BuildSlotProbe{}, err
 	}
-	held := make([]int64, 0, max)
-	busy := 0
-	for slot := 0; slot < max; slot++ {
-		key := buildSlotKey(name, slot)
-		acquired, err := txq.TryPlatformSessionLock(ctx, key)
-		if err != nil {
-			rollbackLeaseTx(tx)
-			discardConn(conn)
-			return BuildSlotProbe{}, fmt.Errorf("%w: build-slot acquisition failed", ErrPlatformLeaseUncertain)
-		}
-		if acquired {
-			held = append(held, key)
-		} else {
-			busy++
-		}
+	held, busy, err := tryBuildSlotLocks(ctx, txq, name, max)
+	if err != nil {
+		rollbackLeaseTx(ctx, tx)
+		discardConn(ctx, conn)
+		return BuildSlotProbe{}, err
 	}
 	var chosen int64
 	admitted := busy < limit && len(held) > 0
@@ -983,29 +974,59 @@ func (s *NodeStore) ProbeBuildSlots(ctx context.Context, name string, max int) (
 		chosen = held[0]
 		held = held[1:]
 	}
-	for _, key := range held {
-		unlocked, err := txq.ReleasePlatformSessionLock(ctx, key)
-		if err != nil || !unlocked {
-			rollbackLeaseTx(tx)
-			discardConn(conn)
-			return BuildSlotProbe{}, fmt.Errorf("%w: build-slot unlock failed", ErrPlatformLeaseUncertain)
-		}
+	if err := releaseBuildSlotLocks(ctx, txq, held); err != nil {
+		rollbackLeaseTx(ctx, tx)
+		discardConn(ctx, conn)
+		return BuildSlotProbe{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		discardConn(conn)
+		discardConn(ctx, conn)
 		return BuildSlotProbe{}, fmt.Errorf("%w: build-slot commit failed", ErrPlatformLeaseUncertain)
 	}
 	probe := BuildSlotProbe{Node: name, Limit: limit, Busy: busy}
 	if admitted {
-		probe.Lease = &SessionLease{conn: conn, keys: []int64{chosen}}
+		probe.Lease = &SessionLease{ctx: ctx, conn: conn, keys: []int64{chosen}}
 	} else {
 		conn.Release()
 	}
 	return probe, nil
 }
 
+func tryBuildSlotLocks(ctx context.Context, q *query.Queries, node string, max int) ([]int64, int, error) {
+	held := make([]int64, 0, max)
+	busy := 0
+	for slot := 0; slot < max; slot++ {
+		key := buildSlotKey(node, slot)
+		acquired, err := q.TryPlatformSessionLock(ctx, key)
+		if err != nil {
+			return nil, 0, fmt.Errorf("%w: build-slot acquisition failed", ErrPlatformLeaseUncertain)
+		}
+		if acquired {
+			held = append(held, key)
+		} else {
+			busy++
+		}
+	}
+	return held, busy, nil
+}
+
+func releaseBuildSlotLocks(ctx context.Context, q *query.Queries, keys []int64) error {
+	for _, key := range keys {
+		unlocked, err := q.ReleasePlatformSessionLock(ctx, key)
+		if err != nil || !unlocked {
+			return fmt.Errorf("%w: build-slot unlock failed", ErrPlatformLeaseUncertain)
+		}
+	}
+	return nil
+}
+
 func buildSlotKey(node string, slot int) int64 {
 	sum := sha256.Sum256([]byte("eregion-build-slot\x00" + node + "\x00" + strconv.Itoa(slot)))
+	// The full hash is an intentional two's-complement PostgreSQL advisory-lock
+	// key, not a bounded numeric quantity. Masking a bit would change the lock
+	// identity for half of all nodes and break coordination with processes
+	// still using the original key.
+	// #nosec G115 -- intentional full-width hash-to-advisory-key conversion.
 	return int64(binary.BigEndian.Uint64(sum[:8]))
 }
 

@@ -53,7 +53,7 @@ const (
 // placementViolation is the structured refusal for work outside a node's
 // declared placement or capability constraints. The code is
 // precondition_failed; the reason, node, and requirement are in the details.
-func placementViolation(reason, nodeName, message, hint string, extra map[string]any) *contract.Fault {
+func placementViolation(reason, nodeName, message, hint string, extra map[string]any) *contract.FaultError {
 	fault := contract.NewFault(contract.PreconditionFailed, placementViolationPrefix+message, hint)
 	fault.Details = map[string]any{"placement": true, "reason": reason, "node": nodeName}
 	for key, value := range extra {
@@ -65,7 +65,7 @@ func placementViolation(reason, nodeName, message, hint string, extra map[string
 // IsPlacementViolation reports whether err is a structured placement refusal
 // and returns its reason.
 func IsPlacementViolation(err error) (string, bool) {
-	var fault *contract.Fault
+	var fault *contract.FaultError
 	if !errors.As(err, &fault) || fault == nil || fault.Details == nil {
 		return "", false
 	}
@@ -84,6 +84,9 @@ func nodePlacement(n platform.Node, role, capability string) error {
 	case platform.EnrollmentPending, platform.EnrollmentFailed:
 		return placementViolation(ReasonNotEnrolled, n.Name, fmt.Sprintf("node %q is not enrolled (%s)", n.Name, n.EnrollmentState),
 			"Finish node enrollment, then submit the work again.", nil)
+	case platform.EnrollmentRegistered, platform.EnrollmentEnrolled:
+		// Enrolled nodes continue through the placement checks below;
+		// registered nodes are still becoming usable.
 	}
 	if n.EnrollmentState == platform.EnrollmentEnrolled && n.LastCheckState == ReasonIdentityMismatch {
 		// The last authenticated check found a different identity key on this
@@ -102,20 +105,6 @@ func nodePlacement(n platform.Node, role, capability string) error {
 	if capability != "" && !contains(n.Capabilities, capability) {
 		return placementViolation(ReasonCapabilityMissing, n.Name, fmt.Sprintf("node %q lacks the %s capability", n.Name, capability),
 			"Install or enable "+capability+" on the node, then re-run the node check.", map[string]any{"required_capability": capability})
-	}
-	return nil
-}
-
-// checkRegistryCredential refuses a registry credential whose scope the node's
-// roles do not justify: only a builder may hold push credentials, and a node
-// without the builder role is limited to pull.
-func checkRegistryCredential(n platform.Node, scope platform.RegistryScope) error {
-	if scope != platform.RegistryPush && scope != platform.RegistryPull {
-		return placementViolation(ReasonRegistryScope, n.Name, "unknown registry credential scope", "Use a push or pull scope.", nil)
-	}
-	if scope == platform.RegistryPush && !contains(n.Roles, platform.RoleBuilder) {
-		return placementViolation(ReasonRegistryScope, n.Name, fmt.Sprintf("node %q has no builder role; it may only hold pull-scoped registry credentials", n.Name),
-			"Push credentials are only issued to builder nodes.", map[string]any{"scope": string(scope)})
 	}
 	return nil
 }

@@ -98,7 +98,7 @@ func NewCloudflare(cfg CloudflareConfig) (*Cloudflare, error) {
 		base = "https://api.cloudflare.com/client/v4"
 	}
 	parsed, err := url.Parse(base)
-	if err != nil || parsed.User != nil || parsed.Host == "" || parsed.RawQuery != "" || parsed.Fragment != "" || (parsed.Scheme != "https" && !(parsed.Scheme == "http" && isLoopbackHost(parsed.Hostname()))) {
+	if err != nil || parsed.User != nil || parsed.Host == "" || parsed.RawQuery != "" || parsed.Fragment != "" || (parsed.Scheme != "https" && (parsed.Scheme != "http" || !isLoopbackHost(parsed.Hostname()))) {
 		return nil, contract.NewFault(contract.ValidationFailed, "invalid Cloudflare API URL", "Use HTTPS, or plain HTTP only for a loopback test endpoint.")
 	}
 	// Read-only inventory may construct a client without an authorizer or audit
@@ -178,35 +178,48 @@ func (c *Cloudflare) ReconcileOperation(ctx context.Context, actor contract.Acto
 	if len(changes) == 0 {
 		return report, nil
 	}
+	if err := c.authorizeChanges(ctx, actor, opID, changes); err != nil {
+		return report, err
+	}
+	if err := c.applyChanges(ctx, actor, opID, changes, &report); err != nil {
+		return report, err
+	}
+	return report, nil
+}
+
+func (c *Cloudflare) authorizeChanges(ctx context.Context, actor contract.Actor, opID contract.OperationID, changes []DNSChange) error {
 	for _, change := range changes {
 		action, target := changeAction(change)
 		if err := c.authz.Authorize(ctx, actor, action, target); err != nil {
 			_ = c.audit.Record(ctx, AuditEntry{At: c.now().UTC(), Actor: actor.Subject, Action: action, Target: target, Outcome: "denied", Detail: auditDetail(opID, "authorization denied")})
-			return report, err
+			return err
 		}
 		if err := c.audit.Record(ctx, AuditEntry{At: c.now().UTC(), Actor: actor.Subject, Action: action, Target: target, Outcome: "intent", Detail: string(opID)}); err != nil {
-			return report, err
+			return err
 		}
 	}
-	for index, change := range changes {
+	return nil
+}
+
+func (c *Cloudflare) applyChanges(ctx context.Context, actor contract.Actor, opID contract.OperationID, changes []DNSChange, report *DNSReport) error {
+	for _, change := range changes {
 		if err := ctx.Err(); err != nil {
-			return report, err
+			return err
 		}
 		action, target := changeAction(change)
 		if err := c.apply(ctx, change); err != nil {
 			_ = c.audit.Record(ctx, AuditEntry{At: c.now().UTC(), Actor: actor.Subject, Action: action, Target: target, Outcome: "failed", Detail: string(opID)})
-			return report, err
+			return err
 		}
 		report.Applied++
 		if err := c.audit.Record(ctx, AuditEntry{At: c.now().UTC(), Actor: actor.Subject, Action: action, Target: target, Outcome: "succeeded", Detail: string(opID)}); err != nil {
 			// The mutation happened but cannot be audited. Stop; a retry
 			// re-reads Cloudflare state and converges, but the caller must not
 			// be told the whole reconciliation was fully audited.
-			return report, contract.NewFault(contract.Unavailable, "DNS change was applied but its audit record failed", "Stop and inspect the audit sink before continuing; do not assume remaining changes were applied.")
+			return contract.NewFault(contract.Unavailable, "DNS change was applied but its audit record failed", "Stop and inspect the audit sink before continuing; do not assume remaining changes were applied.")
 		}
-		_ = index
 	}
-	return report, nil
+	return nil
 }
 
 func changeAction(change DNSChange) (string, string) {
@@ -237,62 +250,16 @@ func normalizeDesiredRecords(zoneName string, records []DNSRecord) ([]DNSRecord,
 		if record.ID != "" {
 			return nil, contract.NewFault(contract.ValidationFailed, "desired DNS records cannot carry IDs", "Reconciliation matches records by name and type and owns only records with the eregion marker.")
 		}
-		name := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(record.Name), "."))
-		if name == "@" {
-			name = zoneName
+		normalized, err := normalizeDesiredRecord(zoneName, record)
+		if err != nil {
+			return nil, err
 		}
-		if name != zoneName && !strings.HasSuffix(name, "."+zoneName) {
-			return nil, contract.NewFault(contract.ValidationFailed, "DNS record is outside the configured zone", "Desired names must equal the zone or be a name inside it.")
-		}
-		if !dnsNamePattern.MatchString(name) {
-			return nil, contract.NewFault(contract.ValidationFailed, "invalid DNS record name", "Use lowercase DNS labels without control or whitespace characters.")
-		}
-		record.Name = name
-		record.Type = strings.ToUpper(strings.TrimSpace(record.Type))
-		switch record.Type {
-		case "A":
-			ip := net.ParseIP(record.Content)
-			if ip == nil || ip.To4() == nil {
-				return nil, contract.NewFault(contract.ValidationFailed, "invalid A record content", "Use an IPv4 address.")
-			}
-			record.Content = ip.To4().String()
-		case "AAAA":
-			ip := net.ParseIP(record.Content)
-			if ip == nil || ip.To4() != nil || ip.To16() == nil {
-				return nil, contract.NewFault(contract.ValidationFailed, "invalid AAAA record content", "Use an IPv6 address.")
-			}
-			record.Content = ip.String()
-		case "CNAME":
-			record.Content = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(record.Content), "."))
-			if !cnamePattern.MatchString(record.Content) || !strings.Contains(record.Content, ".") {
-				return nil, contract.NewFault(contract.ValidationFailed, "invalid CNAME content", "Use a lowercase fully qualified target name.")
-			}
-		case "TXT":
-			if record.Content == "" || len(record.Content) > 2048 || strings.ContainsAny(record.Content, "\r\n\x00") {
-				return nil, contract.NewFault(contract.ValidationFailed, "invalid TXT content", "Use 1–2048 bytes without control characters.")
-			}
-		default:
-			return nil, contract.NewFault(contract.ValidationFailed, "unsupported DNS record type", "Use A, AAAA, CNAME, or TXT; add a deliberate extension for other types.")
-		}
-		if record.Proxied && record.Type == "TXT" {
-			return nil, contract.NewFault(contract.ValidationFailed, "TXT records cannot be proxied", "Disable proxying for TXT.")
-		}
-		if record.TTL == 0 {
-			record.TTL = 1
-		}
-		if record.TTL != 1 && (record.TTL < 60 || record.TTL > 86400) {
-			return nil, contract.NewFault(contract.ValidationFailed, "invalid DNS TTL", "Use 1 (automatic) or 60–86400 seconds.")
-		}
-		record.Comment = strings.TrimSpace(record.Comment)
-		if len(record.Comment) > 256 || strings.ContainsAny(record.Comment, "\r\n\x00") {
-			return nil, contract.NewFault(contract.ValidationFailed, "invalid DNS comment", "Use at most 256 bytes without control characters.")
-		}
-		key := name + "\x00" + record.Type
+		key := normalized.Name + "\x00" + normalized.Type
 		if seen[key] {
 			return nil, contract.NewFault(contract.ValidationFailed, "duplicate DNS name and type", "Describe at most one desired record per name/type pair.")
 		}
 		seen[key] = true
-		result = append(result, record)
+		result = append(result, normalized)
 	}
 	sort.Slice(result, func(i, j int) bool {
 		if result[i].Name == result[j].Name {
@@ -301,6 +268,74 @@ func normalizeDesiredRecords(zoneName string, records []DNSRecord) ([]DNSRecord,
 		return result[i].Name < result[j].Name
 	})
 	return result, nil
+}
+
+func normalizeDesiredRecord(zoneName string, record DNSRecord) (DNSRecord, error) {
+	name := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(record.Name), "."))
+	if name == "@" {
+		name = zoneName
+	}
+	if name != zoneName && !strings.HasSuffix(name, "."+zoneName) {
+		return DNSRecord{}, contract.NewFault(contract.ValidationFailed, "DNS record is outside the configured zone", "Desired names must equal the zone or be a name inside it.")
+	}
+	if !dnsNamePattern.MatchString(name) {
+		return DNSRecord{}, contract.NewFault(contract.ValidationFailed, "invalid DNS record name", "Use lowercase DNS labels without control or whitespace characters.")
+	}
+	record.Name = name
+	record.Type = strings.ToUpper(strings.TrimSpace(record.Type))
+	if err := normalizeRecordContent(&record); err != nil {
+		return DNSRecord{}, err
+	}
+	if record.Proxied && record.Type == "TXT" {
+		return DNSRecord{}, contract.NewFault(contract.ValidationFailed, "TXT records cannot be proxied", "Disable proxying for TXT.")
+	}
+	if err := normalizeRecordTTL(&record); err != nil {
+		return DNSRecord{}, err
+	}
+	record.Comment = strings.TrimSpace(record.Comment)
+	if len(record.Comment) > 256 || strings.ContainsAny(record.Comment, "\r\n\x00") {
+		return DNSRecord{}, contract.NewFault(contract.ValidationFailed, "invalid DNS comment", "Use at most 256 bytes without control characters.")
+	}
+	return record, nil
+}
+
+func normalizeRecordContent(record *DNSRecord) error {
+	switch record.Type {
+	case "A":
+		ip := net.ParseIP(record.Content)
+		if ip == nil || ip.To4() == nil {
+			return contract.NewFault(contract.ValidationFailed, "invalid A record content", "Use an IPv4 address.")
+		}
+		record.Content = ip.To4().String()
+	case "AAAA":
+		ip := net.ParseIP(record.Content)
+		if ip == nil || ip.To4() != nil || ip.To16() == nil {
+			return contract.NewFault(contract.ValidationFailed, "invalid AAAA record content", "Use an IPv6 address.")
+		}
+		record.Content = ip.String()
+	case "CNAME":
+		record.Content = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(record.Content), "."))
+		if !cnamePattern.MatchString(record.Content) || !strings.Contains(record.Content, ".") {
+			return contract.NewFault(contract.ValidationFailed, "invalid CNAME content", "Use a lowercase fully qualified target name.")
+		}
+	case "TXT":
+		if record.Content == "" || len(record.Content) > 2048 || strings.ContainsAny(record.Content, "\r\n\x00") {
+			return contract.NewFault(contract.ValidationFailed, "invalid TXT content", "Use 1–2048 bytes without control characters.")
+		}
+	default:
+		return contract.NewFault(contract.ValidationFailed, "unsupported DNS record type", "Use A, AAAA, CNAME, or TXT; add a deliberate extension for other types.")
+	}
+	return nil
+}
+
+func normalizeRecordTTL(record *DNSRecord) error {
+	if record.TTL == 0 {
+		record.TTL = 1
+	}
+	if record.TTL != 1 && (record.TTL < 60 || record.TTL > 86400) {
+		return contract.NewFault(contract.ValidationFailed, "invalid DNS TTL", "Use 1 (automatic) or 60–86400 seconds.")
+	}
+	return nil
 }
 
 func managed(record DNSRecord) bool {
@@ -332,12 +367,27 @@ func auditDetail(opID contract.OperationID, detail string) string {
 }
 
 func (c *Cloudflare) plan(actual, desired []DNSRecord, opID contract.OperationID) ([]DNSChange, int, error) {
+	byKey := groupDNSRecords(actual)
+	desiredKeys := map[string]bool{}
+	changes, unchanged, err := c.planDesired(desired, byKey, opID, desiredKeys)
+	if err != nil {
+		return nil, 0, err
+	}
+	changes = append(changes, planObsoleteDNS(actual, desiredKeys)...)
+	sortDNSChanges(changes)
+	return changes, unchanged, nil
+}
+
+func groupDNSRecords(actual []DNSRecord) map[string][]DNSRecord {
 	byKey := map[string][]DNSRecord{}
 	for _, record := range actual {
 		key := record.Name + "\x00" + record.Type
 		byKey[key] = append(byKey[key], record)
 	}
-	desiredKeys := map[string]bool{}
+	return byKey
+}
+
+func (c *Cloudflare) planDesired(desired []DNSRecord, byKey map[string][]DNSRecord, opID contract.OperationID, desiredKeys map[string]bool) ([]DNSChange, int, error) {
 	var changes []DNSChange
 	unchanged := 0
 	for _, want := range desired {
@@ -371,6 +421,11 @@ func (c *Cloudflare) plan(actual, desired []DNSRecord, opID contract.OperationID
 		before := current
 		changes = append(changes, DNSChange{Action: "update", Before: &before, After: &want})
 	}
+	return changes, unchanged, nil
+}
+
+func planObsoleteDNS(actual []DNSRecord, desiredKeys map[string]bool) []DNSChange {
+	var changes []DNSChange
 	for _, record := range actual {
 		key := record.Name + "\x00" + record.Type
 		if !managed(record) || desiredKeys[key] {
@@ -379,26 +434,27 @@ func (c *Cloudflare) plan(actual, desired []DNSRecord, opID contract.OperationID
 		before := record
 		changes = append(changes, DNSChange{Action: "delete", Before: &before})
 	}
+	return changes
+}
+
+func dnsChangeName(change DNSChange) string {
+	if change.After != nil {
+		return change.After.Name + "/" + change.After.Type
+	}
+	if change.Before != nil {
+		return change.Before.Name + "/" + change.Before.Type
+	}
+	return ""
+}
+
+func sortDNSChanges(changes []DNSChange) {
 	sort.Slice(changes, func(i, j int) bool {
-		left, right := changes[i], changes[j]
-		leftName := ""
-		if left.After != nil {
-			leftName = left.After.Name + "/" + left.After.Type
-		} else if left.Before != nil {
-			leftName = left.Before.Name + "/" + left.Before.Type
+		left, right := dnsChangeName(changes[i]), dnsChangeName(changes[j])
+		if left == right {
+			return changes[i].Action < changes[j].Action
 		}
-		rightName := ""
-		if right.After != nil {
-			rightName = right.After.Name + "/" + right.After.Type
-		} else if right.Before != nil {
-			rightName = right.Before.Name + "/" + right.Before.Type
-		}
-		if leftName == rightName {
-			return left.Action < right.Action
-		}
-		return leftName < rightName
+		return left < right
 	})
-	return changes, unchanged, nil
 }
 
 func (c *Cloudflare) apply(ctx context.Context, change DNSChange) error {
@@ -537,9 +593,9 @@ type cloudflareError struct {
 	Code json.RawMessage `json:"code"`
 }
 
-// ProviderFailure contains a fixed category, HTTP status and optional safe code. It never
+// ProviderError contains a fixed category, HTTP status and optional safe code. It never
 // retains an upstream body, URL, token or transport error.
-type ProviderFailure struct {
+type ProviderError struct {
 	Category               string
 	Status                 int
 	DefinitiveWrite        bool
@@ -547,11 +603,14 @@ type ProviderFailure struct {
 	fault                  *contract.Fault
 }
 
-func (e *ProviderFailure) Error() string { return e.fault.Message }
-func (e *ProviderFailure) Unwrap() error { return e.fault }
+// ProviderFailure is a compatibility alias for ProviderError.
+type ProviderFailure = ProviderError //nolint:errname // compatibility alias for existing callers
 
-func cloudflareFailure(category string, status int, code contract.Code, hint string) error {
-	return cloudflareFailureWithDetail(category, status, code, hint, "")
+func (e *ProviderError) Error() string { return e.fault.Message }
+func (e *ProviderError) Unwrap() error { return e.fault }
+
+func cloudflareFailure(category string, status int, hint string) error {
+	return cloudflareFailureWithDetail(category, status, contract.Unavailable, hint, "")
 }
 
 func cloudflareFailureWithDetail(category string, status int, code contract.Code, hint, detail string) error {
@@ -562,7 +621,7 @@ func cloudflareFailureWithDetail(category string, status int, code contract.Code
 	if detail != "" {
 		message += " " + detail
 	}
-	return &ProviderFailure{Category: category, Status: status, fault: contract.NewFault(code, message, hint)}
+	return &ProviderError{Category: category, Status: status, fault: contract.NewFault(code, message, hint)}
 }
 
 // CloudflareErrorDetail renders only validated numeric codes and reviewed text.
@@ -609,13 +668,9 @@ func (c *Cloudflare) request(ctx context.Context, method, path string, body any,
 }
 
 func (c *Cloudflare) requestWithInfo(ctx context.Context, method, endpoint string, body any, target any, info any) error {
-	var reader io.Reader
-	if body != nil {
-		raw, err := json.Marshal(body)
-		if err != nil {
-			return contract.NewFault(contract.Internal, "could not encode DNS request", "Do not retry with a fresh key.")
-		}
-		reader = bytes.NewReader(raw)
+	reader, err := cloudflareRequestBody(body)
+	if err != nil {
+		return contract.NewFault(contract.Internal, "could not encode DNS request", "Do not retry with a fresh key.")
 	}
 	request, err := http.NewRequestWithContext(ctx, method, endpoint, reader)
 	if err != nil {
@@ -631,57 +686,75 @@ func (c *Cloudflare) requestWithInfo(ctx context.Context, method, endpoint strin
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		return cloudflareFailure("network/timeout", 0, contract.Unavailable, "Inspect connectivity and retry the same operation; reconcile any uncertain write first.")
+		return cloudflareFailure("network/timeout", 0, "Inspect connectivity and retry the same operation; reconcile any uncertain write first.")
 	}
-	defer response.Body.Close()
-	var category, hint string
-	var faultCode contract.Code
-	switch {
-	case response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden:
-		category, faultCode, hint = "authorization", contract.Forbidden, "Check credential scope and zone permissions, then review the operation."
-	case response.StatusCode == http.StatusTooManyRequests:
-		category, faultCode, hint = "rate-limit", contract.Unavailable, "Wait and retry the same operation; reconcile any uncertain write first."
-	case response.StatusCode == http.StatusRequestTimeout:
-		category, faultCode, hint = "network/timeout", contract.Unavailable, "Retry the same operation after reconciling any uncertain write."
-	case response.StatusCode >= 400 && response.StatusCode < 500:
-		category, faultCode, hint = "client-rejection", contract.PreconditionFailed, "Inspect the approved DNS request and provider configuration before replanning."
-	case response.StatusCode >= 500:
-		category, faultCode, hint = "provider-unavailable", contract.Unavailable, "Wait and retry the same operation; reconcile any uncertain write first."
-	case response.StatusCode < 200 || response.StatusCode > 299:
-		category, faultCode, hint = "invalid-response", contract.Unavailable, "Inspect provider availability and reconcile any uncertain write."
-	}
-	raw, err := io.ReadAll(io.LimitReader(response.Body, c.maxBody+1))
+	defer func() { _ = response.Body.Close() }()
+	category, faultCode, hint := classifyCloudflareStatus(response.StatusCode)
+	raw, readErr := io.ReadAll(io.LimitReader(response.Body, c.maxBody+1))
 	if category != "" {
 		detail := ""
-		if err == nil && int64(len(raw)) <= c.maxBody {
+		if readErr == nil && int64(len(raw)) <= c.maxBody {
 			detail = cloudflareErrorDetail(raw)
 		}
 		return cloudflareFailureWithDetail(category, response.StatusCode, faultCode, hint, detail)
 	}
-	if err != nil {
-		return cloudflareFailure("network/timeout", 0, contract.Unavailable, "Retry the same operation after reconciling any uncertain write.")
+	if readErr != nil {
+		return cloudflareFailure("network/timeout", 0, "Retry the same operation after reconciling any uncertain write.")
 	}
 	if int64(len(raw)) > c.maxBody {
-		return cloudflareFailure("invalid-response", 0, contract.Unavailable, "Inspect provider availability and reconcile any uncertain write.")
+		return cloudflareFailure("invalid-response", 0, "Inspect provider availability and reconcile any uncertain write.")
 	}
 	var envelope cloudflareEnvelope
 	if err := json.Unmarshal(raw, &envelope); err != nil {
-		return cloudflareFailure("invalid-response", 0, contract.Unavailable, "Inspect provider availability and reconcile any uncertain write.")
+		return cloudflareFailure("invalid-response", 0, "Inspect provider availability and reconcile any uncertain write.")
 	}
 	if !envelope.Success {
 		return cloudflareFailureWithDetail("invalid-response", 0, contract.Unavailable, "Inspect provider availability and reconcile any uncertain write.", cloudflareErrorDetail(raw))
 	}
-	if target != nil && len(envelope.Result) > 0 && string(envelope.Result) != "null" {
-		if err := json.Unmarshal(envelope.Result, target); err != nil {
-			return cloudflareFailure("invalid-response", 0, contract.Unavailable, "Inspect provider availability and reconcile any uncertain write.")
-		}
+	if !decodeCloudflareResult(envelope.Result, target) {
+		return cloudflareFailure("invalid-response", 0, "Inspect provider availability and reconcile any uncertain write.")
 	}
-	if info != nil && len(envelope.ResultInfo) > 0 && string(envelope.ResultInfo) != "null" {
-		if err := json.Unmarshal(envelope.ResultInfo, info); err != nil {
-			return cloudflareFailure("invalid-response", 0, contract.Unavailable, "Inspect provider availability and reconcile any uncertain write.")
-		}
+	if !decodeCloudflareResult(envelope.ResultInfo, info) {
+		return cloudflareFailure("invalid-response", 0, "Inspect provider availability and reconcile any uncertain write.")
 	}
 	return nil
+}
+
+func cloudflareRequestBody(body any) (io.Reader, error) {
+	if body == nil {
+		return nil, nil
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	return bytes.NewReader(raw), nil
+}
+
+func classifyCloudflareStatus(status int) (string, contract.Code, string) {
+	switch {
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		return "authorization", contract.Forbidden, "Check credential scope and zone permissions, then review the operation."
+	case status == http.StatusTooManyRequests:
+		return "rate-limit", contract.Unavailable, "Wait and retry the same operation; reconcile any uncertain write first."
+	case status == http.StatusRequestTimeout:
+		return "network/timeout", contract.Unavailable, "Retry the same operation after reconciling any uncertain write."
+	case status >= 400 && status < 500:
+		return "client-rejection", contract.PreconditionFailed, "Inspect the approved DNS request and provider configuration before replanning."
+	case status >= 500:
+		return "provider-unavailable", contract.Unavailable, "Wait and retry the same operation; reconcile any uncertain write first."
+	case status < 200 || status > 299:
+		return "invalid-response", contract.Unavailable, "Inspect provider availability and reconcile any uncertain write."
+	default:
+		return "", "", ""
+	}
+}
+
+func decodeCloudflareResult(raw json.RawMessage, target any) bool {
+	if target == nil || len(raw) == 0 || string(raw) == "null" {
+		return true
+	}
+	return json.Unmarshal(raw, target) == nil
 }
 
 // ListRecords returns the current zone records for inventory. It performs no

@@ -24,7 +24,10 @@ import (
 // an explicit Cloudflare effect runs before the route write. A remove keeps the
 // binding until the exact owned provider record is gone, then deletes the row.
 func (w *platformWorker) runDomain(ctx context.Context, id contract.OperationID, attempt uint32, normalized platform.Normalized) error {
-	input := normalized.Input.(*platform.DomainInput)
+	input, err := typedOperationInput[*platform.DomainInput](normalized.Input)
+	if err != nil {
+		return w.settle(ctx, id, attempt, err)
+	}
 	op, _, err := w.service.operationSnapshot(ctx, id)
 	if err != nil {
 		return w.settle(ctx, id, attempt, err)
@@ -33,22 +36,12 @@ func (w *platformWorker) runDomain(ctx context.Context, id contract.OperationID,
 		return w.settle(ctx, id, attempt, err)
 	}
 	if err := w.service.applyDomainDNSEffect(ctx, op, attempt, input, normalized.Kind == platform.KindDomainRemove); err != nil {
-		if errors.Is(err, errPlatformCancelled) {
-			if handled, recoveryErr := w.stopDefinitionDNSChild(ctx, op, attempt); handled {
-				return recoveryErr
-			}
-		}
-		return w.settle(ctx, id, attempt, err)
+		return w.settleDomain(ctx, op, attempt, err)
 	}
 	// A cancellation accepted after provider effects but before the binding
 	// row is deleted must stop here and retain the ledger/cleanup state.
 	if err := w.service.checkDomainDNSBoundary(ctx, id, attempt); err != nil {
-		if errors.Is(err, errPlatformCancelled) {
-			if handled, recoveryErr := w.stopDefinitionDNSChild(ctx, op, attempt); handled {
-				return recoveryErr
-			}
-		}
-		return w.settle(ctx, id, attempt, err)
+		return w.settleDomain(ctx, op, attempt, err)
 	}
 	if normalized.Kind == platform.KindDomainRemove {
 		if err := w.service.deleteDomainBindingRowOwned(ctx, id, attempt, input.App, input.Environment, input.Domain); err != nil {
@@ -68,6 +61,17 @@ func (w *platformWorker) runDomain(ctx context.Context, id contract.OperationID,
 		return w.settle(ctx, id, attempt, err)
 	}
 	return nil
+}
+
+// settleDomain gives a cancelled definition DNS child its recovery tail before
+// settling any other domain worker failure.
+func (w *platformWorker) settleDomain(ctx context.Context, op contract.Operation, attempt uint32, err error) error {
+	if errors.Is(err, errPlatformCancelled) {
+		if handled, recoveryErr := w.stopDefinitionDNSChild(ctx, op, attempt); handled {
+			return recoveryErr
+		}
+	}
+	return w.settle(ctx, op.ID, attempt, err)
 }
 
 // caddyRoutesLockKey serializes every writer of the one routes file, including
@@ -127,67 +131,22 @@ func (s *Service) writeRoutes(ctx context.Context, overrideEnvironment platform.
 		if err != nil {
 			return unavailable(err)
 		}
-		routes := make([]platform.Route, 0, len(targets))
-		var routed, unrouted []string
-		for _, target := range targets {
-			route := platform.Route{Domain: target.Domain, Primary: target.Primary}
-			if target.EnvironmentID == overrideEnvironment {
-				route.Upstreams = append([]string(nil), overrideUpstreams...)
-			} else if len(target.Instances) > 0 {
-				var instances []platform.DeploymentInstance
-				if err := json.Unmarshal(target.Instances, &instances); err != nil {
-					return unavailable(err)
-				}
-				route.Upstreams = platform.WebUpstreams(instances)
-			}
-			if len(route.Upstreams) == 0 {
-				unrouted = append(unrouted, route.Domain)
-			} else {
-				routed = append(routed, route.Domain)
-			}
-			routes = append(routes, route)
-		}
-		content := platform.RenderRoutes(routes)
-		now := time.Now().UTC()
-		// Keep the worker's PostgreSQL desired-route lock first, then serialize the
-		// fragment publish and activation with the host's root publish/activation.
-		// The host never takes a database lock, so this order cannot deadlock.
-		releaseIngress, err := engine.AcquireFile(ctx, platform.CaddyIngressLockPath, engine.LockExclusive, 30*time.Second)
+		routes, routed, unrouted, err := routesForTargets(targets, overrideEnvironment, overrideUpstreams)
 		if err != nil {
+			return err
+		}
+		now := time.Now().UTC()
+		content := platform.RenderRoutes(routes)
+		releaseIngress, ingressErr := engine.AcquireFile(ctx, platform.CaddyIngressLockPath, engine.LockExclusive, 30*time.Second)
+		if ingressErr != nil {
 			routeErr = contract.NewFault(contract.Unavailable,
 				"the local ingress is busy with another publish or activation",
 				"Wait for the other ingress operation to finish, then retry.")
-			return s.finishRouteWriteTx(ctx, tx, routed, unrouted, routeErr, now)
+		} else {
+			defer releaseIngress()
+			routeErr = s.publishCaddyRoutesLocked(ctx, content, len(routed) > 0)
 		}
-		defer releaseIngress()
-		previous, err := os.ReadFile(platform.CaddyRoutesPath)
-		if err != nil {
-			routeErr = contract.NewFault(contract.PreconditionFailed, "Caddy is not set up on the main node ("+err.Error()+")", "Run eregion server init with a public hostname.")
-			return s.finishRouteWriteTx(ctx, tx, routed, unrouted, routeErr, now)
-		}
-		if len(routed) > 0 {
-			if err := validateCaddyRoutes(ctx, content); err != nil {
-				routeErr = err
-				return s.finishRouteWriteTx(ctx, tx, routed, unrouted, routeErr, now)
-			}
-		}
-		if !bytes.Equal(previous, content) {
-			if err := platform.WriteFileAtomic(platform.CaddyRoutesPath, content, 0o644); err != nil {
-				routeErr = contract.NewFault(contract.PreconditionFailed, "could not write the Caddy routes", err.Error())
-				return s.finishRouteWriteTx(ctx, tx, routed, unrouted, routeErr, now)
-			}
-			if err := loadCaddyfile(ctx); err != nil {
-				restoreErr := platform.WriteFileAtomic(platform.CaddyRoutesPath, previous, 0o644)
-				_ = loadCaddyfile(context.WithoutCancel(ctx))
-				if restoreErr != nil {
-					err = errors.Join(err, fmt.Errorf("restore previous routes: %w", restoreErr))
-				}
-				routeErr = err
-				return s.finishRouteWriteTx(ctx, tx, routed, unrouted, routeErr, now)
-			}
-		}
-		routeErr = nil
-		return s.finishRouteWriteTx(ctx, tx, routed, unrouted, nil, now)
+		return s.finishRouteWriteTx(ctx, tx, routed, unrouted, routeErr, now)
 	})
 	if err != nil {
 		if routeErr != nil {
@@ -196,6 +155,59 @@ func (s *Service) writeRoutes(ctx context.Context, overrideEnvironment platform.
 		return err
 	}
 	return routeErr
+}
+
+func routesForTargets(targets []entities.RouteTarget, overrideEnvironment platform.EnvironmentID, overrideUpstreams []string) ([]platform.Route, []string, []string, error) {
+	routes := make([]platform.Route, 0, len(targets))
+	var routed, unrouted []string
+	for _, target := range targets {
+		route := platform.Route{Domain: target.Domain, Primary: target.Primary}
+		if target.EnvironmentID == overrideEnvironment {
+			route.Upstreams = append([]string(nil), overrideUpstreams...)
+		} else if len(target.Instances) > 0 {
+			var instances []platform.DeploymentInstance
+			if err := json.Unmarshal(target.Instances, &instances); err != nil {
+				return nil, nil, nil, unavailable(err)
+			}
+			route.Upstreams = platform.WebUpstreams(instances)
+		}
+		if len(route.Upstreams) == 0 {
+			unrouted = append(unrouted, route.Domain)
+		} else {
+			routed = append(routed, route.Domain)
+		}
+		routes = append(routes, route)
+	}
+	return routes, routed, unrouted, nil
+}
+
+// publishCaddyRoutesLocked validates, atomically replaces and reloads the one
+// routes file while the caller holds the ingress file lock.
+func (s *Service) publishCaddyRoutesLocked(ctx context.Context, content []byte, hasRouted bool) error {
+	previous, err := os.ReadFile(platform.CaddyRoutesPath)
+	if err != nil {
+		return contract.NewFault(contract.PreconditionFailed, "Caddy is not set up on the main node ("+err.Error()+")", "Run eregion server init with a public hostname.")
+	}
+	if hasRouted {
+		if err := validateCaddyRoutes(ctx, content); err != nil {
+			return err
+		}
+	}
+	if bytes.Equal(previous, content) {
+		return nil
+	}
+	if err := platform.WriteFileAtomic(platform.CaddyRoutesPath, content, 0o644); err != nil {
+		return contract.NewFault(contract.PreconditionFailed, "could not write the Caddy routes", err.Error())
+	}
+	if err := loadCaddyfile(ctx); err != nil {
+		restoreErr := platform.WriteFileAtomic(platform.CaddyRoutesPath, previous, 0o644)
+		_ = loadCaddyfile(context.WithoutCancel(ctx))
+		if restoreErr != nil {
+			return errors.Join(err, fmt.Errorf("restore previous routes: %w", restoreErr))
+		}
+		return err
+	}
+	return nil
 }
 
 // finishRouteWriteTx records the applied or failed route attempt in the
@@ -242,7 +254,7 @@ func validateCaddyRoutes(ctx context.Context, content []byte) error {
 	if err != nil {
 		return contract.NewFault(contract.Unavailable, "Caddy's admin endpoint does not answer", err.Error())
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return contract.NewFault(contract.PreconditionFailed, fmt.Sprintf("Caddy rejected the routes (%d)", resp.StatusCode), strings.TrimSpace(string(body)))
@@ -269,7 +281,7 @@ func loadCaddyfile(ctx context.Context) error {
 	if err != nil {
 		return contract.NewFault(contract.Unavailable, "Caddy's admin endpoint does not answer", err.Error())
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return contract.NewFault(contract.PreconditionFailed, fmt.Sprintf("Caddy rejected the routes (%d)", resp.StatusCode), strings.TrimSpace(string(body)))
@@ -329,7 +341,12 @@ func (s *Service) verifyPublicRoute(ctx context.Context, id contract.OperationID
 	if healthPath == "" {
 		healthPath = "/"
 	}
-	client := &http.Client{
+	client := newPublicCheckClient(domain)
+	return s.waitForPublicRoute(ctx, client, id, attempt, domain, healthPath)
+}
+
+func newPublicCheckClient(domain string) *http.Client {
+	return &http.Client{
 		Timeout: 3 * time.Second,
 		Transport: &http.Transport{
 			Proxy: nil,
@@ -344,34 +361,20 @@ func (s *Service) verifyPublicRoute(ctx context.Context, id contract.OperationID
 		},
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
+}
+
+func (s *Service) waitForPublicRoute(ctx context.Context, client *http.Client, id contract.OperationID, attempt uint32, domain, healthPath string) error {
 	deadline := time.Now().Add(publicCheckWindow)
-	last := "no response"
+	var last string
 	lastEvent := ""
 	for {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+domain+healthPath, nil)
+		probeLast, probeEvent, ok, err := s.probePublicRouteOnce(ctx, client, id, attempt, domain, healthPath, lastEvent)
 		if err != nil {
 			return err
 		}
-		resp, err := client.Do(req)
-		if err == nil {
-			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-			_ = resp.Body.Close()
-			message := publicCheckMessage(domain, healthPath, resp.StatusCode, nil)
-			if message != lastEvent {
-				s.appendWorkerEvent(ctx, id, attempt, deploymentPublicStep, message)
-				lastEvent = message
-			}
-			if resp.StatusCode >= 200 && resp.StatusCode < 400 {
-				return nil
-			}
-			last = fmt.Sprintf("status %d", resp.StatusCode)
-		} else {
-			last = err.Error()
-			message := publicCheckMessage(domain, healthPath, 0, err)
-			if message != lastEvent {
-				s.appendWorkerEvent(ctx, id, attempt, deploymentPublicStep, message)
-				lastEvent = message
-			}
+		last, lastEvent = probeLast, probeEvent
+		if ok {
+			return nil
 		}
 		if time.Now().After(deadline) {
 			message := "public check https://" + domain + healthPath + " → " + last
@@ -386,4 +389,32 @@ func (s *Service) verifyPublicRoute(ctx context.Context, id contract.OperationID
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
+}
+
+func (s *Service) probePublicRouteOnce(ctx context.Context, client *http.Client, id contract.OperationID, attempt uint32, domain, healthPath, lastEvent string) (string, string, bool, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+domain+healthPath, nil)
+	if err != nil {
+		return "", lastEvent, false, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		last := err.Error()
+		message := publicCheckMessage(domain, healthPath, 0, err)
+		if message != lastEvent {
+			s.appendWorkerEvent(ctx, id, attempt, deploymentPublicStep, message)
+			lastEvent = message
+		}
+		return last, lastEvent, false, nil
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	_ = resp.Body.Close()
+	message := publicCheckMessage(domain, healthPath, resp.StatusCode, nil)
+	if message != lastEvent {
+		s.appendWorkerEvent(ctx, id, attempt, deploymentPublicStep, message)
+		lastEvent = message
+	}
+	if resp.StatusCode >= 200 && resp.StatusCode < 400 {
+		return "", lastEvent, true, nil
+	}
+	return fmt.Sprintf("status %d", resp.StatusCode), lastEvent, false, nil
 }

@@ -226,7 +226,7 @@ func ObserveRetentionInventory(ctx context.Context, paths RetentionInventoryPath
 func registryStorageFault(registryDir string, err error) error {
 	registryDir = strings.TrimSpace(registryDir)
 	if errors.Is(err, fs.ErrPermission) {
-		return &contract.Fault{
+		return &contract.FaultError{
 			Code:    contract.Unavailable,
 			Message: "the node's registry storage at " + registryDir + " is not readable; run eregion apply to apply host-directories-v2",
 			Hint:    "host-directories-v2 makes " + registryDir + " root:eregion 0750 so the worker can read manifests and blobs without write access. If the step is current, check the directory owner, group and mode.",
@@ -416,23 +416,9 @@ type dockerDiskUsage struct {
 }
 
 func readCacheVolumes(ctx context.Context, dockerSocket string, run NodeReadRunner) ([]retention.CacheVolume, bool, error) {
-	seen := map[string]bool{}
-	var names []string
-	for _, prefix := range []string{BuildpackCacheVolumePrefix, BuildpackLaunchCacheVolumePrefix, PackCacheVolumePrefix} {
-		raw, err := run(ctx, "docker", "volume", "ls", "--quiet", "--filter", "name="+prefix)
-		if err != nil {
-			return nil, false, dockerObservationFault("list build cache volumes", err)
-		}
-		for _, name := range splitLines(raw) {
-			if seen[name] {
-				continue
-			}
-			if _, _, _, ok := ParseBuildpacksCacheVolume(name); !ok {
-				continue
-			}
-			seen[name] = true
-			names = append(names, name)
-		}
+	names, err := cacheVolumeNames(ctx, run)
+	if err != nil {
+		return nil, false, err
 	}
 	names, truncated := capRetentionItems(names)
 	if len(names) == 0 {
@@ -457,6 +443,34 @@ func readCacheVolumes(ctx context.Context, dockerSocket string, run NodeReadRunn
 		sizes = measured
 	}
 
+	volumes := cacheVolumesFromNames(names, sizes)
+	sort.Slice(volumes, func(i, j int) bool { return volumes[i].Name < volumes[j].Name })
+	return volumes, truncated, nil
+}
+
+func cacheVolumeNames(ctx context.Context, run NodeReadRunner) ([]string, error) {
+	seen := map[string]bool{}
+	var names []string
+	for _, prefix := range []string{BuildpackCacheVolumePrefix, BuildpackLaunchCacheVolumePrefix, PackCacheVolumePrefix} {
+		raw, err := run(ctx, "docker", "volume", "ls", "--quiet", "--filter", "name="+prefix)
+		if err != nil {
+			return nil, dockerObservationFault("list build cache volumes", err)
+		}
+		for _, name := range splitLines(raw) {
+			if seen[name] {
+				continue
+			}
+			if _, _, _, ok := ParseBuildpacksCacheVolume(name); !ok {
+				continue
+			}
+			seen[name] = true
+			names = append(names, name)
+		}
+	}
+	return names, nil
+}
+
+func cacheVolumesFromNames(names []string, sizes map[string]int64) []retention.CacheVolume {
 	volumes := make([]retention.CacheVolume, 0, len(names))
 	for _, name := range names {
 		app, environment, kind, ok := ParseBuildpacksCacheVolume(name)
@@ -470,13 +484,11 @@ func readCacheVolumes(ctx context.Context, dockerSocket string, run NodeReadRunn
 		if size, known := sizes[name]; known {
 			volume.SizeBytes = size
 		} else {
-			volume.SizeBytes = 0
 			volume.SizeUnknown = true
 		}
 		volumes = append(volumes, volume)
 	}
-	sort.Slice(volumes, func(i, j int) bool { return volumes[i].Name < volumes[j].Name })
-	return volumes, truncated, nil
+	return volumes
 }
 
 // readDockerVolumeSizes reads GET /system/df over the Docker socket. Docker
@@ -557,6 +569,20 @@ func readRegistryArtifacts(registryDir string) ([]retention.InventoryRegistryArt
 	if err != nil {
 		return nil, nil, false, err
 	}
+	artifacts, warnings, truncated, err := registryArtifacts(base, repositoriesRoot, repositories)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	sort.Slice(artifacts, func(i, j int) bool {
+		if artifacts[i].Repository != artifacts[j].Repository {
+			return artifacts[i].Repository < artifacts[j].Repository
+		}
+		return artifacts[i].Digest < artifacts[j].Digest
+	})
+	return artifacts, warnings, truncated, nil
+}
+
+func registryArtifacts(base, repositoriesRoot string, repositories []string) ([]retention.InventoryRegistryArtifact, []string, bool, error) {
 	artifacts := []retention.InventoryRegistryArtifact{}
 	var warnings []string
 	truncated := false
@@ -571,32 +597,33 @@ func readRegistryArtifacts(registryDir string) ([]retention.InventoryRegistryArt
 				truncated = true
 				break
 			}
-			blobs := map[string]int64{}
-			var artifactWarnings []string
-			configDigest, created, ok := collectRegistryManifest(base, digest, 0, blobs, &artifactWarnings)
+			artifact, artifactWarnings, ok := registryArtifact(base, repository, digest, tags[digest])
 			warnings = append(warnings, artifactWarnings...)
-			if !ok {
-				// The revision link exists but its manifest blob is missing or
-				// unreadable. Never report a zero-byte artifact as known.
-				continue
+			if ok {
+				artifacts = append(artifacts, artifact)
 			}
-			var bytes int64
-			for _, size := range blobs {
-				bytes += size
-			}
-			artifacts = append(artifacts, retention.InventoryRegistryArtifact{
-				Repository: repository, Digest: digest, Tags: tags[digest],
-				ConfigDigest: configDigest, Bytes: bytes, CreatedAt: created,
-			})
 		}
 	}
-	sort.Slice(artifacts, func(i, j int) bool {
-		if artifacts[i].Repository != artifacts[j].Repository {
-			return artifacts[i].Repository < artifacts[j].Repository
-		}
-		return artifacts[i].Digest < artifacts[j].Digest
-	})
 	return artifacts, warnings, truncated, nil
+}
+
+func registryArtifact(base, repository, digest string, tags []string) (retention.InventoryRegistryArtifact, []string, bool) {
+	blobs := map[string]int64{}
+	var warnings []string
+	configDigest, created, ok := collectRegistryManifest(base, digest, 0, blobs, &warnings)
+	if !ok {
+		// The revision link exists but its manifest blob is missing or
+		// unreadable. Never report a zero-byte artifact as known.
+		return retention.InventoryRegistryArtifact{}, warnings, false
+	}
+	var bytes int64
+	for _, size := range blobs {
+		bytes += size
+	}
+	return retention.InventoryRegistryArtifact{
+		Repository: repository, Digest: digest, Tags: tags,
+		ConfigDigest: configDigest, Bytes: bytes, CreatedAt: created,
+	}, warnings, true
 }
 
 // registryRepositories finds every repository root by its _manifests
@@ -641,7 +668,7 @@ func registryManifestDigests(repositoriesRoot, repository string) ([]string, err
 		if !entry.IsDir() || len(entry.Name()) != 64 || !lowerHex(entry.Name()) {
 			continue
 		}
-		raw, err := os.ReadFile(filepath.Join(root, entry.Name(), "link")) //nolint:gosec // G304: fixed registry storage layout.
+		raw, err := os.ReadFile(filepath.Join(root, entry.Name(), "link"))
 		if err != nil {
 			continue
 		}
@@ -667,7 +694,7 @@ func registryTags(repositoriesRoot, repository string) map[string][]string {
 		if !entry.IsDir() {
 			continue
 		}
-		raw, err := os.ReadFile(filepath.Join(root, entry.Name(), "current", "link")) //nolint:gosec // G304: fixed registry storage layout.
+		raw, err := os.ReadFile(filepath.Join(root, entry.Name(), "current", "link"))
 		if err != nil {
 			continue
 		}
@@ -787,7 +814,7 @@ func readRegistryBlob(base, digest string) ([]byte, error) {
 	if !ok {
 		return nil, errors.New("invalid registry digest")
 	}
-	return os.ReadFile(path) //nolint:gosec // G304: fixed registry storage layout under the node data directory.
+	return os.ReadFile(path)
 }
 
 // registryBlobPath is Distribution's filesystem layout: the digest is sharded
@@ -850,12 +877,6 @@ func parseDockerTime(value string) *time.Time {
 	}
 	utc := parsed.UTC()
 	return &utc
-}
-
-func alreadyGone(err error) bool {
-	message := strings.ToLower(err.Error())
-	return strings.Contains(message, "no such volume") || strings.Contains(message, "no such object") ||
-		strings.Contains(message, "no such image") || strings.Contains(message, "no such container")
 }
 
 func dockerObservationFault(action string, err error) error {

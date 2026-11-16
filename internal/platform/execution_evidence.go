@@ -58,50 +58,92 @@ var evidenceContainerID = regexp.MustCompile(`^[a-f0-9]{64}$`)
 
 func captureExecutionEvidence(parent context.Context, name string, labels map[string]string, rt engine.Runtime) ExecutionEvidence {
 	result := ExecutionEvidence{Availability: "unavailable"}
-	// These labels are the existing deployment ownership boundary. Empty or
-	// caller-supplied partial labels are not evidence of an owned execution.
-	for _, key := range []string{"io.eregion.app", "io.eregion.environment", "io.eregion.process.kind", "io.eregion.release", "io.eregion.deployment"} {
-		if labels[key] == "" {
-			return result
-		}
-	}
-	if rt.Secrets == nil {
+	if !executionEvidenceLabelsComplete(labels) || rt.Secrets == nil {
 		return result
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), 5*time.Second)
 	defer cancel()
+	inspection, ok := readExecutionInspection(ctx, name)
+	if !ok || !executionLabelsMatch(labels, inspection.Labels) || !knownExecutionState(inspection.State.Status) {
+		return result
+	}
+	result = executionEvidenceFromInspection(inspection)
+	if rt.Secrets.RequiresWholeTextRedaction() {
+		// A Docker tail can begin within a secret. Metadata remains useful,
+		// but no bounded tail can prove the missing prefix was safe.
+		return result
+	}
+	return captureEvidenceLogs(ctx, inspection.ID, rt, result)
+}
+
+// executionEvidenceLabelsComplete enforces the existing deployment ownership
+// boundary. Empty or caller-supplied partial labels are not evidence of an
+// owned execution.
+func executionEvidenceLabelsComplete(labels map[string]string) bool {
+	for _, key := range []string{"io.eregion.app", "io.eregion.environment", "io.eregion.process.kind", "io.eregion.release", "io.eregion.deployment"} {
+		if labels[key] == "" {
+			return false
+		}
+	}
+	return true
+}
+
+type executionContainerState struct {
+	Status     string
+	Running    bool
+	StartedAt  time.Time
+	FinishedAt time.Time
+	ExitCode   int
+	OOMKilled  bool
+	Health     *struct{ Status string }
+}
+
+type executionInspection struct {
+	ID     string
+	Labels map[string]string
+	State  executionContainerState
+}
+
+func readExecutionInspection(ctx context.Context, name string) (executionInspection, bool) {
 	cmd := exec.CommandContext(ctx, "docker", "inspect", "--type=container", "--format", "{{json .Id}}\n{{json .Config.Labels}}\n{{json .State}}", name)
 	buf := &limitedDiagnosticBuffer{limit: 64 * 1024}
 	cmd.Stdout = buf
 	if cmd.Run() != nil || buf.overflow {
-		return result
+		return executionInspection{}, false
 	}
 	parts := strings.SplitN(buf.String(), "\n", 3)
-	var id string
-	var actual map[string]string
-	var state struct {
-		Status     string
-		Running    bool
-		StartedAt  time.Time
-		FinishedAt time.Time
-		ExitCode   int
-		OOMKilled  bool
-		Health     *struct{ Status string }
+	var inspection executionInspection
+	if len(parts) != 3 ||
+		json.Unmarshal([]byte(parts[0]), &inspection.ID) != nil ||
+		!evidenceContainerID.MatchString(inspection.ID) ||
+		json.Unmarshal([]byte(parts[1]), &inspection.Labels) != nil ||
+		json.Unmarshal([]byte(parts[2]), &inspection.State) != nil {
+		return executionInspection{}, false
 	}
-	if len(parts) != 3 || json.Unmarshal([]byte(parts[0]), &id) != nil || !evidenceContainerID.MatchString(id) || json.Unmarshal([]byte(parts[1]), &actual) != nil || json.Unmarshal([]byte(parts[2]), &state) != nil {
-		return result
-	}
+	return inspection, true
+}
+
+func executionLabelsMatch(labels, actual map[string]string) bool {
 	for key, value := range labels {
 		if actual[key] != value {
-			return result
+			return false
 		}
 	}
-	switch state.Status {
+	return true
+}
+
+func knownExecutionState(status string) bool {
+	switch status {
 	case "created", "running", "paused", "restarting", "removing", "exited", "dead":
+		return true
 	default:
-		return result
+		return false
 	}
-	result = ExecutionEvidence{Availability: "partial", ContainerID: id, ObservedAt: time.Now().UTC(), State: state.Status, Running: state.Running, StartedAt: state.StartedAt, FinishedAt: state.FinishedAt, OOMKilled: state.OOMKilled}
+}
+
+func executionEvidenceFromInspection(inspection executionInspection) ExecutionEvidence {
+	state := inspection.State
+	result := ExecutionEvidence{Availability: "partial", ContainerID: inspection.ID, ObservedAt: time.Now().UTC(), State: state.Status, Running: state.Running, StartedAt: state.StartedAt, FinishedAt: state.FinishedAt, OOMKilled: state.OOMKilled}
 	if !state.StartedAt.IsZero() && !state.FinishedAt.IsZero() {
 		result.ExitCode = &state.ExitCode
 	}
@@ -111,11 +153,10 @@ func captureExecutionEvidence(parent context.Context, name string, labels map[st
 			result.Health = state.Health.Status
 		}
 	}
-	if rt.Secrets.RequiresWholeTextRedaction() {
-		// A Docker tail can begin within a secret. Metadata remains useful,
-		// but no bounded tail can prove the missing prefix was safe.
-		return result
-	}
+	return result
+}
+
+func captureEvidenceLogs(ctx context.Context, id string, rt engine.Runtime, result ExecutionEvidence) ExecutionEvidence {
 	logs := exec.CommandContext(ctx, "docker", "logs", "--tail", "201", id)
 	raw := &limitedDiagnosticBuffer{limit: 1024 * 1024}
 	logs.Stdout, logs.Stderr = raw, raw

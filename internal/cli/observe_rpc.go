@@ -165,23 +165,8 @@ func boundedDockerOutput(value string) string {
 // as an RPC event. Following stops when the operator disconnects or Docker
 // exits; nothing is persisted.
 func streamNodeLogs(ctx context.Context, params rpcLogParams, out io.Writer, registry *secrets.Registry) (platform.LogResult, error) {
-	query := platform.LogQuery{
-		App: params.App, Environment: params.Environment,
-		DeploymentID: platform.DeploymentID(params.DeploymentID), Process: params.Process,
-		Follow: params.Follow, Tail: params.Tail,
-	}
-	query.Since = 10 * time.Minute
-	if params.Since != "" {
-		since, err := time.ParseDuration(params.Since)
-		if err != nil {
-			return platform.LogResult{}, contract.NewFault(contract.ValidationFailed, "invalid log lookback", "Use a positive duration such as 15m or 2h.")
-		}
-		query.Since = since
-	}
-	if query.Tail == 0 {
-		query.Tail = 200
-	}
-	if err := query.Validate(); err != nil {
+	query, err := nodeLogQuery(params)
+	if err != nil {
 		return platform.LogResult{}, err
 	}
 	if registry == nil {
@@ -191,56 +176,101 @@ func streamNodeLogs(ctx context.Context, params rpcLogParams, out io.Writer, reg
 	if err != nil {
 		return platform.LogResult{}, err
 	}
-	containers := make([]platform.ContainerObservation, 0, len(workloads.Containers))
-	for _, container := range workloads.Containers {
-		if params.DeploymentID != "" && container.Deployment != params.DeploymentID {
-			continue
-		}
-		if params.Process != "" && container.Process != params.Process {
-			continue
-		}
-		containers = append(containers, container)
-	}
+	containers := matchingLogContainers(workloads.Containers, params)
 	result := platform.LogResult{Follow: params.Follow}
 	if params.DeploymentID != "" && len(containers) == 0 {
 		result.Unavailable = true
 	}
-	if len(params.ExpectedContainers) > 0 {
-		found := make(map[string]bool, len(containers))
-		for _, container := range containers {
-			found[container.Name] = true
-		}
-		for _, name := range params.ExpectedContainers {
-			if !found[name] {
-				result.Unavailable = true
-				break
-			}
-		}
+	if missingExpectedContainers(containers, params.ExpectedContainers) {
+		result.Unavailable = true
 	}
 	if len(containers) > 64 {
 		containers = containers[:64]
 		result.Truncated = true
 	}
 	if !params.Follow {
-		for _, container := range containers {
-			raw, err := runDockerCombinedRead(ctx, dockerLogsArgs(query, container.ContainerID))
-			if err != nil {
-				return result, err
-			}
-			for _, message := range splitLogLines([]byte(registry.Redact(string(raw)))) {
-				if len(result.Lines) >= 10000 {
-					result.Truncated = true
-					break
-				}
-				result.Lines = append(result.Lines, containerLogLine(container, registry, message))
-			}
-		}
-		result.Count = len(result.Lines)
-		return result, nil
+		return readNodeLogs(ctx, result, containers, query, registry)
 	}
 	count, err := followNodeLogs(ctx, containers, query, out, registry)
 	result.Count = count
 	return result, err
+}
+
+func nodeLogQuery(params rpcLogParams) (platform.LogQuery, error) {
+	query := platform.LogQuery{
+		App: params.App, Environment: params.Environment,
+		DeploymentID: platform.DeploymentID(params.DeploymentID), Process: params.Process,
+		Follow: params.Follow, Tail: params.Tail,
+	}
+	query.Since = 10 * time.Minute
+	if params.Since != "" {
+		since, err := time.ParseDuration(params.Since)
+		if err != nil {
+			return platform.LogQuery{}, contract.NewFault(contract.ValidationFailed, "invalid log lookback", "Use a positive duration such as 15m or 2h.")
+		}
+		query.Since = since
+	}
+	if query.Tail == 0 {
+		query.Tail = 200
+	}
+	if err := query.Validate(); err != nil {
+		return platform.LogQuery{}, err
+	}
+	return query, nil
+}
+
+func matchingLogContainers(containers []platform.ContainerObservation, params rpcLogParams) []platform.ContainerObservation {
+	matched := make([]platform.ContainerObservation, 0, len(containers))
+	for _, container := range containers {
+		if params.DeploymentID != "" && container.Deployment != params.DeploymentID {
+			continue
+		}
+		if params.Process != "" && container.Process != params.Process {
+			continue
+		}
+		matched = append(matched, container)
+	}
+	return matched
+}
+
+func missingExpectedContainers(containers []platform.ContainerObservation, expected []string) bool {
+	if len(expected) == 0 {
+		return false
+	}
+	found := make(map[string]bool, len(containers))
+	for _, container := range containers {
+		found[container.Name] = true
+	}
+	for _, name := range expected {
+		if !found[name] {
+			return true
+		}
+	}
+	return false
+}
+
+func readNodeLogs(
+	ctx context.Context,
+	result platform.LogResult,
+	containers []platform.ContainerObservation,
+	query platform.LogQuery,
+	registry *secrets.Registry,
+) (platform.LogResult, error) {
+	for _, container := range containers {
+		raw, err := runDockerCombinedRead(ctx, dockerLogsArgs(query, container.ContainerID))
+		if err != nil {
+			return result, err
+		}
+		for _, message := range splitLogLines([]byte(registry.Redact(string(raw)))) {
+			if len(result.Lines) >= 10000 {
+				result.Truncated = true
+				break
+			}
+			result.Lines = append(result.Lines, containerLogLine(container, registry, message))
+		}
+	}
+	result.Count = len(result.Lines)
+	return result, nil
 }
 
 func dockerLogsArgs(query platform.LogQuery, containerID string) []string {

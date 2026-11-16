@@ -40,7 +40,7 @@ func (r *serverInit) checkTelemetryEndpoint(ctx context.Context) string {
 		r.warnings = append(r.warnings, "the telemetry endpoint does not answer on "+url+"; run eregion metrics rotate and check public ingress and eregion-telemetry.service on the server")
 		return "unreachable"
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 64<<10))
 	switch response.StatusCode {
 	case http.StatusUnauthorized:

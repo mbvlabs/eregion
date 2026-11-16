@@ -9,7 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/integrations"
 )
 
@@ -40,18 +42,29 @@ func TestIntegrationEntitiesGrantStoreContract(t *testing.T) {
 	now := time.Now().UTC()
 	grant := testGrant("a", now)
 
+	checkGrantEmptyAndValidation(t, grants, ctx, grant)
+	checkGrantCreationAndConflict(t, grants, ctx, now, grant)
+	checkGrantRevocations(t, grants, ctx, now, grant)
+	checkGrantListAndMalformed(t, pool, grants, ctx, now, grant)
+	checkGrantCanceledContext(t, grants, ctx, now)
+}
+
+func checkGrantEmptyAndValidation(t *testing.T, grants *entities.GrantStore, ctx context.Context, grant integrations.DeviceGrant) {
+	t.Helper()
 	if list, err := grants.List(ctx); err != nil || list == nil || len(list) != 0 {
 		t.Fatalf("empty list = %v, %v; want a non-nil empty snapshot", list, err)
 	}
 	if got, found, err := grants.Get(ctx, grant.ID); err != nil || found || got.ID != "" {
 		t.Fatalf("missing get = %+v, %v, %v; want zero, false, nil", got, found, err)
 	}
-
-	var validation *contract.Fault
+	var validation *contract.FaultError
 	if err := grants.Put(ctx, integrations.DeviceGrant{ID: "grant_short"}); !errors.As(err, &validation) || validation.Code != contract.ValidationFailed {
 		t.Fatalf("invalid identity put = %v; want validation fault", err)
 	}
+}
 
+func checkGrantCreationAndConflict(t *testing.T, grants *entities.GrantStore, ctx context.Context, now time.Time, grant integrations.DeviceGrant) {
+	t.Helper()
 	if err := grants.Put(ctx, grant); err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -84,14 +97,17 @@ func TestIntegrationEntitiesGrantStoreContract(t *testing.T) {
 
 	conflicting := grant
 	conflicting.Subject = "bob"
-	var conflict *contract.Fault
+	var conflict *contract.FaultError
 	if err := grants.Put(ctx, conflicting); !errors.As(err, &conflict) || conflict.Code != contract.Conflict {
 		t.Fatalf("conflicting put = %v; want conflict fault", err)
 	}
 	if stored, _, err := grants.Get(ctx, grant.ID); err != nil || stored.Subject != grant.Subject {
 		t.Fatalf("conflict changed stored grant: %+v, %v", stored, err)
 	}
+}
 
+func checkGrantRevocations(t *testing.T, grants *entities.GrantStore, ctx context.Context, now time.Time, grant integrations.DeviceGrant) {
+	t.Helper()
 	revokedAt := now.Add(time.Minute)
 	revocation := grant
 	revocation.RevokedAt = &revokedAt
@@ -100,7 +116,7 @@ func TestIntegrationEntitiesGrantStoreContract(t *testing.T) {
 	if err := grants.Put(ctx, revocation); err != nil {
 		t.Fatalf("revoke: %v", err)
 	}
-	stored, _, err = grants.Get(ctx, grant.ID)
+	stored, _, err := grants.Get(ctx, grant.ID)
 	if err != nil || stored.RevokedAt == nil || !stored.RevokedAt.Equal(revokedAt) ||
 		stored.RevokedBy != "operator" || stored.RevokedByOperation != "op_revoke_first" {
 		t.Fatalf("revocation not persisted exactly: %+v, %v", stored, err)
@@ -128,8 +144,10 @@ func TestIntegrationEntitiesGrantStoreContract(t *testing.T) {
 	if err != nil || !stored.RevokedAt.Equal(revokedAt) || stored.RevokedBy != "operator" || stored.RevokedByOperation != "op_revoke_first" {
 		t.Fatalf("competing revocation replaced the first: %+v, %v", stored, err)
 	}
+}
 
-	// List is unbounded and ordered by grant identity only.
+func checkGrantListAndMalformed(t *testing.T, pool *pgxpool.Pool, grants *entities.GrantStore, ctx context.Context, now time.Time, grant integrations.DeviceGrant) {
+	t.Helper()
 	second := testGrant("b", now)
 	second.Subject, second.DeviceID, second.Note = "bob", "beta", "second"
 	if err := grants.Put(ctx, second); err != nil {
@@ -146,7 +164,7 @@ func TestIntegrationEntitiesGrantStoreContract(t *testing.T) {
 	if _, err := pool.Exec(ctx, `INSERT INTO eregion_access_grants (id, record, created_at) VALUES ($1, $2::jsonb, clock_timestamp())`, malformedID, `"not-a-grant"`); err != nil {
 		t.Fatal(err)
 	}
-	var unavailable *contract.Fault
+	var unavailable *contract.FaultError
 	if _, _, err := grants.Get(ctx, malformedID); !errors.As(err, &unavailable) || unavailable.Code != contract.Unavailable {
 		t.Fatalf("malformed get = %v; want unavailable fault", err)
 	}
@@ -154,11 +172,13 @@ func TestIntegrationEntitiesGrantStoreContract(t *testing.T) {
 	if _, err := grants.List(ctx); !errors.As(err, &unavailable) || unavailable.Code != contract.Unavailable {
 		t.Fatalf("malformed list = %v; want unavailable fault", err)
 	}
+}
 
-	// A canceled caller context fails as unavailable and leaves no row.
+func checkGrantCanceledContext(t *testing.T, grants *entities.GrantStore, ctx context.Context, now time.Time) {
+	t.Helper()
 	canceled, cancel := context.WithCancel(ctx)
 	cancel()
-	unavailable = nil
+	var unavailable *contract.FaultError
 	unwritten := testGrant("d", now)
 	if err := grants.Put(canceled, unwritten); !errors.As(err, &unavailable) || unavailable.Code != contract.Unavailable {
 		t.Fatalf("canceled put = %v; want unavailable fault", err)

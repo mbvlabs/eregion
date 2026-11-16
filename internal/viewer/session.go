@@ -53,6 +53,7 @@ func followSession(
 		},
 	)
 	model.Cursor = opts.After
+	backoff := opts.PollInterval
 	send := func(o Observation) error {
 		if emit == nil {
 			return nil
@@ -61,105 +62,30 @@ func followSession(
 		o.Cursor, o.EventCount, o.Age = model.Cursor, model.EventCount, model.Age(o.At)
 		return emit(o)
 	}
-	backoff := opts.PollInterval
 	for {
 		if ctx.Err() != nil {
 			return detach(model, opts.Now(), send, ctx.Err())
 		}
+		handler := &sessionHandler{id: id, opts: opts, model: model, emit: send, backoff: backoff}
 		var callbackErr error
-		var snapshot *contract.Operation
 		result, err := client.FollowSession(
 			ctx,
 			contract.Cursor{OperationID: id, After: model.Cursor},
 			opts.PageLimit,
 			opts.PollInterval,
 			func(observation SessionObservation) error {
-				now := opts.Now()
-				fail := func(err error) error { callbackErr = err; return err }
-				if observation.Cursor.OperationID != id {
-					return fail(followProtocolError())
+				err := handler.handle(observation)
+				if err != nil {
+					callbackErr = err
 				}
-				if observation.Snapshot != nil {
-					op := *observation.Snapshot
-					if op.Validate() != nil || op.ID != id ||
-						observation.Cursor.After != model.Cursor ||
-						observation.Events != nil ||
-						op.LastSequence < model.Cursor {
-						return fail(followProtocolError())
-					}
-					snapshot = &op
-					model.Snapshot(op, now)
-					model.PollSucceeded(now)
-					backoff = opts.PollInterval
-					if err := send(
-						Observation{Kind: ObservationSnapshot, At: now, Snapshot: &op},
-					); err != nil {
-						return fail(err)
-					}
-					return nil
-				}
-				if snapshot == nil || len(observation.Events) == 0 ||
-					len(observation.Events) > opts.PageLimit {
-					return fail(followProtocolError())
-				}
-				next := model.Cursor
-				var previous uint64
-				var fresh []contract.Event
-				for _, event := range observation.Events {
-					if event.Validate() != nil || event.OperationID != id ||
-						(previous != 0 && event.Sequence <= previous) {
-						return fail(followProtocolError())
-					}
-					previous = event.Sequence
-					if event.Sequence <= model.Cursor {
-						continue
-					}
-					if event.Sequence != next+1 {
-						return fail(followProtocolError())
-					}
-					next = event.Sequence
-					fresh = append(fresh, event)
-				}
-				if observation.Cursor.After != previous {
-					return fail(followProtocolError())
-				}
-				if len(fresh) == 0 {
-					return nil
-				}
-				if err := model.Page(fresh, now); err != nil {
-					return fail(followProtocolError())
-				}
-				model.PollSucceeded(now)
-				if err := send(
-					Observation{Kind: ObservationEvents, At: now, Events: fresh},
-				); err != nil {
-					return fail(err)
-				}
-				return nil
+				return err
 			},
 		)
 		if callbackErr != nil {
 			return modelSummary(model), callbackErr
 		}
 		if err == nil {
-			if snapshot == nil {
-				return modelSummary(model), followProtocolError()
-			}
-			sameOperation, compareErr := sameOperationWire(*snapshot, result.Operation)
-			if result.Operation.Validate() != nil || result.Operation.ID != id ||
-				result.Cursor.OperationID != id || result.Cursor.After != model.Cursor ||
-				!result.Operation.State.Terminal() || result.Operation.LastSequence != model.Cursor ||
-				compareErr != nil || !sameOperation || model.State != result.Operation.State ||
-				model.Attempt != result.Operation.Attempt || model.ErrorCode != result.Operation.ErrorCode {
-				return modelSummary(model), followProtocolError()
-			}
-			model.Close(opts.Now())
-			if err := send(Observation{Kind: ObservationClosed, At: opts.Now()}); err != nil {
-				return modelSummary(model), err
-			}
-			summary := modelSummary(model)
-			summary.Operation = result.Operation
-			return summary, nil
+			return finishSession(model, handler, result, id, opts.Now, send)
 		}
 		if fatalFollowError(err) || ctx.Err() != nil {
 			return failFollow(ctx, model, opts.Now(), err, send)
@@ -169,11 +95,115 @@ func followSession(
 		if err := send(Observation{Kind: ObservationFailed, At: now, Err: err}); err != nil {
 			return modelSummary(model), err
 		}
-		backoff = nextBackoff(backoff)
+		handler.backoff = nextBackoff(handler.backoff)
+		backoff = handler.backoff
 		if !wait(ctx, backoff, opts.Now, model) {
 			return detach(model, opts.Now(), send, ctx.Err())
 		}
 	}
+}
+
+func finishSession(model *Model, handler *sessionHandler, result SessionResult, id contract.OperationID, now func() time.Time, emit func(Observation) error) (Summary, error) {
+	if !validSessionResult(result, handler.snapshot, id, model) {
+		return modelSummary(model), followProtocolError()
+	}
+	model.Close(now())
+	if err := emit(Observation{Kind: ObservationClosed, At: now()}); err != nil {
+		return modelSummary(model), err
+	}
+	summary := modelSummary(model)
+	summary.Operation = result.Operation
+	return summary, nil
+}
+
+type sessionHandler struct {
+	id       contract.OperationID
+	opts     FollowOptions
+	model    *Model
+	emit     func(Observation) error
+	backoff  time.Duration
+	snapshot *contract.Operation
+}
+
+func (h *sessionHandler) handle(observation SessionObservation) error {
+	now := h.opts.Now()
+	if observation.Cursor.OperationID != h.id {
+		return followProtocolError()
+	}
+	if observation.Snapshot != nil {
+		return h.handleSnapshot(observation, now)
+	}
+	return h.handleEvents(observation, now)
+}
+
+func (h *sessionHandler) handleSnapshot(observation SessionObservation, now time.Time) error {
+	op := *observation.Snapshot
+	if op.Validate() != nil || op.ID != h.id ||
+		observation.Cursor.After != h.model.Cursor ||
+		observation.Events != nil ||
+		op.LastSequence < h.model.Cursor {
+		return followProtocolError()
+	}
+	h.snapshot = &op
+	h.model.Snapshot(op, now)
+	h.model.PollSucceeded(now)
+	h.backoff = h.opts.PollInterval
+	return h.emit(Observation{Kind: ObservationSnapshot, At: now, Snapshot: &op})
+}
+
+func (h *sessionHandler) handleEvents(observation SessionObservation, now time.Time) error {
+	if h.snapshot == nil || len(observation.Events) == 0 ||
+		len(observation.Events) > h.opts.PageLimit {
+		return followProtocolError()
+	}
+	next := h.model.Cursor
+	var previous uint64
+	var fresh []contract.Event
+	for _, event := range observation.Events {
+		if event.Validate() != nil || event.OperationID != h.id ||
+			(previous != 0 && event.Sequence <= previous) {
+			return followProtocolError()
+		}
+		previous = event.Sequence
+		if event.Sequence <= h.model.Cursor {
+			continue
+		}
+		if event.Sequence != next+1 {
+			return followProtocolError()
+		}
+		next = event.Sequence
+		fresh = append(fresh, event)
+	}
+	if observation.Cursor.After != previous {
+		return followProtocolError()
+	}
+	if len(fresh) == 0 {
+		return nil
+	}
+	if err := h.model.Page(fresh, now); err != nil {
+		return followProtocolError()
+	}
+	h.model.PollSucceeded(now)
+	return h.emit(Observation{Kind: ObservationEvents, At: now, Events: fresh})
+}
+
+func validSessionResult(result SessionResult, snapshot *contract.Operation, id contract.OperationID, model *Model) bool {
+	if snapshot == nil {
+		return false
+	}
+	sameOperation, compareErr := sameOperationWire(*snapshot, result.Operation)
+	if compareErr != nil || !sameOperation {
+		return false
+	}
+	return result.Operation.Validate() == nil &&
+		result.Operation.ID == id &&
+		result.Cursor.OperationID == id &&
+		result.Cursor.After == model.Cursor &&
+		result.Operation.State.Terminal() &&
+		result.Operation.LastSequence == model.Cursor &&
+		model.State == result.Operation.State &&
+		model.Attempt == result.Operation.Attempt &&
+		model.ErrorCode == result.Operation.ErrorCode
 }
 
 func followProtocolError() error {

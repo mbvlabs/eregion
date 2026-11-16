@@ -41,8 +41,8 @@ var exits = map[Code]int{
 
 func KnownCode(code Code) bool { _, ok := exits[code]; return ok }
 
-// Fault is safe to expose after redaction. Causes are never serialized.
-type Fault struct {
+// FaultError is safe to expose after redaction. Causes are never serialized.
+type FaultError struct {
 	Code          Code                `json:"code"`
 	Message       string              `json:"message"`
 	Hint          string              `json:"hint,omitempty"`
@@ -51,22 +51,25 @@ type Fault struct {
 	FollowDetails *FollowFaultDetails `json:"-"`
 }
 
+// Fault is a compatibility alias for FaultError.
+type Fault = FaultError //nolint:errname // compatibility alias for existing callers
+
 // FollowFaultDetails identifies the values produced by the follow viewer,
 // independently of any additional, untrusted fault details.
 type FollowFaultDetails struct {
 	Values map[string]any
 }
 
-func (e *Fault) Error() string { return e.Message }
-func (e *Fault) Unwrap() error { return e.Cause }
+func (e *FaultError) Error() string { return e.Message }
+func (e *FaultError) Unwrap() error { return e.Cause }
 
-func NewFault(code Code, message, hint string) *Fault {
-	return &Fault{Code: code, Message: message, Hint: hint}
+func NewFault(code Code, message, hint string) *FaultError {
+	return &FaultError{Code: code, Message: message, Hint: hint}
 }
 
 // Classify never leaks arbitrary implementation errors or their causes.
-func Classify(err error) *Fault {
-	var fault *Fault
+func Classify(err error) *FaultError {
+	var fault *FaultError
 	if errors.As(err, &fault) && fault != nil && KnownCode(fault.Code) && fault.Message != "" {
 		copy := *fault
 		return &copy
@@ -77,7 +80,7 @@ func Classify(err error) *Fault {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return NewFault(Unavailable, "request deadline exceeded", "Inspect the existing operation before submitting again.")
 	}
-	return &Fault{Code: Internal, Message: "an internal error occurred", Hint: "Report the command and binary version.", Cause: err}
+	return &FaultError{Code: Internal, Message: "an internal error occurred", Hint: "Report the command and binary version.", Cause: err}
 }
 
 func ExitCode(err error) int {

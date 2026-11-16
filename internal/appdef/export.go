@@ -28,82 +28,18 @@ func Inspect(app, environment, imageRepository string, current platform.Environm
 }
 
 func export(app, environment, imageRepository, buildNode string, revision *platform.EnvironmentRevision, domains []platform.DomainBinding, resources []platform.Resource, inspection *platform.Environment) (string, error) {
-	if err := platform.ValidateName(app); err != nil {
-		return "", fmt.Errorf("app: %w", err)
-	}
-	if err := platform.ValidateName(environment); err != nil {
-		return "", fmt.Errorf("environment: %w", err)
-	}
-	if revision == nil {
-		return "", errors.New("the environment has no current revision; nothing is exportable")
-	}
-	if inspection == nil && !revision.Retention.IsZero() {
-		return "", errors.New("the environment has a retention override and is not representable in this definition version")
-	}
-	if inspection == nil && hasCustomReleaseTimeout(revision.Runtime) {
-		return "", errors.New("the environment has a release timeout override and is not representable in this definition version")
-	}
-	// Resource declarations are exported from the explicit inventory, never
-	// inferred from a revision name alone. A resource that no longer exists is
-	// an error: silently dropping a dependency would change the environment.
-	byName := make(map[string]platform.Resource, len(resources))
-	for _, resource := range resources {
-		if resource.App != "" && resource.App != app {
-			return "", fmt.Errorf("resource %q belongs to app %q, not %q", resource.Name, resource.App, app)
-		}
-		if resource.Environment != "" && resource.Environment != environment {
-			return "", fmt.Errorf("resource %q belongs to environment %q, not %q", resource.Name, resource.Environment, environment)
-		}
-		byName[resource.Name] = resource
-	}
-	for _, name := range revision.Resources {
-		if _, ok := byName[name]; !ok {
-			return "", fmt.Errorf("the revision depends on resource %q but its definition is unavailable", name)
-		}
-	}
-	state := platform.CloneRevisionState(revision.RevisionState)
-	if err := platform.NormalizeRevisionState(&state); err != nil {
+	byName, err := validateExportScope(app, environment, revision, resources, inspection)
+	if err != nil {
 		return "", err
 	}
-	if inspection == nil {
-		if err := platform.ValidatePushToDeploy(state); err != nil {
-			return "", err
-		}
+	state := platform.CloneRevisionState(revision.RevisionState)
+	if err := normalizeExportState(&state, inspection); err != nil {
+		return "", err
 	}
-	if state.Source.URL == "" && (len(state.Source.BuildEnv) > 0 || state.Source.Builder != "" || state.Source.Ref != "" || state.Source.ContextPath != "" || state.Source.CredentialSecretName != "" || state.Source.GoTargets != nil || state.Source.Buildpacks != nil) {
-		return "", errors.New("the environment has Git build settings without a source URL")
+	sortedDomains, err := validateExportDomains(app, environment, domains)
+	if err != nil {
+		return "", err
 	}
-
-	sortedDomains := append([]platform.DomainBinding(nil), domains...)
-	sort.Slice(sortedDomains, func(i, j int) bool { return sortedDomains[i].Domain < sortedDomains[j].Domain })
-	primary := 0
-	seen := map[string]bool{}
-	for index := range sortedDomains {
-		binding := &sortedDomains[index]
-		if binding.App != "" && binding.App != app {
-			return "", fmt.Errorf("domain %q belongs to app %q, not %q", binding.Domain, binding.App, app)
-		}
-		if binding.Environment != "" && binding.Environment != environment {
-			return "", fmt.Errorf("domain %q belongs to environment %q, not %q", binding.Domain, binding.Environment, environment)
-		}
-		if err := platform.ValidateDomain(binding.Domain); err != nil {
-			return "", fmt.Errorf("domain %q: %w", binding.Domain, err)
-		}
-		if seen[binding.Domain] {
-			return "", fmt.Errorf("duplicate domain %q", binding.Domain)
-		}
-		seen[binding.Domain] = true
-		if binding.Primary {
-			primary++
-		}
-	}
-	if primary > 1 {
-		return "", errors.New("more than one domain is marked primary")
-	}
-	if len(sortedDomains) > 0 && primary == 0 {
-		return "", errors.New("the environment has domain bindings but no primary domain")
-	}
-
 	processes := append([]platform.ProcessSpec(nil), state.Processes...)
 	sort.Slice(processes, func(i, j int) bool { return processes[i].Name < processes[j].Name })
 
@@ -130,182 +66,295 @@ func export(app, environment, imageRepository, buildNode string, revision *platf
 	out.WriteString("\n[automation]\n")
 	fmt.Fprintf(&out, "auto_deploy = %t\nwebhook_secret_name = %s\n", revision.AutoDeploy, quote(revision.WebhookSecretName))
 	if inspection != nil {
-		out.WriteString("\n[inspection]\n")
-		fmt.Fprintf(&out, "auto_deploy = %t\nwebhook_secret_name = %s\nprotected = %t\n", revision.AutoDeploy, quote(revision.WebhookSecretName), inspection.Protected)
-		timeout := "not configured"
-		if revision.Runtime.ReleaseCommand != nil {
-			timeout = strconv.Itoa(revision.Runtime.ReleaseCommand.TimeoutSeconds) + " seconds (0 means default)"
+		writeExportInspection(&out, revision, *inspection, sortedDomains)
+	}
+	writeExportSource(&out, state.Source)
+	writeExportRuntime(&out, state.Runtime)
+	writeExportConfig(&out, state.Config)
+
+	writeExportProcesses(&out, processes)
+	writeExportResources(&out, revision, byName)
+	writeExportDomains(&out, environment, sortedDomains)
+	return strings.TrimRight(out.String(), "\n") + "\n", nil
+}
+
+func validateExportScope(app, environment string, revision *platform.EnvironmentRevision, resources []platform.Resource, inspection *platform.Environment) (map[string]platform.Resource, error) {
+	if err := platform.ValidateName(app); err != nil {
+		return nil, fmt.Errorf("app: %w", err)
+	}
+	if err := platform.ValidateName(environment); err != nil {
+		return nil, fmt.Errorf("environment: %w", err)
+	}
+	if revision == nil {
+		return nil, errors.New("the environment has no current revision; nothing is exportable")
+	}
+	if inspection == nil && !revision.Retention.IsZero() {
+		return nil, errors.New("the environment has a retention override and is not representable in this definition version")
+	}
+	if inspection == nil && hasCustomReleaseTimeout(revision.Runtime) {
+		return nil, errors.New("the environment has a release timeout override and is not representable in this definition version")
+	}
+	// Resource declarations are exported from the explicit inventory, never
+	// inferred from a revision name alone. A resource that no longer exists is
+	// an error: silently dropping a dependency would change the environment.
+	byName := make(map[string]platform.Resource, len(resources))
+	for _, resource := range resources {
+		if resource.App != "" && resource.App != app {
+			return nil, fmt.Errorf("resource %q belongs to app %q, not %q", resource.Name, resource.App, app)
 		}
-		fmt.Fprintf(&out, "release_timeout = %s\n", quote(timeout))
-		value := func(v *int) string {
-			if v == nil {
-				return "inherited (server value unavailable)"
-			}
-			return strconv.Itoa(*v)
+		if resource.Environment != "" && resource.Environment != environment {
+			return nil, fmt.Errorf("resource %q belongs to environment %q, not %q", resource.Name, resource.Environment, environment)
 		}
-		fmt.Fprintf(&out, "retention_keep_releases = %s\nretention_keep_newer_than_days = %s\nretention_artifact_grace_days = %s\n", quote(value(revision.Retention.KeepReleases)), quote(value(revision.Retention.KeepNewerThanDays)), quote(value(revision.Retention.ArtifactGraceDays)))
-		out.WriteString("not_represented = [\"external webhook configuration\", \"retention override\", \"environment protection\", \"release timeout\", \"provider ownership and DNS automation\", \"provider live state, credentials, TLS and health observations\"]\n")
-		out.WriteString("provider_inventory = \"Only managed DNS metadata present in domain inventory is shown; live provider state and ownership details are unavailable.\"\n")
-		for _, binding := range sortedDomains {
-			if d := binding.ManagedDNS; d != nil {
-				out.WriteString("\n[[inspection.managed_dns]]\n")
-				fmt.Fprintf(&out, "domain = %s\nprovider = %s\nzone_id = %s\nzone_name = %s\norigins = %s\nproxied = %t\nstate = %s\ngeneration = %d\napplied_generation = %d\n", quote(binding.Domain), quote(d.Provider), quote(d.ZoneID), quote(d.ZoneName), stringArray(d.Origins), d.Proxied, quote(d.State), d.Generation, d.AppliedGeneration)
-			}
+		byName[resource.Name] = resource
+	}
+	for _, name := range revision.Resources {
+		if _, ok := byName[name]; !ok {
+			return nil, fmt.Errorf("the revision depends on resource %q but its definition is unavailable", name)
 		}
 	}
+	return byName, nil
+}
 
-	if state.Source.URL != "" {
+func normalizeExportState(state *platform.RevisionState, inspection *platform.Environment) error {
+	if err := platform.NormalizeRevisionState(state); err != nil {
+		return err
+	}
+	if inspection == nil {
+		if err := platform.ValidatePushToDeploy(*state); err != nil {
+			return err
+		}
+	}
+	if state.Source.URL == "" && (len(state.Source.BuildEnv) > 0 || state.Source.Builder != "" || state.Source.Ref != "" || state.Source.ContextPath != "" || state.Source.CredentialSecretName != "" || state.Source.GoTargets != nil || state.Source.Buildpacks != nil) {
+		return errors.New("the environment has Git build settings without a source URL")
+	}
+	return nil
+}
+
+func validateExportDomains(app, environment string, domains []platform.DomainBinding) ([]platform.DomainBinding, error) {
+	sortedDomains := append([]platform.DomainBinding(nil), domains...)
+	sort.Slice(sortedDomains, func(i, j int) bool { return sortedDomains[i].Domain < sortedDomains[j].Domain })
+	primary := 0
+	seen := map[string]bool{}
+	for index := range sortedDomains {
+		binding := &sortedDomains[index]
+		if binding.App != "" && binding.App != app {
+			return nil, fmt.Errorf("domain %q belongs to app %q, not %q", binding.Domain, binding.App, app)
+		}
+		if binding.Environment != "" && binding.Environment != environment {
+			return nil, fmt.Errorf("domain %q belongs to environment %q, not %q", binding.Domain, binding.Environment, environment)
+		}
+		if err := platform.ValidateDomain(binding.Domain); err != nil {
+			return nil, fmt.Errorf("domain %q: %w", binding.Domain, err)
+		}
+		if seen[binding.Domain] {
+			return nil, fmt.Errorf("duplicate domain %q", binding.Domain)
+		}
+		seen[binding.Domain] = true
+		if binding.Primary {
+			primary++
+		}
+	}
+	if primary > 1 {
+		return nil, errors.New("more than one domain is marked primary")
+	}
+	if len(sortedDomains) > 0 && primary == 0 {
+		return nil, errors.New("the environment has domain bindings but no primary domain")
+	}
+	return sortedDomains, nil
+}
+
+func writeExportInspection(out *strings.Builder, revision *platform.EnvironmentRevision, inspection platform.Environment, domains []platform.DomainBinding) {
+	out.WriteString("\n[inspection]\n")
+	fmt.Fprintf(out, "auto_deploy = %t\nwebhook_secret_name = %s\nprotected = %t\n", revision.AutoDeploy, quote(revision.WebhookSecretName), inspection.Protected)
+	timeout := "not configured"
+	if revision.Runtime.ReleaseCommand != nil {
+		timeout = strconv.Itoa(revision.Runtime.ReleaseCommand.TimeoutSeconds) + " seconds (0 means default)"
+	}
+	fmt.Fprintf(out, "release_timeout = %s\n", quote(timeout))
+	value := func(v *int) string {
+		if v == nil {
+			return "inherited (server value unavailable)"
+		}
+		return strconv.Itoa(*v)
+	}
+	fmt.Fprintf(out, "retention_keep_releases = %s\nretention_keep_newer_than_days = %s\nretention_artifact_grace_days = %s\n", quote(value(revision.Retention.KeepReleases)), quote(value(revision.Retention.KeepNewerThanDays)), quote(value(revision.Retention.ArtifactGraceDays)))
+	out.WriteString("not_represented = [\"external webhook configuration\", \"retention override\", \"environment protection\", \"release timeout\", \"provider ownership and DNS automation\", \"provider live state, credentials, TLS and health observations\"]\n")
+	out.WriteString("provider_inventory = \"Only managed DNS metadata present in domain inventory is shown; live provider state and ownership details are unavailable.\"\n")
+	for _, binding := range domains {
+		if d := binding.ManagedDNS; d != nil {
+			out.WriteString("\n[[inspection.managed_dns]]\n")
+			fmt.Fprintf(out, "domain = %s\nprovider = %s\nzone_id = %s\nzone_name = %s\norigins = %s\nproxied = %t\nstate = %s\ngeneration = %d\napplied_generation = %d\n", quote(binding.Domain), quote(d.Provider), quote(d.ZoneID), quote(d.ZoneName), stringArray(d.Origins), d.Proxied, quote(d.State), d.Generation, d.AppliedGeneration)
+		}
+	}
+}
+
+func writeExportSource(out *strings.Builder, source platform.SourceBinding) {
+	if source.URL != "" {
 		out.WriteString("\n[source]\n")
-		fmt.Fprintf(&out, "url = %s\n", quote(state.Source.URL))
-		fmt.Fprintf(&out, "ref = %s\n", quote(state.Source.Ref))
-		fmt.Fprintf(&out, "credential_secret = %s\n", quote(state.Source.CredentialSecretName))
-		fmt.Fprintf(&out, "context_path = %s\n", quote(state.Source.ContextPath))
-		fmt.Fprintf(&out, "builder = %s\n", quote(state.Source.Builder))
+		fmt.Fprintf(out, "url = %s\n", quote(source.URL))
+		fmt.Fprintf(out, "ref = %s\n", quote(source.Ref))
+		fmt.Fprintf(out, "credential_secret = %s\n", quote(source.CredentialSecretName))
+		fmt.Fprintf(out, "context_path = %s\n", quote(source.ContextPath))
+		fmt.Fprintf(out, "builder = %s\n", quote(source.Builder))
 		out.WriteString("targets = [")
-		for index, target := range state.Source.GoTargets {
+		for index, target := range source.GoTargets {
 			if index > 0 {
 				out.WriteString(", ")
 			}
-			fmt.Fprintf(&out, "{ process = %s, target = %s }", quote(target.Process), quote(target.Target))
+			fmt.Fprintf(out, "{ process = %s, target = %s }", quote(target.Process), quote(target.Target))
 		}
 		out.WriteString("]\n")
 	}
-	if settings := state.Source.Buildpacks; settings != nil {
+	if settings := source.Buildpacks; settings != nil {
 		out.WriteString("\n[source.buildpacks]\n")
-		fmt.Fprintf(&out, "order = %s\n", stringArray(settings.Order))
-		fmt.Fprintf(&out, "keep_files = %s\n", stringArray(settings.KeepFiles))
+		fmt.Fprintf(out, "order = %s\n", stringArray(settings.Order))
+		fmt.Fprintf(out, "keep_files = %s\n", stringArray(settings.KeepFiles))
 		if frontend := settings.Frontend; frontend != nil {
 			out.WriteString("\n[source.buildpacks.frontend]\n")
-			fmt.Fprintf(&out, "directory = %s\n", quote(frontend.Directory))
-			fmt.Fprintf(&out, "scripts = %s\n", stringArray(frontend.Scripts))
-			fmt.Fprintf(&out, "start_script = %s\n", quote(frontend.StartScript))
+			fmt.Fprintf(out, "directory = %s\n", quote(frontend.Directory))
+			fmt.Fprintf(out, "scripts = %s\n", stringArray(frontend.Scripts))
+			fmt.Fprintf(out, "start_script = %s\n", quote(frontend.StartScript))
 		}
 		if advanced := settings.Advanced; advanced != nil {
 			out.WriteString("\n[source.buildpacks.advanced]\n")
-			fmt.Fprintf(&out, "go_version = %s\n", quote(advanced.GoVersion))
-			fmt.Fprintf(&out, "go_build_flags = %s\n", quote(advanced.GoBuildFlags))
-			fmt.Fprintf(&out, "node_version = %s\n", quote(advanced.NodeVersion))
+			fmt.Fprintf(out, "go_version = %s\n", quote(advanced.GoVersion))
+			fmt.Fprintf(out, "go_build_flags = %s\n", quote(advanced.GoBuildFlags))
+			fmt.Fprintf(out, "node_version = %s\n", quote(advanced.NodeVersion))
 		}
 	}
-	if state.Source.URL != "" && len(state.Source.BuildEnv) == 0 {
+	if source.URL != "" && len(source.BuildEnv) == 0 {
 		out.WriteString("\n[source.build_env]\n")
-	} else if len(state.Source.BuildEnv) > 0 {
+	} else if len(source.BuildEnv) > 0 {
 		out.WriteString("\n[source.build_env]\n")
-		for _, key := range sortedKeys(state.Source.BuildEnv) {
-			fmt.Fprintf(&out, "%s = %s\n", tomlKey(key), quote(state.Source.BuildEnv[key]))
+		for _, key := range sortedKeys(source.BuildEnv) {
+			fmt.Fprintf(out, "%s = %s\n", tomlKey(key), quote(source.BuildEnv[key]))
 		}
 	}
+}
 
+func writeExportRuntime(out *strings.Builder, runtime platform.RuntimeSpec) {
 	out.WriteString("\n[runtime]\n")
-	fmt.Fprintf(&out, "health_type = %s\n", quote(state.Runtime.HealthType))
-	fmt.Fprintf(&out, "health_path = %s\n", quote(state.Runtime.HealthPath))
-	fmt.Fprintf(&out, "health_timeout_seconds = %d\n", state.Runtime.HealthTimeoutSeconds)
-	if state.Runtime.ReleaseCommand != nil {
-		fmt.Fprintf(&out, "release_command = %s\n", stringArray(state.Runtime.ReleaseCommand.Argv))
+	fmt.Fprintf(out, "health_type = %s\n", quote(runtime.HealthType))
+	fmt.Fprintf(out, "health_path = %s\n", quote(runtime.HealthPath))
+	fmt.Fprintf(out, "health_timeout_seconds = %d\n", runtime.HealthTimeoutSeconds)
+	if runtime.ReleaseCommand != nil {
+		fmt.Fprintf(out, "release_command = %s\n", stringArray(runtime.ReleaseCommand.Argv))
 	} else {
 		out.WriteString("release_command = []\n")
 	}
+}
 
+func writeExportConfig(out *strings.Builder, config map[string]string) {
 	out.WriteString("\n[config]\n")
-	for _, key := range sortedKeys(state.Config) {
-		fmt.Fprintf(&out, "%s = %s\n", tomlKey(key), quote(state.Config[key]))
+	for _, key := range sortedKeys(config) {
+		fmt.Fprintf(out, "%s = %s\n", tomlKey(key), quote(config[key]))
 	}
+}
 
-	if len(processes) > 0 {
-		out.WriteString("\n")
-		for _, process := range processes {
-			out.WriteString("[[processes]]\n")
-			fmt.Fprintf(&out, "name = %s\n", quote(process.Name))
-			fmt.Fprintf(&out, "kind = %s\n", quote(process.Kind))
-			if process.Command != "" {
-				fmt.Fprintf(&out, "command = %s\n", quote(process.Command))
-			}
-			if len(process.Args) > 0 {
-				fmt.Fprintf(&out, "args = %s\n", stringArray(process.Args))
-			}
-			fmt.Fprintf(&out, "replicas = %d\n", process.Replicas)
-			if process.ContainerPort > 0 {
-				fmt.Fprintf(&out, "container_port = %d\n", process.ContainerPort)
-			}
-			out.WriteString("\n")
+func writeExportProcesses(out *strings.Builder, processes []platform.ProcessSpec) {
+	if len(processes) == 0 {
+		return
+	}
+	out.WriteString("\n")
+	for _, process := range processes {
+		out.WriteString("[[processes]]\n")
+		fmt.Fprintf(out, "name = %s\n", quote(process.Name))
+		fmt.Fprintf(out, "kind = %s\n", quote(process.Kind))
+		if process.Command != "" {
+			fmt.Fprintf(out, "command = %s\n", quote(process.Command))
 		}
+		if len(process.Args) > 0 {
+			fmt.Fprintf(out, "args = %s\n", stringArray(process.Args))
+		}
+		fmt.Fprintf(out, "replicas = %d\n", process.Replicas)
+		if process.ContainerPort > 0 {
+			fmt.Fprintf(out, "container_port = %d\n", process.ContainerPort)
+		}
+		out.WriteString("\n")
 	}
+}
 
+func writeExportResources(out *strings.Builder, revision *platform.EnvironmentRevision, resources map[string]platform.Resource) {
 	attached := make(map[string]bool, len(revision.Resources))
 	for _, name := range revision.Resources {
 		attached[name] = true
 	}
-	names := make([]string, 0, len(byName))
-	for name := range byName {
+	names := make([]string, 0, len(resources))
+	for name := range resources {
 		names = append(names, name)
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		resource := byName[name]
-		out.WriteString("\n[[resources]]\n")
-		fmt.Fprintf(&out, "name = %s\n", quote(resource.Name))
-		fmt.Fprintf(&out, "image = %s\n", quote(resource.Spec.Image))
-		if resource.Spec.Port > 0 {
-			fmt.Fprintf(&out, "port = %d\n", resource.Spec.Port)
-		}
-		if !attached[resource.Name] {
-			out.WriteString("attach = false\n")
-		}
-		if len(resource.Spec.Command) > 0 {
-			fmt.Fprintf(&out, "command = %s\n", stringArray(resource.Spec.Command))
-		}
-		if len(resource.Spec.Env) > 0 {
-			out.WriteString("\n[resources.env]\n")
-			for _, key := range sortedKeys(resource.Spec.Env) {
-				fmt.Fprintf(&out, "%s = %s\n", tomlKey(key), quote(resource.Spec.Env[key]))
-			}
-		}
-		if len(resource.Spec.SecretEnv) > 0 {
-			out.WriteString("\n[resources.secret_env]\n")
-			for _, key := range sortedKeys(resource.Spec.SecretEnv) {
-				fmt.Fprintf(&out, "%s = %s\n", tomlKey(key), quote(resource.Spec.SecretEnv[key]))
-			}
-		}
-		out.WriteString("\n[resources.health]\n")
-		healthType := resource.Spec.Health.Type
-		if healthType == "" {
-			healthType = "exec"
-		}
-		fmt.Fprintf(&out, "type = %s\n", quote(healthType))
-		fmt.Fprintf(&out, "command = %s\n", stringArray(resource.Spec.Health.Command))
-		if resource.Spec.Health.TimeoutSeconds > 0 {
-			fmt.Fprintf(&out, "timeout_seconds = %d\n", resource.Spec.Health.TimeoutSeconds)
-		}
-		if resource.Spec.Health.IntervalMS > 0 {
-			fmt.Fprintf(&out, "interval_ms = %d\n", resource.Spec.Health.IntervalMS)
-		}
-		for _, mount := range resource.Spec.Mounts {
-			out.WriteString("\n[[resources.mounts]]\n")
-			fmt.Fprintf(&out, "name = %s\n", quote(mount.Name))
-			fmt.Fprintf(&out, "destination = %s\n", quote(mount.Destination))
-			if mount.ReadOnly {
-				out.WriteString("read_only = true\n")
-			}
-		}
-		out.WriteString("\n")
+		writeExportResource(out, resources[name], attached)
 	}
+}
 
-	// Domains are environment-specific: one hostname cannot route to two
-	// environments. Exporting them under the selected environment's optional
-	// override keeps the shared recipe reusable for staging, PR environments and
-	// arbitrary names without duplicating a hostname.
-	if len(sortedDomains) > 0 {
-		fmt.Fprintf(&out, "\n[environments.%s]\n", tomlKey(environment))
-		for _, binding := range sortedDomains {
-			fmt.Fprintf(&out, "\n[[environments.%s.domains]]\n", tomlKey(environment))
-			fmt.Fprintf(&out, "name = %s\n", quote(binding.Domain))
-			fmt.Fprintf(&out, "primary = %t\n", binding.Primary)
-			if binding.CheckPath != "" {
-				fmt.Fprintf(&out, "check_path = %s\n", quote(binding.CheckPath))
-			}
+func writeExportResource(out *strings.Builder, resource platform.Resource, attached map[string]bool) {
+	out.WriteString("\n[[resources]]\n")
+	fmt.Fprintf(out, "name = %s\n", quote(resource.Name))
+	fmt.Fprintf(out, "image = %s\n", quote(resource.Spec.Image))
+	if resource.Spec.Port > 0 {
+		fmt.Fprintf(out, "port = %d\n", resource.Spec.Port)
+	}
+	if !attached[resource.Name] {
+		out.WriteString("attach = false\n")
+	}
+	if len(resource.Spec.Command) > 0 {
+		fmt.Fprintf(out, "command = %s\n", stringArray(resource.Spec.Command))
+	}
+	if len(resource.Spec.Env) > 0 {
+		out.WriteString("\n[resources.env]\n")
+		for _, key := range sortedKeys(resource.Spec.Env) {
+			fmt.Fprintf(out, "%s = %s\n", tomlKey(key), quote(resource.Spec.Env[key]))
 		}
 	}
-	return strings.TrimRight(out.String(), "\n") + "\n", nil
+	if len(resource.Spec.SecretEnv) > 0 {
+		out.WriteString("\n[resources.secret_env]\n")
+		for _, key := range sortedKeys(resource.Spec.SecretEnv) {
+			fmt.Fprintf(out, "%s = %s\n", tomlKey(key), quote(resource.Spec.SecretEnv[key]))
+		}
+	}
+	out.WriteString("\n[resources.health]\n")
+	healthType := resource.Spec.Health.Type
+	if healthType == "" {
+		healthType = "exec"
+	}
+	fmt.Fprintf(out, "type = %s\n", quote(healthType))
+	fmt.Fprintf(out, "command = %s\n", stringArray(resource.Spec.Health.Command))
+	if resource.Spec.Health.TimeoutSeconds > 0 {
+		fmt.Fprintf(out, "timeout_seconds = %d\n", resource.Spec.Health.TimeoutSeconds)
+	}
+	if resource.Spec.Health.IntervalMS > 0 {
+		fmt.Fprintf(out, "interval_ms = %d\n", resource.Spec.Health.IntervalMS)
+	}
+	for _, mount := range resource.Spec.Mounts {
+		out.WriteString("\n[[resources.mounts]]\n")
+		fmt.Fprintf(out, "name = %s\n", quote(mount.Name))
+		fmt.Fprintf(out, "destination = %s\n", quote(mount.Destination))
+		if mount.ReadOnly {
+			out.WriteString("read_only = true\n")
+		}
+	}
+	out.WriteString("\n")
+}
+
+// Domains are environment-specific: one hostname cannot route to two
+// environments. Exporting them under the selected environment's optional
+// override keeps the shared recipe reusable for staging, PR environments and
+// arbitrary names without duplicating a hostname.
+func writeExportDomains(out *strings.Builder, environment string, domains []platform.DomainBinding) {
+	if len(domains) == 0 {
+		return
+	}
+	fmt.Fprintf(out, "\n[environments.%s]\n", tomlKey(environment))
+	for _, binding := range domains {
+		fmt.Fprintf(out, "\n[[environments.%s.domains]]\n", tomlKey(environment))
+		fmt.Fprintf(out, "name = %s\n", quote(binding.Domain))
+		fmt.Fprintf(out, "primary = %t\n", binding.Primary)
+		if binding.CheckPath != "" {
+			fmt.Fprintf(out, "check_path = %s\n", quote(binding.CheckPath))
+		}
+	}
 }
 
 // currentBuildNode is not part of EnvironmentRevision; it lives on the
@@ -352,7 +401,7 @@ func stringArray(values []string) string {
 
 func tomlKey(key string) string {
 	for _, r := range key {
-		if !(r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '_' || r == '-') {
+		if !validTOMLBareKeyRune(r) {
 			return quote(key)
 		}
 	}
@@ -360,6 +409,10 @@ func tomlKey(key string) string {
 		return quote(key)
 	}
 	return key
+}
+
+func validTOMLBareKeyRune(r rune) bool {
+	return r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '_' || r == '-'
 }
 
 func sortedKeys(values map[string]string) []string {
@@ -380,22 +433,37 @@ func sortedKeys(values map[string]string) []string {
 func (r *Resolved) UpdatePatch(current platform.Environment, currentDomains []platform.DomainBinding) (platform.EnvironmentUpdateInput, []string, []string, error) {
 	patch := platform.EnvironmentUpdateInput{App: current.App, Environment: current.Name, ExpectedRevisionID: current.RevisionID}
 	base := currentRevisionState(current)
-	if hasCustomReleaseTimeout(base.Runtime) {
-		return patch, nil, nil, errors.New("the environment has a release timeout override that definitions cannot represent")
-	}
-	if err := platform.NormalizeRevisionState(&base); err != nil {
+	if err := r.validateUpdate(current, currentDomains, &base); err != nil {
 		return patch, nil, nil, err
+	}
+	desired := r.desiredRevisionState(base)
+	if err := platform.NormalizeRevisionState(&desired); err != nil {
+		return patch, nil, nil, err
+	}
+	if err := platform.ValidatePushToDeploy(desired); err != nil {
+		return patch, nil, nil, err
+	}
+	changed, diff := updateChanges(&patch, current, base, desired, r.BuildNode)
+	return patch, changed, diff, nil
+}
+
+func (r *Resolved) validateUpdate(current platform.Environment, currentDomains []platform.DomainBinding, base *platform.RevisionState) error {
+	if hasCustomReleaseTimeout(base.Runtime) {
+		return errors.New("the environment has a release timeout override that definitions cannot represent")
+	}
+	if err := platform.NormalizeRevisionState(base); err != nil {
+		return err
 	}
 	if r.ImageRepository != "" && r.ImageRepository != current.ImageRepository {
-		return patch, nil, nil, fmt.Errorf("image_repository: definition value %q does not match the app's repository %q", r.ImageRepository, current.ImageRepository)
+		return fmt.Errorf("image_repository: definition value %q does not match the app's repository %q", r.ImageRepository, current.ImageRepository)
 	}
 	if !r.NodeSet {
-		return patch, nil, nil, errors.New("node is required for an update definition; export an existing environment to get a complete file")
+		return errors.New("node is required for an update definition; export an existing environment to get a complete file")
 	}
-	if err := currentDomainsMatch(current, currentDomains); err != nil {
-		return patch, nil, nil, err
-	}
+	return currentDomainsMatch(current, currentDomains)
+}
 
+func (r *Resolved) desiredRevisionState(base platform.RevisionState) platform.RevisionState {
 	desired := platform.RevisionState{
 		Source:            platform.SourceBinding{},
 		Runtime:           runtimeFromDefinition(r.Runtime, r.Node),
@@ -418,13 +486,10 @@ func (r *Resolved) UpdatePatch(current platform.Environment, currentDomains []pl
 			desired.WebhookSecretName = *r.Automation.WebhookSecretName
 		}
 	}
-	if err := platform.NormalizeRevisionState(&desired); err != nil {
-		return patch, nil, nil, err
-	}
-	if err := platform.ValidatePushToDeploy(desired); err != nil {
-		return patch, nil, nil, err
-	}
+	return desired
+}
 
+func updateChanges(patch *platform.EnvironmentUpdateInput, current platform.Environment, base, desired platform.RevisionState, buildNode string) ([]string, []string) {
 	changed := make([]string, 0, 8)
 	diff := make([]string, 0, 16)
 	if desired.AutoDeploy != base.AutoDeploy {
@@ -445,16 +510,16 @@ func (r *Resolved) UpdatePatch(current platform.Environment, currentDomains []pl
 		patch.WebhookSecretName = &value
 	}
 	if desired.Runtime.Node != current.Node {
-		node := r.Node
+		node := desired.Runtime.Node
 		patch.Node = &node
 		changed = append(changed, "node")
 		diff = append(diff, "node: "+display(current.Node)+" -> "+display(node))
 	}
-	if r.BuildNode != current.BuildNode {
-		buildNode := r.BuildNode
-		patch.BuildNode = &buildNode
+	if buildNode != current.BuildNode {
+		value := buildNode
+		patch.BuildNode = &value
 		changed = append(changed, "build_node")
-		diff = append(diff, "build_node: "+display(current.BuildNode)+" -> "+display(buildNode))
+		diff = append(diff, "build_node: "+display(current.BuildNode)+" -> "+display(value))
 	}
 	if !sourceEqual(base.Source, desired.Source) {
 		source := desired.Source
@@ -493,7 +558,7 @@ func (r *Resolved) UpdatePatch(current platform.Environment, currentDomains []pl
 		changed = append(changed, "resources")
 		diff = append(diff, stringSliceDiff("resources", base.Resources, desired.Resources)...)
 	}
-	return patch, changed, diff, nil
+	return changed, diff
 }
 
 func hasCustomReleaseTimeout(runtime platform.RuntimeSpec) bool {

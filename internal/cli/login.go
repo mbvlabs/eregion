@@ -79,22 +79,27 @@ func parseHandoffRecord(text string) handoffRecord {
 		}
 		value = strings.TrimSpace(value)
 		if value == "" {
-			// A multi-line value is the fenced block that follows.
-			j := i + 1
-			for j < len(lines) && strings.TrimSpace(lines[j]) == "" {
-				j++
-			}
-			if j < len(lines) && strings.TrimSpace(lines[j]) == "```" {
-				var block []string
-				for j++; j < len(lines) && strings.TrimSpace(lines[j]) != "```"; j++ {
-					block = append(block, strings.TrimRight(lines[j], " \t"))
-				}
-				value, i = strings.Join(block, "\n"), j
-			}
+			value, i = fencedHandoffValue(lines, i, value)
 		}
 		record[section][strings.TrimSpace(label)] = value
 	}
 	return record
+}
+
+// fencedHandoffValue reads the fenced block that carries a multi-line value.
+func fencedHandoffValue(lines []string, index int, value string) (string, int) {
+	j := index + 1
+	for j < len(lines) && strings.TrimSpace(lines[j]) == "" {
+		j++
+	}
+	if j >= len(lines) || strings.TrimSpace(lines[j]) != "```" {
+		return value, index
+	}
+	var block []string
+	for j++; j < len(lines) && strings.TrimSpace(lines[j]) != "```"; j++ {
+		block = append(block, strings.TrimRight(lines[j], " \t"))
+	}
+	return strings.Join(block, "\n"), j
 }
 
 // field finds label in the first section whose title starts with prefix.
@@ -111,75 +116,24 @@ func (a *app) login(cmd *cobra.Command, _ []string) (result, error) {
 	path, _ := cmd.Flags().GetString("file")
 	passFile, _ := cmd.Flags().GetString("passphrase-file")
 	interactive := humanAtTerminal(cmd)
-	var armored []byte
-	var err error
-	if path != "" {
-		var raw []byte
-		if raw, err = os.ReadFile(expandHome(path)); err == nil { //nolint:gosec // G304: the operator's bundle.
-			armored, err = bundle.Read(bytes.NewReader(raw))
-		}
-	} else {
-		if interactive {
-			fmt.Fprintln(cmd.ErrOrStderr(), "\n"+ui.Header("eregion login", 72))
-			fmt.Fprintln(cmd.ErrOrStderr(), "Paste the transfer bundle (from "+bundle.Header+" to "+bundle.Footer+"), or the whole copied handoff:")
-		}
-		armored, err = bundle.Read(cmd.InOrStdin())
-	}
+	armored, err := readLoginBundle(cmd, path, interactive)
 	if err != nil {
 		return result{}, contract.NewFault(contract.InputRequired, "could not read the transfer bundle", err.Error())
 	}
-	var pass string
-	switch {
-	case passFile != "":
-		raw, err := os.ReadFile(expandHome(passFile)) //nolint:gosec // G304: the operator's passphrase file.
-		if err != nil {
-			return result{}, contract.NewFault(contract.InputRequired, "could not read the passphrase file", err.Error())
-		}
-		pass = strings.TrimSpace(strings.SplitN(string(raw), "\n", 2)[0])
-	case interactive:
-		if pass, err = ui.Secret("Bundle passphrase"); err != nil {
-			return result{}, err
-		}
-	default:
-		return result{}, contract.NewFault(contract.InputRequired, "--passphrase-file is required without a terminal", "Pass the bundle passphrase in a file.")
+	pass, err := readLoginPassphrase(passFile, interactive)
+	if err != nil {
+		return result{}, err
 	}
 	a.secrets.Add(pass)
 	plain, err := bundle.Decrypt(armored, pass)
 	if err != nil {
 		return result{}, contract.NewFault(contract.ValidationFailed, err.Error(), "Check the passphrase and the bundle, then retry.")
 	}
-	rec := parseHandoffRecord(string(plain))
-	get := func(section, label string) string { return rec.field(section, label) }
-	nodeName := get("Main node", "Node name")
-	sshKey := get("Operator", "SSH private key")
-	wgKey := get("Operator", "WireGuard private key")
-	wireGuardAddress := get("Main node", "WireGuard address")
-	adminUser := get("Operator", "Admin user")
-	workspaceName := strings.TrimSpace(get("Main node", "Workspace"))
-	workspaceID := strings.TrimSpace(get("Main node", "Workspace ID"))
-	required := map[string]string{
-		"SSH private key": sshKey, "WireGuard private key": wgKey,
-		"WireGuard address":    wireGuardAddress,
-		"admin user":           adminUser,
-		"WireGuard endpoint":   get("Main node", "WireGuard endpoint"),
-		"WireGuard public key": get("Main node", "WireGuard public key"),
-		"SSH host key":         get("Main node", "SSH host key"),
-	}
-	for label, value := range required {
-		if value == "" {
-			return result{}, contract.NewFault(contract.ValidationFailed, "the transfer bundle has no "+label, "Use the bundle from eregion server init's secrets handoff.")
-		}
-	}
-	if workspaceName == "" || workspaceID == "" {
-		return result{}, contract.NewFault(contract.ValidationFailed, "the transfer bundle has an incomplete workspace identity", "Use a current protected export with both the workspace name and ID.")
-	}
-	if err := controlplane.ValidateWorkspaceName(workspaceName); err != nil {
+	rec, err := decodeLoginRecord(parseHandoffRecord(string(plain)))
+	if err != nil {
 		return result{}, err
 	}
-	if err := controlplane.ValidateWorkspaceID(workspaceID); err != nil {
-		return result{}, err
-	}
-	for _, v := range []string{sshKey, wgKey, get("Operator", "Sudo password")} {
+	for _, v := range []string{rec.sshKey, rec.wgKey, rec.sudoPassword} {
 		a.secrets.Add(v)
 	}
 
@@ -192,23 +146,12 @@ func (a *app) login(cmd *cobra.Command, _ []string) (result, error) {
 	}
 	replace, _ := cmd.Flags().GetString("replace")
 	replace = strings.TrimSpace(replace)
-	if err := validateLoginWorkspaceTarget(store, workspaceName, workspaceID, replace); err != nil {
+	if err := validateLoginWorkspaceTarget(store, rec.workspaceName, rec.workspaceID, replace); err != nil {
 		return result{}, err
 	}
-	autoUpgrade := boolFlag(cmd, "auto-upgrade-nodes")
-	for _, group := range store.Groups() {
-		if group.ID == workspaceID {
-			for _, access := range group.Access {
-				autoUpgrade = autoUpgrade || access.AutoUpgradeNodes
-			}
-		}
-	}
-	credentialDirName, err := store.CredentialDirName(workspaceID)
+	autoUpgrade := loginAutoUpgrade(cmd, store, rec.workspaceID)
+	credentialDirName, dir, err := prepareLoginCredentialDir(store, rec.workspaceID)
 	if err != nil {
-		return result{}, contract.NewFault(contract.PreconditionFailed, "could not allocate a private workspace credential directory", err.Error())
-	}
-	dir := filepath.Join(filepath.Dir(store.Path), credentialDirName)
-	if err := os.MkdirAll(filepath.Dir(dir), 0o700); err != nil {
 		return result{}, err
 	}
 	// Build and prove the identity in a sibling directory first; the existing
@@ -218,96 +161,11 @@ func (a *app) login(cmd *cobra.Command, _ []string) (result, error) {
 		return result{}, err
 	}
 	defer func() { _ = os.RemoveAll(tempDir) }()
-	sshPath, wgPath := filepath.Join(tempDir, "ssh_ed25519"), filepath.Join(tempDir, "wireguard.key")
-	for path, content := range map[string]string{sshPath: sshKey + "\n", wgPath: wgKey + "\n", filepath.Join(tempDir, "sudo-password"): get("Operator", "Sudo password") + "\n"} {
-		if err := writePrivate(path, []byte(content)); err != nil {
-			return result{}, err
-		}
-	}
-	if password, err := restoreMetricsCredential(tempDir, rec); err != nil {
-		return result{}, err
-	} else if password != "" {
-		a.secrets.Add(password)
-	}
-	if _, err := transport.ReadWireGuardKey(wgPath); err != nil {
-		return result{}, contract.NewFault(contract.ValidationFailed, "the record's WireGuard key is not usable", err.Error())
-	}
-	tempKnownHosts := filepath.Join(tempDir, "known_hosts")
-	route := &host.WorkspaceSSH{
-		Address: net.JoinHostPort(wireGuardAddress, "22"), User: adminUser,
-		Identity: sshPath, KnownHosts: tempKnownHosts,
-		WireGuard: &host.WorkspaceWireGuard{
-			PrivateKeyFile: wgPath, Address: get("Operator", "WireGuard address"),
-			NodeAddress: wireGuardAddress, NodePublicKey: get("Main node", "WireGuard public key"),
-			Endpoint: get("Main node", "WireGuard endpoint"),
-		},
-	}
-	// The import is fresh, so always prove the key through the tunnel against
-	// the record before writing anything the workspace access will trust.
-	want := get("Main node", "SSH host key")
-	keyType, _, _ := strings.Cut(want, " ")
-	probe := a.loginSeams.probe
-	if probe == nil {
-		probe = probeOverWireGuard
-	}
-	key, err := probe(cmd.Context(), route, keyType)
-	if err != nil {
-		return result{}, contract.NewFault(contract.Unavailable, "the node does not answer over WireGuard", err.Error())
-	}
-	if got := key.Type() + " " + ssh.FingerprintSHA256(key); got != want {
-		return result{}, contract.NewFault(contract.PreconditionFailed, "the node's host key "+got+" does not match the record", "Do not continue until the server is checked.")
-	}
-	if err := pinHostKey(tempKnownHosts, route.Address, key); err != nil {
+	if err := a.writeLoginCredentialFiles(tempDir, rec); err != nil {
 		return result{}, err
 	}
-	stderr := cmd.ErrOrStderr()
-	// Prove the bundle against the node before publishing local access.
-	{
-		verify := a.loginSeams.verify
-		if verify == nil {
-			verify = func(ctx context.Context, route *host.WorkspaceSSH) (rpcNodeInfoResult, error) {
-				return infoRoute(ctx, route, autoUpgrade, stderr)
-			}
-		}
-		info, err := verify(cmd.Context(), route)
-		if err != nil {
-			return result{}, err
-		}
-		if info.WorkspaceError != "" {
-			return result{}, contract.NewFault(contract.Unavailable,
-				"the node workspace identity could not be verified: "+info.WorkspaceError,
-				"Check the control database and its migrations on the node, then retry login.")
-		}
-		if !info.Workspace.Configured {
-			return result{}, contract.NewFault(contract.PreconditionFailed,
-				"the node's workspace identity is not configured",
-				"Use a freshly initialized workspace and a current protected export from eregion secrets export on the correct node.")
-		}
-		if nodeName != "" && info.Node != "" && info.Node != nodeName {
-			fault := contract.NewFault(contract.Conflict,
-				"the bundle node does not match the node identity",
-				"Export again from the correct node; do not hand-edit the bundle.")
-			fault.Details = map[string]any{"bundle_node": nodeName, "node": info.Node}
-			return result{}, fault
-		}
-		if info.Workspace.Name != workspaceName || info.Workspace.ID != workspaceID {
-			fault := contract.NewFault(contract.Conflict,
-				"the bundle workspace identity does not match the node",
-				"The workspace name and ID are immutable. Export again from the correct node; do not edit the bundle.")
-			fault.Details = map[string]any{
-				"bundle_workspace": workspaceName, "bundle_workspace_id": workspaceID,
-				"node_workspace": info.Workspace.Name, "node_workspace_id": info.Workspace.ID,
-			}
-			return result{}, fault
-		}
-	}
-	ready := a.loginSeams.ready
-	if ready == nil {
-		ready = func(ctx context.Context, route *host.WorkspaceSSH) error {
-			return readyRoute(ctx, route, autoUpgrade, stderr)
-		}
-	}
-	if err := ready(cmd.Context(), route); err != nil {
+	route := loginRoute(tempDir, rec)
+	if err := a.proveLoginRoute(cmd, route, rec, autoUpgrade); err != nil {
 		return result{}, err
 	}
 
@@ -323,10 +181,10 @@ func (a *app) login(cmd *cobra.Command, _ []string) (result, error) {
 		savedRoute.WireGuard = &wg
 	}
 	saved := host.WorkspaceAccess{
-		Name: workspaceName, SSH: &savedRoute, CredentialDir: credentialDirName,
+		Name: rec.workspaceName, SSH: &savedRoute, CredentialDir: credentialDirName,
 		AutoUpgradeNodes: autoUpgrade,
 	}
-	_, err = store.PublishWorkspace(workspaceID, workspaceName, saved, replace != "")
+	_, err = store.PublishWorkspace(rec.workspaceID, rec.workspaceName, saved, replace != "")
 	if err != nil {
 		// The published directory is new and never replaced an old credential
 		// directory. Removing it cannot touch existing workspace files.
@@ -334,13 +192,234 @@ func (a *app) login(cmd *cobra.Command, _ []string) (result, error) {
 		return result{}, err
 	}
 	routeText := route.User + "@" + route.Address + " over WireGuard"
-	data := loginSuccessData(nodeName, routeText, workspaceName, workspaceID, true)
-	title, rows, message := loginSuccessPresentation(nodeName, routeText, workspaceName, workspaceID, true)
+	data := loginSuccessData(rec.nodeName, routeText, rec.workspaceName, rec.workspaceID, true)
+	title, rows, message := loginSuccessPresentation(rec.nodeName, routeText, rec.workspaceName, rec.workspaceID, true)
 	if interactive {
-		fmt.Fprintln(cmd.ErrOrStderr(), ui.Card(title, rows, nil))
+		_, _ = fmt.Fprintln(cmd.ErrOrStderr(), ui.Card(title, rows, nil))
 		return result{data: data, streamed: true}, nil
 	}
 	return result{data: data, plain: message}, nil
+}
+
+func loginAutoUpgrade(cmd *cobra.Command, store *host.WorkspaceStore, workspaceID string) bool {
+	enabled := boolFlag(cmd, "auto-upgrade-nodes")
+	for _, group := range store.Groups() {
+		if group.ID != workspaceID {
+			continue
+		}
+		for _, access := range group.Access {
+			enabled = enabled || access.AutoUpgradeNodes
+		}
+	}
+	return enabled
+}
+
+func prepareLoginCredentialDir(store *host.WorkspaceStore, workspaceID string) (string, string, error) {
+	credentialDirName, err := store.CredentialDirName(workspaceID)
+	if err != nil {
+		return "", "", contract.NewFault(contract.PreconditionFailed, "could not allocate a private workspace credential directory", err.Error())
+	}
+	dir := filepath.Join(filepath.Dir(store.Path), credentialDirName)
+	if err := os.MkdirAll(filepath.Dir(dir), 0o700); err != nil {
+		return "", "", err
+	}
+	return credentialDirName, dir, nil
+}
+
+func readLoginBundle(cmd *cobra.Command, path string, interactive bool) ([]byte, error) {
+	if path != "" {
+		raw, err := os.ReadFile(expandHome(path))
+		if err != nil {
+			return nil, err
+		}
+		return bundle.Read(bytes.NewReader(raw))
+	}
+	if interactive {
+		_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "\n"+ui.Header("eregion login", 72))
+		_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "Paste the transfer bundle (from "+bundle.Header+" to "+bundle.Footer+"), or the whole copied handoff:")
+	}
+	return bundle.Read(cmd.InOrStdin())
+}
+
+func readLoginPassphrase(passFile string, interactive bool) (string, error) {
+	switch {
+	case passFile != "":
+		raw, err := os.ReadFile(expandHome(passFile))
+		if err != nil {
+			return "", contract.NewFault(contract.InputRequired, "could not read the passphrase file", err.Error())
+		}
+		return strings.TrimSpace(strings.SplitN(string(raw), "\n", 2)[0]), nil
+	case interactive:
+		return ui.Secret("Bundle passphrase")
+	default:
+		return "", contract.NewFault(contract.InputRequired, "--passphrase-file is required without a terminal", "Pass the bundle passphrase in a file.")
+	}
+}
+
+type loginRecord struct {
+	record                   handoffRecord
+	nodeName                 string
+	sshKey                   string
+	wgKey                    string
+	operatorWireGuardAddress string
+	wireGuardAddress         string
+	adminUser                string
+	workspaceName            string
+	workspaceID              string
+	wireGuardEndpoint        string
+	wireGuardPublicKey       string
+	sshHostKey               string
+	sudoPassword             string
+}
+
+func decodeLoginRecord(rec handoffRecord) (loginRecord, error) {
+	get := func(section, label string) string { return rec.field(section, label) }
+	parsed := loginRecord{
+		record:                   rec,
+		nodeName:                 get("Main node", "Node name"),
+		sshKey:                   get("Operator", "SSH private key"),
+		wgKey:                    get("Operator", "WireGuard private key"),
+		operatorWireGuardAddress: get("Operator", "WireGuard address"),
+		wireGuardAddress:         get("Main node", "WireGuard address"),
+		adminUser:                get("Operator", "Admin user"),
+		workspaceName:            strings.TrimSpace(get("Main node", "Workspace")),
+		workspaceID:              strings.TrimSpace(get("Main node", "Workspace ID")),
+		wireGuardEndpoint:        get("Main node", "WireGuard endpoint"),
+		wireGuardPublicKey:       get("Main node", "WireGuard public key"),
+		sshHostKey:               get("Main node", "SSH host key"),
+		sudoPassword:             get("Operator", "Sudo password"),
+	}
+	required := map[string]string{
+		"SSH private key":       parsed.sshKey,
+		"WireGuard private key": parsed.wgKey,
+		"WireGuard address":     parsed.wireGuardAddress,
+		"admin user":            parsed.adminUser,
+		"WireGuard endpoint":    parsed.wireGuardEndpoint,
+		"WireGuard public key":  parsed.wireGuardPublicKey,
+		"SSH host key":          parsed.sshHostKey,
+	}
+	for label, value := range required {
+		if value == "" {
+			return loginRecord{}, contract.NewFault(contract.ValidationFailed, "the transfer bundle has no "+label, "Use the bundle from eregion server init's secrets handoff.")
+		}
+	}
+	if parsed.workspaceName == "" || parsed.workspaceID == "" {
+		return loginRecord{}, contract.NewFault(contract.ValidationFailed, "the transfer bundle has an incomplete workspace identity", "Use a current protected export with both the workspace name and ID.")
+	}
+	if err := controlplane.ValidateWorkspaceName(parsed.workspaceName); err != nil {
+		return loginRecord{}, err
+	}
+	if err := controlplane.ValidateWorkspaceID(parsed.workspaceID); err != nil {
+		return loginRecord{}, err
+	}
+	return parsed, nil
+}
+
+func (a *app) writeLoginCredentialFiles(tempDir string, rec loginRecord) error {
+	sshPath, wgPath := filepath.Join(tempDir, "ssh_ed25519"), filepath.Join(tempDir, "wireguard.key")
+	files := map[string]string{
+		sshPath:                                 rec.sshKey + "\n",
+		wgPath:                                  rec.wgKey + "\n",
+		filepath.Join(tempDir, "sudo-password"): rec.sudoPassword + "\n",
+	}
+	for path, content := range files {
+		if err := writePrivate(path, []byte(content)); err != nil {
+			return err
+		}
+	}
+	if password, err := restoreMetricsCredential(tempDir, rec.record); err != nil {
+		return err
+	} else if password != "" {
+		a.secrets.Add(password)
+	}
+	if _, err := transport.ReadWireGuardKey(wgPath); err != nil {
+		return contract.NewFault(contract.ValidationFailed, "the record's WireGuard key is not usable", err.Error())
+	}
+	return nil
+}
+
+func loginRoute(tempDir string, rec loginRecord) *host.WorkspaceSSH {
+	return &host.WorkspaceSSH{
+		Address: net.JoinHostPort(rec.wireGuardAddress, "22"), User: rec.adminUser,
+		Identity: filepath.Join(tempDir, "ssh_ed25519"), KnownHosts: filepath.Join(tempDir, "known_hosts"),
+		WireGuard: &host.WorkspaceWireGuard{
+			PrivateKeyFile: filepath.Join(tempDir, "wireguard.key"), Address: rec.operatorWireGuardAddress,
+			NodeAddress: rec.wireGuardAddress, NodePublicKey: rec.wireGuardPublicKey,
+			Endpoint: rec.wireGuardEndpoint,
+		},
+	}
+}
+
+func (a *app) proveLoginRoute(cmd *cobra.Command, route *host.WorkspaceSSH, rec loginRecord, autoUpgrade bool) error {
+	// The import is fresh, so always prove the key through the tunnel against
+	// the record before writing anything the workspace access will trust.
+	keyType, _, _ := strings.Cut(rec.sshHostKey, " ")
+	probe := a.loginSeams.probe
+	if probe == nil {
+		probe = probeOverWireGuard
+	}
+	key, err := probe(cmd.Context(), route, keyType)
+	if err != nil {
+		return contract.NewFault(contract.Unavailable, "the node does not answer over WireGuard", err.Error())
+	}
+	if got := key.Type() + " " + ssh.FingerprintSHA256(key); got != rec.sshHostKey {
+		return contract.NewFault(contract.PreconditionFailed, "the node's host key "+got+" does not match the record", "Do not continue until the server is checked.")
+	}
+	if err := pinHostKey(route.KnownHosts, route.Address, key); err != nil {
+		return err
+	}
+	stderr := cmd.ErrOrStderr()
+	verify := a.loginSeams.verify
+	if verify == nil {
+		verify = func(ctx context.Context, route *host.WorkspaceSSH) (rpcNodeInfoResult, error) {
+			return infoRoute(ctx, route, autoUpgrade, stderr)
+		}
+	}
+	info, err := verify(cmd.Context(), route)
+	if err != nil {
+		return err
+	}
+	if err := verifyLoginWorkspaceIdentity(info, rec); err != nil {
+		return err
+	}
+	ready := a.loginSeams.ready
+	if ready == nil {
+		ready = func(ctx context.Context, route *host.WorkspaceSSH) error {
+			return readyRoute(ctx, route, autoUpgrade, stderr)
+		}
+	}
+	return ready(cmd.Context(), route)
+}
+
+func verifyLoginWorkspaceIdentity(info rpcNodeInfoResult, rec loginRecord) error {
+	if info.WorkspaceError != "" {
+		return contract.NewFault(contract.Unavailable,
+			"the node workspace identity could not be verified: "+info.WorkspaceError,
+			"Check the control database and its migrations on the node, then retry login.")
+	}
+	if !info.Workspace.Configured {
+		return contract.NewFault(contract.PreconditionFailed,
+			"the node's workspace identity is not configured",
+			"Use a freshly initialized workspace and a current protected export from eregion secrets export on the correct node.")
+	}
+	if rec.nodeName != "" && info.Node != "" && info.Node != rec.nodeName {
+		fault := contract.NewFault(contract.Conflict,
+			"the bundle node does not match the node identity",
+			"Export again from the correct node; do not hand-edit the bundle.")
+		fault.Details = map[string]any{"bundle_node": rec.nodeName, "node": info.Node}
+		return fault
+	}
+	if info.Workspace.Name != rec.workspaceName || info.Workspace.ID != rec.workspaceID {
+		fault := contract.NewFault(contract.Conflict,
+			"the bundle workspace identity does not match the node",
+			"The workspace name and ID are immutable. Export again from the correct node; do not edit the bundle.")
+		fault.Details = map[string]any{
+			"bundle_workspace": rec.workspaceName, "bundle_workspace_id": rec.workspaceID,
+			"node_workspace": info.Workspace.Name, "node_workspace_id": info.Workspace.ID,
+		}
+		return fault
+	}
+	return nil
 }
 
 func validateLoginWorkspaceTarget(store *host.WorkspaceStore, workspaceName, workspaceID, replace string) error {
@@ -444,7 +523,7 @@ func restoreMetricsCredential(dir string, record handoffRecord) (string, error) 
 	if err := credential.Validate(); err != nil {
 		return "", contract.NewFault(contract.ValidationFailed, "the record's telemetry credential is not usable", err.Error())
 	}
-	raw, err := json.MarshalIndent(credential, "", "  ")
+	raw, err := json.MarshalIndent(credential, "", "  ") //nolint:gosec // G117: writing the node telemetry credential into the handoff is the intended operation.
 	if err != nil {
 		return "", err
 	}
@@ -456,7 +535,7 @@ func restoreMetricsCredential(dir string, record handoffRecord) (string, error) 
 
 // readyRoute checks a not-yet-saved route without touching the workspace store.
 func readyRoute(ctx context.Context, route *host.WorkspaceSSH, autoUpgrade bool, stderr io.Writer) error {
-	client, err := routeNodeClient(route, autoUpgrade, stderr)
+	client, err := routeNodeClient(ctx, route, autoUpgrade, stderr)
 	if err != nil {
 		return err
 	}
@@ -465,15 +544,15 @@ func readyRoute(ctx context.Context, route *host.WorkspaceSSH, autoUpgrade bool,
 
 // infoRoute reads the node's authoritative identity over a not-yet-saved route.
 func infoRoute(ctx context.Context, route *host.WorkspaceSSH, autoUpgrade bool, stderr io.Writer) (rpcNodeInfoResult, error) {
-	client, err := routeNodeClient(route, autoUpgrade, stderr)
+	client, err := routeNodeClient(ctx, route, autoUpgrade, stderr)
 	if err != nil {
 		return rpcNodeInfoResult{}, err
 	}
 	return client.NodeInfo(ctx)
 }
 
-func routeNodeClient(route *host.WorkspaceSSH, autoUpgrade bool, stderr io.Writer) (*nodeClient, error) {
-	remote, err := routeRemote(route, false)
+func routeNodeClient(ctx context.Context, route *host.WorkspaceSSH, autoUpgrade bool, stderr io.Writer) (*nodeClient, error) {
+	remote, err := routeRemote(ctx, route, false)
 	if err != nil {
 		return nil, contract.NewFault(contract.ValidationFailed, "the workspace SSH route is not usable", err.Error())
 	}
@@ -483,7 +562,7 @@ func routeNodeClient(route *host.WorkspaceSSH, autoUpgrade bool, stderr io.Write
 // probeOverWireGuard reads the node's SSH host key of keyType through the
 // tunnel; the node offers several types and the record names one.
 func probeOverWireGuard(ctx context.Context, route *host.WorkspaceSSH, keyType string) (ssh.PublicKey, error) {
-	dial, err := wireGuardDial(route.WireGuard)
+	dial, err := wireGuardDial(ctx, route.WireGuard)
 	if err != nil {
 		return nil, err
 	}
@@ -493,7 +572,7 @@ func probeOverWireGuard(ctx context.Context, route *host.WorkspaceSSH, keyType s
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	var key ssh.PublicKey
 	_, _, _, _ = ssh.NewClientConn(conn, route.Address, &ssh.ClientConfig{
 		User:              "probe",

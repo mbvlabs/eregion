@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -92,7 +93,7 @@ func (d HTTPDownloader) Get(ctx context.Context, rawURL string, max int64, wantS
 	if err != nil {
 		return nil, fmt.Errorf("download the pinned artifact: %w", err)
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("download the pinned artifact: HTTP %d", response.StatusCode)
 	}
@@ -118,12 +119,12 @@ func extractPack(archive []byte, max int64) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("the pinned pack archive is not gzip: %w", err)
 	}
-	defer reader.Close()
+	defer func() { _ = reader.Close() }()
 	tarball := tar.NewReader(reader)
 	var found []byte
 	for {
 		header, err := tarball.Next()
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
@@ -133,7 +134,7 @@ func extractPack(archive []byte, max int64) ([]byte, error) {
 		if name != "pack" {
 			continue
 		}
-		if header.Typeflag != tar.TypeReg && header.Typeflag != tar.TypeRegA {
+		if header.Typeflag != tar.TypeReg {
 			return nil, fmt.Errorf("the pinned pack archive member is not a regular file")
 		}
 		if header.Size < 1 || header.Size > max {

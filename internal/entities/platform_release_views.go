@@ -202,7 +202,7 @@ func (s *ReleaseStore) GetByID(ctx context.Context, id platform.ReleaseID) (plat
 	if err != nil {
 		return platform.Release{}, false, err
 	}
-	release, err := releaseRow(query.GetPlatformReleaseByIDRow(row))
+	release, err := releaseRow(row)
 	return release, err == nil, err
 }
 
@@ -408,7 +408,7 @@ func (s *BuildStore) GetByID(ctx context.Context, id platform.BuildID) (platform
 	if err != nil {
 		return platform.BuildRecord{}, false, err
 	}
-	build, err := buildRow(query.GetPlatformBuildByIDRow(row))
+	build, err := buildRow(row)
 	return build, err == nil, err
 }
 

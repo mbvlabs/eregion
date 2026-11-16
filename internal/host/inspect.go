@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -237,7 +238,7 @@ func StatusFromFacts(facts doctor.Facts) NodeStatus {
 func sshdDropInPath() string { return "/etc/ssh/sshd_config.d/00-eregion.conf" }
 
 func readSSHDDropIn() (string, bool) {
-	raw, err := os.ReadFile(sshdDropInPath()) //nolint:gosec // G304: fixed system configuration path.
+	raw, err := os.ReadFile(sshdDropInPath())
 	if err != nil {
 		return "", false
 	}
@@ -296,7 +297,7 @@ func ParseUFWStatus(text string) doctor.FirewallFacts {
 
 func sshPort() string {
 	port := "22"
-	raw, err := os.ReadFile(filepath.Join(access.StateDir, "ssh-port")) //nolint:gosec // G304: node access state.
+	raw, err := os.ReadFile(filepath.Join(access.StateDir, "ssh-port"))
 	if err == nil {
 		if value := strings.TrimSpace(string(raw)); value != "" {
 			port = value
@@ -349,6 +350,25 @@ func certificateExpiry(root, hostname string) (time.Time, bool, string) {
 	if strings.TrimSpace(hostname) == "" {
 		return time.Time{}, false, ""
 	}
+	rootFS, err := os.OpenRoot(root)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return time.Time{}, false, "no Caddy certificate for " + hostname
+		}
+		return time.Time{}, false, err.Error()
+	}
+	defer func() { _ = rootFS.Close() }()
+	newest, errText := newestCertificateInRoot(root, rootFS, hostname)
+	if errText != "" {
+		return time.Time{}, false, errText
+	}
+	if newest.IsZero() {
+		return time.Time{}, false, "no Caddy certificate for " + hostname
+	}
+	return newest, true, ""
+}
+
+func newestCertificateInRoot(root string, rootFS *os.Root, hostname string) (time.Time, string) {
 	var newest time.Time
 	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
@@ -357,31 +377,46 @@ func certificateExpiry(root, hostname string) (time.Time, bool, string) {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".crt") {
 			return nil
 		}
-		raw, readErr := os.ReadFile(path) //nolint:gosec // G304: fixed Caddy storage root.
+		relative, relErr := filepath.Rel(root, path)
+		if relErr != nil {
+			return nil //nolint:nilerr // Keep observing other certificates.
+		}
+		// Root confines symlink resolution to the Caddy certificate tree, and
+		// Stat rejects devices, FIFOs and other non-regular entries.
+		info, statErr := rootFS.Stat(relative)
+		if statErr != nil || !info.Mode().IsRegular() {
+			return nil //nolint:nilerr // Keep observing other certificates.
+		}
+		raw, readErr := rootFS.ReadFile(relative)
 		if readErr != nil {
 			return nil //nolint:nilerr // Keep observing other certificates.
 		}
-		for block, rest := pem.Decode(raw); block != nil; block, rest = pem.Decode(rest) {
-			if block.Type != "CERTIFICATE" {
-				continue
-			}
-			certificate, parseErr := x509.ParseCertificate(block.Bytes)
-			if parseErr != nil {
-				continue
-			}
-			if certificate.VerifyHostname(hostname) == nil && certificate.NotAfter.After(newest) {
-				newest = certificate.NotAfter
-			}
+		if expiry, ok := certificateExpiryForHost(raw, hostname); ok && expiry.After(newest) {
+			newest = expiry
 		}
 		return nil
 	})
 	if err != nil {
-		return time.Time{}, false, err.Error()
+		return time.Time{}, err.Error()
 	}
-	if newest.IsZero() {
-		return time.Time{}, false, "no Caddy certificate for " + hostname
+	return newest, ""
+}
+
+func certificateExpiryForHost(raw []byte, hostname string) (time.Time, bool) {
+	var newest time.Time
+	for block, rest := pem.Decode(raw); block != nil; block, rest = pem.Decode(rest) {
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		certificate, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			continue
+		}
+		if certificate.VerifyHostname(hostname) == nil && certificate.NotAfter.After(newest) {
+			newest = certificate.NotAfter
+		}
 	}
-	return newest, true, ""
+	return newest, !newest.IsZero()
 }
 
 func diskUsage(path string) (total, free uint64, known bool) {
@@ -430,7 +465,7 @@ func uptimeSeconds() int64 {
 }
 
 func readCommand(ctx context.Context, name string, args ...string) (string, error) {
-	command := exec.CommandContext(ctx, name, args...) //nolint:gosec // G204: fixed local observation commands.
+	command := exec.CommandContext(ctx, name, args...)
 	output, err := command.CombinedOutput()
 	text := strings.TrimSpace(string(output))
 	if err != nil {

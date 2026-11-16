@@ -65,11 +65,11 @@ func (s *ingressSysctlStep) Check(context.Context, engine.Runtime) (engine.Check
 }
 
 func (s *ingressSysctlStep) Apply(context.Context, engine.Runtime, engine.Reporter) (engine.ApplyResult, error) {
-	if err := writePublicFile(s.confPath, ingressSysctlConf, "root", "root"); err != nil {
+	if err := writePublicFile(s.confPath, ingressSysctlConf, "root"); err != nil {
 		return engine.ApplyResult{}, err
 	}
 	// The running kernel takes the value now; the file restores it at boot.
-	if err := os.WriteFile(s.procPath, []byte("1\n"), 0o644); err != nil {
+	if err := os.WriteFile(s.procPath, []byte("1\n"), 0o644); err != nil { //nolint:gosec // G306: /proc/sys ignores the creation mode and the file already exists.
 		return engine.ApplyResult{}, err
 	}
 	return engine.ApplyResult{Notes: []string{"net.ipv4.tcp_migrate_req = 1"}, Result: map[string]any{

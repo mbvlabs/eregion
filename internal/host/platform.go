@@ -205,7 +205,7 @@ func DetectPlatform(osReleasePath string, arch string) (Platform, error) {
 	if arch == "" {
 		arch = runtime.GOARCH
 	}
-	raw, err := os.ReadFile(osReleasePath) //nolint:gosec // G304: fixed system metadata path or an explicit test fixture.
+	raw, err := os.ReadFile(osReleasePath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return Platform{}, fmt.Errorf("cannot verify the host distribution: %s is missing", osReleasePath)

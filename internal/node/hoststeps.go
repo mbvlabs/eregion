@@ -200,7 +200,7 @@ func ParseOSRelease(text string) OSRelease {
 // Probe gathers the node's host facts. Missing tools are facts, not errors.
 func Probe(ctx context.Context, osReleasePath, arch string, run Commander) ProbeResult {
 	result := ProbeResult{Arch: arch, Capabilities: []string{}}
-	if raw, err := os.ReadFile(osReleasePath); err == nil { //nolint:gosec // G304: fixed os-release path.
+	if raw, err := os.ReadFile(osReleasePath); err == nil {
 		result.OS = ParseOSRelease(string(raw))
 	}
 	switch {
@@ -350,19 +350,19 @@ func (s *hostcfgStep) desired() []byte {
 	return append(raw, '\n')
 }
 
-func (s *hostcfgStep) Check(_ context.Context, rt engine.Runtime) (engine.CheckResult, error) {
+func (s *hostcfgStep) Check(ctx context.Context, rt engine.Runtime) (engine.CheckResult, error) {
 	for _, dir := range s.dirs(rt.Root) {
 		info, err := os.Stat(dir)
 		if err != nil || !info.IsDir() || info.Mode().Perm() != 0o700 {
 			return engine.CheckResult{Detail: "role directories are not configured"}, nil
 		}
 	}
-	current, err := os.ReadFile(s.marker(rt.Root)) //nolint:gosec // G304: fixed path beneath the node state directory.
+	current, err := os.ReadFile(s.marker(rt.Root))
 	if err != nil || !bytes.Equal(current, s.desired()) {
 		return engine.CheckResult{Detail: "role configuration marker differs"}, nil
 	}
 	if s.payload.BuildUser != "" {
-		if _, err := ExecCommander(context.Background(), "id", "-u", s.payload.BuildUser); err != nil {
+		if _, err := ExecCommander(ctx, "id", "-u", s.payload.BuildUser); err != nil {
 			return engine.CheckResult{Detail: "the dedicated build user is missing"}, nil
 		}
 	}
@@ -382,7 +382,7 @@ func (s *hostcfgStep) Apply(ctx context.Context, rt engine.Runtime, report engin
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return engine.ApplyResult{}, err
 		}
-		if err := os.Chmod(dir, 0o700); err != nil {
+		if err := os.Chmod(dir, 0o700); err != nil { //nolint:gosec // G302: this is a directory, not a file.
 			return engine.ApplyResult{}, err
 		}
 	}
@@ -453,48 +453,61 @@ func buildWireGuardStep(exec engine.Execution, raw json.RawMessage, settings Hos
 	if payload.Step != exec.Step {
 		return nil, fmt.Errorf("step ID %q does not match the payload step %q", exec.Step, payload.Step)
 	}
+	if err := validateWireGuardPayload(&payload); err != nil {
+		return nil, err
+	}
+	return &wireguardStep{payload: payload, settings: settings}, nil
+}
+
+func validateWireGuardPayload(payload *WireGuardPayload) error {
 	switch payload.Action {
 	case "keygen":
 		if payload.Address != "" || payload.ListenPort != 0 || len(payload.Peers) > 0 {
-			return nil, errors.New("a key-generation request carries no peers")
+			return errors.New("a key-generation request carries no peers")
 		}
 	case "apply":
 		if payload.ListenPort < 1 || payload.ListenPort > 65535 {
-			return nil, errors.New("invalid WireGuard listen port")
+			return errors.New("invalid WireGuard listen port")
 		}
 		if !cidrPattern.MatchString(payload.Address) {
-			return nil, errors.New("the tunnel address must be an IPv4 CIDR")
+			return errors.New("the tunnel address must be an IPv4 CIDR")
 		}
 		if len(payload.Peers) > 64 {
-			return nil, errors.New("too many WireGuard peers")
+			return errors.New("too many WireGuard peers")
 		}
-		seen := map[string]bool{}
-		for i, peer := range payload.Peers {
-			if !wgKeyPattern.MatchString(peer.PublicKey) || seen[peer.PublicKey] {
-				return nil, errors.New("invalid or duplicate WireGuard peer key")
-			}
-			seen[peer.PublicKey] = true
-			if len(peer.AllowedIPs) == 0 || len(peer.AllowedIPs) > 8 {
-				return nil, errors.New("a peer needs 1–8 allowed prefixes")
-			}
-			for _, prefix := range peer.AllowedIPs {
-				if !cidrPattern.MatchString(prefix) {
-					return nil, errors.New("invalid allowed prefix")
-				}
-			}
-			if peer.Endpoint != "" && !hostPortPattern.MatchString(peer.Endpoint) {
-				return nil, errors.New("invalid peer endpoint")
-			}
-			if peer.Keepalive < 0 || peer.Keepalive > 3600 {
-				return nil, errors.New("invalid peer keepalive")
-			}
-			payload.Peers[i] = peer
+		if err := validateWireGuardPeers(payload.Peers); err != nil {
+			return err
 		}
 		sort.Slice(payload.Peers, func(i, j int) bool { return payload.Peers[i].PublicKey < payload.Peers[j].PublicKey })
 	default:
-		return nil, fmt.Errorf("unknown WireGuard action %q", payload.Action)
+		return fmt.Errorf("unknown WireGuard action %q", payload.Action)
 	}
-	return &wireguardStep{payload: payload, settings: settings}, nil
+	return nil
+}
+
+func validateWireGuardPeers(peers []WireGuardPeer) error {
+	seen := make(map[string]bool, len(peers))
+	for _, peer := range peers {
+		if !wgKeyPattern.MatchString(peer.PublicKey) || seen[peer.PublicKey] {
+			return errors.New("invalid or duplicate WireGuard peer key")
+		}
+		seen[peer.PublicKey] = true
+		if len(peer.AllowedIPs) == 0 || len(peer.AllowedIPs) > 8 {
+			return errors.New("a peer needs 1–8 allowed prefixes")
+		}
+		for _, prefix := range peer.AllowedIPs {
+			if !cidrPattern.MatchString(prefix) {
+				return errors.New("invalid allowed prefix")
+			}
+		}
+		if peer.Endpoint != "" && !hostPortPattern.MatchString(peer.Endpoint) {
+			return errors.New("invalid peer endpoint")
+		}
+		if peer.Keepalive < 0 || peer.Keepalive > 3600 {
+			return errors.New("invalid peer keepalive")
+		}
+	}
+	return nil
 }
 
 func (s *wireguardStep) ID() string                      { return s.payload.Step }
@@ -541,13 +554,13 @@ func (s *wireguardStep) Apply(ctx context.Context, rt engine.Runtime, report eng
 	confPath := filepath.Join(wgDir(rt.Root), "wg0.conf")
 	appliedPath := filepath.Join(wgDir(rt.Root), "applied.sha256")
 	result := WireGuardResult{PublicKey: public, ConfigHash: hash, PeerCount: len(s.payload.Peers)}
-	if current, err := os.ReadFile(confPath); err != nil || string(current) != config { //nolint:gosec // G304: fixed path beneath the node state directory.
+	if current, err := os.ReadFile(confPath); err != nil || string(current) != config {
 		if err := writeFileAtomic(confPath, []byte(config), 0o600); err != nil {
 			return engine.ApplyResult{}, err
 		}
 		result.Changed = true
 	}
-	appliedHash, _ := os.ReadFile(appliedPath) //nolint:gosec // G304: fixed path beneath the node state directory.
+	appliedHash, _ := os.ReadFile(appliedPath)
 	switch {
 	case len(s.settings.WireGuardApply) == 0:
 		result.State = "rendered"
@@ -596,7 +609,7 @@ func RenderWireGuardConfig(privateKey string, payload WireGuardPayload) string {
 // it on the node the first time. The private key never leaves this file.
 func loadOrCreateWireGuardKey(root string) (string, string, error) {
 	path := filepath.Join(wgDir(root), "private.key")
-	if raw, err := os.ReadFile(path); err == nil { //nolint:gosec // G304: fixed path beneath the node state directory.
+	if raw, err := os.ReadFile(path); err == nil {
 		private := strings.TrimSpace(string(raw))
 		public, err := wireGuardPublic(private)
 		if err != nil {
@@ -616,7 +629,7 @@ func loadOrCreateWireGuardKey(root string) (string, string, error) {
 	key[0] &= 248
 	key[31] = (key[31] & 127) | 64
 	private := base64.StdEncoding.EncodeToString(key[:])
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) //nolint:gosec // G304: fixed path beneath the node state directory.
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		if os.IsExist(err) {
 			return loadOrCreateWireGuardKey(root)

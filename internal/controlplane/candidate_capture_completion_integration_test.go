@@ -876,8 +876,8 @@ func TestIntegrationCandidateCaptureCompletionAtomicRollback(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_, _ = f.pool.Exec(context.Background(), `DROP TRIGGER IF EXISTS eregion_test_reject_captured_event ON eregion_operation_events`)
-		_, _ = f.pool.Exec(context.Background(), `DROP FUNCTION IF EXISTS eregion_test_reject_captured_event()`)
+		_, _ = f.pool.Exec(context.WithoutCancel(ctx), `DROP TRIGGER IF EXISTS eregion_test_reject_captured_event ON eregion_operation_events`)
+		_, _ = f.pool.Exec(context.WithoutCancel(ctx), `DROP FUNCTION IF EXISTS eregion_test_reject_captured_event()`)
 	})
 	var logBuffer bytes.Buffer
 	f.service.logger = slog.New(slog.NewTextHandler(&logBuffer, nil))
@@ -917,25 +917,56 @@ func TestIntegrationCandidateCaptureCompletionAtomicRollback(t *testing.T) {
 // real; there is no simulated server or network.
 func TestIntegrationCandidateCaptureCompletionBatchesSequenceAdvance(t *testing.T) {
 	f := newCandidateCaptureFixture(t, "capture-batched-tail", nil)
+	result := candidateBatchTailResult(f, 200)
+	transport, release, done := runGatedCandidateCapture(t, f, result)
+	ctx := context.Background()
+	installCandidateCaptureBudgetTriggers(t, ctx, f)
+	if _, err := f.pool.Exec(
+		ctx,
+		`INSERT INTO eregion_test_sequence_targets(operation_id) VALUES ($1)`,
+		f.op.ID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	var before uint64
+	if err := f.pool.QueryRow(ctx, `SELECT last_sequence FROM eregion_operations WHERE id=$1`, f.op.ID).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+
+	started := time.Now()
+	close(release)
+	waitCaptureDone(t, done)
+	elapsed := time.Since(started)
+
+	// One observation, the 200 accepted lines and the completion summary are
+	// contiguous after the pre-existing sequence.
+	events := readCandidateCaptureEvents(t, f.pool, f.op.ID)
+	if events.claims != 1 || events.summary != "complete" || events.observed != 1 ||
+		events.captured != 200 {
+		t.Fatalf("batched tail completion: %+v", events)
+	}
+	stored := assertBatchedCaptureCompletion(t, ctx, f, before, elapsed, transport)
+	assertCandidateCaptureReplay(t, ctx, f, stored)
+}
+
+func candidateBatchTailResult(f candidateCaptureFixture, lines int) platform.CandidateDiagnosticResult {
 	containers := candidateContainers(f.plan)
 	observedAt := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
 	result := platform.CandidateDiagnosticResult{
 		Observations:       candidateObservations(containers, observedAt),
 		LogTimestampSource: "observation_time",
 	}
-	for index := 0; index < 200; index++ {
+	for index := 0; index < lines; index++ {
 		result.Lines = append(
 			result.Lines,
-			candidateLine(
-				containers[0],
-				0,
-				observedAt,
-				fmt.Sprintf("candidate tail line %03d", index),
-			),
+			candidateLine(containers[0], 0, observedAt, fmt.Sprintf("candidate tail line %03d", index)),
 		)
 	}
-	transport, release, done := runGatedCandidateCapture(t, f, result)
-	ctx := context.Background()
+	return result
+}
+
+func installCandidateCaptureBudgetTriggers(t *testing.T, ctx context.Context, f candidateCaptureFixture) {
+	t.Helper()
 	// The trigger is scoped by a row in a test-owned target table, never by an
 	// ambient name or a broad pattern, and this test database is isolated.
 	for _, statement := range []string{
@@ -971,48 +1002,31 @@ func TestIntegrationCandidateCaptureCompletionBatchesSequenceAdvance(t *testing.
 		}
 	}
 	t.Cleanup(func() {
-		_, _ = f.pool.Exec(context.Background(), `DROP TRIGGER IF EXISTS eregion_test_slow_sequence_advance ON eregion_operations`)
-		_, _ = f.pool.Exec(context.Background(), `DROP TRIGGER IF EXISTS eregion_test_count_event_inserts ON eregion_operation_events`)
-		_, _ = f.pool.Exec(context.Background(), `DROP FUNCTION IF EXISTS eregion_test_slow_sequence_advance()`)
-		_, _ = f.pool.Exec(context.Background(), `DROP FUNCTION IF EXISTS eregion_test_count_event_inserts()`)
-		_, _ = f.pool.Exec(context.Background(), `DROP TABLE IF EXISTS eregion_test_sequence_targets`)
-		_, _ = f.pool.Exec(context.Background(), `DROP SEQUENCE IF EXISTS eregion_test_sequence_advances`)
-		_, _ = f.pool.Exec(context.Background(), `DROP SEQUENCE IF EXISTS eregion_test_event_inserts`)
+		_, _ = f.pool.Exec(context.WithoutCancel(ctx), `DROP TRIGGER IF EXISTS eregion_test_slow_sequence_advance ON eregion_operations`)
+		_, _ = f.pool.Exec(context.WithoutCancel(ctx), `DROP TRIGGER IF EXISTS eregion_test_count_event_inserts ON eregion_operation_events`)
+		_, _ = f.pool.Exec(context.WithoutCancel(ctx), `DROP FUNCTION IF EXISTS eregion_test_slow_sequence_advance()`)
+		_, _ = f.pool.Exec(context.WithoutCancel(ctx), `DROP FUNCTION IF EXISTS eregion_test_count_event_inserts()`)
+		_, _ = f.pool.Exec(context.WithoutCancel(ctx), `DROP TABLE IF EXISTS eregion_test_sequence_targets`)
+		_, _ = f.pool.Exec(context.WithoutCancel(ctx), `DROP SEQUENCE IF EXISTS eregion_test_sequence_advances`)
+		_, _ = f.pool.Exec(context.WithoutCancel(ctx), `DROP SEQUENCE IF EXISTS eregion_test_event_inserts`)
 	})
-	if _, err := f.pool.Exec(
-		ctx,
-		`INSERT INTO eregion_test_sequence_targets(operation_id) VALUES ($1)`,
-		f.op.ID,
-	); err != nil {
-		t.Fatal(err)
-	}
-	var before uint64
-	if err := f.pool.QueryRow(ctx, `SELECT last_sequence FROM eregion_operations WHERE id=$1`, f.op.ID).Scan(&before); err != nil {
-		t.Fatal(err)
-	}
+}
 
-	started := time.Now()
-	close(release)
-	waitCaptureDone(t, done)
-	elapsed := time.Since(started)
-
-	// One observation, the 200 accepted lines and the completion summary are
-	// contiguous after the pre-existing sequence.
-	events := readCandidateCaptureEvents(t, f.pool, f.op.ID)
-	if events.claims != 1 || events.summary != "complete" || events.observed != 1 ||
-		events.captured != 200 {
-		t.Fatalf("batched tail completion: %+v", events)
-	}
+func assertBatchedCaptureCompletion(
+	t *testing.T,
+	ctx context.Context,
+	f candidateCaptureFixture,
+	before uint64,
+	elapsed time.Duration,
+	transport *candidateCaptureTransport,
+) contract.Operation {
+	t.Helper()
 	stored, err := f.service.Get(ctx, testActor, f.op.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if stored.LastSequence != before+202 {
-		t.Fatalf(
-			"last sequence = %d, want %d (contiguous observation, lines and summary)",
-			stored.LastSequence,
-			before+202,
-		)
+		t.Fatalf("last sequence = %d, want %d (contiguous observation, lines and summary)", stored.LastSequence, before+202)
 	}
 	for _, probe := range []struct {
 		name string
@@ -1023,10 +1037,7 @@ func TestIntegrationCandidateCaptureCompletionBatchesSequenceAdvance(t *testing.
 	} {
 		var calls int64
 		var called bool
-		if err := f.pool.QueryRow(
-			ctx,
-			`SELECT last_value,is_called FROM `+probe.want,
-		).Scan(&calls, &called); err != nil {
+		if err := f.pool.QueryRow(ctx, `SELECT last_value,is_called FROM `+probe.want).Scan(&calls, &called); err != nil {
 			t.Fatal(err)
 		}
 		if !called || calls != 1 {
@@ -1039,7 +1050,11 @@ func TestIntegrationCandidateCaptureCompletionBatchesSequenceAdvance(t *testing.
 	if transport.ReadCount() != 1 {
 		t.Fatalf("node reads = %d, want one", transport.ReadCount())
 	}
+	return stored
+}
 
+func assertCandidateCaptureReplay(t *testing.T, ctx context.Context, f candidateCaptureFixture, stored contract.Operation) {
+	t.Helper()
 	// Replay the committed history through the application service and verify
 	// every published cursor step is contiguous and carries the typed values.
 	cursor := contract.Cursor{OperationID: f.op.ID}
@@ -1075,14 +1090,7 @@ func TestIntegrationCandidateCaptureCompletionBatchesSequenceAdvance(t *testing.
 	}
 	if cursor.After != stored.LastSequence || replayedCaptured != 200 ||
 		replayedObserved != 1 || replayedSummary != "complete" {
-		t.Fatalf(
-			"replayed cursor=%d/%d captured=%d observed=%d summary=%q",
-			cursor.After,
-			stored.LastSequence,
-			replayedCaptured,
-			replayedObserved,
-			replayedSummary,
-		)
+		t.Fatalf("replayed cursor=%d/%d captured=%d observed=%d summary=%q", cursor.After, stored.LastSequence, replayedCaptured, replayedObserved, replayedSummary)
 	}
 }
 

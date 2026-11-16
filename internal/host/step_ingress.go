@@ -154,7 +154,7 @@ func (s *ingressStep) unmanagedCaddy(ctx context.Context) (string, error) {
 	} else if !os.IsNotExist(err) {
 		return "", err
 	}
-	output, err := checkOutput(ctx, engine.Runtime{}, s.exec, `if ! command -v systemctl >/dev/null 2>&1; then echo systemctl:missing; exit 0; fi
+	output, err := checkOutput(ctx, s.exec, `if ! command -v systemctl >/dev/null 2>&1; then echo systemctl:missing; exit 0; fi
 for unit in caddy.service caddy-api.service; do
   if systemctl is-enabled --quiet "$unit" >/dev/null 2>&1; then echo "$unit:enabled"; fi
   if systemctl is-active --quiet "$unit" >/dev/null 2>&1; then echo "$unit:active"; fi
@@ -237,7 +237,7 @@ func (s *ingressStep) Check(ctx context.Context, _ engine.Runtime) (engine.Check
 	if err != nil || !pinnedCaddyVersion(version) {
 		return incomplete("Caddy must report pinned version " + CaddyVersion + " at " + CaddyBinaryPath)
 	}
-	account, err := checkOutput(ctx, engine.Runtime{}, s.exec, caddyAccountCheckScript())
+	account, err := checkOutput(ctx, s.exec, caddyAccountCheckScript())
 	if err != nil {
 		return engine.CheckResult{}, err
 	}
@@ -257,7 +257,7 @@ func (s *ingressStep) Check(ctx context.Context, _ engine.Runtime) (engine.Check
 	if _, err := os.Stat(platform.CaddyRoutesPath); err != nil {
 		return incomplete("the routes file " + platform.CaddyRoutesPath + " is missing")
 	}
-	output, err := checkOutput(ctx, engine.Runtime{}, s.exec, `if systemctl is-active caddy.service >/dev/null 2>&1; then echo active:ok; else echo active:missing; fi`)
+	output, err := checkOutput(ctx, s.exec, `if systemctl is-active caddy.service >/dev/null 2>&1; then echo active:ok; else echo active:missing; fi`)
 	if err != nil {
 		return engine.CheckResult{}, err
 	}
@@ -272,20 +272,40 @@ func (s *ingressStep) Apply(ctx context.Context, _ engine.Runtime, report engine
 	if !ok {
 		return engine.ApplyResult{}, fmt.Errorf("%w: no pinned Caddy artifact for architecture %s", engine.ErrPermanent, s.arch())
 	}
-	hostnameLess := strings.TrimSpace(s.cfg.Hostname) == ""
-	if hostnameLess {
-		reason, err := s.unmanagedCaddy(ctx)
-		if err != nil {
-			return engine.ApplyResult{}, err
-		}
-		if reason != "" {
-			fault := contract.NewFault(contract.PreconditionFailed,
-				"refusing to install Caddy over unmanaged existing state: "+reason,
-				"Remove or stop the existing Caddy configuration/service, or configure a public hostname so eregion can manage it.")
-			fault.Details = map[string]any{"unmanaged_caddy": reason}
-			return engine.ApplyResult{}, fault
-		}
+	hostnameLess, err := s.preflightCaddyInstall(ctx)
+	if err != nil {
+		return engine.ApplyResult{}, err
 	}
+	restart, err := s.installCaddy(ctx, url, checksum, hostnameLess, report)
+	if err != nil {
+		return engine.ApplyResult{}, err
+	}
+	if hostnameLess {
+		return s.finishHostnameLessCaddy(ctx, checksum, report)
+	}
+	return s.publishManagedIngress(ctx, checksum, restart, report)
+}
+
+func (s *ingressStep) preflightCaddyInstall(ctx context.Context) (bool, error) {
+	hostnameLess := strings.TrimSpace(s.cfg.Hostname) == ""
+	if !hostnameLess {
+		return false, nil
+	}
+	reason, err := s.unmanagedCaddy(ctx)
+	if err != nil {
+		return false, err
+	}
+	if reason == "" {
+		return true, nil
+	}
+	fault := contract.NewFault(contract.PreconditionFailed,
+		"refusing to install Caddy over unmanaged existing state: "+reason,
+		"Remove or stop the existing Caddy configuration/service, or configure a public hostname so eregion can manage it.")
+	fault.Details = map[string]any{"unmanaged_caddy": reason}
+	return false, fault
+}
+
+func (s *ingressStep) installCaddy(ctx context.Context, url, checksum string, hostnameLess bool, report engine.Reporter) (bool, error) {
 	// Only a changed executable needs a restart, which drops every site's
 	// connections; a Caddyfile change on the pinned version reloads.
 	installed, err := s.exec.Output(ctx, CaddyBinaryPath+" version")
@@ -295,25 +315,30 @@ func (s *ingressStep) Apply(ctx context.Context, _ engine.Runtime, report engine
 	}, report); err != nil {
 		if hostnameLess {
 			if cleanupErr := s.neutralizeFreshCaddy(ctx, report); cleanupErr != nil {
-				return engine.ApplyResult{}, errors.Join(err, fmt.Errorf("neutralize the failed Caddy install: %w", cleanupErr))
+				return false, errors.Join(err, fmt.Errorf("neutralize the failed Caddy install: %w", cleanupErr))
 			}
 		}
-		return engine.ApplyResult{}, err
+		return false, err
 	}
 	if err := s.exec.Run(ctx, s.ID()+"-account", caddyAccountScript(), nil, report); err != nil {
-		return engine.ApplyResult{}, fmt.Errorf("ensure the Caddy service account: %w", err)
+		return false, fmt.Errorf("ensure the Caddy service account: %w", err)
 	}
-	if hostnameLess {
-		// apt's postinst may create its default public Caddyfile and start
-		// caddy.service. The state was absent at preflight, so neutralize only
-		// the package's fresh defaults; never touch a pre-existing service.
-		if err := s.neutralizeFreshCaddy(ctx, report); err != nil {
-			return engine.ApplyResult{}, err
-		}
-		return engine.ApplyResult{Notes: []string{"Caddy " + CaddyVersion + " is installed for the dedicated telemetry endpoint; no public Caddy config or service"}, Result: map[string]any{
-			"hostname": "", "paths": []string{}, "public": false, "version": CaddyVersion, "sha256": checksum,
-		}}, nil
+	return restart, nil
+}
+
+func (s *ingressStep) finishHostnameLessCaddy(ctx context.Context, checksum string, report engine.Reporter) (engine.ApplyResult, error) {
+	// apt's postinst may create its default public Caddyfile and start
+	// caddy.service. The state was absent at preflight, so neutralize only
+	// the package's fresh defaults; never touch a pre-existing service.
+	if err := s.neutralizeFreshCaddy(ctx, report); err != nil {
+		return engine.ApplyResult{}, err
 	}
+	return engine.ApplyResult{Notes: []string{"Caddy " + CaddyVersion + " is installed for the dedicated telemetry endpoint; no public Caddy config or service"}, Result: map[string]any{
+		"hostname": "", "paths": []string{}, "public": false, "version": CaddyVersion, "sha256": checksum,
+	}}, nil
+}
+
+func (s *ingressStep) publishManagedIngress(ctx context.Context, checksum string, restart bool, report engine.Reporter) (engine.ApplyResult, error) {
 	// The worker owns the routes file; it rewrites it on every domain change.
 	routes := fmt.Sprintf(`set -euo pipefail
 install -d -m 0755 -o %[1]s -g %[2]s %[3]s
@@ -336,7 +361,7 @@ install -d -m 0755 -o %[1]s -g %[2]s %[3]s
 	if err != nil {
 		return engine.ApplyResult{}, err
 	}
-	if err := writePublicFile(s.caddyConfigPath(), s.caddyfile(), "root", "root"); err != nil {
+	if err := writePublicFile(s.caddyConfigPath(), s.caddyfile(), "root"); err != nil {
 		return engine.ApplyResult{}, err
 	}
 	if err := s.exec.Run(ctx, s.ID(), caddyActivateScript(s.caddyConfigPath(), restart), nil, report); err != nil {
@@ -358,7 +383,7 @@ install -d -m 0755 -o %[1]s -g %[2]s %[3]s
 // invalidate a lock another process already holds.
 func (s *ingressStep) ensureIngressLock() error {
 	path := s.ingressLockPath()
-	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o660) //nolint:gosec // G304: fixed node state path.
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o660) //nolint:gosec // G302: the lock is shared read/write by the operator and node group.
 	if errors.Is(err, os.ErrExist) {
 		return nil
 	}
@@ -368,7 +393,7 @@ func (s *ingressStep) ensureIngressLock() error {
 	if err := file.Close(); err != nil {
 		return err
 	}
-	if err := os.Chmod(path, 0o660); err != nil {
+	if err := os.Chmod(path, 0o660); err != nil { //nolint:gosec // G302: the lock is shared read/write by the operator and node group.
 		return err
 	}
 	return chownIfRoot(path, s.cfg.Layout.User, s.cfg.Layout.Group)

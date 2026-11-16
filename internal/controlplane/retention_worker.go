@@ -42,7 +42,7 @@ func (w *retentionWorker) Work(ctx context.Context, job *river.Job[jobargs.Reten
 	if job.Args.OperationID == "" {
 		return w.service.submitDailyRetention(ctx)
 	}
-	attempt := uint32(job.Attempt)
+	attempt := uint32(job.Attempt) //nolint:gosec // G115: River attempts are non-negative.
 	op, claimed, err := w.service.claimRetention(ctx, job.Args.OperationID, attempt)
 	if err != nil {
 		return err
@@ -222,43 +222,55 @@ func (s *Service) runRetentionAttempt(ctx context.Context, op contract.Operation
 		exists = false
 	}
 	now := time.Now().UTC()
-	if !exists {
-		inventory, input, loadErr := s.loadRetentionInput(ctx, nodeName, now)
-		if loadErr != nil {
-			s.recordRetentionPlanFailure(ctx, op, attempt, loadErr)
-			return loadErr
-		}
-		result := retention.PlanInventory(inventory, retention.PlatformState{
-			Environments: input.Environments,
-			Releases:     input.Releases,
-			Deployments:  input.Deployments,
-			InFlight:     input.InFlight,
-			ServerPolicy: input.ServerPolicy,
-		}, now)
-		run = retention.Run{
-			OperationID: string(op.ID), Status: retention.RunRunning,
-			Planned: result.Items, PlannedBytes: result.PlannedBytes,
-			StartedAt: now,
-		}
-		retentionApplyCacheMeasurement(&run, inventory)
-		run.ID, err = retention.NewRunID()
-		if err != nil {
-			return contract.NewFault(contract.Internal, "could not allocate a retention run", "Report the binary version.")
-		}
-		if err := s.insertRetentionRun(ctx, run); err != nil {
-			return err
-		}
-		s.appendWorkerEvent(ctx, op.ID, attempt, "retention",
-			fmt.Sprintf("Retention planned %d item(s), %d byte(s) on node %s.", len(retentionRemovalItems(run.Planned)), run.PlannedBytes, nodeName))
+	if exists {
+		run, err = s.resumeRetentionRun(ctx, run)
 	} else {
-		run.Status = retention.RunRunning
-		run.FinishedAt = nil
-		if err := s.updateRetentionRun(ctx, run); err != nil {
-			return err
-		}
+		run, err = s.planRetentionRun(ctx, op, attempt, nodeName, now)
 	}
-
+	if err != nil {
+		return err
+	}
 	return s.executeRetentionRun(ctx, op, attempt, &run, nodeName)
+}
+
+func (s *Service) planRetentionRun(ctx context.Context, op contract.Operation, attempt uint32, nodeName string, now time.Time) (retention.Run, error) {
+	inventory, input, err := s.loadRetentionInput(ctx, nodeName, now)
+	if err != nil {
+		s.recordRetentionPlanFailure(ctx, op, attempt, err)
+		return retention.Run{}, err
+	}
+	result := retention.PlanInventory(inventory, retention.PlatformState{
+		Environments: input.Environments,
+		Releases:     input.Releases,
+		Deployments:  input.Deployments,
+		InFlight:     input.InFlight,
+		ServerPolicy: input.ServerPolicy,
+	}, now)
+	run := retention.Run{
+		OperationID: string(op.ID), Status: retention.RunRunning,
+		Planned: result.Items, PlannedBytes: result.PlannedBytes,
+		StartedAt: now,
+	}
+	retentionApplyCacheMeasurement(&run, inventory)
+	run.ID, err = retention.NewRunID()
+	if err != nil {
+		return retention.Run{}, contract.NewFault(contract.Internal, "could not allocate a retention run", "Report the binary version.")
+	}
+	if err := s.insertRetentionRun(ctx, run); err != nil {
+		return retention.Run{}, err
+	}
+	s.appendWorkerEvent(ctx, op.ID, attempt, "retention",
+		fmt.Sprintf("Retention planned %d item(s), %d byte(s) on node %s.", len(retentionRemovalItems(run.Planned)), run.PlannedBytes, nodeName))
+	return run, nil
+}
+
+func (s *Service) resumeRetentionRun(ctx context.Context, run retention.Run) (retention.Run, error) {
+	run.Status = retention.RunRunning
+	run.FinishedAt = nil
+	if err := s.updateRetentionRun(ctx, run); err != nil {
+		return retention.Run{}, err
+	}
+	return run, nil
 }
 
 // retentionRunForOperation returns the newest run for one operation. A retry
@@ -404,302 +416,380 @@ func (s *Service) executeRetentionRun(ctx context.Context, op contract.Operation
 	if err != nil {
 		return err
 	}
+	execution := newRetentionExecution(s, ctx, op, attempt, run, nodeName, transport)
 	if s.beforeRetentionMark != nil {
 		s.beforeRetentionMark(ctx, op.ID)
 	}
+	// A persisted plan can be older than the policy or the serving state. Drop
+	// what is no longer eligible before any release row is marked.
+	if err := s.revalidateRetentionRun(ctx, nodeName, attempt, run, execution.removed); err != nil {
+		return err
+	}
+	if err := execution.markReleases(); err != nil {
+		return err
+	}
+	execution.prepareRegistryGC()
+	if err := execution.removeItems(); err != nil {
+		return err
+	}
+	execution.dropSkipped()
+	if err := execution.finalizeRegistryGC(); err != nil {
+		return err
+	}
+	return execution.finish()
+}
+
+type retentionExecution struct {
+	service   *Service
+	ctx       context.Context
+	op        contract.Operation
+	attempt   uint32
+	run       *retention.Run
+	nodeName  string
+	transport node.Transport
+	removed   map[string]bool
+
+	failures                   []error
+	protected                  map[string]bool
+	markFailed                 map[string]bool
+	protectedScopes            map[string]bool
+	skippedItems               map[string]bool
+	registryRemovedThisAttempt bool
+	registryFailedThisAttempt  bool
+	registryGCStateBlocked     bool
+	gcPending                  bool
+}
+
+func newRetentionExecution(service *Service, ctx context.Context, op contract.Operation, attempt uint32, run *retention.Run, nodeName string, transport node.Transport) *retentionExecution {
 	removed := map[string]bool{}
 	for _, item := range run.Removed {
 		removed[retentionItemKey(item)] = true
 	}
-	// A persisted plan can be older than the policy or the serving state. Drop
-	// what is no longer eligible before any release row is marked.
-	if _, err := s.revalidateRetentionRun(ctx, nodeName, attempt, run, removed); err != nil {
-		return err
+	return &retentionExecution{
+		service: service, ctx: ctx, op: op, attempt: attempt, run: run, nodeName: nodeName, transport: transport,
+		removed: removed, protected: map[string]bool{}, markFailed: map[string]bool{},
+		protectedScopes: map[string]bool{}, skippedItems: map[string]bool{},
 	}
+}
 
-	var failures []error
-	protected := map[string]bool{}
-	markFailed := map[string]bool{}
-	protectedScopes := map[string]bool{}
+func (e *retentionExecution) markReleases() error {
 	changed := false
-	for _, item := range run.Planned {
-		if item.Kind != retention.ItemRelease || removed[retentionItemKey(item)] {
+	for _, item := range e.run.Planned {
+		if item.Kind != retention.ItemRelease || e.removed[retentionItemKey(item)] {
 			continue
 		}
-		safe, err := s.markRetentionReleaseForAttempt(ctx, item.Reference)
+		safe, err := e.service.markRetentionReleaseForAttempt(e.ctx, item.Reference)
 		if err != nil {
-			markFailed[item.Reference] = true
-			protectedScopes[item.App+"\x00"+item.Environment] = true
-			s.recordRetentionRunError(run, "mark_release", item.Reference, err)
-			failures = append(failures, err)
+			e.markFailed[item.Reference] = true
+			e.protectedScopes[item.App+"\x00"+item.Environment] = true
+			e.service.recordRetentionRunError(e.run, "mark_release", item.Reference, err)
+			e.failures = append(e.failures, err)
 			continue
 		}
 		if !safe {
-			protected[item.Reference] = true
-			protectedScopes[item.App+"\x00"+item.Environment] = true
-			s.appendWorkerEvent(ctx, op.ID, attempt, "retention",
+			e.protected[item.Reference] = true
+			e.protectedScopes[item.App+"\x00"+item.Environment] = true
+			e.service.appendWorkerEvent(e.ctx, e.op.ID, e.attempt, "retention",
 				"Release "+item.Reference+" became serving, a rollback target or in flight after planning; it is not pruned.")
 			continue
 		}
-		run.Removed = append(run.Removed, item)
-		removed[retentionItemKey(item)] = true
+		e.run.Removed = append(e.run.Removed, item)
+		e.removed[retentionItemKey(item)] = true
 		changed = true
-		s.appendWorkerEvent(ctx, op.ID, attempt, "retention", "Marked release "+item.Reference+" pruned; its row remains for history.")
+		e.service.appendWorkerEvent(e.ctx, e.op.ID, e.attempt, "retention", "Marked release "+item.Reference+" pruned; its row remains for history.")
 	}
-
-	filtered := make([]retention.Item, 0, len(run.Planned))
-	for _, item := range run.Planned {
-		if removed[retentionItemKey(item)] {
-			changed = true
-			continue
-		}
-		switch item.Kind {
-		case retention.ItemRelease:
-			// A failed mark stays in the plan so the next River attempt
-			// re-attempts it. Only a release that became protected/stale is
-			// dropped.
-			if protected[item.Reference] {
-				changed = true
-				continue
-			}
-		case retention.ItemImage:
-			if protected[item.Release] {
-				changed = true
-				continue
-			}
-		case retention.ItemImageSkipped:
-			if protected[item.Release] {
-				changed = true
-				continue
-			}
-		case retention.ItemRegistryArtifact, retention.ItemDanglingImage:
-			if len(protected) > 0 || len(markFailed) > 0 {
-				changed = true
-				continue
-			}
-		case retention.ItemContainer:
-			if protectedScopes[item.App+"\x00"+item.Environment] {
-				changed = true
-				continue
-			}
-		}
-		filtered = append(filtered, item)
-	}
-	run.Planned = filtered
-	if changed {
-		if err := s.updateRetentionRun(ctx, *run); err != nil {
-			return err
-		}
-	}
-
-	registryRemovedThisAttempt := false
-	registryFailedThisAttempt := false
-	gcPending, err := s.retentionGCPending(ctx)
-	if err != nil {
-		s.recordRetentionRunError(run, "registry_gc_state", "registry-gc", err)
-		failures = append(failures, err)
-	}
-	registryGCStateBlocked := false
-	for _, item := range run.Planned {
-		if item.Kind == retention.ItemRegistryArtifact && !removed[retentionItemKey(item)] {
-			// Make the follow-up durable before any manifest delete. A crash
-			// after the delete can then never leave an un-GCed registry.
-			if pendingErr := s.setRetentionGCPending(ctx, true); pendingErr != nil {
-				s.recordRetentionRunError(run, "registry_gc_state", "registry-gc", pendingErr)
-				failures = append(failures, pendingErr)
-				registryGCStateBlocked = true
-			} else {
-				gcPending = true
-			}
-			break
-		}
-	}
-
-	attempted := map[string]bool{}
-	skippedItems := map[string]bool{}
-	for {
-		item, ok := nextRetentionRemoval(run, removed, attempted)
-		if !ok {
-			break
-		}
-		// Re-run protection and resolution before every effect. A retry or a
-		// manually changed release/container must not delete something that
-		// became protected after the original plan.
-		if _, err := s.revalidateRetentionRun(ctx, nodeName, attempt, run, removed); err != nil {
-			return err
-		}
-		if !retentionPlanContains(run, item) {
-			continue
-		}
-		attempted[retentionItemKey(item)] = true
-		if item.Kind == retention.ItemRegistryArtifact && registryGCStateBlocked {
-			// The durable GC follow-up could not be recorded; never delete a
-			// manifest without it. The item stays planned for the retry.
-			continue
-		}
-		if item.Kind == retention.ItemImage && markFailed[item.Release] {
-			// The row could not be marked this attempt, so its image must not
-			// be removed yet. Keep the item for the retry.
-			continue
-		}
-		if item.Kind == retention.ItemImage {
-			shared, reason, err := s.retentionImageStillShared(ctx, item.Reference, item.Release, transport)
-			if err != nil {
-				s.recordRetentionRunError(run, "image_shared_check", item.Reference, err)
-				failures = append(failures, err)
-				continue
-			}
-			if shared {
-				s.recordRetentionSkip(run, "image_skipped", item.Reference, reason)
-				s.appendWorkerEvent(ctx, op.ID, attempt, "retention",
-					"Skipped local image "+item.Reference+" for release "+item.Release+": "+reason)
-				skippedItems[retentionItemKey(item)] = true
-				continue
-			}
-		}
-		stepID := platform.RetentionRemoveStepID(item.Kind, item.Reference)
-		payload := platform.RetentionRemovePayload{
-			Step: stepID, Kind: string(item.Kind), Reference: item.Reference,
-		}
-		if item.Kind == retention.ItemContainer {
-			payload.App = item.App
-			payload.Environment = item.Environment
-		}
-		if item.Kind == retention.ItemRegistryArtifact {
-			payload.Registry = platform.DefaultRegistryAddr
-		}
-		result, err := (&platformWorker{service: s}).runStepOn(ctx, transport, op.ID, attempt, stepID, payload, nil)
-		if err != nil {
-			// A deterministic conflict is a per-item skip, not a failed run:
-			// retrying cannot make the node accept the same removal.
-			if contract.Classify(err).Code == contract.Conflict {
-				reason := s.cleanupCauseText(err)
-				if reason == "" {
-					reason = "the node refused the removal with a deterministic conflict"
-				}
-				s.recordRetentionSkip(run, "skipped", item.Reference, reason)
-				s.appendWorkerEvent(ctx, op.ID, attempt, "retention",
-					"Skipped "+string(item.Kind)+" "+item.Reference+": "+reason)
-				skippedItems[retentionItemKey(item)] = true
-				continue
-			}
-			if item.Kind == retention.ItemRegistryArtifact {
-				registryFailedThisAttempt = true
-			}
-			s.recordRetentionRunError(run, string(item.Kind), item.Reference, err)
-			failures = append(failures, err)
-			continue
-		}
-		if skipped, reason := retentionStepSkipped(result); skipped {
-			if reason == "" {
-				reason = "the node reported a deterministic skip"
-			}
-			s.recordRetentionSkip(run, "skipped", item.Reference, reason)
-			s.appendWorkerEvent(ctx, op.ID, attempt, "retention",
-				"Skipped "+string(item.Kind)+" "+item.Reference+": "+reason)
-			skippedItems[retentionItemKey(item)] = true
-			continue
-		}
-		run.Removed = append(run.Removed, item)
-		removed[retentionItemKey(item)] = true
-		if item.Bytes > 0 {
-			run.ReclaimedBytes += item.Bytes
-		}
-		if item.Kind == retention.ItemRegistryArtifact {
-			registryRemovedThisAttempt = true
-		}
-		if err := s.updateRetentionRun(ctx, *run); err != nil {
-			return err
-		}
-		s.appendWorkerEvent(ctx, op.ID, attempt, "retention",
-			fmt.Sprintf("Removed %s %s (%d bytes).", item.Kind, item.Reference, item.Bytes))
-	}
-
-	if len(skippedItems) > 0 {
-		kept := make([]retention.Item, 0, len(run.Planned))
-		for _, item := range run.Planned {
-			if skippedItems[retentionItemKey(item)] {
-				continue
-			}
-			kept = append(kept, item)
-		}
-		run.Planned = kept
-	}
-
-	registryUnsettled := false
-	for _, item := range run.Planned {
-		if item.Kind == retention.ItemRegistryArtifact && !removed[retentionItemKey(item)] {
-			registryUnsettled = true
-			break
-		}
-	}
-	if !registryUnsettled && !registryFailedThisAttempt && (registryRemovedThisAttempt || gcPending) {
-		if err := s.setRetentionGCPending(ctx, true); err != nil {
-			s.recordRetentionRunError(run, "registry_gc_state", "registry-gc", err)
-			failures = append(failures, err)
-		} else if allowed, reason, err := s.retentionGCEligible(ctx, nodeName); err != nil {
-			s.recordRetentionRunError(run, "registry_gc_check", "registry-gc", err)
-			failures = append(failures, err)
-		} else if !allowed {
-			s.recordRetentionSkip(run, "registry_gc_skipped", "registry-gc", reason)
-			s.appendWorkerEvent(ctx, op.ID, attempt, "retention", "Skipped registry garbage collection: "+reason)
+	filtered := make([]retention.Item, 0, len(e.run.Planned))
+	for _, item := range e.run.Planned {
+		if e.retainPlannedItem(item) {
+			filtered = append(filtered, item)
 		} else {
-			generation := run.GCGeneration
-			switch {
-			case generation == 0:
-				generation = 1
-			case registryRemovedThisAttempt:
-				// A completed earlier GC pass must not satisfy this one.
-				generation++
-			}
-			if generation != run.GCGeneration {
-				run.GCGeneration = generation
-				if err := s.updateRetentionRun(ctx, *run); err != nil {
-					return err
-				}
-			}
-			stepID := platform.RetentionGCStepID(generation)
-			payload := platform.RetentionGCPayload{Step: stepID, Generation: generation}
-			if _, err := (&platformWorker{service: s}).runStepOn(ctx, transport, op.ID, attempt, stepID, payload, nil); err != nil {
-				s.recordRetentionRunError(run, "registry_gc", "registry-gc", err)
-				failures = append(failures, err)
-			} else if err := s.setRetentionGCPending(ctx, false); err != nil {
-				s.recordRetentionRunError(run, "registry_gc_state", "registry-gc", err)
-				failures = append(failures, err)
-			} else {
-				if !removed[retentionGCMarker] {
-					marker := retention.Item{Kind: retention.ItemRegistryGC, Reference: "registry-gc"}
-					run.Removed = append(run.Removed, marker)
-					removed[retentionGCMarker] = true
-				}
-				if err := s.updateRetentionRun(ctx, *run); err != nil {
-					return err
-				}
-				s.appendWorkerEvent(ctx, op.ID, attempt, "retention", "Registry garbage collection completed.")
-			}
+			changed = true
 		}
 	}
-
-	finished := time.Now().UTC()
-	run.FinishedAt = &finished
-	if len(failures) > 0 {
-		run.Status = retention.RunFailed
-	} else if retentionRunHasSkips(run.Errors) {
-		run.Status = retention.RunSucceededWithSkips
-	} else {
-		run.Status = retention.RunSucceeded
+	e.run.Planned = filtered
+	if !changed {
+		return nil
 	}
-	if err := s.updateRetentionRun(ctx, *run); err != nil {
+	return e.service.updateRetentionRun(e.ctx, *e.run)
+}
+
+func (e *retentionExecution) retainPlannedItem(item retention.Item) bool {
+	if e.removed[retentionItemKey(item)] {
+		return false
+	}
+	switch item.Kind {
+	case retention.ItemRelease:
+		// A failed mark stays in the plan so the next River attempt re-attempts
+		// it. Only a release that became protected/stale is dropped.
+		return !e.protected[item.Reference]
+	case retention.ItemImage, retention.ItemImageSkipped:
+		return !e.protected[item.Release]
+	case retention.ItemRegistryArtifact, retention.ItemDanglingImage:
+		return len(e.protected) == 0 && len(e.markFailed) == 0
+	case retention.ItemContainer:
+		return !e.protectedScopes[item.App+"\x00"+item.Environment]
+	case retention.ItemRegistrySkipped, retention.ItemRegistryGC, retention.ItemCacheSkipped, retention.ItemBuildpackCache:
+		// Diagnostics and cache removals carry no additional release guard.
+		return true
+	default:
+		return true
+	}
+}
+
+func (e *retentionExecution) prepareRegistryGC() {
+	gcPending, err := e.service.retentionGCPending(e.ctx)
+	if err != nil {
+		e.service.recordRetentionRunError(e.run, "registry_gc_state", "registry-gc", err)
+		e.failures = append(e.failures, err)
+	}
+	e.gcPending = gcPending
+	for _, item := range e.run.Planned {
+		if item.Kind != retention.ItemRegistryArtifact || e.removed[retentionItemKey(item)] {
+			continue
+		}
+		// Make the follow-up durable before any manifest delete. A crash after
+		// the delete can then never leave an un-GCed registry.
+		if pendingErr := e.service.setRetentionGCPending(e.ctx, true); pendingErr != nil {
+			e.service.recordRetentionRunError(e.run, "registry_gc_state", "registry-gc", pendingErr)
+			e.failures = append(e.failures, pendingErr)
+			e.registryGCStateBlocked = true
+		} else {
+			e.gcPending = true
+		}
+		break
+	}
+}
+
+func (e *retentionExecution) removeItems() error {
+	attempted := map[string]bool{}
+	for {
+		item, ok := nextRetentionRemoval(e.run, e.removed, attempted)
+		if !ok {
+			return nil
+		}
+		stop, err := e.removeItem(item, attempted)
+		if err != nil || stop {
+			return err
+		}
+	}
+}
+
+func (e *retentionExecution) removeItem(item retention.Item, attempted map[string]bool) (bool, error) {
+	// Re-run protection and resolution before every effect. A retry or a
+	// manually changed release/container must not delete something that became
+	// protected after the original plan.
+	if err := e.service.revalidateRetentionRun(e.ctx, e.nodeName, e.attempt, e.run, e.removed); err != nil {
+		return true, err
+	}
+	if !retentionPlanContains(e.run, item) {
+		return false, nil
+	}
+	attempted[retentionItemKey(item)] = true
+	if skip := e.removalPrecondition(item); skip {
+		return false, nil
+	}
+	stepID, payload := retentionRemovalPayload(item)
+	result, err := (&platformWorker{service: e.service}).runStepOn(e.ctx, e.transport, e.op.ID, e.attempt, stepID, payload, nil)
+	if err != nil {
+		e.handleRemovalError(item, err)
+		return false, nil
+	}
+	if skipped, reason := retentionStepSkipped(result); skipped {
+		if reason == "" {
+			reason = "the node reported a deterministic skip"
+		}
+		e.recordSkip("skipped", item, reason, "")
+		return false, nil
+	}
+	e.run.Removed = append(e.run.Removed, item)
+	e.removed[retentionItemKey(item)] = true
+	if item.Bytes > 0 {
+		e.run.ReclaimedBytes += item.Bytes
+	}
+	if item.Kind == retention.ItemRegistryArtifact {
+		e.registryRemovedThisAttempt = true
+	}
+	if err := e.service.updateRetentionRun(e.ctx, *e.run); err != nil {
+		return true, err
+	}
+	e.service.appendWorkerEvent(e.ctx, e.op.ID, e.attempt, "retention",
+		fmt.Sprintf("Removed %s %s (%d bytes).", item.Kind, item.Reference, item.Bytes))
+	return false, nil
+}
+
+func (e *retentionExecution) removalPrecondition(item retention.Item) bool {
+	if item.Kind == retention.ItemRegistryArtifact && e.registryGCStateBlocked {
+		// The durable GC follow-up could not be recorded; never delete a
+		// manifest without it. The item stays planned for the retry.
+		return true
+	}
+	if item.Kind == retention.ItemImage && e.markFailed[item.Release] {
+		// The row could not be marked this attempt, so its image must not be
+		// removed yet. Keep the item for the retry.
+		return true
+	}
+	if item.Kind != retention.ItemImage {
+		return false
+	}
+	shared, reason, err := e.service.retentionImageStillShared(e.ctx, item.Reference, item.Release, e.transport)
+	if err != nil {
+		e.recordFailure("image_shared_check", item.Reference, err)
+		return true
+	}
+	if !shared {
+		return false
+	}
+	e.recordSkip("image_skipped", item, reason,
+		"Skipped local image "+item.Reference+" for release "+item.Release+": "+reason)
+	return true
+}
+
+func (e *retentionExecution) handleRemovalError(item retention.Item, err error) {
+	// A deterministic conflict is a per-item skip, not a failed run: retrying
+	// cannot make the node accept the same removal.
+	if contract.Classify(err).Code == contract.Conflict {
+		reason := e.service.cleanupCauseText(err)
+		if reason == "" {
+			reason = "the node refused the removal with a deterministic conflict"
+		}
+		e.recordSkip("skipped", item, reason, "")
+		return
+	}
+	if item.Kind == retention.ItemRegistryArtifact {
+		e.registryFailedThisAttempt = true
+	}
+	e.recordFailure(string(item.Kind), item.Reference, err)
+}
+
+func retentionRemovalPayload(item retention.Item) (string, platform.RetentionRemovePayload) {
+	stepID := platform.RetentionRemoveStepID(item.Kind, item.Reference)
+	payload := platform.RetentionRemovePayload{
+		Step: stepID, Kind: string(item.Kind), Reference: item.Reference,
+	}
+	if item.Kind == retention.ItemContainer {
+		payload.App = item.App
+		payload.Environment = item.Environment
+	}
+	if item.Kind == retention.ItemRegistryArtifact {
+		payload.Registry = platform.DefaultRegistryAddr
+	}
+	return stepID, payload
+}
+
+func (e *retentionExecution) recordFailure(stage, reference string, err error) {
+	e.service.recordRetentionRunError(e.run, stage, reference, err)
+	e.failures = append(e.failures, err)
+}
+
+func (e *retentionExecution) recordSkip(stage string, item retention.Item, reason, event string) {
+	e.service.recordRetentionSkip(e.run, stage, item.Reference, reason)
+	if event == "" {
+		event = "Skipped " + string(item.Kind) + " " + item.Reference + ": " + reason
+	}
+	e.service.appendWorkerEvent(e.ctx, e.op.ID, e.attempt, "retention", event)
+	e.skippedItems[retentionItemKey(item)] = true
+}
+
+func (e *retentionExecution) dropSkipped() {
+	if len(e.skippedItems) == 0 {
+		return
+	}
+	kept := make([]retention.Item, 0, len(e.run.Planned))
+	for _, item := range e.run.Planned {
+		if e.skippedItems[retentionItemKey(item)] {
+			continue
+		}
+		kept = append(kept, item)
+	}
+	e.run.Planned = kept
+}
+
+func (e *retentionExecution) registryUnsettled() bool {
+	for _, item := range e.run.Planned {
+		if item.Kind == retention.ItemRegistryArtifact && !e.removed[retentionItemKey(item)] {
+			return true
+		}
+	}
+	return false
+}
+
+func (e *retentionExecution) finalizeRegistryGC() error {
+	if e.registryUnsettled() || e.registryFailedThisAttempt || (!e.registryRemovedThisAttempt && !e.gcPending) {
+		return nil
+	}
+	if err := e.service.setRetentionGCPending(e.ctx, true); err != nil {
+		e.recordFailure("registry_gc_state", "registry-gc", err)
+		return nil
+	}
+	allowed, reason, err := e.service.retentionGCEligible(e.ctx, e.nodeName)
+	if err != nil {
+		e.recordFailure("registry_gc_check", "registry-gc", err)
+		return nil
+	}
+	if !allowed {
+		e.service.recordRetentionSkip(e.run, "registry_gc_skipped", "registry-gc", reason)
+		e.service.appendWorkerEvent(e.ctx, e.op.ID, e.attempt, "retention", "Skipped registry garbage collection: "+reason)
+		return nil
+	}
+	return e.runRegistryGC()
+}
+
+func (e *retentionExecution) runRegistryGC() error {
+	generation := e.run.GCGeneration
+	switch {
+	case generation == 0:
+		generation = 1
+	case e.registryRemovedThisAttempt:
+		// A completed earlier GC pass must not satisfy this one.
+		generation++
+	}
+	if generation != e.run.GCGeneration {
+		e.run.GCGeneration = generation
+		if err := e.service.updateRetentionRun(e.ctx, *e.run); err != nil {
+			return err
+		}
+	}
+	stepID := platform.RetentionGCStepID(generation)
+	payload := platform.RetentionGCPayload{Step: stepID, Generation: generation}
+	if _, err := (&platformWorker{service: e.service}).runStepOn(e.ctx, e.transport, e.op.ID, e.attempt, stepID, payload, nil); err != nil {
+		e.recordFailure("registry_gc", "registry-gc", err)
+		return nil
+	}
+	if err := e.service.setRetentionGCPending(e.ctx, false); err != nil {
+		e.recordFailure("registry_gc_state", "registry-gc", err)
+		return nil
+	}
+	if !e.removed[retentionGCMarker] {
+		marker := retention.Item{Kind: retention.ItemRegistryGC, Reference: "registry-gc"}
+		e.run.Removed = append(e.run.Removed, marker)
+		e.removed[retentionGCMarker] = true
+	}
+	if err := e.service.updateRetentionRun(e.ctx, *e.run); err != nil {
 		return err
 	}
-	if len(failures) > 0 {
-		s.appendWorkerEvent(ctx, op.ID, attempt, "retention",
-			fmt.Sprintf("Retention run %s recorded %d failure(s); unfinished effects remain for retry.", run.ID, len(run.Errors)))
-	}
-	if len(failures) > 0 {
-		return errors.Join(failures...)
-	}
+	e.service.appendWorkerEvent(e.ctx, e.op.ID, e.attempt, "retention", "Registry garbage collection completed.")
 	return nil
+}
+
+func (e *retentionExecution) finish() error {
+	finished := time.Now().UTC()
+	e.run.FinishedAt = &finished
+	if len(e.failures) > 0 {
+		e.run.Status = retention.RunFailed
+	} else if retentionRunHasSkips(e.run.Errors) {
+		e.run.Status = retention.RunSucceededWithSkips
+	} else {
+		e.run.Status = retention.RunSucceeded
+	}
+	if err := e.service.updateRetentionRun(e.ctx, *e.run); err != nil {
+		return err
+	}
+	if len(e.failures) == 0 {
+		return nil
+	}
+	e.service.appendWorkerEvent(e.ctx, e.op.ID, e.attempt, "retention",
+		fmt.Sprintf("Retention run %s recorded %d failure(s); unfinished effects remain for retry.", e.run.ID, len(e.run.Errors)))
+	return errors.Join(e.failures...)
 }
 
 const retentionGCMarker = "registry_gc\x00registry-gc"
@@ -775,6 +865,8 @@ func nextRetentionRemoval(run *retention.Run, removed, attempted map[string]bool
 		switch item.Kind {
 		case retention.ItemRelease, retention.ItemRegistrySkipped, retention.ItemImageSkipped, retention.ItemCacheSkipped, retention.ItemRegistryGC:
 			continue
+		case retention.ItemRegistryArtifact, retention.ItemImage, retention.ItemBuildpackCache, retention.ItemContainer, retention.ItemDanglingImage:
+			// Removal candidates are returned below.
 		}
 		return item, true
 	}
@@ -795,10 +887,10 @@ func retentionPlanContains(run *retention.Run, item retention.Item) bool {
 // plan under the attempt's locks. A retry after a release became serving, or
 // after a new release/container started using an artifact, must not delete the
 // now-protected object just because it was eligible in the original plan.
-func (s *Service) revalidateRetentionRun(ctx context.Context, nodeName string, attempt uint32, run *retention.Run, removed map[string]bool) (retention.Input, error) {
+func (s *Service) revalidateRetentionRun(ctx context.Context, nodeName string, attempt uint32, run *retention.Run, removed map[string]bool) error {
 	inventory, input, err := s.loadRetentionInput(ctx, nodeName, time.Now().UTC())
 	if err != nil {
-		return retention.Input{}, err
+		return err
 	}
 	retentionApplyCacheMeasurement(run, inventory)
 	eligible := map[string]bool{}
@@ -825,13 +917,13 @@ func (s *Service) revalidateRetentionRun(ctx context.Context, nodeName string, a
 	}
 	run.Planned = kept
 	if err := s.updateRetentionRun(ctx, *run); err != nil {
-		return retention.Input{}, err
+		return err
 	}
 	if dropped > 0 {
 		s.appendWorkerEvent(context.WithoutCancel(ctx), runOperationID(run), attempt, "retention",
 			fmt.Sprintf("Retention dropped %d stale planned item(s) before removal.", dropped))
 	}
-	return input, nil
+	return nil
 }
 
 func runOperationID(run *retention.Run) contract.OperationID {
@@ -936,39 +1028,11 @@ func (s *Service) markRetentionRelease(ctx context.Context, releaseID string) (b
 		if !found {
 			return contract.NewFault(contract.NotFound, "release not found while pruning", "Inspect the release row and retry the operation.")
 		}
-		if environment.Serving == platform.ReleaseID(releaseID) ||
-			environment.Desired == platform.ReleaseID(releaseID) ||
-			environment.Applied == platform.ReleaseID(releaseID) {
-			return nil
-		}
-		active, err := releases.CountActiveDeployments(ctx, platform.ReleaseID(releaseID))
+		protected, err := releaseIsProtectedTx(ctx, tx, environment, platform.ReleaseID(releaseID))
 		if err != nil {
-			return unavailable(err)
+			return err
 		}
-		if active > 0 {
-			return nil
-		}
-		active, err = releases.CountActiveOperations(ctx, platform.ReleaseID(releaseID))
-		if err != nil {
-			return unavailable(err)
-		}
-		if active > 0 {
-			return nil
-		}
-		if environment.Serving != "" {
-			previous, found, err := tx.Platform().Deployments().PreviousReleaseOfServing(ctx, environment.EnvironmentID, environment.Serving)
-			if err != nil {
-				return unavailable(err)
-			}
-			if found && previous == platform.ReleaseID(releaseID) {
-				return nil
-			}
-		}
-		previous, found, err := tx.Platform().Deployments().LatestSucceededReleaseExcluding(ctx, environment.EnvironmentID, environment.Serving)
-		if err != nil {
-			return unavailable(err)
-		}
-		if found && previous == platform.ReleaseID(releaseID) {
+		if protected {
 			return nil
 		}
 		if _, err := releases.MarkPruned(ctx, platform.ReleaseID(releaseID)); err != nil {
@@ -984,4 +1048,44 @@ func (s *Service) markRetentionRelease(ctx context.Context, releaseID string) (b
 		return false, err
 	}
 	return safe, nil
+}
+
+func releaseIsProtectedTx(ctx context.Context, tx *entities.StoreTx, environment entities.ReleaseServingEnvironment, releaseID platform.ReleaseID) (bool, error) {
+	if environment.Serving == releaseID ||
+		environment.Desired == releaseID ||
+		environment.Applied == releaseID {
+		return true, nil
+	}
+	releases := tx.Platform().Releases()
+	active, err := releases.CountActiveDeployments(ctx, releaseID)
+	if err != nil {
+		return false, unavailable(err)
+	}
+	if active > 0 {
+		return true, nil
+	}
+	active, err = releases.CountActiveOperations(ctx, releaseID)
+	if err != nil {
+		return false, unavailable(err)
+	}
+	if active > 0 {
+		return true, nil
+	}
+	if environment.Serving != "" {
+		previous, found, err := tx.Platform().Deployments().PreviousReleaseOfServing(ctx, environment.EnvironmentID, environment.Serving)
+		if err != nil {
+			return false, unavailable(err)
+		}
+		if found && previous == releaseID {
+			return true, nil
+		}
+	}
+	previous, found, err := tx.Platform().Deployments().LatestSucceededReleaseExcluding(ctx, environment.EnvironmentID, environment.Serving)
+	if err != nil {
+		return false, unavailable(err)
+	}
+	if found && previous == releaseID {
+		return true, nil
+	}
+	return false, nil
 }

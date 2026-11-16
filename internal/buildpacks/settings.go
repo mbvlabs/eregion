@@ -56,13 +56,13 @@ func NormalizeTargets(targets []GoTarget) ([]GoTarget, error) {
 		target.Process = strings.ToLower(strings.TrimSpace(target.Process))
 		target.Target = strings.TrimSpace(target.Target)
 		if target.Process == "" || target.Target == "" {
-			return nil, fmt.Errorf("Go target requires both process and target")
+			return nil, fmt.Errorf("go target requires both process and target")
 		}
 		if !processPattern.MatchString(target.Process) || seen[target.Process] {
-			return nil, fmt.Errorf("Go target process %q is invalid or duplicated", target.Process)
+			return nil, fmt.Errorf("go target process %q is invalid or duplicated", target.Process)
 		}
 		if !targetPattern.MatchString(target.Target) || strings.HasPrefix(target.Target, "/") || strings.Contains(target.Target, "..") || len(target.Target) > 1024 {
-			return nil, fmt.Errorf("Go target %q must be a repository-relative Go package path", target.Target)
+			return nil, fmt.Errorf("go target %q must be a repository-relative Go package path", target.Target)
 		}
 		seen[target.Process] = true
 		out = append(out, target)
@@ -76,8 +76,30 @@ func NormalizeSettings(input *Settings) (*Settings, error) {
 		return nil, nil
 	}
 	out := *input
-	out.KeepFiles = nil
-	for _, pattern := range input.KeepFiles {
+	keepFiles, err := normalizeKeepFiles(input.KeepFiles)
+	if err != nil {
+		return nil, err
+	}
+	order, err := normalizeOrder(input.Order)
+	if err != nil {
+		return nil, err
+	}
+	frontend, err := normalizeFrontend(input.Frontend)
+	if err != nil {
+		return nil, err
+	}
+	advanced, err := normalizeAdvanced(input.Advanced)
+	if err != nil {
+		return nil, err
+	}
+	out.KeepFiles, out.Order = keepFiles, order
+	out.Frontend, out.Advanced = frontend, advanced
+	return &out, nil
+}
+
+func normalizeKeepFiles(patterns []string) ([]string, error) {
+	var out []string
+	for _, pattern := range patterns {
 		if strings.TrimSpace(pattern) == "" || strings.HasPrefix(pattern, "/") || strings.ContainsAny(pattern, ":\\") || len(pattern) > 1024 || strings.IndexFunc(pattern, unicode.IsControl) >= 0 {
 			return nil, fmt.Errorf("keep file pattern %q must be a repository-relative glob without colon or control characters", pattern)
 		}
@@ -86,78 +108,88 @@ func NormalizeSettings(input *Settings) (*Settings, error) {
 				return nil, fmt.Errorf("keep file pattern %q cannot leave the build context", pattern)
 			}
 		}
-		out.KeepFiles = append(out.KeepFiles, pattern)
+		out = append(out, pattern)
 	}
-	if len(input.Order) == 0 {
-		out.Order = nil
-	} else {
-		out.Order = append([]string{}, input.Order...)
-		for _, ref := range out.Order {
-			if builderURNPattern.MatchString(ref) {
-				continue
-			}
-			parts := strings.SplitN(ref, "/", 2)
-			if strings.HasPrefix(ref, ".") || len(parts) != 2 || !(strings.ContainsAny(parts[0], ".:") || parts[0] == "localhost") || (!strings.Contains(parts[1], ":") && !strings.Contains(parts[1], "@")) {
-				return nil, fmt.Errorf("buildpack %q must be a fully qualified OCI reference with tag or digest, or a builder URN", ref)
-			}
-			if _, err := name.ParseReference(ref, name.StrictValidation); err != nil {
-				return nil, fmt.Errorf("invalid buildpack reference %q: %w", ref, err)
-			}
-		}
+	return out, nil
+}
+
+func normalizeOrder(input []string) ([]string, error) {
+	if len(input) == 0 {
+		return nil, nil
 	}
-	if input.Frontend != nil {
-		frontend := *input.Frontend
-		frontend.StartScript = strings.TrimSpace(frontend.StartScript)
-		if input.Frontend.StartScript != "" && frontend.StartScript == "" {
-			return nil, fmt.Errorf("frontend start script must be a package script name")
+	order := append([]string{}, input...)
+	for _, ref := range order {
+		if builderURNPattern.MatchString(ref) {
+			continue
 		}
-		if frontend.StartScript != "" && !scriptPattern.MatchString(frontend.StartScript) {
-			return nil, fmt.Errorf("frontend start script must be a package script name")
+		parts := strings.SplitN(ref, "/", 2)
+		if strings.HasPrefix(ref, ".") || len(parts) != 2 || (!strings.ContainsAny(parts[0], ".:") && parts[0] != "localhost") || (!strings.Contains(parts[1], ":") && !strings.Contains(parts[1], "@")) {
+			return nil, fmt.Errorf("buildpack %q must be a fully qualified OCI reference with tag or digest, or a builder URN", ref)
 		}
-		frontend.Directory = strings.TrimSpace(frontend.Directory)
-		if strings.HasPrefix(frontend.Directory, "/") || strings.ContainsAny(frontend.Directory, "\x00\r\n") {
-			return nil, fmt.Errorf("frontend directory must be relative")
-		}
-		if frontend.Directory != "" {
-			frontend.Directory = path.Clean(frontend.Directory)
-		}
-		if frontend.Directory == ".." || strings.HasPrefix(frontend.Directory, "../") {
-			return nil, fmt.Errorf("frontend directory cannot leave the build context")
-		}
-		frontend.Scripts = make([]string, 0, len(input.Frontend.Scripts))
-		for _, script := range input.Frontend.Scripts {
-			script = strings.TrimSpace(script)
-			if script == "" {
-				continue
-			}
-			if !scriptPattern.MatchString(script) {
-				return nil, fmt.Errorf("frontend build script must be a package script name")
-			}
-			frontend.Scripts = append(frontend.Scripts, script)
-		}
-		out.Frontend = &frontend
-	}
-	if input.Advanced != nil {
-		advanced := *input.Advanced
-		advanced.GoVersion = strings.TrimSpace(advanced.GoVersion)
-		advanced.GoBuildFlags = strings.TrimSpace(advanced.GoBuildFlags)
-		advanced.NodeVersion = strings.TrimSpace(advanced.NodeVersion)
-		if advanced.GoVersion != "" && !versionPattern.MatchString(advanced.GoVersion) {
-			return nil, fmt.Errorf("buildpack Go version must look like 1.23.4")
-		}
-		if advanced.NodeVersion != "" && !versionPattern.MatchString(advanced.NodeVersion) {
-			return nil, fmt.Errorf("buildpack Node version must look like 22.11.0")
-		}
-		if strings.ContainsAny(advanced.GoBuildFlags, "\r\n") || len(advanced.GoBuildFlags) > 512 {
-			return nil, fmt.Errorf("buildpack Go build flags cannot contain line breaks or exceed 512 bytes")
-		}
-		if advanced == (Advanced{}) {
-			out.Advanced = nil
-		} else {
-			out.Advanced = &advanced
+		if _, err := name.ParseReference(ref, name.StrictValidation); err != nil {
+			return nil, fmt.Errorf("invalid buildpack reference %q: %w", ref, err)
 		}
 	}
-	return &out, nil
+	return order, nil
+}
+
+func normalizeFrontend(input *Frontend) (*Frontend, error) {
+	if input == nil {
+		return nil, nil
+	}
+	frontend := *input
+	frontend.StartScript = strings.TrimSpace(frontend.StartScript)
+	if input.StartScript != "" && frontend.StartScript == "" {
+		return nil, fmt.Errorf("frontend start script must be a package script name")
+	}
+	if frontend.StartScript != "" && !scriptPattern.MatchString(frontend.StartScript) {
+		return nil, fmt.Errorf("frontend start script must be a package script name")
+	}
+	frontend.Directory = strings.TrimSpace(frontend.Directory)
+	if strings.HasPrefix(frontend.Directory, "/") || strings.ContainsAny(frontend.Directory, "\x00\r\n") {
+		return nil, fmt.Errorf("frontend directory must be relative")
+	}
+	if frontend.Directory != "" {
+		frontend.Directory = path.Clean(frontend.Directory)
+	}
+	if frontend.Directory == ".." || strings.HasPrefix(frontend.Directory, "../") {
+		return nil, fmt.Errorf("frontend directory cannot leave the build context")
+	}
+	frontend.Scripts = make([]string, 0, len(input.Scripts))
+	for _, script := range input.Scripts {
+		script = strings.TrimSpace(script)
+		if script == "" {
+			continue
+		}
+		if !scriptPattern.MatchString(script) {
+			return nil, fmt.Errorf("frontend build script must be a package script name")
+		}
+		frontend.Scripts = append(frontend.Scripts, script)
+	}
+	return &frontend, nil
+}
+
+func normalizeAdvanced(input *Advanced) (*Advanced, error) {
+	if input == nil {
+		return nil, nil
+	}
+	advanced := *input
+	advanced.GoVersion = strings.TrimSpace(advanced.GoVersion)
+	advanced.GoBuildFlags = strings.TrimSpace(advanced.GoBuildFlags)
+	advanced.NodeVersion = strings.TrimSpace(advanced.NodeVersion)
+	if advanced.GoVersion != "" && !versionPattern.MatchString(advanced.GoVersion) {
+		return nil, fmt.Errorf("buildpack Go version must look like 1.23.4")
+	}
+	if advanced.NodeVersion != "" && !versionPattern.MatchString(advanced.NodeVersion) {
+		return nil, fmt.Errorf("buildpack Node version must look like 22.11.0")
+	}
+	if strings.ContainsAny(advanced.GoBuildFlags, "\r\n") || len(advanced.GoBuildFlags) > 512 {
+		return nil, fmt.Errorf("buildpack Go build flags cannot contain line breaks or exceed 512 bytes")
+	}
+	if advanced == (Advanced{}) {
+		return nil, nil
+	}
+	return &advanced, nil
 }
 
 // Environment returns generated pack variables; callers must give them

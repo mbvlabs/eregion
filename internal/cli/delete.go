@@ -81,7 +81,7 @@ func (a *app) envDeleteSpec() spec {
 	return spec{
 		use:   "delete <app> <environment>",
 		meta:  meta,
-		args:  platformTwoNames("app", "environment"),
+		args:  platformTwoNames(),
 		flags: addDeleteFlags,
 		run: func(cmd *cobra.Command, args []string) (result, error) {
 			target, err := platform.NewEnvironmentTarget(args[0], args[1])
@@ -117,21 +117,7 @@ func (a *app) runDelete(cmd *cobra.Command, kind string, target platform.Target,
 		input = platform.EnvironmentDeleteInput{App: app, Environment: environment, Confirm: confirm}
 	}
 	if dryRun {
-		preview, err := a.previewAction(cmd, kind, target.String(), input)
-		if err != nil {
-			return result{}, err
-		}
-		data := deleteResult{App: app, Environment: environment, ConfirmationToken: token, DryRun: true, Preview: &preview}
-		var plain strings.Builder
-		fmt.Fprintf(&plain, "Dry run: delete %s\n", target.String())
-		for _, step := range preview.Steps {
-			fmt.Fprintf(&plain, "  step: %s\n", step)
-		}
-		for _, warning := range preview.Warnings {
-			fmt.Fprintf(&plain, "  warning: %s\n", warning)
-		}
-		fmt.Fprintf(&plain, "confirmation_token: %s\n", token)
-		return result{data: data, plain: plain.String()}, nil
+		return a.deletePreviewResult(cmd, kind, target, app, environment, confirm, token)
 	}
 	if err := platform.ValidateTargetConfirmation(target, confirm); err != nil {
 		return result{}, err
@@ -173,12 +159,36 @@ func (a *app) runDelete(cmd *cobra.Command, kind string, target platform.Target,
 	return result{data: data, plain: plain}, nil
 }
 
+func (a *app) deletePreviewResult(cmd *cobra.Command, kind string, target platform.Target, app, environment, confirm, token string) (result, error) {
+	var input any
+	if environment == "" {
+		input = platform.AppDeleteInput{App: app, Confirm: confirm}
+	} else {
+		input = platform.EnvironmentDeleteInput{App: app, Environment: environment, Confirm: confirm}
+	}
+	preview, err := a.previewAction(cmd, kind, target.String(), input)
+	if err != nil {
+		return result{}, err
+	}
+	data := deleteResult{App: app, Environment: environment, ConfirmationToken: token, DryRun: true, Preview: &preview}
+	var plain strings.Builder
+	fmt.Fprintf(&plain, "Dry run: delete %s\n", target.String())
+	for _, step := range preview.Steps {
+		fmt.Fprintf(&plain, "  step: %s\n", step)
+	}
+	for _, warning := range preview.Warnings {
+		fmt.Fprintf(&plain, "  warning: %s\n", warning)
+	}
+	fmt.Fprintf(&plain, "confirmation_token: %s\n", token)
+	return result{data: data, plain: plain.String()}, nil
+}
+
 // environmentDeleteNeedsHumanFactor reads the target's durable protection and
 // the application-wide environment count. The control plane re-checks both in
 // the submission transaction, so a concurrent protection or sibling change
 // can never turn this client read into a bypass.
 func (a *app) environmentDeleteNeedsHumanFactor(cmd *cobra.Command, app, environment string) (bool, error) {
-	env, _, err := a.readEnvironment(cmd, app, environment)
+	env, err := a.readEnvironment(cmd, app, environment)
 	if err != nil {
 		return false, err
 	}

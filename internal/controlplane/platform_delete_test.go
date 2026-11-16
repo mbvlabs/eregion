@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/platform"
 )
@@ -24,10 +25,19 @@ func TestIntegrationDeletionPreviewResourceAdmissionAndStateChange(t *testing.T)
 	ctx := context.Background()
 	pool, _ := testPool(t, true)
 	s := testRuntime(t, pool, 0).Service
-	platformSubmit(t, s, platform.KindNodeRegister, "platform", "resource-preview-node", map[string]any{
+	seedDeletionPreviewResources(t, ctx, pool, s)
+	factorCalls, beforeOps := instrumentDeletionPreview(t, ctx, pool, s)
+	assertDeletionPreviewWarnings(t, ctx, pool, s, factorCalls, beforeOps)
+	assertResourceDeleteRefusals(t, ctx, s)
+	assertPreviewAdmissionRechecksResources(t, ctx, pool, s)
+}
+
+func seedDeletionPreviewResources(t *testing.T, ctx context.Context, pool *pgxpool.Pool, s *Service) {
+	t.Helper()
+	platformSubmitContext(ctx, t, s, platform.KindNodeRegister, "platform", "resource-preview-node", map[string]any{
 		"name": "local", "roles": []string{platform.RoleApplication}, "capabilities": []string{platform.CapabilityDocker},
 	})
-	platformSubmit(t, s, platform.KindAppCreate, "platform", "resource-preview-app", map[string]any{
+	platformSubmitContext(ctx, t, s, platform.KindAppCreate, "platform", "resource-preview-app", map[string]any{
 		"name": "previewresources", "environments": []map[string]any{
 			{"name": "production", "node": "local"}, {"name": "staging", "node": "local"},
 		},
@@ -35,7 +45,7 @@ func TestIntegrationDeletionPreviewResourceAdmissionAndStateChange(t *testing.T)
 	for _, resource := range []struct{ env, name string }{
 		{"production", "changing"}, {"production", "degraded"}, {"production", "retained"}, {"staging", "other"},
 	} {
-		platformSubmit(t, s, platform.KindResourceApply, "resource/previewresources/"+resource.env+"/"+resource.name,
+		platformSubmitContext(ctx, t, s, platform.KindResourceApply, "resource/previewresources/"+resource.env+"/"+resource.name,
 			"resource-preview-"+resource.name, map[string]any{
 				"image": "postgres:17", "health": map[string]any{"type": "exec", "command": []string{"pg_isready"}},
 			})
@@ -47,13 +57,29 @@ func TestIntegrationDeletionPreviewResourceAdmissionAndStateChange(t *testing.T)
 		WHERE app_id=(SELECT id FROM eregion_platform_apps WHERE name='previewresources')`); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func instrumentDeletionPreview(t *testing.T, ctx context.Context, pool *pgxpool.Pool, s *Service) (*int, int) {
+	t.Helper()
 	factorCalls := 0
 	s.humanFactor = func(string) error { factorCalls++; return nil }
-	var beforeOps, afterOps int
+	var beforeOps int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_operations`).Scan(&beforeOps); err != nil {
 		t.Fatal(err)
 	}
-	env, err := previewSubmission(t, s, platform.KindEnvironmentDelete, "env/previewresources/production", map[string]any{})
+	return &factorCalls, beforeOps
+}
+
+func assertDeletionPreviewWarnings(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	s *Service,
+	factorCalls *int,
+	beforeOps int,
+) {
+	t.Helper()
+	env, err := previewSubmissionContext(ctx, t, s, platform.KindEnvironmentDelete, "env/previewresources/production", map[string]any{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +91,7 @@ func TestIntegrationDeletionPreviewResourceAdmissionAndStateChange(t *testing.T)
 	if deletionWarningContains(env.Warnings, "production/retained") || deletionWarningContains(env.Warnings, "staging/other") {
 		t.Fatalf("wrong preview scope: %v", env.Warnings)
 	}
-	app, err := previewSubmission(t, s, platform.KindAppDelete, "app/previewresources", map[string]any{})
+	app, err := previewSubmissionContext(ctx, t, s, platform.KindAppDelete, "app/previewresources", map[string]any{})
 	if err != nil || !deletionWarningContains(app.Warnings, "staging/other (state: ready)") {
 		t.Fatalf("application preview: %+v, %v", app, err)
 	}
@@ -73,16 +99,21 @@ func TestIntegrationDeletionPreviewResourceAdmissionAndStateChange(t *testing.T)
 	if err != nil || !strings.Contains(string(encoded), "production/changing (state: provisioning)") {
 		t.Fatalf("JSON preview: %s, %v", encoded, err)
 	}
+	var afterOps int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_operations`).Scan(&afterOps); err != nil {
 		t.Fatal(err)
 	}
-	if beforeOps != afterOps || factorCalls != 0 {
-		t.Fatalf("preview changed operations or requested factor: %d -> %d, factor calls %d", beforeOps, afterOps, factorCalls)
+	if beforeOps != afterOps || *factorCalls != 0 {
+		t.Fatalf("preview changed operations or requested factor: %d -> %d, factor calls %d", beforeOps, afterOps, *factorCalls)
 	}
 	var retained string
 	if err := pool.QueryRow(ctx, `SELECT volumes::text FROM eregion_platform_resources WHERE name='retained'`).Scan(&retained); err != nil || !strings.Contains(retained, "retained-data") {
 		t.Fatalf("preview changed retained data ledger: %s, %v", retained, err)
 	}
+}
+
+func assertResourceDeleteRefusals(t *testing.T, ctx context.Context, s *Service) {
+	t.Helper()
 	submission := platformSubmission(platform.KindEnvironmentDelete, "env/previewresources/production", "resource-preview-refused", map[string]any{"confirm": "previewresources/production"})
 	submission.HumanFactor = "test"
 	if _, err := s.Submit(ctx, submission); err == nil || contract.Classify(err).Code != contract.PreconditionFailed {
@@ -93,7 +124,10 @@ func TestIntegrationDeletionPreviewResourceAdmissionAndStateChange(t *testing.T)
 	if _, err := s.Submit(ctx, appSubmission); err == nil || contract.Classify(err).Code != contract.PreconditionFailed {
 		t.Fatalf("app resource admission: %v", err)
 	}
+}
 
+func assertPreviewAdmissionRechecksResources(t *testing.T, ctx context.Context, pool *pgxpool.Pool, s *Service) {
+	t.Helper()
 	// Preview sees the committed destroyed state while a transaction holds the
 	// app lock and changes it back. Admission waits for that lock and rechecks.
 	if _, err := pool.Exec(ctx, `UPDATE eregion_platform_resources SET state='destroyed' WHERE app_id=(SELECT id FROM eregion_platform_apps WHERE name='previewresources')`); err != nil {
@@ -103,19 +137,19 @@ func TestIntegrationDeletionPreviewResourceAdmissionAndStateChange(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rollback(tx)
+	defer rollback(ctx, tx)
 	if _, err := tx.Exec(ctx, `SELECT id FROM eregion_platform_apps WHERE name='previewresources' FOR UPDATE`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := tx.Exec(ctx, `UPDATE eregion_platform_resources SET state='degraded' WHERE name='changing'`); err != nil {
 		t.Fatal(err)
 	}
-	preview, err := previewSubmission(t, s, platform.KindEnvironmentDelete, "env/previewresources/production", map[string]any{})
+	preview, err := previewSubmissionContext(ctx, t, s, platform.KindEnvironmentDelete, "env/previewresources/production", map[string]any{})
 	if err != nil || deletionWarningContains(preview.Warnings, "Deletion blocked by resource") {
 		t.Fatalf("committed snapshot preview: %+v, %v", preview, err)
 	}
 	result := make(chan error, 1)
-	submission = platformSubmission(platform.KindEnvironmentDelete, "env/previewresources/production", "resource-preview-race", map[string]any{"confirm": "previewresources/production"})
+	submission := platformSubmission(platform.KindEnvironmentDelete, "env/previewresources/production", "resource-preview-race", map[string]any{"confirm": "previewresources/production"})
 	submission.HumanFactor = "test"
 	go func() { _, err := s.Submit(ctx, submission); result <- err }()
 	waitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)

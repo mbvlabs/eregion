@@ -115,10 +115,7 @@ func (a *app) upgradeRun(cmd *cobra.Command, _ []string) (result, error) {
 	}
 
 	if !yes && upgradeCanPrompt(cmd) {
-		ok, err := upgradePrompt(cmd, fmt.Sprintf("Upgrade eregion %s → %s (%s) at %s?", plan.From.Version, plan.To.Version, upgradeReleaseLabel(plan.To.Version), target))
-		if err != nil {
-			return result{}, err
-		}
+		ok := upgradePrompt(cmd, fmt.Sprintf("Upgrade eregion %s → %s (%s) at %s?", plan.From.Version, plan.To.Version, upgradeReleaseLabel(plan.To.Version), target))
 		if !ok {
 			return result{}, contract.NewFault(
 				contract.PreconditionFailed,
@@ -217,20 +214,20 @@ func resolveUpgradeManifest(ctx context.Context, client upgradeManifestResolver,
 func upgradeCanPrompt(cmd *cobra.Command) bool {
 	jsonMode, _ := cmd.Flags().GetBool("json")
 	outputMode, _ := cmd.Flags().GetString("output")
-	return !jsonMode && outputMode != "json" && term.IsTerminal(int(os.Stdin.Fd())) //nolint:gosec // G115: file descriptors fit in int.
+	return !jsonMode && outputMode != "json" && term.IsTerminal(int(os.Stdin.Fd()))
 }
 
-func upgradePrompt(cmd *cobra.Command, question string) (bool, error) {
-	fmt.Fprintf(cmd.ErrOrStderr(), "%s [y/N] ", question)
+func upgradePrompt(cmd *cobra.Command, question string) bool {
+	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "%s [y/N] ", question)
 	line, err := bufio.NewReader(cmd.InOrStdin()).ReadString('\n')
 	if err != nil && line == "" {
-		return false, nil
+		return false
 	}
 	switch strings.ToLower(strings.TrimSpace(line)) {
 	case "y", "yes":
-		return true, nil
+		return true
 	default:
-		return false, nil
+		return false
 	}
 }
 

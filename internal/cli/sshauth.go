@@ -26,7 +26,7 @@ import (
 // --password-stdin, then --identity, then ssh-agent and the default ~/.ssh
 // keys. The password is read from stdin, never a flag. An encrypted identity is
 // unlocked with a prompt only in a terminal.
-func firstContactAuth(cmd *cobra.Command, identity string, prompt bool, registry *secrets.Registry) ([]ssh.AuthMethod, error) {
+func firstContactAuth(ctx context.Context, cmd *cobra.Command, identity string, prompt bool, registry *secrets.Registry) ([]ssh.AuthMethod, error) {
 	if flag, _ := cmd.Flags().GetBool("password-stdin"); flag {
 		password, err := readFirstLine(cmd.InOrStdin())
 		if err != nil {
@@ -49,7 +49,7 @@ func firstContactAuth(cmd *cobra.Command, identity string, prompt bool, registry
 		}
 		return []ssh.AuthMethod{ssh.Password(password), ssh.KeyboardInteractive(answers)}, nil
 	}
-	return sshAuth(identity, prompt)
+	return sshAuth(ctx, identity, prompt)
 }
 
 // readFirstLine reads one line, bounded, for a password supplied on stdin.
@@ -66,7 +66,7 @@ func readFirstLine(r io.Reader) (string, error) {
 // identity, otherwise ssh-agent keys plus the default ~/.ssh keys in one
 // publickey method (x/crypto/ssh tries only the first method of each kind).
 // An encrypted key is unlocked with a passphrase prompt when prompt is set.
-func sshAuth(identity string, prompt bool) ([]ssh.AuthMethod, error) {
+func sshAuth(ctx context.Context, identity string, prompt bool) ([]ssh.AuthMethod, error) {
 	if identity != "" {
 		signer, err := loadSigner(expandHome(identity), prompt)
 		if err != nil {
@@ -74,29 +74,9 @@ func sshAuth(identity string, prompt bool) ([]ssh.AuthMethod, error) {
 		}
 		return []ssh.AuthMethod{ssh.PublicKeys(signer)}, nil
 	}
-	var signers []ssh.Signer
-	if sock := os.Getenv("SSH_AUTH_SOCK"); sock != "" {
-		if conn, err := net.Dial("unix", sock); err == nil {
-			if agentSigners, err := agent.NewClient(conn).Signers(); err == nil {
-				signers = append(signers, agentSigners...)
-			}
-		}
-	}
-	var skipped []string
-	if home, err := os.UserHomeDir(); err == nil {
-		for _, name := range []string{"id_ed25519", "id_ecdsa", "id_rsa"} {
-			path := filepath.Join(home, ".ssh", name)
-			if _, err := os.Stat(path); err != nil {
-				continue
-			}
-			signer, err := loadSigner(path, prompt)
-			if err != nil {
-				skipped = append(skipped, path)
-				continue
-			}
-			signers = append(signers, signer)
-		}
-	}
+	signers := sshAgentSigners(ctx)
+	keySigners, skipped := defaultSSHKeySigners(prompt)
+	signers = append(signers, keySigners...)
 	if len(signers) == 0 {
 		hint := "Pass --identity <key>, or load a key into ssh-agent."
 		if len(skipped) > 0 {
@@ -107,8 +87,46 @@ func sshAuth(identity string, prompt bool) ([]ssh.AuthMethod, error) {
 	return []ssh.AuthMethod{ssh.PublicKeys(signers...)}, nil
 }
 
+func sshAgentSigners(ctx context.Context) []ssh.Signer {
+	sock := os.Getenv("SSH_AUTH_SOCK")
+	if sock == "" {
+		return nil
+	}
+	conn, err := new(net.Dialer).DialContext(ctx, "unix", sock)
+	if err != nil {
+		return nil
+	}
+	signers, err := agent.NewClient(conn).Signers()
+	if err != nil {
+		return nil
+	}
+	return signers
+}
+
+func defaultSSHKeySigners(prompt bool) ([]ssh.Signer, []string) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, nil
+	}
+	var signers []ssh.Signer
+	var skipped []string
+	for _, name := range []string{"id_ed25519", "id_ecdsa", "id_rsa"} {
+		path := filepath.Join(home, ".ssh", name)
+		if _, err := os.Stat(path); err != nil {
+			continue
+		}
+		signer, err := loadSigner(path, prompt)
+		if err != nil {
+			skipped = append(skipped, path)
+			continue
+		}
+		signers = append(signers, signer)
+	}
+	return signers, skipped
+}
+
 func loadSigner(path string, prompt bool) (ssh.Signer, error) {
-	raw, err := os.ReadFile(path) //nolint:gosec // G304: the operator's own SSH key.
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
@@ -136,17 +154,6 @@ func expandHome(path string) string {
 	return path
 }
 
-// workspaceKnownHostsPath is the pinned host keys of one workspace access record. Every
-// node is reached at the same WireGuard address, so a shared known_hosts file
-// cannot tell two nodes' host keys apart.
-func workspaceKnownHostsPath(name string) (string, error) {
-	dir, err := identityDir(name)
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(dir, "known_hosts"), nil
-}
-
 func knownHostsPathAt(storePath, name string) string {
 	return filepath.Join(identityDirAt(storePath, name), "known_hosts")
 }
@@ -160,7 +167,7 @@ func probeHostKey(ctx context.Context, address string) (ssh.PublicKey, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
 	_, _, _, err = ssh.NewClientConn(conn, address, &ssh.ClientConfig{
 		User: "probe",
@@ -181,11 +188,11 @@ func pinHostKey(path, address string, key ssh.PublicKey) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600) //nolint:gosec // G304: eregion's own known_hosts.
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	_, err = fmt.Fprintln(file, knownhosts.Line([]string{knownhosts.Normalize(address)}, key))
 	return err
 }
@@ -209,7 +216,7 @@ func pinnedKeyMatches(path, address string, key ssh.PublicKey) bool {
 
 // unpinHostKey drops every known_hosts line for address.
 func unpinHostKey(path, address string) error {
-	raw, err := os.ReadFile(path) //nolint:gosec // G304: eregion's own known_hosts.
+	raw, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
@@ -229,5 +236,5 @@ func unpinHostKey(path, address string) error {
 	if out != "" {
 		out += "\n"
 	}
-	return os.WriteFile(path, []byte(out), 0o600)
+	return os.WriteFile(path, []byte(out), 0o600) //nolint:gosec // G703: eregion's own known_hosts inside its identity directory.
 }

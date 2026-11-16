@@ -650,14 +650,11 @@ func operationIdentityQuery(ctx context.Context, q *query.Queries, key Operation
 		err error
 	)
 	if forShare {
-		shared, shareErr := q.GetOperationIdentityForShare(ctx, query.GetOperationIdentityForShareParams{
-			ActorKind: params.ActorKind, ActorSubject: params.ActorSubject,
-			Kind: params.Kind, Target: params.Target, IdempotencyKey: params.IdempotencyKey,
-		})
+		shared, shareErr := q.GetOperationIdentityForShare(ctx, query.GetOperationIdentityForShareParams(params))
 		if shareErr != nil {
 			err = shareErr
 		} else {
-			row = query.GetOperationIdentityRow{ID: shared.ID, InputHash: shared.InputHash}
+			row = query.GetOperationIdentityRow(shared)
 		}
 	} else {
 		row, err = q.GetOperationIdentity(ctx, params)

@@ -85,7 +85,7 @@ func NewJournal(node string) *Journal {
 // LoadJournal reads path. A missing journal is empty. A journal that does not
 // decode returns an explicit precondition error and is never reset silently.
 func LoadJournal(path string) (*Journal, error) {
-	raw, err := os.ReadFile(path) //nolint:gosec // G304: caller-provided node state path.
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return &Journal{Schema: JournalSchema, Tasks: map[string]Task{}}, nil
@@ -144,7 +144,7 @@ func updateJournal(path string, registry *secrets.Registry, fn func(*Journal)) e
 // LoadEffectRecord reads a step's durable effect record. A missing record is
 // (EffectRecord{}, false, nil).
 func LoadEffectRecord(path string) (EffectRecord, bool, error) {
-	raw, err := os.ReadFile(path) //nolint:gosec // G304: caller-provided node state path.
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return EffectRecord{}, false, nil

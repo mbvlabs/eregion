@@ -176,24 +176,10 @@ func (a serverInitAnswers) hostname() string { return a.Hostname }
 func (a serverInitAnswers) address() string { return net.JoinHostPort(a.Host, a.Port) }
 
 func (a *app) serverInit(cmd *cobra.Command, _ []string) (res result, err error) {
-	jsonMode, _ := cmd.Flags().GetBool("json")
-	outputMode, _ := cmd.Flags().GetString("output")
-	r := &serverInit{a: a, cmd: cmd}
-	if err := rejectWorkspaceSelection(cmd, "server init"); err != nil {
-		return result{}, err
-	}
-	store, err := loadWorkspaceStore(cmd)
+	r, err := a.newServerInit(cmd)
 	if err != nil {
 		return result{}, err
 	}
-	r.storePath = store.Path
-	if workspaceFileExplicit(cmd) {
-		if err := rejectSharedInitStoreRoot(store.Path); err != nil {
-			return result{}, err
-		}
-	}
-	r.dryRun = boolFlag(cmd, "dry-run")
-	r.interactive = !jsonMode && outputMode != "json" && term.IsTerminal(int(os.Stdin.Fd())) && ui.Enabled(os.Stderr) //nolint:gosec // G115: file descriptors fit in int.
 	if r.interactive {
 		r.live = ui.Start(os.Stderr)
 		defer func() {
@@ -212,6 +198,32 @@ func (a *app) serverInit(cmd *cobra.Command, _ []string) (res result, err error)
 	if r.interactive {
 		return result{data: summary, streamed: true}, nil
 	}
+	return result{data: summary, plain: serverInitSummaryText(cmd, summary)}, nil
+}
+
+func (a *app) newServerInit(cmd *cobra.Command) (*serverInit, error) {
+	jsonMode, _ := cmd.Flags().GetBool("json")
+	outputMode, _ := cmd.Flags().GetString("output")
+	r := &serverInit{a: a, cmd: cmd}
+	if err := rejectWorkspaceSelection(cmd, "server init"); err != nil {
+		return nil, err
+	}
+	store, err := loadWorkspaceStore(cmd)
+	if err != nil {
+		return nil, err
+	}
+	r.storePath = store.Path
+	if workspaceFileExplicit(cmd) {
+		if err := rejectSharedInitStoreRoot(store.Path); err != nil {
+			return nil, err
+		}
+	}
+	r.dryRun = boolFlag(cmd, "dry-run")
+	r.interactive = !jsonMode && outputMode != "json" && term.IsTerminal(int(os.Stdin.Fd())) && ui.Enabled(os.Stderr)
+	return r, nil
+}
+
+func serverInitSummaryText(cmd *cobra.Command, summary serverInitSummary) string {
 	plain := "server " + summary.Server + " is ready"
 	if summary.Workspace != "" {
 		plain += "; workspace " + summary.Workspace
@@ -236,7 +248,7 @@ func (a *app) serverInit(cmd *cobra.Command, _ []string) (res result, err error)
 	if summary.SecretsOut != "" {
 		plain += "; secrets written to " + summary.SecretsOut
 	}
-	return result{data: summary, plain: plain}, nil
+	return plain
 }
 
 func workspaceFileExplicit(cmd *cobra.Command) bool {
@@ -402,6 +414,50 @@ func (r *serverInit) run(ctx context.Context) (serverInitSummary, error) {
 // before the next one starts, so an interrupted init resumes without a second
 // operator identity or a second lockdown.
 func (r *serverInit) execute(ctx context.Context, summary *serverInitSummary) error {
+	if err := r.executeContact(ctx); err != nil {
+		return err
+	}
+	if err := r.verifyOperatorIdentity(); err != nil {
+		return err
+	}
+	if err := r.loadOperatorIdentity(); err != nil {
+		return err
+	}
+	if err := r.executeHostPhase(ctx, summary); err != nil {
+		return err
+	}
+	if !r.pending.Done(phaseAccessSetup) {
+		if err := r.ensureRootConnection(ctx); err != nil {
+			return err
+		}
+	}
+	if err := r.readVaultKeyring(ctx); err != nil {
+		return err
+	}
+	route, err := r.executeAccessPhase(ctx)
+	if err != nil {
+		return err
+	}
+	summary.API = "ssh " + r.answers.AdminUser + "@" + access.NodeAddress + " over WireGuard"
+	if err := r.publishReadyWorkspace(ctx, route); err != nil {
+		return err
+	}
+	if err := r.ensureTelemetryCredential(ctx); err != nil {
+		return err
+	}
+	if err := r.executeChecks(ctx, summary); err != nil {
+		return err
+	}
+	if err := r.executeHandoff(ctx, summary); err != nil {
+		return err
+	}
+	if err := r.removePending(r.answers.AccessKey); err != nil {
+		r.warnings = append(r.warnings, "the local pending state could not be removed: "+err.Error())
+	}
+	return nil
+}
+
+func (r *serverInit) executeContact(ctx context.Context) error {
 	if !r.pending.Done(phaseContact) {
 		if err := r.localPreflight(ctx); err != nil {
 			return err
@@ -420,22 +476,31 @@ func (r *serverInit) execute(ctx context.Context, summary *serverInitSummary) er
 	}
 	// A resume skips first contact, so show the DNS record here unless this run
 	// already did. --dns-ready treats it as created and never waits.
-	if !r.dnsShown {
-		if err := r.askDNS(); err != nil {
-			return err
+	if r.dnsShown {
+		return nil
+	}
+	return r.askDNS()
+}
+
+func (r *serverInit) verifyOperatorIdentity() error {
+	if !r.pending.Done(phaseAccessSetup) {
+		return nil
+	}
+	// The node already trusts the generated SSH key. Regenerating it would
+	// silently break the only operator login.
+	dir, err := r.identityDir(r.answers.AccessKey)
+	if err != nil {
+		return nil
+	}
+	for _, name := range []string{"ssh_ed25519", "wireguard.key"} {
+		if _, statErr := os.Stat(filepath.Join(dir, name)); statErr != nil {
+			return contract.NewFault(contract.PreconditionFailed, "the operator identity for "+r.answers.AccessKey+" is missing ("+name+")", "The server already trusts the old keys. Restore "+dir+" or run server init --discard and rebuild.")
 		}
 	}
-	if r.pending.Done(phaseAccessSetup) {
-		// The node already trusts the generated SSH key. Regenerating it would
-		// silently break the only operator login.
-		if dir, dirErr := r.identityDir(r.answers.AccessKey); dirErr == nil {
-			for _, name := range []string{"ssh_ed25519", "wireguard.key"} {
-				if _, statErr := os.Stat(filepath.Join(dir, name)); statErr != nil {
-					return contract.NewFault(contract.PreconditionFailed, "the operator identity for "+r.answers.AccessKey+" is missing ("+name+")", "The server already trusts the old keys. Restore "+dir+" or run server init --discard and rebuild.")
-				}
-			}
-		}
-	}
+	return nil
+}
+
+func (r *serverInit) loadOperatorIdentity() error {
 	id, err := r.loadOrCreateIdentity(r.answers.AccessKey)
 	if err != nil {
 		return err
@@ -443,12 +508,13 @@ func (r *serverInit) execute(ctx context.Context, summary *serverInitSummary) er
 	r.identity = id
 	// The generated operator credentials are secrets in every later message.
 	r.a.secrets.Add(id.sudoPassword, id.wg.Encode(), id.sshKeyPEM)
-	if !r.pending.Done(phaseSecrets) {
-		if err := r.mark(phaseSecrets); err != nil {
-			return err
-		}
+	if r.pending.Done(phaseSecrets) {
+		return nil
 	}
+	return r.mark(phaseSecrets)
+}
 
+func (r *serverInit) executeHostPhase(ctx context.Context, summary *serverInitSummary) error {
 	// Plan, then confirm, before any host change.
 	if !r.pending.Done(phaseHost) {
 		if err := r.ensureRootConnection(ctx); err != nil {
@@ -471,43 +537,29 @@ func (r *serverInit) execute(ctx context.Context, summary *serverInitSummary) er
 		}
 	}
 	summary.OperationID = r.operationID
+	return nil
+}
 
-	if !r.pending.Done(phaseAccessSetup) {
-		if err := r.ensureRootConnection(ctx); err != nil {
-			return err
-		}
+func (r *serverInit) executeAccessPhase(ctx context.Context) (*host.WorkspaceSSH, error) {
+	if r.pending.Done(phaseAccess) {
+		return r.routeFromPending()
 	}
-	if err := r.readVaultKeyring(ctx); err != nil {
-		return err
+	route, err := r.secureAccess(ctx, r.identity, r.answers.Host)
+	if err != nil {
+		return nil, err
 	}
+	r.pending.NodePublicKey = route.WireGuard.NodePublicKey
+	if err := r.savePending(); err != nil {
+		return nil, err
+	}
+	if err := r.mark(phaseAccess); err != nil {
+		return nil, err
+	}
+	r.remote = nil
+	return route, nil
+}
 
-	var route *host.WorkspaceSSH
-	if !r.pending.Done(phaseAccess) {
-		if route, err = r.secureAccess(ctx, r.identity, r.answers.Host); err != nil {
-			return err
-		}
-		r.pending.NodePublicKey = route.WireGuard.NodePublicKey
-		if err := r.savePending(); err != nil {
-			return err
-		}
-		if err := r.mark(phaseAccess); err != nil {
-			return err
-		}
-		r.remote = nil
-	} else {
-		if route, err = r.routeFromPending(); err != nil {
-			return err
-		}
-	}
-	summary.API = "ssh " + r.answers.AdminUser + "@" + access.NodeAddress + " over WireGuard"
-
-	if err := r.publishReadyWorkspace(ctx, route); err != nil {
-		return err
-	}
-
-	if err := r.ensureTelemetryCredential(ctx); err != nil {
-		return err
-	}
+func (r *serverInit) executeChecks(ctx context.Context, summary *serverInitSummary) error {
 	if !r.pending.Done(phaseChecks) {
 		summary.Telemetry = r.checkTelemetryEndpoint(ctx)
 		r.checkDNS(ctx)
@@ -519,22 +571,17 @@ func (r *serverInit) execute(ctx context.Context, summary *serverInitSummary) er
 			return err
 		}
 	}
-	if err := r.runDoctorGate(ctx, summary); err != nil {
+	return r.runDoctorGate(ctx, summary)
+}
+
+func (r *serverInit) executeHandoff(ctx context.Context, summary *serverInitSummary) error {
+	if r.pending.Done(phaseHandoff) {
+		return nil
+	}
+	if err := r.handoff(ctx, summary); err != nil {
 		return err
 	}
-
-	if !r.pending.Done(phaseHandoff) {
-		if err := r.handoff(ctx, summary); err != nil {
-			return err
-		}
-		if err := r.mark(phaseHandoff); err != nil {
-			return err
-		}
-	}
-	if err := r.removePending(r.answers.AccessKey); err != nil {
-		r.warnings = append(r.warnings, "the local pending state could not be removed: "+err.Error())
-	}
-	return nil
+	return r.mark(phaseHandoff)
 }
 
 // prepare collects and validates the answers, loads a pending init on
@@ -542,99 +589,126 @@ func (r *serverInit) execute(ctx context.Context, summary *serverInitSummary) er
 // init.
 func (r *serverInit) prepare() error {
 	if boolFlag(r.cmd, "resume") {
-		name, err := r.pendingNameFor(flagString(r.cmd, "workspace-name"), true)
-		if err != nil {
+		if err := r.prepareResume(); err != nil {
 			return err
 		}
-		pending, err := r.loadPending(name)
-		if err != nil {
-			return err
-		}
-		r.pending = pending
-		if v := flagString(r.cmd, "workspace-name"); v != "" {
-			if err := host.ValidateWorkspaceName(v); err != nil {
-				return err
-			}
-			if pending.Workspace != v {
-				fault := contract.NewFault(contract.Conflict,
-					"the unfinished init already requested workspace "+pending.Workspace,
-					"Resume with --workspace-name "+pending.Workspace+", or discard the unfinished init before choosing another workspace.")
-				fault.Details = map[string]any{"pending_workspace": pending.Workspace, "requested_workspace": v}
-				return fault
-			}
-		}
-		r.answers = answersFromPending(pending)
-		if v := flagString(r.cmd, "identity"); v != "" {
-			r.answers.Identity = v
-		}
-		r.answers.PasswordStdin = boolFlag(r.cmd, "password-stdin")
-		if err := r.loadDatabaseURL(); err != nil {
-			return err
-		}
-		if v := flagString(r.cmd, "host-key-fingerprint"); v != "" {
-			r.pending.HostKeyFingerprint = v
-		}
-		if v := flagString(r.cmd, "secrets-out"); v != "" {
-			r.pending.SecretsOut = v
-		}
-		known, err := r.pendingKnownHosts(name)
-		if err != nil {
-			return err
-		}
-		r.knownHosts = known
-		r.publicIPv4 = pending.PublicIPv4
-		r.hostKey = pending.HostKey
-		r.platform = host.Platform{PrettyName: pending.Platform, Arch: pending.Arch}
-	} else {
-		if err := r.collect(); err != nil {
-			return err
-		}
-		name := r.answers.AccessKey
-		store, err := loadWorkspaceStore(r.cmd)
-		if err != nil {
-			return err
-		}
-		for _, saved := range store.Access {
-			if saved.Name == name {
-				fault := contract.NewFault(contract.PreconditionFailed, "workspace "+name+" already has local access on this machine", "Use another --workspace-name, or remove the saved workspace access with eregion workspace remove "+name+" --confirm "+name+".")
-				fault.Details = map[string]any{"reason": "workspace_access_exists", "workspace": name}
-				return fault
-			}
-		}
-		if r.pendingExists(name) {
-			if _, err := r.loadPending(name); err != nil {
-				return contract.NewFault(contract.PreconditionFailed, "an unsupported or unreadable unfinished init occupies this workspace name", "Preserve its files and use a new workspace name or a separate private store directory.")
-			}
-			fault := contract.NewFault(contract.PreconditionFailed, "an unfinished init for "+name+" exists", "Continue it with eregion server init --resume --workspace-name "+name+", or drop it with eregion server init --discard --workspace-name "+name+".")
-			fault.Details = map[string]any{"reason": "init_pending", "server": name}
-			return fault
-		}
-		identityDir, err := r.identityDir(name)
-		if err != nil {
-			return err
-		}
-		if err := refuseOccupiedInitPath(identityDir); err != nil {
-			return err
-		}
-		storePath, err := r.workspaceStorePath()
-		if err != nil {
-			return err
-		}
-		pendingDir, err := host.PendingDirAt(storePath, name)
-		if err != nil {
-			return err
-		}
-		if err := refuseOccupiedInitPath(pendingDir); err != nil {
-			return err
-		}
-		r.pending = &host.PendingInit{Server: name, Phases: map[string]string{}}
-		known, err := r.pendingKnownHosts(name)
-		if err != nil {
-			return err
-		}
-		r.knownHosts = known
+	} else if err := r.prepareNew(); err != nil {
+		return err
 	}
 	return r.validate()
+}
+
+func (r *serverInit) prepareResume() error {
+	name, err := r.pendingNameFor(flagString(r.cmd, "workspace-name"), true)
+	if err != nil {
+		return err
+	}
+	pending, err := r.loadPending(name)
+	if err != nil {
+		return err
+	}
+	r.pending = pending
+	if v := flagString(r.cmd, "workspace-name"); v != "" {
+		if err := host.ValidateWorkspaceName(v); err != nil {
+			return err
+		}
+		if pending.Workspace != v {
+			fault := contract.NewFault(contract.Conflict,
+				"the unfinished init already requested workspace "+pending.Workspace,
+				"Resume with --workspace-name "+pending.Workspace+", or discard the unfinished init before choosing another workspace.")
+			fault.Details = map[string]any{"pending_workspace": pending.Workspace, "requested_workspace": v}
+			return fault
+		}
+	}
+	r.answers = answersFromPending(pending)
+	if v := flagString(r.cmd, "identity"); v != "" {
+		r.answers.Identity = v
+	}
+	r.answers.PasswordStdin = boolFlag(r.cmd, "password-stdin")
+	if err := r.loadDatabaseURL(); err != nil {
+		return err
+	}
+	if v := flagString(r.cmd, "host-key-fingerprint"); v != "" {
+		r.pending.HostKeyFingerprint = v
+	}
+	if v := flagString(r.cmd, "secrets-out"); v != "" {
+		r.pending.SecretsOut = v
+	}
+	known, err := r.pendingKnownHosts(name)
+	if err != nil {
+		return err
+	}
+	r.knownHosts = known
+	r.publicIPv4 = pending.PublicIPv4
+	r.hostKey = pending.HostKey
+	r.platform = host.Platform{PrettyName: pending.Platform, Arch: pending.Arch}
+	return nil
+}
+
+func (r *serverInit) prepareNew() error {
+	if err := r.collect(); err != nil {
+		return err
+	}
+	name := r.answers.AccessKey
+	if err := r.refuseExistingWorkspaceAccess(name); err != nil {
+		return err
+	}
+	if err := r.refuseExistingPending(name); err != nil {
+		return err
+	}
+	identityDir, err := r.identityDir(name)
+	if err != nil {
+		return err
+	}
+	if err := refuseOccupiedInitPath(identityDir); err != nil {
+		return err
+	}
+	storePath, err := r.workspaceStorePath()
+	if err != nil {
+		return err
+	}
+	pendingDir, err := host.PendingDirAt(storePath, name)
+	if err != nil {
+		return err
+	}
+	if err := refuseOccupiedInitPath(pendingDir); err != nil {
+		return err
+	}
+	r.pending = &host.PendingInit{Server: name, Phases: map[string]string{}}
+	known, err := r.pendingKnownHosts(name)
+	if err != nil {
+		return err
+	}
+	r.knownHosts = known
+	return nil
+}
+
+func (r *serverInit) refuseExistingWorkspaceAccess(name string) error {
+	store, err := loadWorkspaceStore(r.cmd)
+	if err != nil {
+		return err
+	}
+	for _, saved := range store.Access {
+		if saved.Name != name {
+			continue
+		}
+		fault := contract.NewFault(contract.PreconditionFailed, "workspace "+name+" already has local access on this machine", "Use another --workspace-name, or remove the saved workspace access with eregion workspace remove "+name+" --confirm "+name+".")
+		fault.Details = map[string]any{"reason": "workspace_access_exists", "workspace": name}
+		return fault
+	}
+	return nil
+}
+
+func (r *serverInit) refuseExistingPending(name string) error {
+	if !r.pendingExists(name) {
+		return nil
+	}
+	if _, err := r.loadPending(name); err != nil {
+		return contract.NewFault(contract.PreconditionFailed, "an unsupported or unreadable unfinished init occupies this workspace name", "Preserve its files and use a new workspace name or a separate private store directory.")
+	}
+	fault := contract.NewFault(contract.PreconditionFailed, "an unfinished init for "+name+" exists", "Continue it with eregion server init --resume --workspace-name "+name+", or drop it with eregion server init --discard --workspace-name "+name+".")
+	fault.Details = map[string]any{"reason": "init_pending", "server": name}
+	return fault
 }
 
 // A new init may not adopt files left by an older installation or another
@@ -665,32 +739,72 @@ func answersFromPending(p *host.PendingInit) serverInitAnswers {
 // collect reads the answers file, then flags, then prompts for a terminal.
 func (r *serverInit) collect() error {
 	cmd := r.cmd
+	ans, given, filePort, err := readAnswersFile(cmd)
+	if err != nil {
+		return err
+	}
+	applyAnswerFlags(cmd, &ans, given)
+	if err := r.completeHost(&ans, given, filePort); err != nil {
+		return err
+	}
+	node, admin := ans.Node, ans.AdminUser
+	if node == "" {
+		ans.Node = "main"
+	}
+	if admin == "" {
+		ans.AdminUser = access.AdminUser
+	}
+	if err := r.completeHostname(&ans, given); err != nil {
+		return err
+	}
+	if err := r.completeDatabaseURL(&ans, given); err != nil {
+		return err
+	}
+	if err := r.completeOptionalAnswers(&ans, given); err != nil {
+		return err
+	}
+	r.answers = ans
+	if r.interactive {
+		for _, row := range serverInitAnswerRows(ans) {
+			r.live.Println(ui.Answered(row[0], row[1]))
+		}
+	}
+	return nil
+}
+
+func readAnswersFile(cmd *cobra.Command) (serverInitAnswers, map[string]bool, int, error) {
 	given := map[string]bool{}
 	var ans serverInitAnswers
 	filePort := 0
-	if path := flagString(cmd, "answers"); path != "" {
-		path = expandHome(path)
-		info, statErr := os.Stat(path)
-		if statErr != nil {
-			return contract.NewFault(contract.ValidationFailed, "could not read the answers file", statErr.Error())
-		}
-		if info.Size() > 64<<10 {
-			return contract.NewFault(contract.ValidationFailed, "the answers file is too large", "Keep --answers under 64 KiB.")
-		}
-		raw, err := os.ReadFile(path) //nolint:gosec // G304: the operator chose this answers file.
-		if err != nil {
-			return contract.NewFault(contract.ValidationFailed, "could not read the answers file", err.Error())
-		}
-		file, err := parseAnswersFile(raw)
-		if err != nil {
-			return contract.NewFault(contract.ValidationFailed, path+" does not parse", err.Error())
-		}
-		ans = file.answers()
-		filePort = file.Port
-		for key, present := range file.supplied() {
-			given[key] = present
-		}
+	path := flagString(cmd, "answers")
+	if path == "" {
+		return ans, given, filePort, nil
 	}
+	path = expandHome(path)
+	info, err := os.Stat(path)
+	if err != nil {
+		return ans, given, filePort, contract.NewFault(contract.ValidationFailed, "could not read the answers file", err.Error())
+	}
+	if info.Size() > 64<<10 {
+		return ans, given, filePort, contract.NewFault(contract.ValidationFailed, "the answers file is too large", "Keep --answers under 64 KiB.")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return ans, given, filePort, contract.NewFault(contract.ValidationFailed, "could not read the answers file", err.Error())
+	}
+	file, err := parseAnswersFile(raw)
+	if err != nil {
+		return ans, given, filePort, contract.NewFault(contract.ValidationFailed, path+" does not parse", err.Error())
+	}
+	ans = file.answers()
+	filePort = file.Port
+	for key, present := range file.supplied() {
+		given[key] = present
+	}
+	return ans, given, filePort, nil
+}
+
+func applyAnswerFlags(cmd *cobra.Command, ans *serverInitAnswers, given map[string]bool) {
 	take := func(name, flag string, dst *string) {
 		if cmd.Flags().Changed(flag) {
 			*dst = strings.TrimSpace(flagString(cmd, flag))
@@ -705,7 +819,9 @@ func (r *serverInit) collect() error {
 	take("database_url_file", "database-url-file", &ans.DatabaseURLFile)
 	take("admin_user", "admin-user", &ans.AdminUser)
 	ans.PasswordStdin = boolFlag(cmd, "password-stdin")
+}
 
+func (r *serverInit) completeHost(ans *serverInitAnswers, given map[string]bool, filePort int) error {
 	if !given["host"] || ans.Host == "" {
 		if !r.interactive {
 			return contract.NewFault(contract.InputRequired, "--host is required without a terminal", "Pass --host root@203.0.113.10.")
@@ -724,13 +840,10 @@ func (r *serverInit) collect() error {
 		port = strconv.Itoa(filePort)
 	}
 	ans.User, ans.Host, ans.Port = user, hostPart, port
+	return nil
+}
 
-	if ans.Node == "" {
-		ans.Node = "main"
-	}
-	if ans.AdminUser == "" {
-		ans.AdminUser = access.AdminUser
-	}
+func (r *serverInit) completeHostname(ans *serverInitAnswers, given map[string]bool) error {
 	if !given["hostname"] || ans.Hostname == "" {
 		if !r.interactive {
 			return contract.NewFault(contract.InputRequired, "--hostname is required without a terminal", "Pass --hostname app.example.com.")
@@ -742,26 +855,48 @@ func (r *serverInit) collect() error {
 		ans.Hostname = v
 	}
 	ans.Hostname = strings.TrimSuffix(strings.TrimSpace(ans.Hostname), ".")
-	if !given["database_url_file"] || ans.DatabaseURLFile == "" {
-		if env := strings.TrimSpace(os.Getenv("EREGION_DATABASE_URL")); env != "" {
-			ans.DatabaseURL = env
-		} else if r.interactive {
-			v, err := ui.Secret("External PostgreSQL URL (postgres://user:password@host:5432/db)")
-			if err != nil {
-				return err
-			}
-			ans.DatabaseURL = v
-		} else {
-			return contract.NewFault(contract.InputRequired, "the control plane needs an external PostgreSQL URL", "Pass --database-url-file with an owner-only file.")
-		}
+	return nil
+}
+
+func (r *serverInit) completeDatabaseURL(ans *serverInitAnswers, given map[string]bool) error {
+	if given["database_url_file"] && ans.DatabaseURLFile != "" {
+		return r.loadDatabaseURLFile(ans)
 	}
-	if ans.DatabaseURL == "" && ans.DatabaseURLFile != "" {
-		raw, err := host.ReadPrivateInput(expandHome(ans.DatabaseURLFile))
-		if err != nil {
-			return contract.NewFault(contract.ValidationFailed, "could not read the database URL file", err.Error())
-		}
-		ans.DatabaseURL = strings.TrimSpace(string(raw))
+	if err := r.chooseDatabaseURL(ans); err != nil {
+		return err
 	}
+	return r.loadDatabaseURLFile(ans)
+}
+
+func (r *serverInit) chooseDatabaseURL(ans *serverInitAnswers) error {
+	if env := strings.TrimSpace(os.Getenv("EREGION_DATABASE_URL")); env != "" {
+		ans.DatabaseURL = env
+		return nil
+	}
+	if !r.interactive {
+		return contract.NewFault(contract.InputRequired, "the control plane needs an external PostgreSQL URL", "Pass --database-url-file with an owner-only file.")
+	}
+	v, err := ui.Secret("External PostgreSQL URL (postgres://user:password@host:5432/db)")
+	if err != nil {
+		return err
+	}
+	ans.DatabaseURL = v
+	return nil
+}
+
+func (r *serverInit) loadDatabaseURLFile(ans *serverInitAnswers) error {
+	if ans.DatabaseURL != "" || ans.DatabaseURLFile == "" {
+		return nil
+	}
+	raw, err := host.ReadPrivateInput(expandHome(ans.DatabaseURLFile))
+	if err != nil {
+		return contract.NewFault(contract.ValidationFailed, "could not read the database URL file", err.Error())
+	}
+	ans.DatabaseURL = strings.TrimSpace(string(raw))
+	return nil
+}
+
+func (r *serverInit) completeOptionalAnswers(ans *serverInitAnswers, given map[string]bool) error {
 	if !given["node"] && r.interactive {
 		v, err := ui.Input("Main node name", "This server becomes the main node: control plane, workers, builds and applications", ans.Node)
 		if err != nil {
@@ -788,12 +923,6 @@ func (r *serverInit) collect() error {
 			return err
 		}
 		ans.AdminUser = v
-	}
-	r.answers = ans
-	if r.interactive {
-		for _, row := range serverInitAnswerRows(ans) {
-			r.live.Println(ui.Answered(row[0], row[1]))
-		}
 	}
 	return nil
 }
@@ -865,7 +994,7 @@ func checkIdentity(path string) error {
 	if strings.TrimSpace(path) == "" {
 		return nil
 	}
-	raw, err := os.ReadFile(expandHome(path)) //nolint:gosec // G304: the operator's own key.
+	raw, err := os.ReadFile(expandHome(path))
 	if err != nil {
 		return contract.NewFault(contract.ValidationFailed, "the SSH identity "+path+" is not readable", err.Error())
 	}
@@ -913,7 +1042,7 @@ func (r *serverInit) localPreflight(ctx context.Context) error {
 		return err
 	}
 	task.detail("operator " + runtime.GOOS + "/" + runtime.GOARCH)
-	auth, err := firstContactAuth(r.cmd, r.answers.Identity, r.interactive, r.a.secrets)
+	auth, err := firstContactAuth(ctx, r.cmd, r.answers.Identity, r.interactive, r.a.secrets)
 	if err != nil {
 		task.end(ui.EndFail, "")
 		return err
@@ -938,54 +1067,10 @@ func (r *serverInit) trustHostKey(ctx context.Context) error {
 		want = r.pending.HostKeyFingerprint
 	}
 	accept := boolFlag(r.cmd, "accept-new-host-key")
-	trusted := func(key ssh.PublicKey) (bool, error) {
-		fingerprint := ssh.FingerprintSHA256(key)
-		r.hostKey = key.Type() + " " + fingerprint
-		if want != "" && (want == fingerprint || "SHA256:"+want == fingerprint) {
-			return true, nil
-		}
-		if accept {
-			r.warnings = append(r.warnings, "trusted host key "+fingerprint+" without checking it")
-			return true, nil
-		}
-		if !r.interactive {
-			fault := contract.NewFault(contract.InputRequired, "first contact needs the host key "+fingerprint+" to be confirmed", "Pass --host-key-fingerprint "+fingerprint+" or --accept-new-host-key.")
-			fault.Details = map[string]any{"flag": "--host-key-fingerprint", "fingerprint": fingerprint}
-			return false, fault
-		}
-		ok, err := ui.YesNoDefault("Trust host key "+fingerprint+"?", "Compare it with ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub on the provider console.", true)
-		if err != nil {
-			return false, err
-		}
-		if !ok {
-			return false, contract.NewFault(contract.Cancelled, "the host key was not trusted", "Pass --host-key-fingerprint "+fingerprint+" once it is checked.")
-		}
-		return true, nil
-	}
-
 	if hostKeyPinned(r.knownHosts, address) {
-		key, err := probeHostKey(ctx, address)
-		if err != nil {
-			return contract.NewFault(contract.RemoteUnreachable, "the server does not answer on "+address, err.Error())
-		}
-		if pinnedKeyMatches(r.knownHosts, address, key) {
-			r.hostKey = key.Type() + " " + ssh.FingerprintSHA256(key)
-			return nil
-		}
-		// A rebuilt server has new host keys. Replacing the pin is a decision.
-		fingerprint := ssh.FingerprintSHA256(key)
-		r.warn("the host key of " + address + " changed to " + key.Type() + " " + fingerprint)
-		ok, err := trusted(key)
-		if err != nil {
+		probe, err := r.trustPinnedHostKey(ctx, address, want, accept)
+		if err != nil || !probe {
 			return err
-		}
-		if !ok {
-			return nil
-		}
-		for _, pinned := range []string{address, net.JoinHostPort(access.NodeAddress, "22")} {
-			if err := unpinHostKey(r.knownHosts, pinned); err != nil {
-				return err
-			}
 		}
 	}
 
@@ -996,12 +1081,63 @@ func (r *serverInit) trustHostKey(ctx context.Context) error {
 		return contract.NewFault(contract.RemoteUnreachable, "the server does not answer on "+address, err.Error())
 	}
 	fingerprint := ssh.FingerprintSHA256(key)
-	if _, err := trusted(key); err != nil {
+	if _, err := r.trustHostKeyCandidate(key, want, accept); err != nil {
 		task.end(ui.EndFail, "")
 		return err
 	}
 	task.end(ui.EndOK, key.Type()+" "+fingerprint)
 	return pinHostKey(r.knownHosts, address, key)
+}
+
+// trustPinnedHostKey checks an existing pin. It reports whether the caller
+// must probe and pin the freshly presented key after a deliberate replacement.
+func (r *serverInit) trustPinnedHostKey(ctx context.Context, address, want string, accept bool) (bool, error) {
+	key, err := probeHostKey(ctx, address)
+	if err != nil {
+		return false, contract.NewFault(contract.RemoteUnreachable, "the server does not answer on "+address, err.Error())
+	}
+	if pinnedKeyMatches(r.knownHosts, address, key) {
+		r.hostKey = key.Type() + " " + ssh.FingerprintSHA256(key)
+		return false, nil
+	}
+	// A rebuilt server has new host keys. Replacing the pin is a decision.
+	fingerprint := ssh.FingerprintSHA256(key)
+	r.warn("the host key of " + address + " changed to " + key.Type() + " " + fingerprint)
+	ok, err := r.trustHostKeyCandidate(key, want, accept)
+	if err != nil || !ok {
+		return false, err
+	}
+	for _, pinned := range []string{address, net.JoinHostPort(access.NodeAddress, "22")} {
+		if err := unpinHostKey(r.knownHosts, pinned); err != nil {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+func (r *serverInit) trustHostKeyCandidate(key ssh.PublicKey, want string, accept bool) (bool, error) {
+	fingerprint := ssh.FingerprintSHA256(key)
+	r.hostKey = key.Type() + " " + fingerprint
+	if want != "" && (want == fingerprint || "SHA256:"+want == fingerprint) {
+		return true, nil
+	}
+	if accept {
+		r.warnings = append(r.warnings, "trusted host key "+fingerprint+" without checking it")
+		return true, nil
+	}
+	if !r.interactive {
+		fault := contract.NewFault(contract.InputRequired, "first contact needs the host key "+fingerprint+" to be confirmed", "Pass --host-key-fingerprint "+fingerprint+" or --accept-new-host-key.")
+		fault.Details = map[string]any{"flag": "--host-key-fingerprint", "fingerprint": fingerprint}
+		return false, fault
+	}
+	ok, err := ui.YesNoDefault("Trust host key "+fingerprint+"?", "Compare it with ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub on the provider console.", true)
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		return false, contract.NewFault(contract.Cancelled, "the host key was not trusted", "Pass --host-key-fingerprint "+fingerprint+" once it is checked.")
+	}
+	return true, nil
 }
 
 // contact pins the host key, authenticates as root and runs the read-only
@@ -1012,7 +1148,7 @@ func (r *serverInit) contact(ctx context.Context) error {
 	}
 	auth := r.auth
 	if len(auth) == 0 {
-		resolved, err := firstContactAuth(r.cmd, r.answers.Identity, r.interactive, r.a.secrets)
+		resolved, err := firstContactAuth(ctx, r.cmd, r.answers.Identity, r.interactive, r.a.secrets)
 		if err != nil {
 			return err
 		}
@@ -1172,7 +1308,7 @@ func (r *serverInit) ensureRootConnection(ctx context.Context) error {
 	}
 	auth := r.auth
 	if len(auth) == 0 {
-		resolved, err := firstContactAuth(r.cmd, r.answers.Identity, r.interactive, r.a.secrets)
+		resolved, err := firstContactAuth(ctx, r.cmd, r.answers.Identity, r.interactive, r.a.secrets)
 		if err != nil {
 			return err
 		}
@@ -1371,20 +1507,28 @@ func (r *serverInit) pendingNameFor(selection string, resume bool) (string, erro
 		return "", err
 	}
 	if selection == "" {
-		switch len(names) {
-		case 0:
-			if resume {
-				return "", contract.NewFault(contract.PreconditionFailed, "there is no unfinished init to resume", "Start one with eregion server init.")
-			}
-			return "", contract.NewFault(contract.PreconditionFailed, "there is no unfinished init to discard", "Start one with eregion server init.")
-		case 1:
-			return names[0], nil
-		default:
-			fault := contract.NewFault(contract.InputRequired, "several unfinished inits exist", "Pass --workspace-name with one of details.pending.")
-			fault.Details = map[string]any{"flag": "--workspace-name", "pending": names}
-			return "", fault
-		}
+		return defaultPendingName(names, resume)
 	}
+	return r.pendingNameMatching(selection, names, resume)
+}
+
+func defaultPendingName(names []string, resume bool) (string, error) {
+	switch len(names) {
+	case 0:
+		if resume {
+			return "", contract.NewFault(contract.PreconditionFailed, "there is no unfinished init to resume", "Start one with eregion server init.")
+		}
+		return "", contract.NewFault(contract.PreconditionFailed, "there is no unfinished init to discard", "Start one with eregion server init.")
+	case 1:
+		return names[0], nil
+	default:
+		fault := contract.NewFault(contract.InputRequired, "several unfinished inits exist", "Pass --workspace-name with one of details.pending.")
+		fault.Details = map[string]any{"flag": "--workspace-name", "pending": names}
+		return "", fault
+	}
+}
+
+func (r *serverInit) pendingNameMatching(selection string, names []string, resume bool) (string, error) {
 	for _, name := range names {
 		if name == selection {
 			return name, nil
@@ -1393,10 +1537,7 @@ func (r *serverInit) pendingNameFor(selection string, resume bool) (string, erro
 	matched := ""
 	for _, name := range names {
 		pending, err := r.loadPending(name)
-		if err != nil {
-			continue
-		}
-		if pending.Workspace != selection {
+		if err != nil || pending.Workspace != selection {
 			continue
 		}
 		if matched != "" {
@@ -1611,7 +1752,7 @@ func (r *serverInit) showPlan(plan host.Plan) {
 	body := strings.TrimRight(b.String(), "\n")
 	title := "Plan for server " + r.answers.AccessKey + " (" + r.platform.String() + ")"
 	if r.live == nil {
-		fmt.Fprintln(r.cmd.ErrOrStderr(), "plan:\n"+body)
+		_, _ = fmt.Fprintln(r.cmd.ErrOrStderr(), "plan:\n"+body)
 		return
 	}
 	r.live.Println(ui.PanelFit(title, body, r.live.Width()))
@@ -1640,7 +1781,7 @@ func (r *serverInit) runDoctorGate(ctx context.Context, summary *serverInitSumma
 	}
 	check := r.hostDoctor
 	if check == nil {
-		client, err := r.initNodeClient()
+		client, err := r.initNodeClient(ctx)
 		if err != nil {
 			return err
 		}
@@ -1682,14 +1823,14 @@ func (r *serverInit) runDoctorGate(ctx context.Context, summary *serverInitSumma
 
 // initNodeClient uses only the pending init's pinned route, never a saved or
 // ambient workspace selection.
-func (r *serverInit) initNodeClient() (*nodeClient, error) {
+func (r *serverInit) initNodeClient(ctx context.Context) (*nodeClient, error) {
 	if r.initClient != nil {
 		return r.initClient, nil
 	}
 	if r.initRoute == nil {
 		return nil, contract.NewFault(contract.PreconditionFailed, "the initialization route is unavailable", "Resume server init to restore the pinned access route.")
 	}
-	client, err := routeNodeClient(r.initRoute, boolFlag(r.cmd, "auto-upgrade-nodes"), r.cmd.ErrOrStderr())
+	client, err := routeNodeClient(ctx, r.initRoute, boolFlag(r.cmd, "auto-upgrade-nodes"), r.cmd.ErrOrStderr())
 	if err != nil {
 		return nil, err
 	}
@@ -1704,7 +1845,7 @@ func (r *serverInit) ensureTelemetryCredential(ctx context.Context) error {
 	client := r.metricsClient
 	if client == nil {
 		var err error
-		client, err = r.initNodeClient()
+		client, err = r.initNodeClient(ctx)
 		if err != nil {
 			return err
 		}
@@ -1733,7 +1874,7 @@ func (r *serverInit) ensureTelemetryCredential(ctx context.Context) error {
 
 // readyNode is the init's readiness probe over the explicit init context.
 func (r *serverInit) readyNode(ctx context.Context) error {
-	client, err := r.initNodeClient()
+	client, err := r.initNodeClient(ctx)
 	if err != nil {
 		return err
 	}
@@ -1767,7 +1908,7 @@ func (r *serverInit) showResumePlan() {
 	remaining := r.resumeTasks()
 	body := "host steps are already applied; remaining:\n- " + strings.Join(remaining, "\n- ")
 	if r.live == nil {
-		fmt.Fprintln(r.cmd.ErrOrStderr(), body)
+		_, _ = fmt.Fprintln(r.cmd.ErrOrStderr(), body)
 		return
 	}
 	r.live.Println(ui.PanelFit("Resuming server "+r.answers.AccessKey, body, r.live.Width()))
@@ -1781,19 +1922,9 @@ func (r *serverInit) apply(ctx context.Context, session *remoteSession, plan hos
 	report, err := remoteApply(ctx, session, plan.Confirmation.Token, progress)
 	var fault *contract.Fault
 	if err != nil && errors.As(err, &fault) && fault.Code == contract.ConfirmationRequired {
-		if id, _ := fault.Details["operation_id"].(string); id != "" {
-			progress.close(ui.EndOK)
-			task := r.start("confirm", "Confirming access change from a fresh connection")
-			raw, runErr := session.run(ctx, "confirm", []string{id}, io.Discard)
-			if runErr == nil {
-				_, runErr = decodeRemoteEnvelope[host.ConfirmReport](raw, "confirm")
-			}
-			if runErr != nil {
-				task.end(ui.EndFail, "")
-				return report, runErr
-			}
-			task.end(ui.EndOK, "")
-			return host.ApplyReport{Node: plan.Node, Role: plan.Role, OperationID: id}, nil
+		confirmed, handled, confirmErr := r.confirmAccessChange(ctx, session, progress, plan, fault)
+		if handled {
+			return confirmed, confirmErr
 		}
 	}
 	if err != nil {
@@ -1802,6 +1933,27 @@ func (r *serverInit) apply(ctx context.Context, session *remoteSession, plan hos
 	}
 	progress.close(ui.EndOK)
 	return report, nil
+}
+
+// confirmAccessChange answers a confirmation-required apply from a fresh
+// connection. It reports whether the fault carried a confirmable operation.
+func (r *serverInit) confirmAccessChange(ctx context.Context, session *remoteSession, progress *applyProgress, plan host.Plan, fault *contract.Fault) (host.ApplyReport, bool, error) {
+	id, _ := fault.Details["operation_id"].(string)
+	if id == "" {
+		return host.ApplyReport{}, false, nil
+	}
+	progress.close(ui.EndOK)
+	task := r.start("confirm", "Confirming access change from a fresh connection")
+	raw, runErr := session.run(ctx, "confirm", []string{id}, io.Discard)
+	if runErr == nil {
+		_, runErr = decodeRemoteEnvelope[host.ConfirmReport](raw)
+	}
+	if runErr != nil {
+		task.end(ui.EndFail, "")
+		return host.ApplyReport{}, true, runErr
+	}
+	task.end(ui.EndOK, "")
+	return host.ApplyReport{Node: plan.Node, Role: plan.Role, OperationID: id}, true, nil
 }
 
 // applyProgress reads "bootstrap <step>: <message>" lines from the remote
@@ -1894,7 +2046,7 @@ func (r *serverInit) line(state, title, detail string) {
 		r.live.Line(state, title, detail)
 		return
 	}
-	fmt.Fprintf(r.cmd.ErrOrStderr(), "server init: %s: %s %s\n", title, state, detail)
+	_, _ = fmt.Fprintf(r.cmd.ErrOrStderr(), "server init: %s: %s %s\n", title, state, detail)
 }
 
 // initTask is a live task in a terminal, or plain lines otherwise.
@@ -1908,7 +2060,7 @@ func (r *serverInit) start(key, title string) *initTask {
 	if r.live != nil {
 		return &initTask{r: r, t: r.live.Start(key, title), title: title}
 	}
-	fmt.Fprintln(r.cmd.ErrOrStderr(), "server init: "+title)
+	_, _ = fmt.Fprintln(r.cmd.ErrOrStderr(), "server init: "+title)
 	return &initTask{r: r, title: title}
 }
 
@@ -1917,7 +2069,7 @@ func (t *initTask) detail(s string) {
 		t.t.Detail(s)
 		return
 	}
-	fmt.Fprintln(t.r.cmd.ErrOrStderr(), "  "+s)
+	_, _ = fmt.Fprintln(t.r.cmd.ErrOrStderr(), "  "+s)
 }
 
 func (t *initTask) end(state, detail string) {
@@ -1926,7 +2078,7 @@ func (t *initTask) end(state, detail string) {
 		return
 	}
 	if detail != "" {
-		fmt.Fprintf(t.r.cmd.ErrOrStderr(), "server init: %s: %s %s\n", t.title, state, detail)
+		_, _ = fmt.Fprintf(t.r.cmd.ErrOrStderr(), "server init: %s: %s %s\n", t.title, state, detail)
 	}
 }
 
@@ -1936,7 +2088,7 @@ func (r *serverInit) warn(s string) {
 		r.live.Println(ui.Warn(s))
 		return
 	}
-	fmt.Fprintln(r.cmd.ErrOrStderr(), "server init: warning: "+s)
+	_, _ = fmt.Fprintln(r.cmd.ErrOrStderr(), "server init: warning: "+s)
 }
 
 func (r *serverInit) warningLine(s string) string {
@@ -1951,7 +2103,7 @@ func (r *serverInit) note(s string) {
 		r.live.Println(ui.Note(s))
 		return
 	}
-	fmt.Fprintln(r.cmd.ErrOrStderr(), "server init: "+s)
+	_, _ = fmt.Fprintln(r.cmd.ErrOrStderr(), "server init: "+s)
 }
 
 func (r *serverInit) finish(s serverInitSummary) {

@@ -128,6 +128,20 @@ func (h *secretsHandoff) writeRecord(path string, overwrite bool) error {
 func (h *secretsHandoff) show(w io.Writer) error {
 	resume := ui.Suspend()
 	defer resume()
+	h.writeIntro(w)
+	for {
+		choice, err := h.chooseAction()
+		if err != nil {
+			return err
+		}
+		done, err := h.handleChoice(w, choice)
+		if err != nil || done {
+			return err
+		}
+	}
+}
+
+func (h *secretsHandoff) writeIntro(w io.Writer) {
 	_, _ = fmt.Fprintln(w, "\n"+ui.Header("Secrets handoff", 72))
 	_, _ = fmt.Fprintln(w, "The server's record: the operator's keys, the sudo password, the database URL and the vault keyring.")
 	_, _ = fmt.Fprintln(w, "eregion doesn't show it again. Store it in your password manager.")
@@ -138,47 +152,58 @@ func (h *secretsHandoff) show(w io.Writer) error {
 	}
 	_, _ = fmt.Fprintln(w, ui.Note("To log in from another machine: eregion login, paste the transfer bundle, then this passphrase."))
 	_, _ = fmt.Fprintln(w)
-	for {
-		options := [][2]string{{"Copy everything to the clipboard", "copy"}}
-		if h.path == "" {
-			options = append(options, [2]string{"Save everything to a file", "save"})
-		}
-		options = append(options, [2]string{"Show everything on screen", "print"}, [2]string{"Done", "done"})
-		choice, err := ui.Choose("Secrets handoff", "", options)
-		if err != nil {
-			return err
-		}
-		switch choice {
-		case "save":
-			path, err := ui.Input("Save everything to", "A new owner-only Markdown file", "./"+h.workspace+"--"+h.node+"-secrets.md")
-			if err != nil {
-				return err
-			}
-			if err := h.writeRecord(path, false); err != nil {
-				_, _ = fmt.Fprintln(w, ui.Note(err.Error()))
-				continue
-			}
-			_, _ = fmt.Fprintln(w, ui.Note("Saved everything to "+h.path+" (readable only by you). Keep the passphrase apart from the file."))
-		case "done":
-			if err := ui.TypeWord("Type 'stored' once the record is in your password manager", "", "stored"); err != nil {
-				if errors.Is(err, ui.ErrAborted) {
-					return contract.NewFault(contract.InputRequired, "the secrets handoff was not confirmed as stored", "The server is set up and the workspace access is saved locally; run server init --resume to show the handoff again.")
-				}
-				return err
-			}
-			if clear, err := ui.YesNoDefault("Clear the screen now?", "", true); err == nil && clear {
-				_, _ = fmt.Fprint(w, clearScreen)
-			}
-			return nil
-		case "copy":
-			_, _ = fmt.Fprint(w, osc52(h.record()))
-			_, _ = fmt.Fprintln(w, ui.Note("Copied to your clipboard. Nothing pasted? Pick Show everything on screen."))
-		case "print":
-			_, _ = fmt.Fprintln(w)
-			_, _ = fmt.Fprint(w, h.record())
-			_, _ = fmt.Fprintln(w)
-		}
+}
+
+func (h *secretsHandoff) chooseAction() (string, error) {
+	options := [][2]string{{"Copy everything to the clipboard", "copy"}}
+	if h.path == "" {
+		options = append(options, [2]string{"Save everything to a file", "save"})
 	}
+	options = append(options, [2]string{"Show everything on screen", "print"}, [2]string{"Done", "done"})
+	return ui.Choose("Secrets handoff", "", options)
+}
+
+func (h *secretsHandoff) handleChoice(w io.Writer, choice string) (bool, error) {
+	switch choice {
+	case "save":
+		return false, h.saveRecord(w)
+	case "done":
+		return true, h.confirmStored(w)
+	case "copy":
+		_, _ = fmt.Fprint(w, osc52(h.record()))
+		_, _ = fmt.Fprintln(w, ui.Note("Copied to your clipboard. Nothing pasted? Pick Show everything on screen."))
+	case "print":
+		_, _ = fmt.Fprintln(w)
+		_, _ = fmt.Fprint(w, h.record())
+		_, _ = fmt.Fprintln(w)
+	}
+	return false, nil
+}
+
+func (h *secretsHandoff) saveRecord(w io.Writer) error {
+	path, err := ui.Input("Save everything to", "A new owner-only Markdown file", "./"+h.workspace+"--"+h.node+"-secrets.md")
+	if err != nil {
+		return err
+	}
+	if err := h.writeRecord(path, false); err != nil {
+		_, _ = fmt.Fprintln(w, ui.Note(err.Error()))
+		return nil
+	}
+	_, _ = fmt.Fprintln(w, ui.Note("Saved everything to "+h.path+" (readable only by you). Keep the passphrase apart from the file."))
+	return nil
+}
+
+func (h *secretsHandoff) confirmStored(w io.Writer) error {
+	if err := ui.TypeWord("Type 'stored' once the record is in your password manager", "", "stored"); err != nil {
+		if errors.Is(err, ui.ErrAborted) {
+			return contract.NewFault(contract.InputRequired, "the secrets handoff was not confirmed as stored", "The server is set up and the workspace access is saved locally; run server init --resume to show the handoff again.")
+		}
+		return err
+	}
+	if clear, err := ui.YesNoDefault("Clear the screen now?", "", true); err == nil && clear {
+		_, _ = fmt.Fprint(w, clearScreen)
+	}
+	return nil
 }
 
 // osc52 asks the terminal to put s on the system clipboard; it works over SSH.
@@ -241,7 +266,7 @@ func (r *serverInit) handoff(ctx context.Context, summary *serverInitSummary) er
 // handoff. It never invents a generated ID locally and refuses a requested name
 // that differs from the database.
 func (r *serverInit) resolveWorkspace(ctx context.Context) (controlplane.WorkspaceIdentity, error) {
-	client, err := r.initNodeClient()
+	client, err := r.initNodeClient(ctx)
 	if err != nil {
 		return controlplane.WorkspaceIdentity{}, err
 	}

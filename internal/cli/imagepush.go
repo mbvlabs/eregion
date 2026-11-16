@@ -16,9 +16,7 @@ import (
 
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/controlplane"
-	"github.com/mbvlabs/eregion/internal/engine"
 	"github.com/mbvlabs/eregion/internal/host"
-	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/mbvlabs/eregion/internal/rpc"
 	"github.com/spf13/cobra"
@@ -118,7 +116,7 @@ func (a *app) imagePush(cmd *cobra.Command, args []string) (result, error) {
 
 	saveCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	save := exec.CommandContext(saveCtx, "docker", "save", localImage) //nolint:gosec // G204: fixed argv, operator-supplied image reference.
+	save := exec.CommandContext(saveCtx, "docker", "save", localImage)
 	stdout, err := save.StdoutPipe()
 	if err != nil {
 		return result{}, contract.NewFault(contract.Unavailable, "could not start local docker save", err.Error())
@@ -158,7 +156,7 @@ func (a *app) imagePush(cmd *cobra.Command, args []string) (result, error) {
 }
 
 func localDockerImageID(ctx context.Context, image string) (string, error) {
-	command := exec.CommandContext(ctx, "docker", "image", "inspect", "--format", "{{.Id}}", image) //nolint:gosec // G204: fixed argv, validated image reference.
+	command := exec.CommandContext(ctx, "docker", "image", "inspect", "--format", "{{.Id}}", image)
 	var stderr bytes.Buffer
 	command.Stderr = &stderr
 	raw, err := command.Output()
@@ -233,29 +231,6 @@ func validateImagePushParams(params rpcImagePushParams) error {
 
 // nodeRegistryAddress follows the recorded host intent so a non-default
 // loopback registry address is used for tagging and the digest lookup.
-// nodeHostLockPath is the actual lock every node host mutation takes: builds,
-// host apply, retention removal, garbage collection, image upload and final app
-// metadata deletion. It comes from the shared managed node state directory,
-// never a separate worker-local path.
-func nodeHostLockPath() string {
-	return node.HostLockPath("")
-}
-
-// acquireNodeHostLock takes the node's host lock without waiting: a running
-// build or collection is reported, not stalled behind an image upload.
-func acquireNodeHostLock(ctx context.Context) (engine.Release, error) {
-	release, err := engine.Acquire(ctx, nodeHostLockPath(), engine.LockExclusive, 0)
-	if err != nil {
-		if errors.Is(err, engine.ErrLockHeld) {
-			return nil, contract.NewFault(contract.Unavailable,
-				"another host mutation is running on the node",
-				"Wait for the running build, apply or garbage collection to finish, then retry the image push.")
-		}
-		return nil, contract.NewFault(contract.Unavailable, "the node host lock is not available", err.Error())
-	}
-	return release, nil
-}
-
 func pushNodeImage(ctx context.Context, params rpcImagePushParams, payload io.Reader, out io.Writer) (rpcImagePushResult, error) {
 	if err := validateImagePushParams(params); err != nil {
 		return rpcImagePushResult{}, err
@@ -264,7 +239,7 @@ func pushNodeImage(ctx context.Context, params rpcImagePushParams, payload io.Re
 	if err != nil {
 		return rpcImagePushResult{}, err
 	}
-	defer lease.Release()
+	defer lease.Release() //nolint:contextcheck // Lease cleanup must release locks even after the upload context is canceled.
 	registry, err := host.ManagedRegistryEndpoint(os.Getenv)
 	if err != nil {
 		return rpcImagePushResult{}, err

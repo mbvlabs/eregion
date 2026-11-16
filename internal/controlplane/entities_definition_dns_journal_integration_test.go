@@ -48,6 +48,13 @@ func TestIntegrationEntitiesDefinitionDNSJournal(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	verifyDefinitionDNSJournalLocks(t, ctx, store, parent, child, domainID)
+	verifyDefinitionDNSCleanupWarning(t, ctx, store)
+	verifyDefinitionDNSProgressCAS(t, ctx, store, parent, child)
+}
+
+func verifyDefinitionDNSJournalLocks(t *testing.T, ctx context.Context, store *entities.Store, parent, child contract.OperationID, domainID platform.DomainID) {
+	t.Helper()
 	if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
 		if _, found, err := tx.Operations().Lock(ctx, parent); err != nil || !found {
 			t.Fatalf("parent lock found=%v err=%v", found, err)
@@ -70,29 +77,37 @@ func TestIntegrationEntitiesDefinitionDNSJournal(t *testing.T) {
 			journal.StepKind != platform.KindDomainAdd || string(journal.DNSPlan) == "" {
 			t.Fatalf("journal=%+v", journal)
 		}
-		linked, err := tx.DefinitionDNS().LinkedCleanupPending(ctx, child)
-		if err != nil || !linked {
-			t.Fatalf("linked cleanup pending=%v err=%v", linked, err)
-		}
-		exists, err := tx.DefinitionSteps().ChildExists(ctx, child)
-		if err != nil || !exists {
-			t.Fatalf("child exists=%v err=%v", exists, err)
-		}
-		marker, found, err := tx.DefinitionDNS().TerminalMarker(ctx, parent)
-		if err != nil || !found || !marker.DefinitionKey || !marker.DNSEvidence {
-			t.Fatalf("terminal marker=%+v found=%v err=%v", marker, found, err)
-		}
-		verified, err := tx.DefinitionDNS().CleanupVerifiedWithoutLink(ctx, child)
-		if err != nil || verified {
-			t.Fatalf("verified without link=%v err=%v", verified, err)
-		}
+		verifyDefinitionDNSJournalReadsTx(t, ctx, tx, parent, child)
 		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}
+}
 
+func verifyDefinitionDNSJournalReadsTx(t *testing.T, ctx context.Context, tx *entities.StoreTx, parent, child contract.OperationID) {
+	t.Helper()
+	linked, err := tx.DefinitionDNS().LinkedCleanupPending(ctx, child)
+	if err != nil || !linked {
+		t.Fatalf("linked cleanup pending=%v err=%v", linked, err)
+	}
+	exists, err := tx.DefinitionSteps().ChildExists(ctx, child)
+	if err != nil || !exists {
+		t.Fatalf("child exists=%v err=%v", exists, err)
+	}
+	marker, found, err := tx.DefinitionDNS().TerminalMarker(ctx, parent)
+	if err != nil || !found || !marker.DefinitionKey || !marker.DNSEvidence {
+		t.Fatalf("terminal marker=%+v found=%v err=%v", marker, found, err)
+	}
+	verified, err := tx.DefinitionDNS().CleanupVerifiedWithoutLink(ctx, child)
+	if err != nil || verified {
+		t.Fatalf("verified without link=%v err=%v", verified, err)
+	}
+}
+
+func verifyDefinitionDNSCleanupWarning(t *testing.T, ctx context.Context, store *entities.Store) {
+	t.Helper()
 	// A verified cleanup event with no definition step is the warning case.
-	cleanupOp := insertDefinitionOperation(t, store, platform.KindDomainRemove, "env/dns-foundation/staging", "cleanup-only",
+	cleanupOp := insertDefinitionOperationWithContext(ctx, t, store, platform.KindDomainRemove, "env/dns-foundation/staging", "cleanup-only",
 		json.RawMessage(`{"domain":"app.example.test"}`))
 	if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
 		op, found, err := tx.Operations().Lock(ctx, cleanupOp)
@@ -114,7 +129,10 @@ func TestIntegrationEntitiesDefinitionDNSJournal(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+}
 
+func verifyDefinitionDNSProgressCAS(t *testing.T, ctx context.Context, store *entities.Store, parent, child contract.OperationID) {
+	t.Helper()
 	// Concurrent CAS writers from the same expected progress: exactly one wins.
 	const writers = 4
 	var wg sync.WaitGroup

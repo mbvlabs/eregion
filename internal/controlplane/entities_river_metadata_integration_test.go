@@ -3,6 +3,7 @@ package controlplane
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -26,9 +27,37 @@ func markRiverRunning(t *testing.T, ctx context.Context, pool *pgxpool.Pool, job
 	}
 }
 
+func insertRiverOperation(t *testing.T, ctx context.Context, store *entities.Store, kind, target, key string) contract.OperationID {
+	t.Helper()
+	id, err := contract.NewOperationID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		inserted, err := tx.Operations().Insert(ctx, entities.OperationInsert{
+			ID: id,
+			Key: entities.OperationKey{
+				Kind: kind, Target: target, Actor: testActor, IdempotencyKey: key,
+			},
+			InputHash: "hash-" + key,
+			Input:     json.RawMessage(`{}`),
+		})
+		if err != nil {
+			return err
+		}
+		if !inserted {
+			return errors.New("operation insert conflicted")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
 func enqueueRiverPlatformJob(t *testing.T, ctx context.Context, store *entities.Store, key string) (int64, contract.OperationID) {
 	t.Helper()
-	op := insertDefinitionOperation(t, store, "platform.deploy", "env/river/staging", key, json.RawMessage(`{}`))
+	op := insertRiverOperation(t, ctx, store, "platform.deploy", "env/river/staging", key)
 	var jobID int64
 	if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
 		var err error
@@ -58,6 +87,13 @@ func TestIntegrationEntitiesRiverMetadata(t *testing.T) {
 	}
 
 	const lastClient = "host:client"
+	firstOp := checkRiverRunningDiscard(t, ctx, pool, store, lastClient)
+	checkRiverRequeueRescheduleSnooze(t, ctx, pool, store, lastClient)
+	checkRiverReconcileCandidates(t, ctx, store, firstOp)
+}
+
+func checkRiverRunningDiscard(t *testing.T, ctx context.Context, pool *pgxpool.Pool, store *entities.Store, lastClient string) contract.OperationID {
+	t.Helper()
 	firstJob, firstOp := enqueueRiverPlatformJob(t, ctx, store, "river-first")
 	markRiverRunning(t, ctx, pool, firstJob, 2, lastClient)
 	running, err := store.RiverJobs().ListRunningForQueue(ctx, jobargs.PlatformQueue)
@@ -90,7 +126,11 @@ func TestIntegrationEntitiesRiverMetadata(t *testing.T) {
 	if state, _, _ := store.RiverJobs().GetState(ctx, firstJob); state != "discarded" {
 		t.Fatalf("discarded state=%q", state)
 	}
+	return firstOp
+}
 
+func checkRiverRequeueRescheduleSnooze(t *testing.T, ctx context.Context, pool *pgxpool.Pool, store *entities.Store, lastClient string) {
+	t.Helper()
 	secondJob, _ := enqueueRiverPlatformJob(t, ctx, store, "river-second")
 	markRiverRunning(t, ctx, pool, secondJob, 1, lastClient)
 	if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
@@ -121,13 +161,7 @@ func TestIntegrationEntitiesRiverMetadata(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	var attempt, maxAttempts int
-	var state string
-	var scheduled time.Time
-	if err := pool.QueryRow(ctx, `SELECT state,attempt,max_attempts,scheduled_at FROM river_job WHERE id=$1`, thirdJob).
-		Scan(&state, &attempt, &maxAttempts, &scheduled); err != nil {
-		t.Fatal(err)
-	}
+	state, attempt, maxAttempts, scheduled := readRiverSchedule(t, ctx, pool, thirdJob)
 	if state != "scheduled" || attempt != 0 || maxAttempts < 2 || !scheduled.After(time.Now()) {
 		t.Fatalf("rescheduled state=%s attempt=%d max=%d scheduled=%v", state, attempt, maxAttempts, scheduled)
 	}
@@ -140,15 +174,26 @@ func TestIntegrationEntitiesRiverMetadata(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := pool.QueryRow(ctx, `SELECT state,attempt,max_attempts,scheduled_at FROM river_job WHERE id=$1`, thirdJob).
-		Scan(&state, &attempt, &maxAttempts, &scheduled); err != nil {
-		t.Fatal(err)
-	}
+	state, attempt, maxAttempts, scheduled = readRiverSchedule(t, ctx, pool, thirdJob)
 	if state != "scheduled" || attempt < 3 || maxAttempts < 4 || !scheduled.After(time.Now()) {
 		t.Fatalf("snoozed state=%s attempt=%d max=%d scheduled=%v", state, attempt, maxAttempts, scheduled)
 	}
+}
 
-	// The reconcile join sees the operation whose job was discarded.
+func readRiverSchedule(t *testing.T, ctx context.Context, pool *pgxpool.Pool, jobID int64) (string, int, int, time.Time) {
+	t.Helper()
+	var attempt, maxAttempts int
+	var state string
+	var scheduled time.Time
+	if err := pool.QueryRow(ctx, `SELECT state,attempt,max_attempts,scheduled_at FROM river_job WHERE id=$1`, jobID).
+		Scan(&state, &attempt, &maxAttempts, &scheduled); err != nil {
+		t.Fatal(err)
+	}
+	return state, attempt, maxAttempts, scheduled
+}
+
+func checkRiverReconcileCandidates(t *testing.T, ctx context.Context, store *entities.Store, firstOp contract.OperationID) {
+	t.Helper()
 	candidates, err := store.RiverJobs().ListReconcileCandidateOperations(ctx, 100)
 	if err != nil {
 		t.Fatal(err)

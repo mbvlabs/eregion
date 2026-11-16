@@ -154,22 +154,8 @@ func (s *Store) SetProviderCredential(ctx context.Context, tx ProviderTx, scope 
 	ciphertextHash := CiphertextSHA256(ciphertext)
 	revisionHash := ProviderRevisionHash(scope, revision, keyID, ciphertext)
 
-	if create {
-		inserted, err := tx.InsertProviderCredential(ctx, ProviderCredentialInput{Scope: scope, ZoneName: zoneName, Actor: actor})
-		if err != nil {
-			return ProviderMetadata{}, providerStorageError(err)
-		}
-		if !inserted {
-			return ProviderMetadata{}, providerUniqueConflict(scope)
-		}
-	} else {
-		updated, err := tx.UpdateProviderCredentialRevision(ctx, scope, expectedRevision, revision, actor)
-		if err != nil {
-			return ProviderMetadata{}, providerStorageError(err)
-		}
-		if !updated {
-			return ProviderMetadata{}, providerRevisionConflict(scope, expectedRevision, state.LatestRevision)
-		}
+	if err := applyProviderRevision(ctx, tx, scope, zoneName, revision, expectedRevision, state.LatestRevision, create, actor); err != nil {
+		return ProviderMetadata{}, err
 	}
 	inserted, err := tx.InsertProviderCredentialRevision(ctx, ProviderRevisionInput{
 		Scope: scope, Revision: revision, KeyID: keyID, Ciphertext: ciphertext,
@@ -189,6 +175,29 @@ func (s *Store) SetProviderCredential(ctx context.Context, tx ProviderTx, scope 
 		return ProviderMetadata{}, providerNotFound(scope)
 	}
 	return metadata, nil
+}
+
+// applyProviderRevision writes the provider pointer for one already-sealed
+// revision: first state for a new scope, or the locked CAS update.
+func applyProviderRevision(ctx context.Context, tx ProviderTx, scope ProviderScope, zoneName string, revision, expectedRevision, latest uint64, create bool, actor contract.Actor) error {
+	if !create {
+		updated, err := tx.UpdateProviderCredentialRevision(ctx, scope, expectedRevision, revision, actor)
+		if err != nil {
+			return providerStorageError(err)
+		}
+		if !updated {
+			return providerRevisionConflict(scope, expectedRevision, latest)
+		}
+		return nil
+	}
+	inserted, err := tx.InsertProviderCredential(ctx, ProviderCredentialInput{Scope: scope, ZoneName: zoneName, Actor: actor})
+	if err != nil {
+		return providerStorageError(err)
+	}
+	if !inserted {
+		return providerUniqueConflict(scope)
+	}
+	return nil
 }
 
 // GetProviderCredential reads secret-free provider metadata.
@@ -323,13 +332,13 @@ func decryptProviderRow(ring *KeyRing, scope ProviderScope, row *providerEncrypt
 	return plaintext, nil
 }
 
-func providerNotFound(scope ProviderScope) *contract.Fault {
+func providerNotFound(scope ProviderScope) *contract.FaultError {
 	fault := contract.NewFault(contract.NotFound, "provider credential was not found", "Configure it with eregion dns configure --provider cloudflare, then retry.")
 	fault.Details = map[string]any{"provider": scope.Provider, "zone_id": scope.ZoneID}
 	return fault
 }
 
-func providerRevisionConflict(scope ProviderScope, expected, current uint64) *contract.Fault {
+func providerRevisionConflict(scope ProviderScope, expected, current uint64) *contract.FaultError {
 	fault := contract.NewFault(contract.Conflict, "provider credential revision does not match", "Re-read the provider credential status and retry with its latest revision; the existing credential was not changed.")
 	fault.Details = map[string]any{
 		"provider": scope.Provider, "zone_id": scope.ZoneID,
@@ -338,18 +347,18 @@ func providerRevisionConflict(scope ProviderScope, expected, current uint64) *co
 	return fault
 }
 
-func providerUniqueConflict(scope ProviderScope) *contract.Fault {
+func providerUniqueConflict(scope ProviderScope) *contract.FaultError {
 	fault := contract.NewFault(contract.Conflict, "provider zone is already configured", "Read the provider credential status; a zone ID and zone name are both configured once.")
 	fault.Details = map[string]any{"provider": scope.Provider, "zone_id": scope.ZoneID}
 	return fault
 }
 
-func providerStorageNotConfigured() *contract.Fault {
+func providerStorageNotConfigured() *contract.FaultError {
 	return contract.NewFault(contract.Internal, "provider credential storage is not configured", "Construct the vault from the typed entities store before using provider credentials.")
 }
 
 func providerStorageError(err error) error {
-	var fault *contract.Fault
+	var fault *contract.FaultError
 	if errors.As(err, &fault) {
 		return fault
 	}

@@ -36,184 +36,270 @@ func (s *Service) Diagnose(ctx context.Context, authority operations.Authority, 
 	if after > op.LastSequence {
 		return report, contract.NewFault(contract.PreconditionFailed, "event cursor is ahead of the operation", "Use a cursor returned by this operation.")
 	}
-	build, found, err := s.buildByOperation(ctx, id)
+	build, buildFound, err := s.diagnoseBuild(ctx, id, &report)
 	if err != nil {
 		return report, err
+	}
+	dep, depFound, err := s.diagnoseDeployment(ctx, id, &report)
+	if err != nil {
+		return report, err
+	}
+	releaseID, err := s.diagnoseReleaseID(ctx, id, build, buildFound, dep, depFound)
+	if err != nil {
+		return report, err
+	}
+	observedImage, err := s.diagnoseReleaseArtifact(ctx, releaseID, &report)
+	if err != nil {
+		return report, err
+	}
+	s.diagnoseBuildRevisionFallback(ctx, build, buildFound, &report)
+	historical, appName, envName := s.diagnoseHistoricalRevision(ctx, build, buildFound, dep, depFound, &report)
+	s.diagnoseCurrentRevision(ctx, appName, envName, &report)
+	runtimeID := s.diagnoseImageObservation(ctx, observedImage, historical, localNode, &report)
+	s.diagnoseLiveCandidate(ctx, dep, historical, localNode, runtimeID, &report)
+	// Capture may append events after terminalization, so the last event is not
+	// necessarily the terminal state. Read the most recent failed state within
+	// the same immutable snapshot and current attempt independently of paging.
+	if err := s.diagnoseFailureState(ctx, id, op, &report); err != nil {
+		return report, err
+	}
+	if err := s.diagnoseEvents(ctx, authority, op, limit, &report); err != nil {
+		return report, err
+	}
+	if err := ctx.Err(); err != nil {
+		return report, err
+	}
+	report.Unavailable = append(report.Unavailable, "child stderr is available only if forwarded to Docker")
+	return report, nil
+}
+
+func (s *Service) diagnoseBuild(ctx context.Context, id contract.OperationID, report *platform.Diagnosis) (platform.BuildRecord, bool, error) {
+	build, found, err := s.buildByOperation(ctx, id)
+	if err != nil {
+		return build, false, err
 	}
 	if found {
 		report.Build = diagnosisBuild(build)
 	} else {
 		report.Unavailable = append(report.Unavailable, "build: no build is recorded for this operation")
 	}
-	dep, depFound, err := s.entities.Platform().Deployments().GetByOperation(ctx, id)
+	return build, found, nil
+}
+
+func (s *Service) diagnoseDeployment(ctx context.Context, id contract.OperationID, report *platform.Diagnosis) (platform.Deployment, bool, error) {
+	dep, found, err := s.entities.Platform().Deployments().GetByOperation(ctx, id)
 	if err != nil {
-		return report, unavailable(err)
+		return dep, false, unavailable(err)
 	}
-	var releaseID platform.ReleaseID
-	if depFound {
+	if found {
 		report.Deployment = &platform.DiagnosisDeployment{ID: dep.ID, ReleaseID: dep.ReleaseID, RevisionID: dep.RevisionID, State: dep.State}
-		releaseID = dep.ReleaseID
 	} else {
 		report.Unavailable = append(report.Unavailable, "deployment: no deployment is recorded for this operation")
 	}
-	if found && build.ReleaseID != "" {
+	return dep, found, nil
+}
+
+func (s *Service) diagnoseReleaseArtifact(ctx context.Context, releaseID platform.ReleaseID, report *platform.Diagnosis) (string, error) {
+	if releaseID == "" {
+		report.Unavailable = append(report.Unavailable, "release: no artifact relationship is recorded")
+		return "", nil
+	}
+	return s.diagnoseRelease(ctx, releaseID, report)
+}
+
+func (s *Service) diagnoseLiveCandidate(ctx context.Context, dep platform.Deployment, historical *platform.EnvironmentRevision, localNode, runtimeID string, report *platform.Diagnosis) {
+	if report.Deployment == nil {
+		report.Unavailable = append(report.Unavailable, "live candidate: no deployment recorded")
+		return
+	}
+	live, reason := s.diagnosisCandidate(ctx, dep, historical, localNode, runtimeID)
+	report.LiveCandidate = live
+	if reason != "" {
+		report.Unavailable = append(report.Unavailable, "live candidate: "+reason)
+	}
+}
+
+func (s *Service) diagnoseReleaseID(ctx context.Context, id contract.OperationID, build platform.BuildRecord, buildFound bool, dep platform.Deployment, depFound bool) (platform.ReleaseID, error) {
+	var releaseID platform.ReleaseID
+	if depFound {
+		releaseID = dep.ReleaseID
+	}
+	if buildFound && build.ReleaseID != "" {
 		if releaseID != "" && releaseID != build.ReleaseID {
-			return report, contract.NewFault(contract.PreconditionFailed, "operation artifact relationships disagree", "Inspect operation inventory before proceeding.")
+			return "", contract.NewFault(contract.PreconditionFailed, "operation artifact relationships disagree", "Inspect operation inventory before proceeding.")
 		}
 		releaseID = build.ReleaseID
 	}
-	if releaseID == "" {
-		release, ok, e := s.entities.Platform().Releases().GetByOperation(ctx, id)
-		if e != nil {
-			return report, unavailable(e)
-		}
-		if ok {
-			releaseID = release.ID
-		}
-	}
-	var observedImage, runtimeID string
 	if releaseID != "" {
-		release, e := s.releaseByID(ctx, releaseID)
-		if e != nil {
-			return report, e
-		}
-		observedImage = release.Image
-		r := &platform.DiagnosisRelease{ID: release.ID, BuildID: release.BuildID, CommitSHA: release.CommitSHA, Status: release.Status, Pruned: release.PrunedAt != nil}
-		if diagnosticImageID.MatchString(release.ImageID) {
-			// The recorded image_id is the authenticated immutable config
-			// identity. The local Docker runtime ID is observed separately
-			// below and must never replace this field.
-			r.ImageID = release.ImageID
-		}
-		if parsed, parseErr := platform.ParseFullyQualifiedImage(release.Image); parseErr == nil && parsed.Digest != "" {
-			r.ImageDigest = parsed.Digest
-		} else if diagnosticDigest.MatchString(release.Image) {
-			r.ImageDigest = release.Image
-		} else {
-			report.Unavailable = append(report.Unavailable, "image digest: exact image reference not recorded")
-		}
-		report.Release = r
-		if release.Build != nil {
-			b := release.Build
-			settings := diagnosisBuildSettings(b.Builder, release.Source.Path, b.Env, b.GoTargets, b.Buildpacks)
-			report.RecordedBuild = &settings
-		} else {
-			report.Unavailable = append(report.Unavailable, "release build settings: no build snapshot recorded")
-		}
-		if release.BuildID != "" {
-			linked, e := s.buildByID(ctx, release.BuildID)
-			if e != nil {
-				report.Unavailable = append(report.Unavailable, "release source build: referenced build unavailable")
-			} else {
-				report.SourceBuild = diagnosisBuild(linked)
-				if linked.RevisionID != "" {
-					br, e := s.revisionByID(ctx, linked.RevisionID)
-					if e == nil && br.App == linked.App && br.Environment == linked.Environment {
-						projected := diagnosisRevision(br)
-						report.BuildRevision = &projected
-					} else {
-						report.Unavailable = append(report.Unavailable, "build revision: recorded source revision unavailable or inconsistent")
-					}
-				} else {
-					report.Unavailable = append(report.Unavailable, "build revision: build did not record a revision")
-				}
-			}
-		}
+		return releaseID, nil
+	}
+	release, ok, err := s.entities.Platform().Releases().GetByOperation(ctx, id)
+	if err != nil {
+		return "", unavailable(err)
+	}
+	if ok {
+		releaseID = release.ID
+	}
+	return releaseID, nil
+}
+
+func (s *Service) diagnoseRelease(ctx context.Context, releaseID platform.ReleaseID, report *platform.Diagnosis) (string, error) {
+	release, err := s.releaseByID(ctx, releaseID)
+	if err != nil {
+		return "", err
+	}
+	r := &platform.DiagnosisRelease{ID: release.ID, BuildID: release.BuildID, CommitSHA: release.CommitSHA, Status: release.Status, Pruned: release.PrunedAt != nil}
+	if diagnosticImageID.MatchString(release.ImageID) {
+		// The recorded image_id is the authenticated immutable config
+		// identity. The local Docker runtime ID is observed separately
+		// below and must never replace this field.
+		r.ImageID = release.ImageID
+	}
+	if parsed, parseErr := platform.ParseFullyQualifiedImage(release.Image); parseErr == nil && parsed.Digest != "" {
+		r.ImageDigest = parsed.Digest
+	} else if diagnosticDigest.MatchString(release.Image) {
+		r.ImageDigest = release.Image
 	} else {
-		report.Unavailable = append(report.Unavailable, "release: no artifact relationship is recorded")
+		report.Unavailable = append(report.Unavailable, "image digest: exact image reference not recorded")
 	}
-	if report.BuildRevision == nil && found && build.RevisionID != "" {
-		br, e := s.revisionByID(ctx, build.RevisionID)
-		if e == nil && br.App == build.App && br.Environment == build.Environment {
-			projected := diagnosisRevision(br)
-			report.BuildRevision = &projected
-		} else {
-			report.Unavailable = append(report.Unavailable, "build revision: recorded revision unavailable or inconsistent")
-		}
+	report.Release = r
+	if release.Build != nil {
+		b := release.Build
+		settings := diagnosisBuildSettings(b.Builder, release.Source.Path, b.Env, b.GoTargets, b.Buildpacks)
+		report.RecordedBuild = &settings
+	} else {
+		report.Unavailable = append(report.Unavailable, "release build settings: no build snapshot recorded")
 	}
+	if release.BuildID != "" {
+		s.diagnoseSourceBuild(ctx, release.BuildID, report)
+	}
+	return release.Image, nil
+}
+
+func (s *Service) diagnoseSourceBuild(ctx context.Context, buildID platform.BuildID, report *platform.Diagnosis) {
+	linked, err := s.buildByID(ctx, buildID)
+	if err != nil {
+		report.Unavailable = append(report.Unavailable, "release source build: referenced build unavailable")
+		return
+	}
+	report.SourceBuild = diagnosisBuild(linked)
+	if linked.RevisionID == "" {
+		report.Unavailable = append(report.Unavailable, "build revision: build did not record a revision")
+		return
+	}
+	br, err := s.revisionByID(ctx, linked.RevisionID)
+	if err != nil || br.App != linked.App || br.Environment != linked.Environment {
+		report.Unavailable = append(report.Unavailable, "build revision: recorded source revision unavailable or inconsistent")
+		return
+	}
+	projected := diagnosisRevision(br)
+	report.BuildRevision = &projected
+}
+
+func (s *Service) diagnoseBuildRevisionFallback(ctx context.Context, build platform.BuildRecord, buildFound bool, report *platform.Diagnosis) {
+	if report.BuildRevision != nil || !buildFound || build.RevisionID == "" {
+		return
+	}
+	br, err := s.revisionByID(ctx, build.RevisionID)
+	if err != nil || br.App != build.App || br.Environment != build.Environment {
+		report.Unavailable = append(report.Unavailable, "build revision: recorded revision unavailable or inconsistent")
+		return
+	}
+	projected := diagnosisRevision(br)
+	report.BuildRevision = &projected
+}
+
+func (s *Service) diagnoseHistoricalRevision(ctx context.Context, build platform.BuildRecord, buildFound bool, dep platform.Deployment, depFound bool, report *platform.Diagnosis) (*platform.EnvironmentRevision, string, string) {
 	var revisionID platform.RevisionID
 	var appName, envName string
-	if found {
+	if buildFound {
 		revisionID, appName, envName = build.RevisionID, build.App, build.Environment
 	}
-	if report.Deployment != nil {
+	if depFound {
 		revisionID, appName, envName = dep.RevisionID, dep.App, dep.Environment
 	}
-	var historical *platform.EnvironmentRevision
-	if revisionID != "" {
-		r, e := s.revisionByID(ctx, revisionID)
-		if e == nil && r.App == appName && r.Environment == envName {
-			historical = &r
-			projected := diagnosisRevision(r)
-			report.Historical = &projected
-		} else {
-			report.Unavailable = append(report.Unavailable, "historical revision: recorded revision is unavailable or inconsistent")
-		}
-	} else {
+	if revisionID == "" {
 		report.Unavailable = append(report.Unavailable, "historical revision: operation did not record a revision")
+		return nil, appName, envName
 	}
-	if appName != "" {
-		env, e := s.environment(ctx, appName, envName)
-		if e == nil && env.Revision != nil {
-			projected := diagnosisRevision(*env.Revision)
-			report.Current = &projected
-		} else {
-			report.Unavailable = append(report.Unavailable, "current desired revision: environment or revision unavailable")
-		}
+	r, err := s.revisionByID(ctx, revisionID)
+	if err != nil || r.App != appName || r.Environment != envName {
+		report.Unavailable = append(report.Unavailable, "historical revision: recorded revision is unavailable or inconsistent")
+		return nil, appName, envName
 	}
+	projected := diagnosisRevision(r)
+	report.Historical = &projected
+	return &r, appName, envName
+}
+
+func (s *Service) diagnoseCurrentRevision(ctx context.Context, appName, envName string, report *platform.Diagnosis) {
+	if appName == "" {
+		return
+	}
+	env, err := s.environment(ctx, appName, envName)
+	if err != nil || env.Revision == nil {
+		report.Unavailable = append(report.Unavailable, "current desired revision: environment or revision unavailable")
+		return
+	}
+	projected := diagnosisRevision(*env.Revision)
+	report.Current = &projected
+}
+
+func (s *Service) diagnoseImageObservation(ctx context.Context, observedImage string, historical *platform.EnvironmentRevision, localNode string, report *platform.Diagnosis) string {
 	if report.Release == nil || report.Release.ImageDigest == "" {
 		report.Unavailable = append(report.Unavailable, "image observation: canonical image reference not recorded")
-	} else if report.Deployment == nil || historical == nil || historical.Runtime.Node == "" || localNode == "" {
+		return ""
+	}
+	if report.Deployment == nil || historical == nil || historical.Runtime.Node == "" || localNode == "" {
 		report.Unavailable = append(report.Unavailable, "image observation: historical node placement is unknown")
-	} else if historical.Runtime.Node != localNode {
+		return ""
+	}
+	if historical.Runtime.Node != localNode {
 		report.Unavailable = append(report.Unavailable, "image observation: historical placement is another node; remote observation unsupported")
-	} else {
-		// Resolve the canonical manifest to the Docker runtime image ID before
-		// observing labels or comparing candidate container .Image values.
-		resolveRuntimeID := platform.ResolveDiagnosisImageID
-		if s.diagnosisImageResolver != nil {
-			resolveRuntimeID = s.diagnosisImageResolver
-		}
-		observeImage := platform.ObserveDiagnosisImage
-		if s.diagnosisImageObserver != nil {
-			observeImage = s.diagnosisImageObserver
-		}
-		resolvedID, reason := resolveRuntimeID(ctx, observedImage)
-		runtimeID = resolvedID
-		if reason != "" {
-			report.Unavailable = append(report.Unavailable, "image observation: "+reason)
-		} else {
-			image, reason := observeImage(ctx, runtimeID)
-			report.Image = image
-			if reason != "" {
-				report.Unavailable = append(report.Unavailable, "image observation: "+reason)
-			}
-		}
+		return ""
 	}
-	if report.Deployment != nil {
-		live, reason := s.diagnosisCandidate(ctx, dep, historical, localNode, runtimeID)
-		report.LiveCandidate = live
-		if reason != "" {
-			report.Unavailable = append(report.Unavailable, "live candidate: "+reason)
-		}
-	} else {
-		report.Unavailable = append(report.Unavailable, "live candidate: no deployment recorded")
+	// Resolve the canonical manifest to the Docker runtime image ID before
+	// observing labels or comparing candidate container .Image values.
+	resolveRuntimeID := platform.ResolveDiagnosisImageID
+	if s.diagnosisImageResolver != nil {
+		resolveRuntimeID = s.diagnosisImageResolver
 	}
-	// Capture may append events after terminalization, so the last event is not
-	// necessarily the terminal state. Read the most recent failed state within
-	// the same immutable snapshot and current attempt independently of paging.
-	if op.State == contract.Failed && op.LastSequence > 0 {
-		event, found, e := s.entities.Operations().FailedStateEvent(ctx, id, op.LastSequence, op.Attempt)
-		if e != nil {
-			return report, unavailable(e)
-		}
-		if found && event.Validate() == nil && event.OperationID == id && event.Attempt == op.Attempt && event.State == contract.Failed {
-			report.Failure = &platform.DiagnosisFailure{Message: event.Message, Stage: event.Stage, Code: event.ErrorCode}
-			if event.Stage != "" {
-				report.Failure.StageSource = "failed state event"
-			}
-		}
+	observeImage := platform.ObserveDiagnosisImage
+	if s.diagnosisImageObserver != nil {
+		observeImage = s.diagnosisImageObserver
 	}
+	resolvedID, reason := resolveRuntimeID(ctx, observedImage)
+	if reason != "" {
+		report.Unavailable = append(report.Unavailable, "image observation: "+reason)
+		return resolvedID
+	}
+	image, reason := observeImage(ctx, resolvedID)
+	report.Image = image
+	if reason != "" {
+		report.Unavailable = append(report.Unavailable, "image observation: "+reason)
+	}
+	return resolvedID
+}
+
+func (s *Service) diagnoseFailureState(ctx context.Context, id contract.OperationID, op contract.Operation, report *platform.Diagnosis) error {
+	if op.State != contract.Failed || op.LastSequence == 0 {
+		return nil
+	}
+	event, found, err := s.entities.Operations().FailedStateEvent(ctx, id, op.LastSequence, op.Attempt)
+	if err != nil {
+		return unavailable(err)
+	}
+	if !found || event.Validate() != nil || event.OperationID != id || event.Attempt != op.Attempt || event.State != contract.Failed {
+		return nil
+	}
+	report.Failure = &platform.DiagnosisFailure{Message: event.Message, Stage: event.Stage, Code: event.ErrorCode}
+	if event.Stage != "" {
+		report.Failure.StageSource = "failed state event"
+	}
+	return nil
+}
+
+func (s *Service) diagnoseEvents(ctx context.Context, authority operations.Authority, op contract.Operation, limit int, report *platform.Diagnosis) error {
 	bytes := 0
 	capturedSeen := false
 	for len(report.Events) < limit && report.Cursor.After < op.LastSequence {
@@ -221,65 +307,19 @@ func (s *Service) Diagnose(ctx context.Context, authority operations.Authority, 
 		if batch > 200 {
 			batch = 200
 		}
-		page, e := s.Events(ctx, authority, report.Cursor, batch)
-		if e != nil {
-			if ctx.Err() != nil {
-				return report, ctx.Err()
-			}
-			report.Partial = true
-			report.HistoryUnavailable = true
-			report.Unavailable = append(report.Unavailable, "events: history unavailable or has a gap")
+		page, err := s.Events(ctx, authority, report.Cursor, batch)
+		stop, err := handleDiagnosisPage(ctx, report, page, err)
+		if err != nil {
+			return err
+		}
+		if stop {
 			break
 		}
-		if len(page.Events) == 0 || page.Cursor.After <= report.Cursor.After {
-			report.Partial = true
-			report.HistoryUnavailable = true
-			report.Unavailable = append(report.Unavailable, "events: history ended before snapshot cursor")
-			break
+		captured, err := appendDiagnosisPage(report, page, op, &bytes)
+		if err != nil {
+			return err
 		}
-		for _, event := range page.Events {
-			if event.Sequence > op.LastSequence {
-				break
-			}
-			raw, e := json.Marshal(event)
-			if e != nil {
-				return report, e
-			}
-			if bytes+len(raw) > 2*1024*1024 {
-				report.Partial = true
-				break
-			}
-			bytes += len(raw)
-			report.Events = append(report.Events, event)
-			report.Cursor.After = event.Sequence
-			if event.Stage == platform.CandidateDiagnosticStage && event.CandidateDiagnostic != nil {
-				capturedSeen = true
-			}
-			if event.Attempt == op.Attempt && event.Kind == "warning" && event.Stage != "" && strings.HasPrefix(event.Message, "Node step failed: ") {
-				if report.Failure == nil {
-					report.Failure = &platform.DiagnosisFailure{}
-				}
-				if report.Failure.Stage == "" || report.Failure.StageSource != "failed state event" {
-					report.Failure.Stage = event.Stage
-					report.Failure.StageSource = "observed failed node step; not necessarily terminal cause"
-				}
-				report.Failure.StepMessage = event.Message
-			}
-			if event.Kind == "state" && event.State == contract.Failed {
-				if event.Attempt != op.Attempt {
-					continue
-				}
-				if report.Failure == nil {
-					report.Failure = &platform.DiagnosisFailure{}
-				}
-				report.Failure.Message = event.Message
-				report.Failure.Code = event.ErrorCode
-				if event.Stage != "" {
-					report.Failure.Stage = event.Stage
-					report.Failure.StageSource = "failed state event"
-				}
-			}
-		}
+		capturedSeen = capturedSeen || captured
 		if report.Partial {
 			break
 		}
@@ -294,11 +334,76 @@ func (s *Service) Diagnose(ctx context.Context, authority operations.Authority, 
 	if !capturedSeen {
 		report.Unavailable = append(report.Unavailable, "captured candidate diagnostics: no capture evidence in this event page")
 	}
-	if err := ctx.Err(); err != nil {
-		return report, err
+	return nil
+}
+
+func handleDiagnosisPage(ctx context.Context, report *platform.Diagnosis, page operations.EventPage, pageErr error) (bool, error) {
+	if pageErr != nil {
+		if ctx.Err() != nil {
+			return true, ctx.Err()
+		}
+		report.Partial = true
+		report.HistoryUnavailable = true
+		report.Unavailable = append(report.Unavailable, "events: history unavailable or has a gap")
+		return true, nil
 	}
-	report.Unavailable = append(report.Unavailable, "child stderr is available only if forwarded to Docker")
-	return report, nil
+	if len(page.Events) == 0 || page.Cursor.After <= report.Cursor.After {
+		report.Partial = true
+		report.HistoryUnavailable = true
+		report.Unavailable = append(report.Unavailable, "events: history ended before snapshot cursor")
+		return true, nil
+	}
+	return false, nil
+}
+
+func appendDiagnosisPage(report *platform.Diagnosis, page operations.EventPage, op contract.Operation, bytes *int) (bool, error) {
+	capturedSeen := false
+	for _, event := range page.Events {
+		if event.Sequence > op.LastSequence {
+			break
+		}
+		raw, err := json.Marshal(event)
+		if err != nil {
+			return capturedSeen, err
+		}
+		if *bytes+len(raw) > 2*1024*1024 {
+			report.Partial = true
+			break
+		}
+		*bytes += len(raw)
+		report.Events = append(report.Events, event)
+		report.Cursor.After = event.Sequence
+		if event.Stage == platform.CandidateDiagnosticStage && event.CandidateDiagnostic != nil {
+			capturedSeen = true
+		}
+		observeDiagnosisFailure(report, op, event)
+	}
+	return capturedSeen, nil
+}
+
+func observeDiagnosisFailure(report *platform.Diagnosis, op contract.Operation, event contract.Event) {
+	if event.Attempt == op.Attempt && event.Kind == "warning" && event.Stage != "" && strings.HasPrefix(event.Message, "Node step failed: ") {
+		if report.Failure == nil {
+			report.Failure = &platform.DiagnosisFailure{}
+		}
+		if report.Failure.Stage == "" || report.Failure.StageSource != "failed state event" {
+			report.Failure.Stage = event.Stage
+			report.Failure.StageSource = "observed failed node step; not necessarily terminal cause"
+		}
+		report.Failure.StepMessage = event.Message
+	}
+	if event.Kind != "state" || event.State != contract.Failed || event.Attempt != op.Attempt {
+		return
+	}
+	if report.Failure == nil {
+		report.Failure = &platform.DiagnosisFailure{}
+	}
+	report.Failure.Message = event.Message
+	report.Failure.Code = event.ErrorCode
+	if event.Stage != "" {
+		report.Failure.Stage = event.Stage
+		report.Failure.StageSource = "failed state event"
+	}
 }
 
 func diagnosisBuild(b platform.BuildRecord) *platform.DiagnosisBuild {
@@ -325,25 +430,50 @@ func (s *Service) diagnosisCandidate(parent context.Context, dep platform.Deploy
 		return nil, "environment unavailable or deployment is serving"
 	}
 	env.Revision = revision
-	names := append([]string(nil), revision.SecretNames...)
-	metadataOnly := false
-	if len(dep.SecretRevisions) == 0 && len(env.SecretRefs) > 0 {
-		// Older snapshots without pins cannot prove whether legacy secret refs
-		// were used, even if today's refs differ.
-		metadataOnly = true
+	values, metadataOnly := s.candidateSecretValues(ctx, dep, env, revision)
+	registry := &secrets.Registry{}
+	for _, value := range values {
+		registry.Add(value)
 	}
+	payload, truncated, ok := candidateDiagnosticPayload(ctx, dep, revision, metadataOnly)
+	if !ok {
+		return nil, "candidate formation unavailable"
+	}
+	result, err := platform.ObserveCandidateDiagnostics(ctx, payload, imageID, engine.Runtime{Secrets: registry, SecretValues: values})
+	if err != nil {
+		return nil, "candidate observation failed"
+	}
+	result.Truncated = result.Truncated || truncated
+	if metadataOnly {
+		return &result, "pinned secret redaction context unavailable or incomplete; logs withheld"
+	}
+	if result.ImageMismatch {
+		return &result, "candidate image identity missing or differs from the recorded release; affected logs withheld"
+	}
+	if result.Unavailable {
+		return &result, "some candidate evidence was unavailable or logs were withheld"
+	}
+	return &result, ""
+}
+
+func (s *Service) candidateSecretValues(ctx context.Context, dep platform.Deployment, env platform.Environment, revision *platform.EnvironmentRevision) (map[string]string, bool) {
+	names := append([]string(nil), revision.SecretNames...)
+	// Older snapshots without pins cannot prove whether legacy secret refs
+	// were used, even if today's refs differ.
+	metadataOnly := len(dep.SecretRevisions) == 0 && len(env.SecretRefs) > 0
 	for _, name := range names {
 		if _, ok := dep.SecretRevisions[name]; !ok {
 			metadataOnly = true
 		}
 	}
-	worker := &platformWorker{service: s}
 	values := map[string]string{}
 	if !metadataOnly {
 		// Never resolve today's names when no secret was pinned to the action.
 		// The current environment can have unrelated later secret references.
 		env.SecretRefs = nil
+		worker := &platformWorker{service: s}
 		var key, credential string
+		var err error
 		values, key, credential, _, err = worker.resolveDeploymentSecrets(ctx, env, dep)
 		if err != nil {
 			metadataOnly = true
@@ -362,13 +492,13 @@ func (s *Service) diagnosisCandidate(parent context.Context, dep platform.Deploy
 			metadataOnly = true
 		}
 	}
-	registry := &secrets.Registry{}
-	for _, value := range values {
-		registry.Add(value)
-	}
+	return values, metadataOnly
+}
+
+func candidateDiagnosticPayload(ctx context.Context, dep platform.Deployment, revision *platform.EnvironmentRevision, metadataOnly bool) (platform.CandidateDiagnosticPayload, bool, bool) {
 	plan, err := platform.PlanDeployment(dep.App, dep.Environment, revision.RevisionState, dep.ReleaseID, dep.ID)
 	if err != nil || len(plan) == 0 {
-		return nil, "candidate formation unavailable"
+		return platform.CandidateDiagnosticPayload{}, false, false
 	}
 	truncated := len(plan) > 64
 	if truncated {
@@ -379,21 +509,7 @@ func (s *Service) diagnosisCandidate(parent context.Context, dep platform.Deploy
 	for _, p := range plan {
 		payload.Containers = append(payload.Containers, platform.CandidateDiagnosticContainer{Name: p.Name, Process: p.Process.Name, Kind: p.Process.Kind, Replica: p.Replica})
 	}
-	result, err := platform.ObserveCandidateDiagnostics(ctx, payload, imageID, engine.Runtime{Secrets: registry, SecretValues: values})
-	if err != nil {
-		return nil, "candidate observation failed"
-	}
-	result.Truncated = result.Truncated || truncated
-	if metadataOnly {
-		return &result, "pinned secret redaction context unavailable or incomplete; logs withheld"
-	}
-	if result.ImageMismatch {
-		return &result, "candidate image identity missing or differs from the recorded release; affected logs withheld"
-	}
-	if result.Unavailable {
-		return &result, "some candidate evidence was unavailable or logs were withheld"
-	}
-	return &result, ""
+	return payload, truncated, true
 }
 
 func diagnosisRevision(r platform.EnvironmentRevision) platform.DiagnosisRevision {

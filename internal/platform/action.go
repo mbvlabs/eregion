@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"sync"
 
@@ -304,8 +303,4 @@ func sortedEnvKeys(values map[string]string) []string {
 
 func invalid(field, hint string) error {
 	return contract.NewFault(contract.ValidationFailed, "invalid "+field, hint)
-}
-
-func describeErr(kind string, err error) string {
-	return fmt.Sprintf("%s: %v", kind, err)
 }

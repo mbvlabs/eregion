@@ -3,7 +3,6 @@ package controlplane
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net"
 	"runtime"
 	"strings"
@@ -117,50 +116,9 @@ func (s *Service) resolveSubmissionArtifact(ctx context.Context, normalized plat
 // fully qualified reference uses HTTPS with anonymous bearer-token auth when
 // the registry asks for it.
 func (s *Service) resolveRemoteArtifact(ctx context.Context, request artifactRequest) (resolvedArtifact, error) {
-	registry := ""
-	repository := request.Repository
-	reference := ""
-	private := false
-	switch request.Kind {
-	case "image-tag":
-		registry = platform.CanonicalRegistryAddress(request.Registry)
-		reference = strings.TrimSpace(request.Tag)
-		if registry == "" {
-			return resolvedArtifact{}, contract.NewFault(contract.PreconditionFailed, "the node has no configured private registry endpoint", "Start the worker with its managed loopback registry endpoint before deploying a private artifact.")
-		}
-		private = true
-	case "image-digest":
-		registry = platform.CanonicalRegistryAddress(request.Registry)
-		reference = strings.ToLower(strings.TrimSpace(request.Digest))
-		if registry == "" {
-			return resolvedArtifact{}, contract.NewFault(contract.PreconditionFailed, "the node has no configured private registry endpoint", "Start the worker with its managed loopback registry endpoint before deploying a private artifact.")
-		}
-		private = true
-	case "image":
-		parsed, err := platform.ParseFullyQualifiedImage(request.Image)
-		if err != nil {
-			return resolvedArtifact{}, err
-		}
-		registry = platform.CanonicalRegistryAddress(parsed.Registry)
-		if parseErr := platform.ValidateImage(parsed.Original); parseErr != nil {
-			return resolvedArtifact{}, parseErr
-		}
-		if canonical := platform.CanonicalRegistryAddress(request.Registry); canonical != "" && canonical == registry {
-			if parsed.Repository != request.Repository {
-				return resolvedArtifact{}, contract.NewFault(contract.ValidationFailed,
-					"the image names another repository in this private registry",
-					"Use the app's repository "+request.Repository+", or select --image-tag/--image-digest.")
-			}
-			private = true
-		}
-		repository = parsed.Repository
-		if parsed.Digest != "" {
-			reference = parsed.Digest
-		} else {
-			reference = parsed.Tag
-		}
-	default:
-		return resolvedArtifact{}, contract.NewFault(contract.Internal, "unsupported artifact selector", "Report the command and binary version.")
+	registry, repository, reference, private, err := artifactSelector(request)
+	if err != nil {
+		return resolvedArtifact{}, err
 	}
 	if reference == "" {
 		return resolvedArtifact{}, contract.NewFault(contract.ValidationFailed, "artifact selector is empty", "Name a tag or digest explicitly; there is no implicit latest.")
@@ -199,6 +157,54 @@ func (s *Service) resolveRemoteArtifact(ctx context.Context, request artifactReq
 		Repository: repository, ManifestDigest: manifestDigest, ConfigDigest: configDigest,
 		CanonicalImage: canonical, Platform: platforms,
 	}, nil
+}
+
+// artifactSelector resolves the requested selector to its registry, repository
+// and immutable reference, and reports whether the private loopback path applies.
+func artifactSelector(request artifactRequest) (registry, repository, reference string, private bool, err error) {
+	repository = request.Repository
+	switch request.Kind {
+	case "image-tag":
+		registry = platform.CanonicalRegistryAddress(request.Registry)
+		reference = strings.TrimSpace(request.Tag)
+		if registry == "" {
+			return "", "", "", false, contract.NewFault(contract.PreconditionFailed, "the node has no configured private registry endpoint", "Start the worker with its managed loopback registry endpoint before deploying a private artifact.")
+		}
+		private = true
+	case "image-digest":
+		registry = platform.CanonicalRegistryAddress(request.Registry)
+		reference = strings.ToLower(strings.TrimSpace(request.Digest))
+		if registry == "" {
+			return "", "", "", false, contract.NewFault(contract.PreconditionFailed, "the node has no configured private registry endpoint", "Start the worker with its managed loopback registry endpoint before deploying a private artifact.")
+		}
+		private = true
+	case "image":
+		parsed, parseErr := platform.ParseFullyQualifiedImage(request.Image)
+		if parseErr != nil {
+			return "", "", "", false, parseErr
+		}
+		registry = platform.CanonicalRegistryAddress(parsed.Registry)
+		if parseErr := platform.ValidateImage(parsed.Original); parseErr != nil {
+			return "", "", "", false, parseErr
+		}
+		if canonical := platform.CanonicalRegistryAddress(request.Registry); canonical != "" && canonical == registry {
+			if parsed.Repository != request.Repository {
+				return "", "", "", false, contract.NewFault(contract.ValidationFailed,
+					"the image names another repository in this private registry",
+					"Use the app's repository "+request.Repository+", or select --image-tag/--image-digest.")
+			}
+			private = true
+		}
+		repository = parsed.Repository
+		if parsed.Digest != "" {
+			reference = parsed.Digest
+		} else {
+			reference = parsed.Tag
+		}
+	default:
+		return "", "", "", false, contract.NewFault(contract.Internal, "unsupported artifact selector", "Report the command and binary version.")
+	}
+	return registry, repository, reference, private, nil
 }
 
 func registryBase(registry string, private bool) (scheme, base string, err error) {
@@ -259,11 +265,4 @@ func (s *Service) createArtifactReleaseTx(ctx context.Context, tx *entities.Stor
 		return "", platformWriteError(err, "artifact release could not be recorded")
 	}
 	return releaseID, nil
-}
-
-func artifactSelectorLabel(artifact *resolvedArtifact) string {
-	if artifact == nil {
-		return ""
-	}
-	return fmt.Sprintf("%s %s resolved to %s (config %s)", artifact.Kind, artifact.Requested, artifact.CanonicalImage, artifact.ConfigDigest)
 }

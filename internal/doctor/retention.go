@@ -231,6 +231,8 @@ func retentionLastRun(facts Facts) []Result {
 		}
 		return one(Pass, "the retention run started at "+run.StartedAt.UTC().Format(time.RFC3339)+" is still running", "")
 	case retention.RunSucceeded, retention.RunSucceededWithSkips:
+	case retention.RunPending, retention.RunFailed, retention.RunCancelled:
+		fallthrough
 	default:
 		detail := fmt.Sprintf("the last retention run %s at %s", run.Status, finished.UTC().Format(time.RFC3339))
 		if run.Errors > 0 {
@@ -300,7 +302,7 @@ func buildpackCache(facts Facts) []Result {
 func workerActiveAge(ctx context.Context) (time.Duration, bool) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	command := exec.CommandContext(ctx, "systemctl", "show", "--property=ActiveEnterTimestampMonotonic", "--value", "eregion-worker.service") //nolint:gosec // G204: fixed unit name.
+	command := exec.CommandContext(ctx, "systemctl", "show", "--property=ActiveEnterTimestampMonotonic", "--value", "eregion-worker.service")
 	output, err := command.Output()
 	if err != nil {
 		return 0, false

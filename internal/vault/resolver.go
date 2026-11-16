@@ -70,34 +70,40 @@ func (r *EnvironmentResolver) ResolveEnvironmentSnapshot(ctx context.Context, ap
 	}
 	actor := contract.Actor{Kind: "system", Subject: "environment-secret-injection"}
 	if len(names) > 0 {
-		if len(names) > MaxSecretsPerEnvironment {
-			return nil, nil, contract.NewFault(contract.ValidationFailed, "too many secret names", "Name at most 128 secrets in one environment revision.")
+		return r.resolveNamedSnapshot(ctx, actor, app, environment, names)
+	}
+	return r.resolvePinnedSnapshot(ctx, actor, app, environment, refs)
+}
+
+func (r *EnvironmentResolver) resolveNamedSnapshot(ctx context.Context, actor contract.Actor, app, environment string, names []string) (map[string]string, map[string]RevisionRef, error) {
+	if len(names) > MaxSecretsPerEnvironment {
+		return nil, nil, contract.NewFault(contract.ValidationFailed, "too many secret names", "Name at most 128 secrets in one environment revision.")
+	}
+	pins := RevisionMap{}
+	for _, name := range names {
+		if err := ValidateName(name); err != nil {
+			return nil, nil, err
 		}
-		pins := RevisionMap{}
-		for _, name := range names {
-			if err := ValidateName(name); err != nil {
-				return nil, nil, err
-			}
-			metadata, err := r.service.Get(ctx, Namespace{App: app, Environment: environment, Name: name})
-			if err != nil {
-				return nil, nil, err
-			}
-			if metadata.State != StateActive {
-				return nil, nil, contract.NewFault(contract.PreconditionFailed, "an environment secret is archived", "Rotate or remove the archived secret name from the environment revision.")
-			}
-			pins[name] = metadata.LatestRevision
-		}
-		resolved, err := r.service.Resolve(ctx, actor, app, environment, pins)
+		metadata, err := r.service.Get(ctx, Namespace{App: app, Environment: environment, Name: name})
 		if err != nil {
 			return nil, nil, err
 		}
-		for _, value := range resolved.Values {
-			if strings.ContainsRune(value, '\x00') {
-				return nil, nil, contract.NewFault(contract.PreconditionFailed, "secret cannot be injected into a process environment", "Rotate the secret to a value without NUL bytes.")
-			}
+		if metadata.State != StateActive {
+			return nil, nil, contract.NewFault(contract.PreconditionFailed, "an environment secret is archived", "Rotate or remove the archived secret name from the environment revision.")
 		}
-		return resolved.Values, resolved.Revisions, nil
+		pins[name] = metadata.LatestRevision
 	}
+	resolved, err := r.service.Resolve(ctx, actor, app, environment, pins)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := validateInjectableValues(resolved.Values); err != nil {
+		return nil, nil, err
+	}
+	return resolved.Values, resolved.Revisions, nil
+}
+
+func (r *EnvironmentResolver) resolvePinnedSnapshot(ctx context.Context, actor contract.Actor, app, environment string, refs map[string]string) (map[string]string, map[string]RevisionRef, error) {
 	if len(refs) > 64 {
 		return nil, nil, contract.NewFault(contract.ValidationFailed, "too many secret references", "Pin at most 64 environment secrets.")
 	}
@@ -130,10 +136,26 @@ func (r *EnvironmentResolver) ResolveEnvironmentSnapshot(ctx context.Context, ap
 	values := make(map[string]string, len(keyNames))
 	for key, name := range keyNames {
 		value := resolved.Values[name]
-		if strings.ContainsRune(value, '\x00') {
-			return nil, nil, contract.NewFault(contract.PreconditionFailed, "secret cannot be injected into a process environment", "Rotate the secret to a value without NUL bytes.")
+		if err := validateInjectableValue(value); err != nil {
+			return nil, nil, err
 		}
 		values[key] = value
 	}
 	return values, resolved.Revisions, nil
+}
+
+func validateInjectableValues(values map[string]string) error {
+	for _, value := range values {
+		if err := validateInjectableValue(value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateInjectableValue(value string) error {
+	if strings.ContainsRune(value, '\x00') {
+		return contract.NewFault(contract.PreconditionFailed, "secret cannot be injected into a process environment", "Rotate the secret to a value without NUL bytes.")
+	}
+	return nil
 }

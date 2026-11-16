@@ -68,7 +68,7 @@ func ClassifyDatabaseFailure(dsn string, err error) DatabaseFailure {
 	// Keep deliberate contract faults (invalid TLS policy, unsupported
 	// PostgreSQL version, inconsistent schema) as their own safe message. They
 	// are not network failures and already never echo the DSN.
-	var fault *contract.Fault
+	var fault *contract.FaultError
 	if errors.As(err, &fault) && fault.Code != contract.Unavailable && fault.Code != contract.Internal {
 		failure.Detail = fault.Message
 		if fault.Hint != "" {
@@ -127,9 +127,9 @@ func ClassifyDatabaseFailure(dsn string, err error) DatabaseFailure {
 
 // ControlDatabaseFault is the classified unavailable fault shared by host
 // plan/apply and doctor/status observations.
-func ControlDatabaseFault(dsn string, cause error) *contract.Fault {
+func ControlDatabaseFault(dsn string, cause error) *contract.FaultError {
 	failure := ClassifyDatabaseFailure(dsn, cause)
-	return &contract.Fault{
+	return &contract.FaultError{
 		Code:    contract.Unavailable,
 		Message: failure.Summary(),
 		Hint:    failure.Fix,

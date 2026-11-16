@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/platform"
@@ -51,7 +52,30 @@ func TestIntegrationEntitiesDefinitionLockOrderConflict(t *testing.T) {
 		})
 	}()
 	<-ready
+	assertDefinitionParentLockBlocked(t, ctx, pool, parent)
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
 
+	// A fresh caller following parent -> run still succeeds after the holder
+	// commits; the test proves serialization at the first lock, not a universal
+	// reverse-order guarantee.
+	if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		if _, found, err := tx.Operations().Lock(ctx, parent); err != nil || !found {
+			return err
+		}
+		if _, found, err := tx.DefinitionRuns().Lock(ctx, parent); err != nil || !found {
+			return err
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertDefinitionParentLockBlocked(t *testing.T, ctx context.Context, pool *pgxpool.Pool, parent contract.OperationID) {
+	t.Helper()
 	blocked, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -73,24 +97,5 @@ func TestIntegrationEntitiesDefinitionLockOrderConflict(t *testing.T) {
 	}
 	if rollbackErr := blocked.Rollback(ctx); rollbackErr != nil {
 		t.Fatal(rollbackErr)
-	}
-	close(release)
-	if err := <-done; err != nil {
-		t.Fatal(err)
-	}
-
-	// A fresh caller following parent -> run still succeeds after the holder
-	// commits; the test proves serialization at the first lock, not a universal
-	// reverse-order guarantee.
-	if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
-		if _, found, err := tx.Operations().Lock(ctx, parent); err != nil || !found {
-			return err
-		}
-		if _, found, err := tx.DefinitionRuns().Lock(ctx, parent); err != nil || !found {
-			return err
-		}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/jobargs"
@@ -27,26 +28,7 @@ func TestIntegrationEntitiesAtomicOperationSecretRiverRollback(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	// Enqueue before initialization fails explicitly; there is no fallback
-	// client and no raw insert path.
-	uninitialized := mustOperationID(t)
-	if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
-		_, err := tx.Jobs().EnqueueDiagnostic(ctx, uninitialized)
-		return err
-	}); !errors.Is(err, entities.ErrJobRuntimeUninitialized) {
-		t.Fatalf("uninitialized enqueue error = %v", err)
-	}
-	var jobs int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM river_job`).Scan(&jobs); err != nil || jobs != 0 {
-		t.Fatalf("river jobs before initialization = %d err %v", jobs, err)
-	}
-
-	if _, err := store.NewJobRuntime(&river.Config{}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.NewJobRuntime(&river.Config{}); !errors.Is(err, entities.ErrJobRuntimeInitialized) {
-		t.Fatalf("second job runtime error = %v", err)
-	}
+	checkJobRuntimeStartup(t, ctx, pool, store)
 
 	id := mustOperationID(t)
 	key := entities.OperationKey{
@@ -62,12 +44,47 @@ func TestIntegrationEntitiesAtomicOperationSecretRiverRollback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	inputsHash := "atomic-hash"
-	jobID := int64(0)
+	jobID := seedAtomicOperationSecret(t, ctx, store, id, key, namespace, keyID, ciphertext)
+	checkCommittedAtomicOperation(t, ctx, pool, store, id, namespace, jobID)
+	checkRejectedAtomicOperation(t, ctx, pool, store, ring)
+}
 
+func checkJobRuntimeStartup(t *testing.T, ctx context.Context, pool *pgxpool.Pool, store *entities.Store) {
+	t.Helper()
+	uninitialized := mustOperationID(t)
+	if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		_, err := tx.Jobs().EnqueueDiagnostic(ctx, uninitialized)
+		return err
+	}); !errors.Is(err, entities.ErrJobRuntimeUninitialized) {
+		t.Fatalf("uninitialized enqueue error = %v", err)
+	}
+	var jobs int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM river_job`).Scan(&jobs); err != nil || jobs != 0 {
+		t.Fatalf("river jobs before initialization = %d err %v", jobs, err)
+	}
+	if _, err := store.NewJobRuntime(&river.Config{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.NewJobRuntime(&river.Config{}); !errors.Is(err, entities.ErrJobRuntimeInitialized) {
+		t.Fatalf("second job runtime error = %v", err)
+	}
+}
+
+func seedAtomicOperationSecret(
+	t *testing.T,
+	ctx context.Context,
+	store *entities.Store,
+	id contract.OperationID,
+	key entities.OperationKey,
+	namespace vault.Namespace,
+	keyID string,
+	ciphertext []byte,
+) int64 {
+	t.Helper()
+	var jobID int64
 	if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
 		inserted, err := tx.Operations().Insert(ctx, entities.OperationInsert{
-			ID: id, Key: key, InputHash: inputsHash,
+			ID: id, Key: key, InputHash: "atomic-hash",
 			Input: json.RawMessage(`{"app":"demo","environment":"staging"}`),
 		})
 		if err != nil || !inserted {
@@ -101,14 +118,15 @@ func TestIntegrationEntitiesAtomicOperationSecretRiverRollback(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if err := tx.Operations().SetJob(ctx, id, jobID); err != nil {
-			return err
-		}
-		return nil
+		return tx.Operations().SetJob(ctx, id, jobID)
 	}); err != nil {
 		t.Fatal(err)
 	}
+	return jobID
+}
 
+func checkCommittedAtomicOperation(t *testing.T, ctx context.Context, pool *pgxpool.Pool, store *entities.Store, id contract.OperationID, namespace vault.Namespace, jobID int64) {
+	t.Helper()
 	if jobID == 0 {
 		t.Fatalf("committed job has no identity")
 	}
@@ -130,8 +148,16 @@ func TestIntegrationEntitiesAtomicOperationSecretRiverRollback(t *testing.T) {
 	if kind != "diagnostic_test" || queue != jobargs.DiagnosticQueue {
 		t.Fatalf("committed job kind=%s queue=%s", kind, queue)
 	}
+}
 
-	// A rejected transaction leaves none of the four writes behind.
+func checkRejectedAtomicOperation(t *testing.T, ctx context.Context, pool *pgxpool.Pool, store *entities.Store, ring *vault.KeyRing) {
+	t.Helper()
+	rejected, rejectedNamespace := seedRejectedAtomicOperation(t, ctx, store, ring)
+	checkRejectedAtomicRolledBack(t, ctx, pool, store, rejected, rejectedNamespace)
+}
+
+func seedRejectedAtomicOperation(t *testing.T, ctx context.Context, store *entities.Store, ring *vault.KeyRing) (contract.OperationID, vault.Namespace) {
+	t.Helper()
 	rejected := mustOperationID(t)
 	rejectedNamespace := vault.Namespace{App: "demo", Environment: "staging", Name: "REJECTED_TOKEN"}
 	rollbackCause := errors.New("foundation rollback")
@@ -178,13 +204,18 @@ func TestIntegrationEntitiesAtomicOperationSecretRiverRollback(t *testing.T) {
 	}); !errors.Is(err, rollbackCause) {
 		t.Fatalf("rollback error = %v, want the callback error unchanged", err)
 	}
+	return rejected, rejectedNamespace
+}
 
+func checkRejectedAtomicRolledBack(t *testing.T, ctx context.Context, pool *pgxpool.Pool, store *entities.Store, rejected contract.OperationID, rejectedNamespace vault.Namespace) {
+	t.Helper()
 	if _, found, err := store.Operations().Get(ctx, rejected); err != nil || found {
 		t.Fatalf("rejected operation found=%v err=%v", found, err)
 	}
 	if _, found, err := store.Secrets().SecretMetadata(ctx, rejectedNamespace); err != nil || found {
 		t.Fatalf("rejected secret found=%v err=%v", found, err)
 	}
+	var jobs int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM river_job`).Scan(&jobs); err != nil || jobs != 1 {
 		t.Fatalf("river jobs after rollback = %d err %v", jobs, err)
 	}
@@ -217,92 +248,110 @@ func TestIntegrationEntitiesSavepointDedup(t *testing.T) {
 	input := json.RawMessage(`{"steps":1}`)
 
 	if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
-		// First speculative admission is rolled back with its River job.
-		if err := tx.WithinSavepoint(ctx, func(nested *entities.StoreTx) error {
-			inserted, err := nested.Operations().Insert(ctx, entities.OperationInsert{
-				ID: speculative, Key: key, InputHash: "speculative-hash", Input: input,
-			})
-			if err != nil || !inserted {
-				t.Fatalf("speculative insert = %v err %v", inserted, err)
-			}
-			if _, err := nested.Jobs().EnqueueDiagnostic(ctx, speculative); err != nil {
-				return err
-			}
-			return discarded
-		}); !errors.Is(err, discarded) {
-			t.Fatalf("speculative savepoint error = %v", err)
-		}
-
-		// The outer transaction is still usable and the discarded admission is
-		// invisible, so the accepted attempt admits the same key.
-		inserted, err := tx.Operations().Insert(ctx, entities.OperationInsert{
-			ID: accepted, Key: key, InputHash: "speculative-hash", Input: input,
-		})
-		if err != nil || !inserted {
-			t.Fatalf("accepted insert = %v err %v", inserted, err)
-		}
-		op, found, err := tx.Operations().Lock(ctx, accepted)
-		if err != nil || !found {
-			t.Fatalf("accepted lock found=%v err=%v", found, err)
-		}
-		if err := tx.Operations().AppendEvent(ctx, &op, contract.Event{
-			Kind: "state", State: contract.Queued, Message: "accepted after a discarded speculative scope",
-		}); err != nil {
+		if err := runDiscardedDedupSavepoint(t, ctx, tx, speculative, key, input, discarded); err != nil {
 			return err
 		}
-		if _, err := tx.Jobs().EnqueueDiagnostic(ctx, accepted); err != nil {
+		if err := seedAcceptedDedup(t, ctx, tx, accepted, key, input); err != nil {
 			return err
 		}
-
-		// A duplicate admission inside a released savepoint observes the row its
-		// own savepoint can read but writes nothing new. Returning nil keeps it.
-		if err := tx.WithinSavepoint(ctx, func(nested *entities.StoreTx) error {
-			inserted, err := nested.Operations().Insert(ctx, entities.OperationInsert{
-				ID: mustOperationID(t), Key: key, InputHash: "other-hash", Input: input,
-			})
-			if err != nil {
-				return err
-			}
-			if inserted {
-				t.Fatalf("duplicate admission inside the savepoint inserted a row")
-			}
-			identity, found, err := nested.Operations().Identity(ctx, key)
-			if err != nil || !found || identity.ID != accepted || identity.InputHash != "speculative-hash" {
-				t.Fatalf("nested identity = %+v found=%v err=%v", identity, found, err)
-			}
-			return nil
-		}); err != nil {
-			t.Fatalf("released savepoint error = %v", err)
-		}
-
-		// A write-then-panic rolls the savepoint back before it escapes; the
-		// outer transaction can still commit.
-		func() {
-			defer func() {
-				if recovered := recover(); recovered == nil {
-					t.Fatalf("savepoint panic did not propagate")
-				}
-			}()
-			_ = tx.WithinSavepoint(ctx, func(nested *entities.StoreTx) error {
-				inserted, err := nested.Operations().Insert(ctx, entities.OperationInsert{
-					ID: phantom,
-					Key: entities.OperationKey{
-						Kind: "diagnostic.test", Target: "control-plane", Actor: testActor,
-						IdempotencyKey: "savepoint-panic",
-					},
-					InputHash: "panic-hash", Input: input,
-				})
-				if err != nil || !inserted {
-					t.Fatalf("panic marker insert = %v err %v", inserted, err)
-				}
-				panic("savepoint panic")
-			})
-		}()
+		checkDuplicateDedupSavepoint(t, ctx, tx, accepted, key, input)
+		expectDedupPanic(t, ctx, tx, phantom, input)
 		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}
 
+	checkDedupResults(t, ctx, pool, store, speculative, accepted, phantom)
+}
+
+func runDiscardedDedupSavepoint(t *testing.T, ctx context.Context, tx *entities.StoreTx, speculative contract.OperationID, key entities.OperationKey, input json.RawMessage, discarded error) error {
+	t.Helper()
+	err := tx.WithinSavepoint(ctx, func(nested *entities.StoreTx) error {
+		inserted, err := nested.Operations().Insert(ctx, entities.OperationInsert{
+			ID: speculative, Key: key, InputHash: "speculative-hash", Input: input,
+		})
+		if err != nil || !inserted {
+			t.Fatalf("speculative insert = %v err %v", inserted, err)
+		}
+		if _, err := nested.Jobs().EnqueueDiagnostic(ctx, speculative); err != nil {
+			return err
+		}
+		return discarded
+	})
+	if !errors.Is(err, discarded) {
+		t.Fatalf("speculative savepoint error = %v", err)
+	}
+	return nil
+}
+
+func seedAcceptedDedup(t *testing.T, ctx context.Context, tx *entities.StoreTx, accepted contract.OperationID, key entities.OperationKey, input json.RawMessage) error {
+	t.Helper()
+	inserted, err := tx.Operations().Insert(ctx, entities.OperationInsert{
+		ID: accepted, Key: key, InputHash: "speculative-hash", Input: input,
+	})
+	if err != nil || !inserted {
+		t.Fatalf("accepted insert = %v err %v", inserted, err)
+	}
+	op, found, err := tx.Operations().Lock(ctx, accepted)
+	if err != nil || !found {
+		t.Fatalf("accepted lock found=%v err=%v", found, err)
+	}
+	if err := tx.Operations().AppendEvent(ctx, &op, contract.Event{
+		Kind: "state", State: contract.Queued, Message: "accepted after a discarded speculative scope",
+	}); err != nil {
+		return err
+	}
+	_, err = tx.Jobs().EnqueueDiagnostic(ctx, accepted)
+	return err
+}
+
+func checkDuplicateDedupSavepoint(t *testing.T, ctx context.Context, tx *entities.StoreTx, accepted contract.OperationID, key entities.OperationKey, input json.RawMessage) {
+	t.Helper()
+	if err := tx.WithinSavepoint(ctx, func(nested *entities.StoreTx) error {
+		inserted, err := nested.Operations().Insert(ctx, entities.OperationInsert{
+			ID: mustOperationID(t), Key: key, InputHash: "other-hash", Input: input,
+		})
+		if err != nil {
+			return err
+		}
+		if inserted {
+			t.Fatalf("duplicate admission inside the savepoint inserted a row")
+		}
+		identity, found, err := nested.Operations().Identity(ctx, key)
+		if err != nil || !found || identity.ID != accepted || identity.InputHash != "speculative-hash" {
+			t.Fatalf("nested identity = %+v found=%v err=%v", identity, found, err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("released savepoint error = %v", err)
+	}
+}
+
+func expectDedupPanic(t *testing.T, ctx context.Context, tx *entities.StoreTx, phantom contract.OperationID, input json.RawMessage) {
+	t.Helper()
+	defer func() {
+		if recovered := recover(); recovered == nil {
+			t.Fatalf("savepoint panic did not propagate")
+		}
+	}()
+	_ = tx.WithinSavepoint(ctx, func(nested *entities.StoreTx) error {
+		inserted, err := nested.Operations().Insert(ctx, entities.OperationInsert{
+			ID: phantom,
+			Key: entities.OperationKey{
+				Kind: "diagnostic.test", Target: "control-plane", Actor: testActor,
+				IdempotencyKey: "savepoint-panic",
+			},
+			InputHash: "panic-hash", Input: input,
+		})
+		if err != nil || !inserted {
+			t.Fatalf("panic marker insert = %v err %v", inserted, err)
+		}
+		panic("savepoint panic")
+	})
+}
+
+func checkDedupResults(t *testing.T, ctx context.Context, pool *pgxpool.Pool, store *entities.Store, speculative, accepted, phantom contract.OperationID) {
+	t.Helper()
 	if _, found, err := store.Operations().Get(ctx, speculative); err != nil || found {
 		t.Fatalf("discarded operation found=%v err=%v", found, err)
 	}
@@ -337,6 +386,12 @@ func TestIntegrationEntitiesJobRuntimeTypedEnqueues(t *testing.T) {
 	op := contract.Operation{
 		ID: id, Kind: "platform.deploy", Target: "env/demo/staging", Actor: testActor,
 	}
+	enqueueTypedJobs(t, ctx, store, op, id)
+	checkTypedJobRows(t, ctx, pool, id)
+}
+
+func enqueueTypedJobs(t *testing.T, ctx context.Context, store *entities.Store, op contract.Operation, id contract.OperationID) {
+	t.Helper()
 	if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
 		if _, err := tx.Jobs().EnqueuePlatform(ctx, op); err != nil {
 			return err
@@ -351,31 +406,21 @@ func TestIntegrationEntitiesJobRuntimeTypedEnqueues(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	rows, err := pool.Query(ctx, `SELECT kind,queue,max_attempts,args FROM river_job ORDER BY kind`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer rows.Close()
-	type jobRow struct {
-		kind, queue string
-		maxAttempts int
-		args        []byte
-	}
-	var got []jobRow
-	for rows.Next() {
-		var row jobRow
-		if err := rows.Scan(&row.kind, &row.queue, &row.maxAttempts, &row.args); err != nil {
-			t.Fatal(err)
-		}
-		got = append(got, row)
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatal(err)
-	}
+}
+
+type typedJobRow struct {
+	kind, queue string
+	maxAttempts int
+	args        []byte
+}
+
+func checkTypedJobRows(t *testing.T, ctx context.Context, pool *pgxpool.Pool, id contract.OperationID) {
+	t.Helper()
+	got := readTypedJobRows(t, ctx, pool)
 	if len(got) != 3 {
 		t.Fatalf("typed job count = %d", len(got))
 	}
-	want := []jobRow{
+	want := []typedJobRow{
 		{kind: "platform_action", queue: jobargs.PlatformQueue, maxAttempts: jobargs.PlatformMaxAttempts},
 		{kind: "platform_retention", queue: jobargs.MaintenanceQueue, maxAttempts: jobargs.PlatformMaxAttempts},
 		{kind: "webhook_admission", queue: jobargs.WebhookQueue, maxAttempts: jobargs.PlatformMaxAttempts},
@@ -403,6 +448,27 @@ func TestIntegrationEntitiesJobRuntimeTypedEnqueues(t *testing.T) {
 	}
 }
 
+func readTypedJobRows(t *testing.T, ctx context.Context, pool *pgxpool.Pool) []typedJobRow {
+	t.Helper()
+	rows, err := pool.Query(ctx, `SELECT kind,queue,max_attempts,args FROM river_job ORDER BY kind`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var got []typedJobRow
+	for rows.Next() {
+		var row typedJobRow
+		if err := rows.Scan(&row.kind, &row.queue, &row.maxAttempts, &row.args); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, row)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return got
+}
+
 type lifecycleDiagnosticWorker struct {
 	river.WorkerDefaults[jobargs.DiagnosticTest]
 	ran chan contract.OperationID
@@ -422,6 +488,12 @@ func TestIntegrationEntitiesJobRuntimeLifecycle(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
+	checkJobRuntimeUninitialized(t, ctx)
+	runJobRuntimeLifecycle(t, ctx, store)
+}
+
+func checkJobRuntimeUninitialized(t *testing.T, ctx context.Context) {
+	t.Helper()
 	var uninitialized entities.JobRuntime
 	if err := uninitialized.Start(ctx); !errors.Is(err, entities.ErrJobRuntimeUninitialized) {
 		t.Fatalf("uninitialized start error = %v", err)
@@ -432,7 +504,10 @@ func TestIntegrationEntitiesJobRuntimeLifecycle(t *testing.T) {
 	if err := uninitialized.StopAndCancel(ctx); !errors.Is(err, entities.ErrJobRuntimeUninitialized) {
 		t.Fatalf("uninitialized hard-stop error = %v", err)
 	}
+}
 
+func runJobRuntimeLifecycle(t *testing.T, ctx context.Context, store *entities.Store) {
+	t.Helper()
 	workers := river.NewWorkers()
 	worker := &lifecycleDiagnosticWorker{ran: make(chan contract.OperationID, 2)}
 	river.AddWorker(workers, worker)
@@ -452,60 +527,21 @@ func TestIntegrationEntitiesJobRuntimeLifecycle(t *testing.T) {
 		if stopped {
 			return
 		}
-		stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		stopCtx, stopCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 		defer stopCancel()
 		_ = jobRuntime.StopAndCancel(stopCtx)
 	})
 
-	insertOperation := func(id contract.OperationID, key string) error {
-		return store.WithinTx(ctx, func(tx *entities.StoreTx) error {
-			inserted, err := tx.Operations().Insert(ctx, entities.OperationInsert{
-				ID: id,
-				Key: entities.OperationKey{
-					Kind: "diagnostic.test", Target: "control-plane", Actor: testActor,
-					IdempotencyKey: key,
-				},
-				InputHash: key, Input: json.RawMessage(`{"steps":1}`),
-			})
-			if err != nil {
-				return err
-			}
-			if !inserted {
-				t.Fatalf("operation %s was not inserted", id)
-			}
-			return nil
-		})
-	}
-	enqueue := func(id contract.OperationID) error {
-		return store.WithinTx(ctx, func(tx *entities.StoreTx) error {
-			_, err := tx.Jobs().EnqueueDiagnostic(ctx, id)
-			return err
-		})
-	}
-
 	first := mustOperationID(t)
 	second := mustOperationID(t)
-	if err := insertOperation(first, "lifecycle-first"); err != nil {
-		t.Fatal(err)
-	}
-	if err := insertOperation(second, "lifecycle-second"); err != nil {
-		t.Fatal(err)
-	}
+	insertLifecycleOperation(t, ctx, store, first, "lifecycle-first")
+	insertLifecycleOperation(t, ctx, store, second, "lifecycle-second")
 
 	if err := jobRuntime.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := enqueue(first); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case got := <-worker.ran:
-		if got != first {
-			t.Fatalf("worker ran %s, want %s", got, first)
-		}
-	case <-ctx.Done():
-		t.Fatalf("worker did not run the first job: %v", ctx.Err())
-	}
+	enqueueLifecycleJob(t, ctx, store, first)
+	requireLifecycleWorkerRun(t, ctx, worker, first)
 	if err := jobRuntime.Stop(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -513,19 +549,55 @@ func TestIntegrationEntitiesJobRuntimeLifecycle(t *testing.T) {
 	if err := jobRuntime.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := enqueue(second); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case got := <-worker.ran:
-		if got != second {
-			t.Fatalf("worker ran %s, want %s", got, second)
-		}
-	case <-ctx.Done():
-		t.Fatalf("worker did not run the second job: %v", ctx.Err())
-	}
+	enqueueLifecycleJob(t, ctx, store, second)
+	requireLifecycleWorkerRun(t, ctx, worker, second)
 	if err := jobRuntime.StopAndCancel(ctx); err != nil {
 		t.Fatal(err)
 	}
 	stopped = true
+}
+
+func insertLifecycleOperation(t *testing.T, ctx context.Context, store *entities.Store, id contract.OperationID, key string) {
+	t.Helper()
+	if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		inserted, err := tx.Operations().Insert(ctx, entities.OperationInsert{
+			ID: id,
+			Key: entities.OperationKey{
+				Kind: "diagnostic.test", Target: "control-plane", Actor: testActor,
+				IdempotencyKey: key,
+			},
+			InputHash: key, Input: json.RawMessage(`{"steps":1}`),
+		})
+		if err != nil {
+			return err
+		}
+		if !inserted {
+			t.Fatalf("operation %s was not inserted", id)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func enqueueLifecycleJob(t *testing.T, ctx context.Context, store *entities.Store, id contract.OperationID) {
+	t.Helper()
+	if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		_, err := tx.Jobs().EnqueueDiagnostic(ctx, id)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func requireLifecycleWorkerRun(t *testing.T, ctx context.Context, worker *lifecycleDiagnosticWorker, want contract.OperationID) {
+	t.Helper()
+	select {
+	case got := <-worker.ran:
+		if got != want {
+			t.Fatalf("worker ran %s, want %s", got, want)
+		}
+	case <-ctx.Done():
+		t.Fatalf("worker did not run job %s: %v", want, ctx.Err())
+	}
 }

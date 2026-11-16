@@ -93,9 +93,28 @@ func (a *app) followSelection(args []string) followSelection {
 }
 
 func followSelectionFor(root *cobra.Command, metadata registry, args []string, valueFlags []string) followSelection {
-	var words []string
-	var selected string
-	var outputSet, jsonEnabled bool
+	state := scanFollowSelection(args, valueFlags)
+	selection := followSelection{JSON: state.jsonEnabled}
+	if len(state.words) > 0 {
+		if target, _, err := root.Find(state.words); err == nil && supportsNDJSON(metadata[target]) {
+			selection.Active = true
+		}
+	}
+	if selection.Active && state.outputSet && state.selected == "ndjson" {
+		selection.NDJSON = true
+	}
+	return selection
+}
+
+type followSelectionInputs struct {
+	words       []string
+	selected    string
+	outputSet   bool
+	jsonEnabled bool
+}
+
+func scanFollowSelection(args []string, valueFlags []string) followSelectionInputs {
+	var state followSelectionInputs
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		if arg == "--" {
@@ -103,56 +122,57 @@ func followSelectionFor(root *cobra.Command, metadata registry, args []string, v
 		}
 		if strings.HasPrefix(arg, "--") {
 			name, value, hasValue := strings.Cut(strings.TrimPrefix(arg, "--"), "=")
-			switch name {
-			case "output":
-				outputSet = true
-				if hasValue {
-					selected = value
-				} else if i+1 < len(args) {
-					i++
-					selected = args[i]
-				}
-			case "json":
-				switch {
-				case !hasValue:
-					jsonEnabled = true
-				case value == "true":
-					jsonEnabled = true
-				case value == "false":
-					jsonEnabled = false
-				}
-			default:
-				if !hasValue {
-					for _, flag := range valueFlags {
-						if name == flag && i+1 < len(args) {
-							i++ // A value that resembles a command word is still a value.
-							break
-						}
-					}
-				}
-			}
+			i = consumeFollowLongArg(args, i, name, value, hasValue, valueFlags, &state)
 			continue
 		}
-		if strings.HasPrefix(arg, "-") {
-			continue
-		}
-		words = append(words, arg)
-	}
-	selection := followSelection{JSON: jsonEnabled}
-	if len(words) > 0 {
-		if target, _, err := root.Find(words); err == nil {
-			for _, mode := range metadata[target].OutputModes {
-				if mode == "ndjson" {
-					selection.Active = true
-					break
-				}
-			}
+		if !strings.HasPrefix(arg, "-") {
+			state.words = append(state.words, arg)
 		}
 	}
-	if selection.Active && outputSet && selected == "ndjson" {
-		selection.NDJSON = true
+	return state
+}
+
+func consumeFollowLongArg(args []string, index int, name, value string, hasValue bool, valueFlags []string, state *followSelectionInputs) int {
+	switch name {
+	case "output":
+		state.outputSet = true
+		if hasValue {
+			state.selected = value
+		} else if index+1 < len(args) {
+			index++
+			state.selected = args[index]
+		}
+	case "json":
+		switch {
+		case !hasValue, value == "true":
+			state.jsonEnabled = true
+		case value == "false":
+			state.jsonEnabled = false
+		}
+	default:
+		if !hasValue && followFlagTakesValue(name, valueFlags) && index+1 < len(args) {
+			index++ // A value that resembles a command word is still a value.
+		}
 	}
-	return selection
+	return index
+}
+
+func followFlagTakesValue(name string, valueFlags []string) bool {
+	for _, flag := range valueFlags {
+		if name == flag {
+			return true
+		}
+	}
+	return false
+}
+
+func supportsNDJSON(meta CommandMeta) bool {
+	for _, mode := range meta.OutputModes {
+		if mode == "ndjson" {
+			return true
+		}
+	}
+	return false
 }
 
 // followFlags configures an operation follow command.
@@ -191,7 +211,7 @@ func (a *app) followOperation(cmd *cobra.Command, client Backend, id contract.Op
 
 	switch config.mode {
 	case "ndjson":
-		return a.followNDJSON(cmd, client, id, opts, config, clean)
+		return a.followNDJSON(cmd, client, id, opts, config)
 	case string(output.JSON):
 		return a.followJSON(cmd, client, id, opts)
 	default:
@@ -280,7 +300,7 @@ func (a *app) followPlain(cmd *cobra.Command, client Backend, id contract.Operat
 // stream with the terminal summary. The caller decides when to write the one
 // final record, so a guided create can continue into its first deploy without
 // emitting two terminal results.
-func (a *app) followNDJSONSummary(cmd *cobra.Command, client Backend, id contract.OperationID, opts viewer.FollowOptions, config *followIO, clean viewer.Cleaner) (*output.Stream, viewer.Summary, error) {
+func (a *app) followNDJSONSummary(cmd *cobra.Command, client Backend, id contract.OperationID, opts viewer.FollowOptions, config *followIO) (*output.Stream, viewer.Summary, error) {
 	stream := output.NewStream(config.out, a.secrets)
 	var last uint64
 	var snapshot *contract.Operation
@@ -316,8 +336,8 @@ func finishNDJSON(stream *output.Stream, cmd *cobra.Command, summary viewer.Summ
 	return err
 }
 
-func (a *app) followNDJSON(cmd *cobra.Command, client Backend, id contract.OperationID, opts viewer.FollowOptions, config *followIO, clean viewer.Cleaner) (result, error) {
-	stream, summary, err := a.followNDJSONSummary(cmd, client, id, opts, config, clean)
+func (a *app) followNDJSON(cmd *cobra.Command, client Backend, id contract.OperationID, opts viewer.FollowOptions, config *followIO) (result, error) {
+	stream, summary, err := a.followNDJSONSummary(cmd, client, id, opts, config)
 	err = finishNDJSON(stream, cmd, summary, err)
 	return result{data: newFollowResult(summary), streamed: true}, err
 }
@@ -418,6 +438,8 @@ func followError(summary viewer.Summary, err error) error {
 				Hint:    "Inspect operation state before submitting again.",
 				Details: details, FollowDetails: companion,
 			}
+		case contract.Queued, contract.Running, contract.Cancelling, contract.Succeeded:
+			return nil
 		default:
 			return nil
 		}

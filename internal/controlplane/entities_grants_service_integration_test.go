@@ -40,8 +40,9 @@ func insertGrantOperation(t *testing.T, ctx context.Context, pool *pgxpool.Pool,
 
 // runGrantWorker drives the real registered extension executor through the
 // control-plane worker settlement path: claim, execute, finish or fail.
-func runGrantWorker(t *testing.T, ctx context.Context, run *Runtime, id contract.OperationID, attempt uint32, normalized platform.Normalized) contract.Operation {
+func runGrantWorker(t *testing.T, ctx context.Context, run *Runtime, id contract.OperationID, normalized platform.Normalized) contract.Operation {
 	t.Helper()
+	const attempt uint32 = 1
 	if _, owned, err := run.Service.mutateOwned(ctx, id, attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
 		return appendEvent(ctx, tx, op, contract.Event{Kind: "step", Stage: "integration", Message: "grant extension attempt started."})
 	}); err != nil || !owned {
@@ -90,12 +91,19 @@ func executeGrantAction(t *testing.T, ctx context.Context, id contract.Operation
 // Retrying an access grant operation replays the original grant, conflicting
 // input for the same operation identity is a conflict that changes nothing, and
 // a revoked grant is never revived by a creation replay or a later revocation.
+type grantServiceFixture struct {
+	pool     *pgxpool.Pool
+	run      *Runtime
+	access   *integrations.AccessController
+	registry *platform.Registry
+	grants   *entities.GrantStore
+	ctx      context.Context
+}
+
 func TestIntegrationExtensionGrantRetryConflictAndNonRevival(t *testing.T) {
 	pool, _ := testPool(t, true)
 	run := testRuntime(t, pool, 0)
-	ctx := context.Background()
 	grants := run.Service.entities.Grants()
-
 	audit := newTestEntities(t, pool).Audit()
 	access, err := integrations.NewAccessController(integrations.AccessConfig{
 		AdminSubjects: []string{testActor.Subject}, Audit: audit, Store: grants,
@@ -107,6 +115,7 @@ func TestIntegrationExtensionGrantRetryConflictAndNonRevival(t *testing.T) {
 	if err := integrations.Configure(registry, integrations.RuntimeConfig{Audit: audit, Access: access}); err != nil {
 		t.Fatal(err)
 	}
+	f := grantServiceFixture{pool: pool, run: run, access: access, registry: registry, grants: grants, ctx: context.Background()}
 
 	expires := time.Now().UTC().Add(2 * time.Hour)
 	createInput := map[string]any{
@@ -114,14 +123,20 @@ func TestIntegrationExtensionGrantRetryConflictAndNonRevival(t *testing.T) {
 		"expires_at": expires, "note": "service retry",
 	}
 	createAction := normalizeGrantAction(t, registry, integrations.KindAccessGrant, createInput)
+	grantID := checkGrantWorkerCreate(t, f, createAction)
+	checkGrantWorkerConflict(t, f, expires)
+	revokeID, firstRevokedAt := checkGrantWorkerRevoke(t, f, grantID)
+	checkGrantNonRevival(t, f, grantID, revokeID, firstRevokedAt)
+}
 
-	// One real worker attempt creates the grant.
+func checkGrantWorkerCreate(t *testing.T, f grantServiceFixture, action platform.Normalized) string {
+	t.Helper()
 	createID, err := contract.NewOperationID()
 	if err != nil {
 		t.Fatal(err)
 	}
-	insertGrantOperation(t, ctx, pool, createID, integrations.KindAccessGrant, createAction)
-	created := runGrantWorker(t, ctx, run, createID, 1, createAction)
+	insertGrantOperation(t, f.ctx, f.pool, createID, integrations.KindAccessGrant, action)
+	created := runGrantWorker(t, f.ctx, f.run, createID, action)
 	if created.State != contract.Succeeded {
 		t.Fatalf("create operation = %s (%s)", created.State, created.ErrorCode)
 	}
@@ -133,23 +148,24 @@ func TestIntegrationExtensionGrantRetryConflictAndNonRevival(t *testing.T) {
 
 	// The same operation identity replayed at the executor boundary returns the
 	// original grant and inserts no second row.
-	replayed, err := executeGrantAction(t, ctx, createID, createAction)
+	replayed, err := executeGrantAction(t, f.ctx, createID, action)
 	if err != nil || replayed["id"] != grantID {
 		t.Fatalf("create replay = %+v, %v", replayed, err)
 	}
 	var count int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_access_grants WHERE id=$1`, grantID).Scan(&count); err != nil || count != 1 {
+	if err := f.pool.QueryRow(f.ctx, `SELECT count(*) FROM eregion_access_grants WHERE id=$1`, grantID).Scan(&count); err != nil || count != 1 {
 		t.Fatalf("create replay rows = %d, %v; want 1", count, err)
 	}
+	return grantID
+}
 
-	// A durable grant created for an operation identity, followed by a worker
-	// attempt that binds different input to the same identity, fails as a
-	// conflict and leaves the grant untouched.
+func checkGrantWorkerConflict(t *testing.T, f grantServiceFixture, expires time.Time) {
+	t.Helper()
 	conflictID, err := contract.NewOperationID()
 	if err != nil {
 		t.Fatal(err)
 	}
-	conflictGrant, err := access.CreateGrantForOperation(ctx, testActor, conflictID, integrations.GrantSpec{
+	conflictGrant, err := f.access.CreateGrantForOperation(f.ctx, testActor, conflictID, integrations.GrantSpec{
 		Subject: "alice", DeviceID: "gamma", Routes: []string{"conflict.example"}, ExpiresAt: expires,
 	})
 	if err != nil {
@@ -159,26 +175,28 @@ func TestIntegrationExtensionGrantRetryConflictAndNonRevival(t *testing.T) {
 		"subject": "bob", "device_id": "gamma", "routes": []string{"conflict.example"},
 		"expires_at": expires, "note": "conflicting retry",
 	}
-	conflictAction := normalizeGrantAction(t, registry, integrations.KindAccessGrant, conflictInput)
-	insertGrantOperation(t, ctx, pool, conflictID, integrations.KindAccessGrant, conflictAction)
-	conflicted := runGrantWorker(t, ctx, run, conflictID, 1, conflictAction)
+	conflictAction := normalizeGrantAction(t, f.registry, integrations.KindAccessGrant, conflictInput)
+	insertGrantOperation(t, f.ctx, f.pool, conflictID, integrations.KindAccessGrant, conflictAction)
+	conflicted := runGrantWorker(t, f.ctx, f.run, conflictID, conflictAction)
 	if conflicted.State != contract.Failed || conflicted.ErrorCode != contract.Conflict {
 		t.Fatalf("conflicting operation = %s (%s), want failed conflict", conflicted.State, conflicted.ErrorCode)
 	}
-	stored, found, err := grants.Get(ctx, conflictGrant.ID)
+	stored, found, err := f.grants.Get(f.ctx, conflictGrant.ID)
 	if err != nil || !found || stored.Subject != "alice" || stored.DeviceID != "gamma" {
 		t.Fatalf("conflict changed the durable grant: %+v, %v, %v", stored, found, err)
 	}
+}
 
-	// Revoke through the worker, then replay the same operation identity.
+func checkGrantWorkerRevoke(t *testing.T, f grantServiceFixture, grantID string) (contract.OperationID, string) {
+	t.Helper()
 	revokeID, err := contract.NewOperationID()
 	if err != nil {
 		t.Fatal(err)
 	}
 	revokeInput := map[string]any{"grant_id": grantID}
-	revokeAction := normalizeGrantAction(t, registry, integrations.KindAccessRevoke, revokeInput)
-	insertGrantOperation(t, ctx, pool, revokeID, integrations.KindAccessRevoke, revokeAction)
-	revoked := runGrantWorker(t, ctx, run, revokeID, 1, revokeAction)
+	revokeAction := normalizeGrantAction(t, f.registry, integrations.KindAccessRevoke, revokeInput)
+	insertGrantOperation(t, f.ctx, f.pool, revokeID, integrations.KindAccessRevoke, revokeAction)
+	revoked := runGrantWorker(t, f.ctx, f.run, revokeID, revokeAction)
 	if revoked.State != contract.Succeeded {
 		t.Fatalf("revoke operation = %s (%s)", revoked.State, revoked.ErrorCode)
 	}
@@ -187,36 +205,38 @@ func TestIntegrationExtensionGrantRetryConflictAndNonRevival(t *testing.T) {
 	if !ok || firstRevokedAt == "" || revokedData["id"] != grantID {
 		t.Fatalf("revoke result = %+v", revokedData)
 	}
-	revokeReplay, err := executeGrantAction(t, ctx, revokeID, revokeAction)
+	revokeReplay, err := executeGrantAction(t, f.ctx, revokeID, revokeAction)
 	revokeReplayAt, ok := revokeReplay["revoked_at"].(*time.Time)
 	if err != nil || !ok || revokeReplayAt == nil || revokeReplayAt.Format(time.RFC3339Nano) != firstRevokedAt {
 		t.Fatalf("revoke replay = %+v, %v", revokeReplay, err)
 	}
+	return revokeID, firstRevokedAt
+}
 
-	// A creation replay after revocation is idempotent and cannot revive it.
-	stored, found, err = grants.Get(ctx, grantID)
+func checkGrantNonRevival(t *testing.T, f grantServiceFixture, grantID string, revokeID contract.OperationID, firstRevokedAt string) {
+	t.Helper()
+	stored, found, err := f.grants.Get(f.ctx, grantID)
 	if err != nil || !found || stored.RevokedAt == nil {
 		t.Fatalf("revoked grant = %+v, %v, %v", stored, found, err)
 	}
 	creationReplay := stored
 	creationReplay.RevokedAt = nil
 	creationReplay.RevokedBy, creationReplay.RevokedByOperation = "", ""
-	if err := grants.Put(ctx, creationReplay); err != nil {
+	if err := f.grants.Put(f.ctx, creationReplay); err != nil {
 		t.Fatalf("creation replay after revocation: %v", err)
 	}
-	afterReplay, found, err := grants.Get(ctx, grantID)
+	afterReplay, found, err := f.grants.Get(f.ctx, grantID)
 	if err != nil || !found || afterReplay.RevokedAt == nil || afterReplay.RevokedAt.Format(time.RFC3339Nano) != firstRevokedAt {
 		t.Fatalf("creation replay revived the grant: %+v, %v, %v", afterReplay, found, err)
 	}
 
-	// A different revocation operation cannot replace the first revocation.
 	secondRevokeID, err := contract.NewOperationID()
 	if err != nil {
 		t.Fatal(err)
 	}
-	secondRevokeAction := normalizeGrantAction(t, registry, integrations.KindAccessRevoke, revokeInput)
-	insertGrantOperation(t, ctx, pool, secondRevokeID, integrations.KindAccessRevoke, secondRevokeAction)
-	secondRevoked := runGrantWorker(t, ctx, run, secondRevokeID, 1, secondRevokeAction)
+	secondRevokeAction := normalizeGrantAction(t, f.registry, integrations.KindAccessRevoke, map[string]any{"grant_id": grantID})
+	insertGrantOperation(t, f.ctx, f.pool, secondRevokeID, integrations.KindAccessRevoke, secondRevokeAction)
+	secondRevoked := runGrantWorker(t, f.ctx, f.run, secondRevokeID, secondRevokeAction)
 	if secondRevoked.State != contract.Succeeded {
 		t.Fatalf("second revoke operation = %s (%s)", secondRevoked.State, secondRevoked.ErrorCode)
 	}
@@ -224,7 +244,7 @@ func TestIntegrationExtensionGrantRetryConflictAndNonRevival(t *testing.T) {
 	if secondRevokedData["revoked_at"] != firstRevokedAt {
 		t.Fatalf("second revoke replaced the first: %+v", secondRevokedData)
 	}
-	final, found, err := grants.Get(ctx, grantID)
+	final, found, err := f.grants.Get(f.ctx, grantID)
 	if err != nil || !found || final.RevokedByOperation != string(revokeID) || final.RevokedBy != testActor.Subject {
 		t.Fatalf("final revocation = %+v, %v, %v", final, found, err)
 	}

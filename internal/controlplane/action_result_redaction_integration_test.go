@@ -13,27 +13,41 @@ import (
 	"github.com/mbvlabs/eregion/internal/secrets"
 )
 
+func submitClaimedTestOperation(t *testing.T, ctx context.Context, run *Runtime, key string) contract.Operation {
+	t.Helper()
+	op, err := run.Service.Submit(ctx, operations.Submission{
+		Kind: operations.TestKind, Target: operations.TestTarget, Actor: testActor,
+		IdempotencyKey: key, Input: []byte(`{}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok, err := run.Service.claimAttempt(ctx, op.ID, 1, "test"); err != nil || !ok {
+		t.Fatalf("claim: %v %v", ok, err)
+	}
+	return op
+}
+
+func assertNoRawSecretEvents(t *testing.T, ctx context.Context, run *Runtime, id contract.OperationID, secret string) {
+	t.Helper()
+	page, err := run.Service.Events(ctx, testActor, contract.Cursor{OperationID: id}, 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range page.Events {
+		if strings.Contains(string(event.ActionOutput), secret) {
+			t.Fatalf("plaintext persisted: %s", event.ActionOutput)
+		}
+	}
+}
+
 func TestIntegrationActionOutputKeepsTrustedIdentityAndExtensionSchema(t *testing.T) {
 	pool, _ := testPool(t, true)
 	run := testRuntime(t, pool, 0)
 	ctx := context.Background()
 	run.Service.redaction = &secrets.Registry{}
 	run.Service.redaction.Add("a", "stdout", "rawsecret")
-	submit := func(key string) contract.Operation {
-		t.Helper()
-		op, err := run.Service.Submit(ctx, operations.Submission{
-			Kind: operations.TestKind, Target: operations.TestTarget, Actor: testActor,
-			IdempotencyKey: key, Input: []byte(`{}`),
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, _, ok, err := run.Service.claimAttempt(ctx, op.ID, 1, "test"); err != nil || !ok {
-			t.Fatalf("claim: %v %v", ok, err)
-		}
-		return op
-	}
-	op := submit("trusted-action-output")
+	op := submitClaimedTestOperation(t, ctx, run, "trusted-action-output")
 	// Typed callers are responsible for redacting free text at its source.
 	snapshot := struct {
 		Domain string `json:"domain"`
@@ -60,17 +74,9 @@ func TestIntegrationActionOutputKeepsTrustedIdentityAndExtensionSchema(t *testin
 		strings.Contains(string(got.LatestResult.Data), "rawsecret") {
 		t.Fatalf("typed output changed identity/schema or leaked text: %s", got.LatestResult.Data)
 	}
-	page, err := run.Service.Events(ctx, testActor, contract.Cursor{OperationID: op.ID}, 200)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, event := range page.Events {
-		if strings.Contains(string(event.ActionOutput), "rawsecret") {
-			t.Fatalf("plaintext persisted: %s", event.ActionOutput)
-		}
-	}
+	assertNoRawSecretEvents(t, ctx, run, op.ID, "rawsecret")
 
-	extension := submit("extension-redaction-structure")
+	extension := submitClaimedTestOperation(t, ctx, run, "extension-redaction-structure")
 	executor := platform.ExecutorFunc(func(context.Context, platform.Execution) (platform.Result, error) {
 		return platform.Result{Data: map[string]any{"stdout": "rawsecret", "counter": json.Number("9007199254740993")}}, nil
 	})

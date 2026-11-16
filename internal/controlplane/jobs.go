@@ -113,7 +113,7 @@ func (s *Service) rescueHostPlatformJobs(
 		}
 		orphaned = append(orphaned, orphanedPlatformJob{
 			ID: job.ID, OperationID: job.OperationID,
-			Attempt: int32(job.Attempt), MaxAttempts: int32(job.MaxAttempts),
+			Attempt: int32(job.Attempt), MaxAttempts: int32(job.MaxAttempts), //nolint:gosec // G115: River attempts are bounded well below int32 range.
 			LastClient: attemptedBy[len(attemptedBy)-1],
 		})
 	}
@@ -141,144 +141,15 @@ func (s *Service) recoverOrphanedPlatformJob(
 	job orphanedPlatformJob,
 ) (requeued, discarded bool, err error) {
 	exhausted := job.Attempt >= job.MaxAttempts
+	jobAttempt := uint32(job.Attempt) //nolint:gosec // G115: rescued River attempts are non-negative.
 	rescue := entities.RiverRescue{
-		ID: job.ID, Queue: jobargs.PlatformQueue, Attempt: uint32(job.Attempt), LastClient: job.LastClient,
+		ID: job.ID, Queue: jobargs.PlatformQueue, Attempt: jobAttempt, LastClient: job.LastClient,
 	}
-	var owned bool
-	var requeuedOutcome, discardedOutcome bool
-	var op contract.Operation
+	var outcome platformJobRecovery
 	err = s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
-		var affected bool
 		var err error
-		if exhausted {
-			const reason = "Platform job discarded after its final attempt was left running by an earlier worker process on this host."
-			affected, err = tx.RiverJobs().DiscardRunning(ctx, rescue, reason)
-		} else {
-			affected, err = tx.RiverJobs().RequeueRunning(ctx, rescue)
-		}
-		if err != nil {
-			return unavailable(err)
-		}
-		if !affected {
-			return nil
-		}
-		if job.OperationID == "" {
-			return fmt.Errorf(
-				"platform job %d has no operation_id in its River arguments",
-				job.ID,
-			)
-		}
-		current, found, err := tx.Operations().Lock(ctx, job.OperationID)
-		if err != nil {
-			return unavailable(err)
-		}
-		if !found {
-			return contract.NewFault(
-				contract.Unavailable,
-				"a running platform job has no operation record",
-				"Inspect the operation and River job rows before starting the worker.",
-			)
-		}
-		op = current
-		// The operation row is locked for this transaction, and the job change is
-		// not visible until commit. No new River attempt can claim the operation
-		// between the state change and this event.
-		if exhausted {
-			if (op.Kind == platform.KindDomainAdd || op.Kind == platform.KindDomainRemove) &&
-				op.Attempt <= uint32(job.Attempt) {
-				handled, err := prepareDefinitionDNSRecoveryTx(ctx, tx, &op)
-				if err != nil {
-					return err
-				}
-				if handled {
-					if _, err := tx.RiverJobs().Reschedule(ctx, job.ID, 30); err != nil {
-						return unavailable(err)
-					}
-					owned, requeuedOutcome = true, true
-					return nil
-				}
-			}
-			if op.Kind == platform.KindDefinitionApply && !op.State.Terminal() &&
-				op.Attempt <= uint32(job.Attempt) {
-				if op.State != contract.Cancelling {
-					if err := definitionFailureTx(
-						ctx,
-						tx,
-						&op,
-						contract.Unavailable,
-						"Definition worker attempts were exhausted; linked work is being drained.",
-					); err != nil {
-						return err
-					}
-				}
-				if _, err := definitionDrainTx(ctx, tx, &op); err != nil {
-					return err
-				}
-				if _, err := tx.RiverJobs().Reschedule(ctx, job.ID, 2); err != nil {
-					return unavailable(err)
-				}
-				owned, requeuedOutcome = true, true
-				return nil
-			}
-			message := fmt.Sprintf(
-				"Discarded platform job %d: its final River attempt was left running by an earlier worker process on this host.",
-				job.ID,
-			)
-			if err := appendEvent(
-				ctx,
-				tx,
-				&op,
-				contract.Event{Kind: "warning", Stage: "worker", Message: message},
-			); err != nil {
-				return err
-			}
-			if op.Attempt <= uint32(job.Attempt) {
-				if deploymentLifecycleKind(op.Kind) {
-					// Restore the owner's exact traffic target before the terminal
-					// failure. Reconcile sees the discarded job and completes the
-					// owner recovery; marking the operation failed here would hide
-					// the route from that recovery.
-					if err := appendEvent(ctx, tx, &op, contract.Event{
-						Kind:    "warning",
-						Stage:   "owner",
-						Message: "River attempts are exhausted; durable deployment ownership will restore the exact recorded serving route before the terminal failure is recorded.",
-					}); err != nil {
-						return err
-					}
-				} else {
-					failure := fmt.Sprintf(
-						"Platform execution stopped after River attempt %d of %d was left running by an earlier worker process on this host; the job was discarded because no attempts remain.",
-						job.Attempt,
-						job.MaxAttempts,
-					)
-					if err := s.failPlatformOperationTx(
-						ctx,
-						tx,
-						&op,
-						contract.Unavailable,
-						failure,
-					); err != nil {
-						return err
-					}
-				}
-			}
-			owned, discardedOutcome = true, true
-			return nil
-		}
-		message := fmt.Sprintf(
-			"Recovered orphaned platform job %d left running by an earlier worker process on this host; durable step records decide which effects still need to run.",
-			job.ID,
-		)
-		if err := appendEvent(
-			ctx,
-			tx,
-			&op,
-			contract.Event{Kind: "warning", Stage: "worker", Message: message},
-		); err != nil {
-			return err
-		}
-		owned, requeuedOutcome = true, true
-		return nil
+		outcome, err = s.recoverOrphanedPlatformJobTx(ctx, tx, job, jobAttempt, rescue, exhausted)
+		return err
 	})
 	if err != nil {
 		if entities.IsBeginFailure(err) || entities.IsCommitFailure(err) {
@@ -286,11 +157,170 @@ func (s *Service) recoverOrphanedPlatformJob(
 		}
 		return false, false, err
 	}
-	if !owned {
+	if !outcome.owned {
 		return false, false, nil
 	}
-	s.observeCommittedActionResult(op)
-	return requeuedOutcome, discardedOutcome, nil
+	s.observeCommittedActionResult(outcome.operation)
+	return outcome.requeued, outcome.discarded, nil
+}
+
+type platformJobRecovery struct {
+	owned     bool
+	requeued  bool
+	discarded bool
+	operation contract.Operation
+}
+
+func (s *Service) recoverOrphanedPlatformJobTx(
+	ctx context.Context,
+	tx *entities.StoreTx,
+	job orphanedPlatformJob,
+	jobAttempt uint32,
+	rescue entities.RiverRescue,
+	exhausted bool,
+) (platformJobRecovery, error) {
+	affected, err := rescuePlatformJobTx(ctx, tx, rescue, exhausted)
+	if err != nil || !affected {
+		return platformJobRecovery{}, err
+	}
+	if job.OperationID == "" {
+		return platformJobRecovery{}, fmt.Errorf(
+			"platform job %d has no operation_id in its River arguments",
+			job.ID,
+		)
+	}
+	op, found, err := tx.Operations().Lock(ctx, job.OperationID)
+	if err != nil {
+		return platformJobRecovery{}, unavailable(err)
+	}
+	if !found {
+		return platformJobRecovery{}, contract.NewFault(
+			contract.Unavailable,
+			"a running platform job has no operation record",
+			"Inspect the operation and River job rows before starting the worker.",
+		)
+	}
+	// The operation row is locked for this transaction, and the job change is
+	// not visible until commit. No new River attempt can claim the operation
+	// between the state change and this event.
+	if exhausted {
+		return s.finishExhaustedPlatformJobTx(ctx, tx, job, jobAttempt, op)
+	}
+	message := fmt.Sprintf(
+		"Recovered orphaned platform job %d left running by an earlier worker process on this host; durable step records decide which effects still need to run.",
+		job.ID,
+	)
+	if err := appendEvent(ctx, tx, &op, contract.Event{Kind: "warning", Stage: "worker", Message: message}); err != nil {
+		return platformJobRecovery{}, err
+	}
+	return platformJobRecovery{owned: true, requeued: true, operation: op}, nil
+}
+
+func rescuePlatformJobTx(ctx context.Context, tx *entities.StoreTx, rescue entities.RiverRescue, exhausted bool) (bool, error) {
+	if !exhausted {
+		affected, err := tx.RiverJobs().RequeueRunning(ctx, rescue)
+		if err != nil {
+			return false, unavailable(err)
+		}
+		return affected, nil
+	}
+	const reason = "Platform job discarded after its final attempt was left running by an earlier worker process on this host."
+	affected, err := tx.RiverJobs().DiscardRunning(ctx, rescue, reason)
+	if err != nil {
+		return false, unavailable(err)
+	}
+	return affected, nil
+}
+
+func (s *Service) finishExhaustedPlatformJobTx(
+	ctx context.Context,
+	tx *entities.StoreTx,
+	job orphanedPlatformJob,
+	jobAttempt uint32,
+	op contract.Operation,
+) (platformJobRecovery, error) {
+	handled, err := rescheduleExhaustedPlatformJobTx(ctx, tx, job, jobAttempt, &op)
+	if err != nil {
+		return platformJobRecovery{}, err
+	}
+	if handled {
+		return platformJobRecovery{owned: true, requeued: true, operation: op}, nil
+	}
+	if err := s.discardExhaustedPlatformJobTx(ctx, tx, &op, job.ID, jobAttempt, job.Attempt, job.MaxAttempts); err != nil {
+		return platformJobRecovery{}, err
+	}
+	return platformJobRecovery{owned: true, discarded: true, operation: op}, nil
+}
+
+func rescheduleExhaustedPlatformJobTx(ctx context.Context, tx *entities.StoreTx, job orphanedPlatformJob, jobAttempt uint32, op *contract.Operation) (bool, error) {
+	if (op.Kind == platform.KindDomainAdd || op.Kind == platform.KindDomainRemove) &&
+		op.Attempt <= jobAttempt {
+		handled, err := prepareDefinitionDNSRecoveryTx(ctx, tx, op)
+		if err != nil {
+			return false, err
+		}
+		if handled {
+			if _, err := tx.RiverJobs().Reschedule(ctx, job.ID, 30); err != nil {
+				return false, unavailable(err)
+			}
+			return true, nil
+		}
+	}
+	if op.Kind != platform.KindDefinitionApply || op.State.Terminal() || op.Attempt > jobAttempt {
+		return false, nil
+	}
+	if op.State != contract.Cancelling {
+		if err := definitionFailureTx(
+			ctx,
+			tx,
+			op,
+			contract.Unavailable,
+			"Definition worker attempts were exhausted; linked work is being drained.",
+		); err != nil {
+			return false, err
+		}
+	}
+	if _, err := definitionDrainTx(ctx, tx, op); err != nil {
+		return false, err
+	}
+	if _, err := tx.RiverJobs().Reschedule(ctx, job.ID, 2); err != nil {
+		return false, unavailable(err)
+	}
+	return true, nil
+}
+
+func (s *Service) discardExhaustedPlatformJobTx(ctx context.Context, tx *entities.StoreTx, op *contract.Operation, jobID int64, jobAttempt uint32, attempt, maxAttempts int32) error {
+	message := fmt.Sprintf(
+		"Discarded platform job %d: its final River attempt was left running by an earlier worker process on this host.",
+		jobID,
+	)
+	if err := appendEvent(
+		ctx,
+		tx,
+		op,
+		contract.Event{Kind: "warning", Stage: "worker", Message: message},
+	); err != nil {
+		return err
+	}
+	if op.Attempt > jobAttempt {
+		return nil
+	}
+	if deploymentLifecycleKind(op.Kind) {
+		// Restore the owner's exact traffic target before the terminal failure.
+		// Reconcile sees the discarded job and completes the owner recovery;
+		// marking the operation failed here would hide the route from that recovery.
+		return appendEvent(ctx, tx, op, contract.Event{
+			Kind:    "warning",
+			Stage:   "owner",
+			Message: "River attempts are exhausted; durable deployment ownership will restore the exact recorded serving route before the terminal failure is recorded.",
+		})
+	}
+	failure := fmt.Sprintf(
+		"Platform execution stopped after River attempt %d of %d was left running by an earlier worker process on this host; the job was discarded because no attempts remain.",
+		attempt,
+		maxAttempts,
+	)
+	return s.failPlatformOperationTx(ctx, tx, op, contract.Unavailable, failure)
 }
 
 // jobTimeout is the deadline one River job gets. It is the effective bound
@@ -387,20 +417,55 @@ type WorkerConfig struct {
 }
 
 func New(store *entities.Store, logger *slog.Logger, config WorkerConfig) (*Runtime, error) {
+	if err := validateWorkerStartup(config, store); err != nil {
+		return nil, err
+	}
+	service := newRuntimeService(store, logger, config)
+	if err := service.configureRegistryHost(store, config.RegistryHostIdentity); err != nil {
+		return nil, err
+	}
+	service.configureRedaction(config.Redaction)
+	if err := service.configureNodeTransport(config); err != nil {
+		return nil, err
+	}
+	service.configureResolver(store, config)
+	riverConfig := newWorkerRiverConfig(logger, config, service)
+	hostPrefix := configureWorkerQueues(riverConfig, config)
+	jobRuntime, err := store.NewJobRuntime(riverConfig)
+	if err != nil {
+		return nil, err
+	}
+	if err := rescueWorkerJobs(service, config, riverConfig, hostPrefix, logger); err != nil {
+		return nil, err
+	}
+	return &Runtime{
+		Service:           service,
+		Jobs:              jobRuntime,
+		Metrics:           config.Metrics,
+		Nodes:             service.resolver,
+		WebhookDeliveries: NewWebhookDeliveryStore(store),
+	}, nil
+}
+
+func validateWorkerStartup(config WorkerConfig, store *entities.Store) error {
 	if config.Concurrency < 0 || config.Concurrency > 16 {
-		return nil, contract.NewFault(
+		return contract.NewFault(
 			contract.ValidationFailed,
 			"invalid worker concurrency",
 			"Use 0 for insert-only, or 1–16 workers.",
 		)
 	}
 	if store == nil {
-		return nil, contract.NewFault(
+		return contract.NewFault(
 			contract.Internal,
 			"the control plane needs typed persistence",
 			"Construct the one entities store before constructing the control plane.",
 		)
 	}
+	return nil
+}
+
+func newRuntimeService(store *entities.Store, logger *slog.Logger, config WorkerConfig) *Service {
 	service := &Service{
 		entities:         store,
 		logger:           logger,
@@ -417,57 +482,82 @@ func New(store *entities.Store, logger *slog.Logger, config WorkerConfig) (*Runt
 	if config.Metrics != nil {
 		service.observeActionAttempt = config.Metrics.ObserveActionAttempt
 	}
-	if config.RegistryHostIdentity != nil {
-		identity := *config.RegistryHostIdentity
-		if _, err := VerifyWorkspaceRegistryHost(context.Background(), store.Workspace(), identity); err != nil {
-			return nil, err
-		}
-		service.registryHostIdentity = &identity
+	return service
+}
+
+func (s *Service) configureRegistryHost(store *entities.Store, observed *RegistryHostIdentity) error {
+	if observed == nil {
+		return nil
 	}
-	service.redaction = config.Redaction
-	if service.redaction == nil {
-		service.redaction = &secrets.Registry{}
+	identity := *observed
+	if _, err := VerifyWorkspaceRegistryHost(context.Background(), store.Workspace(), identity); err != nil {
+		return err
 	}
-	registerRuntimeSecrets(service.redaction)
-	service.transport = config.Transport
-	if service.transport == nil && (config.Concurrency > 0 || config.NodeStateDir != "") {
-		stateDir := config.NodeStateDir
-		if stateDir == "" {
-			stateDir = node.DefaultStateDir()
-		}
-		localName := strings.TrimSpace(config.LocalNodeName)
-		if localName == "" {
-			localName = strings.TrimSpace(os.Getenv("EREGION_NODE_NAME"))
-		}
-		if localName == "" {
-			return nil, contract.NewFault(
-				contract.ValidationFailed,
-				"the worker needs EREGION_NODE_NAME",
-				"Set EREGION_NODE_NAME to this node's registered name before starting the worker.",
-			)
-		}
-		local, err := node.NewLocal(stateDir, localName, &secrets.Registry{})
-		if err != nil {
-			return nil, contract.NewFault(
-				contract.ValidationFailed,
-				"could not initialise the local node transport",
-				"Check EREGION_NODE_STATE_DIR permissions and that every worker on this host uses the same directory.",
-			)
-		}
-		service.transport = local
-		service.localNode = localName
-	} else if local, ok := service.transport.(*node.Local); ok {
+	s.registryHostIdentity = &identity
+	return nil
+}
+
+func (s *Service) configureRedaction(provided *secrets.Registry) {
+	s.redaction = provided
+	if s.redaction == nil {
+		s.redaction = &secrets.Registry{}
+	}
+	registerRuntimeSecrets(s.redaction)
+}
+
+func (s *Service) configureNodeTransport(config WorkerConfig) error {
+	s.transport = config.Transport
+	if s.transport == nil && (config.Concurrency > 0 || config.NodeStateDir != "") {
+		return s.startLocalTransport(config)
+	}
+	if local, ok := s.transport.(*node.Local); ok {
 		// Tests and embedders inject the local transport directly.
-		service.localNode = local.NodeIdentity()
+		s.localNode = local.NodeIdentity()
 	}
-	service.resolver = config.Resolver
-	if service.resolver == nil {
-		service.resolver = NewNodeResolver(
-			store.Nodes(),
-			config.Nodes,
-			func() node.Transport { return service.transport },
+	return nil
+}
+
+func (s *Service) startLocalTransport(config WorkerConfig) error {
+	stateDir := config.NodeStateDir
+	if stateDir == "" {
+		stateDir = node.DefaultStateDir()
+	}
+	localName := strings.TrimSpace(config.LocalNodeName)
+	if localName == "" {
+		localName = strings.TrimSpace(os.Getenv("EREGION_NODE_NAME"))
+	}
+	if localName == "" {
+		return contract.NewFault(
+			contract.ValidationFailed,
+			"the worker needs EREGION_NODE_NAME",
+			"Set EREGION_NODE_NAME to this node's registered name before starting the worker.",
 		)
 	}
+	local, err := node.NewLocal(stateDir, localName, &secrets.Registry{})
+	if err != nil {
+		return contract.NewFault(
+			contract.ValidationFailed,
+			"could not initialise the local node transport",
+			"Check EREGION_NODE_STATE_DIR permissions and that every worker on this host uses the same directory.",
+		)
+	}
+	s.transport = local
+	s.localNode = localName
+	return nil
+}
+
+func (s *Service) configureResolver(store *entities.Store, config WorkerConfig) {
+	s.resolver = config.Resolver
+	if s.resolver == nil {
+		s.resolver = NewNodeResolver(
+			store.Nodes(),
+			config.Nodes,
+			func() node.Transport { return s.transport },
+		)
+	}
+}
+
+func newWorkerRiverConfig(logger *slog.Logger, config WorkerConfig, service *Service) *river.Config {
 	workers := river.NewWorkers()
 	river.AddWorker(workers, &testWorker{service: service})
 	river.AddWorker(workers, &platformWorker{service: service})
@@ -484,195 +574,156 @@ func New(store *entities.Store, logger *slog.Logger, config WorkerConfig) (*Runt
 		SoftStopTimeout: 5 * time.Second, TestOnly: config.TestOnly,
 	}
 	if config.Metrics != nil {
-		riverConfig.Middleware = []rivertype.Middleware{
-			river.WorkerMiddlewareFunc(
-				func(ctx context.Context, job *rivertype.JobRow, inner func(context.Context) error) error {
-					kind := job.Kind
-					switch kind {
-					case "diagnostic_test",
-						"platform_action",
-						"operation_reconcile",
-						"platform_domain_routes",
-						"platform_domain_observe",
-						"platform_container_cleanup",
-						"platform_workload_repair",
-						"platform_retention",
-						"webhook_admission":
-					default:
-						kind = "other"
-					}
-					action := "none"
-					if kind == "platform_action" {
-						var args struct {
-							ActionKind string `json:"action_kind"`
-						}
-						if json.Unmarshal(job.EncodedArgs, &args) == nil &&
-							(platform.IsKind(args.ActionKind) || args.ActionKind == platform.KindDefinitionApply) {
-							action = args.ActionKind
-						} else {
-							action = "other"
-						}
-					} else if kind == "platform_retention" && len(job.EncodedArgs) > 0 {
-						var args jobargs.Retention
-						if json.Unmarshal(job.EncodedArgs, &args) == nil && args.OperationID != "" {
-							action = platform.KindRetentionPrune
-						}
-					}
-					if job.Attempt > 1 {
-						config.Metrics.Retries.WithLabelValues(kind, action).Inc()
-					}
-					started := time.Now()
-					outcome := "panic"
-					defer func() {
-						config.Metrics.Attempts.WithLabelValues(kind, action, outcome).Inc()
-						config.Metrics.AttemptDuration.WithLabelValues(kind, action, outcome).
-							Observe(time.Since(started).Seconds())
-					}()
-					err := inner(processmetrics.WithWorker(ctx, config.Metrics))
-					var snooze *river.JobSnoozeError
-					var cancelled *river.JobCancelError
-					switch {
-					case err == nil:
-						outcome = "success"
-					case errors.As(err, &snooze):
-						outcome = "snoozed"
-					case errors.As(err, &cancelled),
-						errors.Is(err, context.Canceled),
-						errors.Is(err, river.ErrJobCancelledRemotely):
-						outcome = "cancelled"
-					default:
-						outcome = "error"
-					}
-					return err
-				},
-			),
+		riverConfig.Middleware = []rivertype.Middleware{workerMetricsMiddleware(config.Metrics)}
+	}
+	return riverConfig
+}
+
+func workerMetricsMiddleware(metrics *processmetrics.Metrics) rivertype.Middleware {
+	return river.WorkerMiddlewareFunc(
+		func(ctx context.Context, job *rivertype.JobRow, inner func(context.Context) error) error {
+			kind, action := workerJobMetricLabels(job)
+			if job.Attempt > 1 {
+				metrics.Retries.WithLabelValues(kind, action).Inc()
+			}
+			started := time.Now()
+			outcome := "panic"
+			defer func() {
+				metrics.Attempts.WithLabelValues(kind, action, outcome).Inc()
+				metrics.AttemptDuration.WithLabelValues(kind, action, outcome).
+					Observe(time.Since(started).Seconds())
+			}()
+			err := inner(processmetrics.WithWorker(ctx, metrics))
+			outcome = workerJobOutcome(err)
+			return err
+		},
+	)
+}
+
+func workerJobMetricLabels(job *rivertype.JobRow) (string, string) {
+	kind := job.Kind
+	switch kind {
+	case "diagnostic_test",
+		"platform_action",
+		"operation_reconcile",
+		"platform_domain_routes",
+		"platform_domain_observe",
+		"platform_container_cleanup",
+		"platform_workload_repair",
+		"platform_retention",
+		"webhook_admission":
+	default:
+		kind = "other"
+	}
+	switch kind {
+	case "platform_action":
+		var args struct {
+			ActionKind string `json:"action_kind"`
+		}
+		if json.Unmarshal(job.EncodedArgs, &args) == nil &&
+			(platform.IsKind(args.ActionKind) || args.ActionKind == platform.KindDefinitionApply) {
+			return kind, args.ActionKind
+		}
+		return kind, "other"
+	case "platform_retention":
+		if len(job.EncodedArgs) > 0 {
+			var args jobargs.Retention
+			if json.Unmarshal(job.EncodedArgs, &args) == nil && args.OperationID != "" {
+				return kind, platform.KindRetentionPrune
+			}
 		}
 	}
-	var hostPrefix string
-	if config.Concurrency > 0 {
-		host, err := os.Hostname()
-		if err != nil || strings.TrimSpace(host) == "" {
-			host = "unknown-host"
-		}
-		hostPrefix = workerHostPrefix(host)
-		riverConfig.ID = newWorkerClientID(host, time.Now())
-		riverConfig.Queues = map[string]river.QueueConfig{
-			jobargs.DiagnosticQueue: {MaxWorkers: config.Concurrency},
-			jobargs.PlatformQueue:   {MaxWorkers: config.Concurrency},
-			jobargs.WebhookQueue:    {MaxWorkers: config.Concurrency},
-			"maintenance":           {MaxWorkers: 1},
-		}
-		riverConfig.PeriodicJobs = []*river.PeriodicJob{
-			river.NewPeriodicJob(
-				river.PeriodicInterval(5*time.Second),
-				func() (river.JobArgs, *river.InsertOpts) {
-					return jobargs.OperationReconcile{}, &river.InsertOpts{Queue: "maintenance", MaxAttempts: 3}
-				},
-				&river.PeriodicJobOpts{RunOnStart: true},
-			),
-			// Reconcile the routes file on worker start and after any failed
-			// reload. The advisory lock keeps this independent of a domain
-			// change that is already writing the same file.
-			river.NewPeriodicJob(
-				river.PeriodicInterval(30*time.Second),
-				func() (river.JobArgs, *river.InsertOpts) {
-					return jobargs.DomainRoutes{}, &river.InsertOpts{
-						Queue:       "maintenance",
-						MaxAttempts: 1,
-					}
-				},
-				&river.PeriodicJobOpts{RunOnStart: true},
-			),
-			// Observe DNS, certificate and public response separately. A
-			// transient probe failure is not a failed binding; the next run
-			// overwrites the observation.
-			river.NewPeriodicJob(
-				river.PeriodicInterval(5*time.Minute),
-				func() (river.JobArgs, *river.InsertOpts) {
-					return jobargs.DomainObserve{}, &river.InsertOpts{
-						Queue:       "maintenance",
-						MaxAttempts: 1,
-					}
-				},
-				&river.PeriodicJobOpts{RunOnStart: true},
-			),
-			// Retry containers a verified switch or a failed candidate could
-			// not remove. The row owns the backoff; the job only retries due
-			// work, so it never races the deploy that recorded it.
-			river.NewPeriodicJob(
-				river.PeriodicInterval(5*time.Minute),
-				func() (river.JobArgs, *river.InsertOpts) {
-					return jobargs.ContainerCleanup{}, &river.InsertOpts{
-						Queue:       "maintenance",
-						MaxAttempts: 1,
-					}
-				},
-				&river.PeriodicJobOpts{RunOnStart: true},
-			),
-			// Restore a serving container that disappeared (reboot, OOM, a
-			// manual rm). The queued restart is idempotent per serving
-			// deployment and missing-name set.
-			river.NewPeriodicJob(
-				river.PeriodicInterval(5*time.Minute),
-				func() (river.JobArgs, *river.InsertOpts) {
-					return jobargs.WorkloadRepair{}, &river.InsertOpts{
-						Queue:       "maintenance",
-						MaxAttempts: 1,
-					}
-				},
-				&river.PeriodicJobOpts{RunOnStart: true},
-			),
-			// Check once an hour whether the UTC day still needs a retention
-			// run. The submitter allows at most one successful run per day,
-			// never submits while one is queued/running, and retries a failed
-			// or cancelled day after a one-hour backoff with a new numbered
-			// idempotency key. RunOnStart catches up after a restart.
-			river.NewPeriodicJob(
-				river.PeriodicInterval(retentionDailyCheckInterval),
-				func() (river.JobArgs, *river.InsertOpts) {
-					return jobargs.Retention{}, &river.InsertOpts{Queue: "maintenance", MaxAttempts: 1}
-				},
-				&river.PeriodicJobOpts{RunOnStart: true},
-			),
-		}
+	return kind, "none"
+}
+
+func workerJobOutcome(err error) string {
+	var snooze *river.JobSnoozeError
+	var cancelled *river.JobCancelError
+	switch {
+	case err == nil:
+		return "success"
+	case errors.As(err, &snooze):
+		return "snoozed"
+	case errors.As(err, &cancelled),
+		errors.Is(err, context.Canceled),
+		errors.Is(err, river.ErrJobCancelledRemotely):
+		return "cancelled"
+	default:
+		return "error"
 	}
-	jobRuntime, err := store.NewJobRuntime(riverConfig)
+}
+
+func configureWorkerQueues(riverConfig *river.Config, config WorkerConfig) string {
+	if config.Concurrency == 0 {
+		return ""
+	}
+	host, err := os.Hostname()
+	if err != nil || strings.TrimSpace(host) == "" {
+		host = "unknown-host"
+	}
+	hostPrefix := workerHostPrefix(host)
+	riverConfig.ID = newWorkerClientID(host, time.Now())
+	riverConfig.Queues = map[string]river.QueueConfig{
+		jobargs.DiagnosticQueue: {MaxWorkers: config.Concurrency},
+		jobargs.PlatformQueue:   {MaxWorkers: config.Concurrency},
+		jobargs.WebhookQueue:    {MaxWorkers: config.Concurrency},
+		"maintenance":           {MaxWorkers: 1},
+	}
+	riverConfig.PeriodicJobs = workerPeriodicJobs()
+	return hostPrefix
+}
+
+func workerPeriodicJobs() []*river.PeriodicJob {
+	return []*river.PeriodicJob{
+		river.NewPeriodicJob(
+			river.PeriodicInterval(5*time.Second),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return jobargs.OperationReconcile{}, &river.InsertOpts{Queue: "maintenance", MaxAttempts: 3}
+			},
+			&river.PeriodicJobOpts{RunOnStart: true},
+		),
+		periodicJob(30*time.Second, jobargs.DomainRoutes{}),
+		periodicJob(5*time.Minute, jobargs.DomainObserve{}),
+		periodicJob(5*time.Minute, jobargs.ContainerCleanup{}),
+		periodicJob(5*time.Minute, jobargs.WorkloadRepair{}),
+		periodicJob(retentionDailyCheckInterval, jobargs.Retention{}),
+	}
+}
+
+func periodicJob(interval time.Duration, args river.JobArgs) *river.PeriodicJob {
+	return river.NewPeriodicJob(
+		river.PeriodicInterval(interval),
+		func() (river.JobArgs, *river.InsertOpts) {
+			return args, &river.InsertOpts{Queue: "maintenance", MaxAttempts: 1}
+		},
+		&river.PeriodicJobOpts{RunOnStart: true},
+	)
+}
+
+func rescueWorkerJobs(service *Service, config WorkerConfig, riverConfig *river.Config, hostPrefix string, logger *slog.Logger) error {
+	if config.Concurrency == 0 {
+		return nil
+	}
+	rescueCtx, cancel := context.WithTimeout(context.Background(), workerRescueTimeout)
+	requeued, discarded, err := service.rescueHostPlatformJobs(rescueCtx, hostPrefix, riverConfig.ID)
+	cancel()
 	if err != nil {
-		return nil, err
-	}
-	if config.Concurrency > 0 {
-		rescueCtx, cancel := context.WithTimeout(context.Background(), workerRescueTimeout)
-		requeued, discarded, rescueErr := service.rescueHostPlatformJobs(
-			rescueCtx,
-			hostPrefix,
-			riverConfig.ID,
+		return contract.NewFault(
+			contract.Unavailable,
+			"could not recover this host's orphaned platform jobs",
+			"Check the control database connection and restart the worker; another host's running jobs are left to River's rescuer.",
 		)
-		cancel()
-		if rescueErr != nil {
-			return nil, contract.NewFault(
-				contract.Unavailable,
-				"could not recover this host's orphaned platform jobs",
-				"Check the control database connection and restart the worker; another host's running jobs are left to River's rescuer.",
-			)
-		}
-		if (requeued > 0 || discarded > 0) && logger != nil {
-			logger.Info(
-				"Recovered orphaned platform jobs before worker start",
-				"requeued",
-				requeued,
-				"discarded",
-				discarded,
-			)
-		}
 	}
-	webhookDeliveries := NewWebhookDeliveryStore(store)
-	return &Runtime{
-		Service:           service,
-		Jobs:              jobRuntime,
-		Metrics:           config.Metrics,
-		Nodes:             service.resolver,
-		WebhookDeliveries: webhookDeliveries,
-	}, nil
+	if (requeued > 0 || discarded > 0) && logger != nil {
+		logger.Info(
+			"Recovered orphaned platform jobs before worker start",
+			"requeued",
+			requeued,
+			"discarded",
+			discarded,
+		)
+	}
+	return nil
 }
 
 // registerRuntimeSecrets registers the worker's own secrets so a child process
@@ -719,7 +770,7 @@ var (
 )
 
 func (w *testWorker) Work(ctx context.Context, job *river.Job[jobargs.DiagnosticTest]) error {
-	attempt := uint32(job.Attempt)
+	attempt := uint32(job.Attempt) //nolint:gosec // G115: River attempts are non-negative.
 	op, raw, claimed, err := w.service.claimAttempt(
 		ctx,
 		job.Args.OperationID,
@@ -770,7 +821,7 @@ func (w *testWorker) Work(ctx context.Context, job *river.Job[jobargs.Diagnostic
 			return w.settleAttempt(ctx, op.ID, attempt, err)
 		}
 	}
-	_, err = w.service.finishSucceeded(ctx, op.ID, attempt)
+	err = w.service.finishSucceeded(ctx, op.ID, attempt)
 	return w.settleAttempt(ctx, op.ID, attempt, err)
 }
 
@@ -909,24 +960,60 @@ func (w *testWorker) runStep(
 	}
 	inputsHash := engine.InputsHash(step.ID(), inputs)
 
-	record, hasRecord, err := w.service.stepRecord(ctx, id, stepID)
+	hasRecord, completed, err := w.checkStepRecord(ctx, id, attempt, stepID, inputsHash)
 	if err != nil {
 		return err
 	}
-	if hasRecord {
-		if record.InputsHash != inputsHash {
-			return w.failInputsMismatch(
-				ctx,
-				id,
-				attempt,
-				"step inputs changed for an existing effect",
-			)
-		}
-		if record.State == "completed" {
-			return nil
-		}
+	if completed {
+		return nil
 	}
+	status, err := w.queryNodeStatus(ctx, id, attempt, stepID, exec)
+	if err != nil {
+		return err
+	}
+	if status.InputsHash != "" && status.InputsHash != inputsHash {
+		return w.failInputsMismatch(ctx, id, attempt, "node effect has different inputs")
+	}
+	if status.Status == engine.StatusCompleted {
+		return w.completeNodeStep(ctx, id, attempt, stepID, inputsHash, status, hasRecord, input.Steps)
+	}
+	already, err := w.service.beginStep(ctx, id, attempt, stepID, inputsHash, exec.ExecutionID())
+	if err != nil {
+		return err
+	}
+	if already {
+		return nil
+	}
+	response, err := w.callNodeRun(ctx, id, attempt, stepID, exec, payload)
+	if err != nil {
+		return err
+	}
+	if response.InputsHash != "" && response.InputsHash != inputsHash {
+		return w.failInputsMismatch(ctx, id, attempt, "node effect has different inputs")
+	}
+	return w.handleNodeRunResponse(ctx, id, attempt, stepID, inputsHash, exec, input, response)
+}
 
+func (w *testWorker) checkStepRecord(ctx context.Context, id contract.OperationID, attempt uint32, stepID, inputsHash string) (bool, bool, error) {
+	record, hasRecord, err := w.service.stepRecord(ctx, id, stepID)
+	if err != nil {
+		return false, false, err
+	}
+	if !hasRecord {
+		return false, false, nil
+	}
+	if record.InputsHash != inputsHash {
+		return false, false, w.failInputsMismatch(
+			ctx,
+			id,
+			attempt,
+			"step inputs changed for an existing effect",
+		)
+	}
+	return true, record.State == "completed", nil
+}
+
+func (w *testWorker) queryNodeStatus(ctx context.Context, id contract.OperationID, attempt uint32, stepID string, exec engine.Execution) (node.Response, error) {
 	status, err := w.service.transport.Call(
 		ctx,
 		node.Request{Method: node.MethodStatus, RequestID: exec.RequestID, Execution: exec},
@@ -941,96 +1028,82 @@ func (w *testWorker) runStep(
 				contract.PreconditionFailed,
 				"Node journal is corrupt; inspect it before retrying.",
 			); failErr != nil {
-				return failErr
+				return node.Response{}, failErr
 			}
-			return errOperationTerminal
+			return node.Response{}, errOperationTerminal
 		}
 		if node.IsPermanentTransport(err) {
-			return w.failTransport(ctx, id, attempt, err)
+			return node.Response{}, w.failTransport(ctx, id, attempt, err)
 		}
-		return fmt.Errorf("node status %s: %w", stepID, err)
+		return node.Response{}, fmt.Errorf("node status %s: %w", stepID, err)
 	}
-	if status.InputsHash != "" && status.InputsHash != inputsHash {
-		return w.failInputsMismatch(ctx, id, attempt, "node effect has different inputs")
-	}
-	if status.Status == engine.StatusCompleted {
-		if !hasRecord {
-			if _, err := w.service.beginStep(
-				ctx,
-				id,
-				attempt,
-				stepID,
-				inputsHash,
-				status.ExecutionID,
-			); err != nil {
-				return err
-			}
-		}
-		if err := w.service.recordRecoveredStep(
-			ctx,
-			id,
-			attempt,
-			stepID,
-			inputsHash,
-			status,
-		); err != nil {
-			return err
-		}
-		_, err := w.service.ackStep(
+	return status, nil
+}
+
+func (w *testWorker) completeNodeStep(ctx context.Context, id contract.OperationID, attempt uint32, stepID, inputsHash string, status node.Response, hasRecord bool, total int) error {
+	if !hasRecord {
+		if _, err := w.service.beginStep(
 			ctx,
 			id,
 			attempt,
 			stepID,
 			inputsHash,
 			status.ExecutionID,
-			status.Result,
-			input.Steps,
-		)
+		); err != nil {
+			return err
+		}
+	}
+	if err := w.service.recordRecoveredStep(
+		ctx,
+		id,
+		attempt,
+		stepID,
+		status,
+	); err != nil {
 		return err
 	}
+	return w.service.ackStep(
+		ctx,
+		id,
+		attempt,
+		stepID,
+		inputsHash,
+		status.ExecutionID,
+		status.Result,
+		total,
+	)
+}
 
-	already, err := w.service.beginStep(ctx, id, attempt, stepID, inputsHash, exec.ExecutionID())
-	if err != nil {
-		return err
-	}
-	if already {
-		return nil
-	}
-
+func (w *testWorker) callNodeRun(ctx context.Context, id contract.OperationID, attempt uint32, stepID string, exec engine.Execution, payload json.RawMessage) (node.Response, error) {
 	var nodeEvents []node.Event
 	onEvent := func(event node.Event) { nodeEvents = append(nodeEvents, event) }
 	response, err := w.service.transport.Call(ctx, node.Request{
 		Method: node.MethodRun, RequestID: exec.RequestID, Execution: exec,
 		Payload: payload,
 	}, onEvent)
-	if appendErr := w.service.appendNodeEvents(
-		ctx,
-		id,
-		attempt,
-		nodeEvents,
-	); appendErr != nil &&
-		err == nil {
+	if appendErr := w.service.appendNodeEvents(ctx, id, attempt, nodeEvents); appendErr != nil && err == nil {
 		err = appendErr
 	}
 	if err != nil {
 		if node.IsPermanentTransport(err) {
-			return w.failTransport(ctx, id, attempt, err)
+			return node.Response{}, w.failTransport(ctx, id, attempt, err)
 		}
 		// A lost stream is an unknown outcome, never proof that the node
 		// stopped. The next attempt asks the node for its status first.
-		return fmt.Errorf("node run %s: %w", stepID, err)
+		return node.Response{}, fmt.Errorf("node run %s: %w", stepID, err)
 	}
 	if w.service.afterNode != nil {
 		if err := w.service.afterNode(id, stepID); err != nil {
-			return err
+			return node.Response{}, err
 		}
 	}
-	if response.InputsHash != "" && response.InputsHash != inputsHash {
-		return w.failInputsMismatch(ctx, id, attempt, "node effect has different inputs")
-	}
+	return response, nil
+}
+
+func (w *testWorker) handleNodeRunResponse(ctx context.Context, id contract.OperationID, attempt uint32, stepID, inputsHash string, exec engine.Execution, input operations.TestInput, response node.Response) error {
 	switch response.Status {
 	case engine.StatusCompleted:
-		_, err := w.service.ackStep(
+		return w.service.ackStep(
 			ctx,
 			id,
 			attempt,
@@ -1040,7 +1113,6 @@ func (w *testWorker) runStep(
 			response.Result,
 			input.Steps,
 		)
-		return err
 	case engine.StatusRunning:
 		// A live node owner holds the effect beyond our lock timeout. Do not
 		// start a second Apply; let River retry and reconcile.
@@ -1050,51 +1122,57 @@ func (w *testWorker) runStep(
 			"The operation remains running; reconnecting or retrying will attach to the existing effect, not start another.",
 		)
 	case engine.StatusFailed:
-		if err := w.service.retainNodeResponse(ctx, exec, response); err != nil {
-			return err
-		}
-		code := response.ErrorCode
-		if code == "" {
-			code = string(contract.Internal)
-		}
-		if failErr := w.service.failStep(
-			ctx,
-			id,
-			attempt,
-			stepID,
-			contract.Code(code),
-			response.Detail,
-		); failErr != nil {
-			return failErr
-		}
-		if response.Retryable {
-			if err := w.service.recordRetryResult(
-				ctx,
-				id,
-				attempt,
-				contract.Code(code),
-				w.service.resultText(response.Detail),
-			); err != nil {
-				return err
-			}
-			return fmt.Errorf("node step %s failed: %s", stepID, response.Detail)
-		}
-		if response.InputsMismatch {
-			return w.failInputsMismatch(ctx, id, attempt, "node step failed with different inputs")
-		}
-		if err := w.service.failOperation(
-			ctx,
-			id,
-			attempt,
-			contract.Code(code),
-			"Node step failed without a retryable cause: "+response.Detail,
-		); err != nil {
-			return err
-		}
-		return errOperationTerminal
+		return w.handleFailedNodeStep(ctx, id, attempt, stepID, exec, response)
+	case engine.StatusAbsent, engine.StatusDeferred, engine.StatusStale:
+		fallthrough
 	default:
 		return fmt.Errorf("node returned unexpected status %q for %s", response.Status, stepID)
 	}
+}
+
+func (w *testWorker) handleFailedNodeStep(ctx context.Context, id contract.OperationID, attempt uint32, stepID string, exec engine.Execution, response node.Response) error {
+	if err := w.service.retainNodeResponse(ctx, exec, response); err != nil {
+		return err
+	}
+	code := response.ErrorCode
+	if code == "" {
+		code = string(contract.Internal)
+	}
+	if failErr := w.service.failStep(
+		ctx,
+		id,
+		attempt,
+		stepID,
+		contract.Code(code),
+		response.Detail,
+	); failErr != nil {
+		return failErr
+	}
+	if response.Retryable {
+		if err := w.service.recordRetryResult(
+			ctx,
+			id,
+			attempt,
+			contract.Code(code),
+			w.service.resultText(response.Detail),
+		); err != nil {
+			return err
+		}
+		return fmt.Errorf("node step %s failed: %s", stepID, response.Detail)
+	}
+	if response.InputsMismatch {
+		return w.failInputsMismatch(ctx, id, attempt, "node step failed with different inputs")
+	}
+	if err := w.service.failOperation(
+		ctx,
+		id,
+		attempt,
+		contract.Code(code),
+		"Node step failed without a retryable cause: "+response.Detail,
+	); err != nil {
+		return err
+	}
+	return errOperationTerminal
 }
 
 // failTransport ends an operation whose transport refused the request for a
@@ -1178,7 +1256,7 @@ func (w *testWorker) reconcileCancellation(
 			"Cancellation waits for the in-flight step boundary; retry to reconcile the completed effect.",
 		)
 	}
-	if _, err := w.service.finishCancelled(ctx, id, attempt, input.Steps); err != nil {
+	if err := w.service.finishCancelled(ctx, id, attempt, input.Steps); err != nil {
 		return err
 	}
 	return nil
@@ -1201,7 +1279,7 @@ type domainRouteWorker struct {
 func (w *domainRouteWorker) Work(ctx context.Context, _ *river.Job[jobargs.DomainRoutes]) error {
 	// Periodic reconciliation retries on its own; returning the error would
 	// only make River attach a retry to the same schedule.
-	logDomainMaintenance("route reconciliation", w.service.reconcileDomainRoutes(ctx))
+	logDomainMaintenance(ctx, "route reconciliation", w.service.reconcileDomainRoutes(ctx))
 	return nil
 }
 
@@ -1211,7 +1289,7 @@ type domainObserveWorker struct {
 }
 
 func (w *domainObserveWorker) Work(ctx context.Context, _ *river.Job[jobargs.DomainObserve]) error {
-	logDomainMaintenance("observation", w.service.observeDomains(ctx))
+	logDomainMaintenance(ctx, "observation", w.service.observeDomains(ctx))
 	return nil
 }
 
@@ -1224,7 +1302,7 @@ func (w *containerCleanupWorker) Work(
 	ctx context.Context,
 	_ *river.Job[jobargs.ContainerCleanup],
 ) error {
-	logMaintenance("container cleanup", w.service.retryDueContainerCleanups(ctx))
+	logMaintenance(ctx, "container cleanup", w.service.retryDueContainerCleanups(ctx))
 	return nil
 }
 
@@ -1234,7 +1312,7 @@ type workloadRepairWorker struct {
 }
 
 func (w *workloadRepairWorker) Work(ctx context.Context, _ *river.Job[jobargs.WorkloadRepair]) error {
-	logMaintenance("workload repair", w.service.repairServingWorkloads(ctx))
+	logMaintenance(ctx, "workload repair", w.service.repairServingWorkloads(ctx))
 	return nil
 }
 
@@ -1308,162 +1386,195 @@ func (s *Service) reconcileOperation(ctx context.Context, id contract.OperationI
 	if err := json.Unmarshal(rawInput, &input); err != nil {
 		return err
 	}
-	live := false
-	records, err := s.stepRecords(ctx, id)
+	live, stop, err := s.reconcileOperationSteps(ctx, id, op, input)
 	if err != nil {
 		return err
+	}
+	if stop {
+		return nil
+	}
+	return s.finishReconciledOperation(ctx, id, op, input, live)
+}
+
+func (s *Service) reconcileOperationSteps(ctx context.Context, id contract.OperationID, op contract.Operation, input operations.TestInput) (live, stop bool, err error) {
+	records, err := s.stepRecords(ctx, id)
+	if err != nil {
+		return false, false, err
 	}
 	for _, record := range records {
 		if record.State == "completed" {
 			continue
 		}
-		exec := engine.Execution{
-			OperationID: id,
-			Attempt:     op.Attempt,
-			Step:        record.Step,
-			RequestID:   newRequestID(),
+		stepLive, stop, err := s.reconcileStepRecord(ctx, id, op, record, input)
+		if errors.Is(err, errNotOwned) {
+			return false, true, nil
 		}
-		status, statusErr := s.transport.Call(
-			ctx,
-			node.Request{Method: node.MethodStatus, RequestID: exec.RequestID, Execution: exec},
-			nil,
-		)
-		if statusErr != nil {
-			if errors.Is(statusErr, engine.ErrJournalCorrupt) {
-				err := s.failOperation(
-					ctx,
-					id,
-					op.Attempt,
-					contract.PreconditionFailed,
-					"Node journal is corrupt; inspect it before retrying.",
-				)
-				if errors.Is(err, errNotOwned) {
-					return nil
-				}
-				return err
-			}
-			if node.IsPermanentTransport(statusErr) {
-				err := s.failOperation(
-					ctx,
-					id,
-					op.Attempt,
-					contract.PreconditionFailed,
-					"The node transport refused the request: "+statusErr.Error(),
-				)
-				if errors.Is(err, errNotOwned) {
-					return nil
-				}
-				return err
-			}
-			return unavailable(statusErr)
+		if err != nil || stop {
+			return false, stop, err
 		}
-		if status.InputsHash != "" && status.InputsHash != record.InputsHash {
-			// The write is attempt-fenced like every other worker write: a
-			// newer attempt owns the operation and must not be overwritten.
-			_, owned, err := s.mutateOwned(
-				ctx,
-				id,
-				op.Attempt,
-				func(tx *entities.StoreTx, current *contract.Operation) error {
-					if current.State.Terminal() {
-						return nil
-					}
-					return transition(
-						ctx,
-						tx,
-						current,
-						contract.Failed,
-						contract.PreconditionFailed,
-						"Node effect inputs changed during reconciliation; inspect the node journal.",
-					)
-				},
-			)
-			if !owned || errors.Is(err, errNotOwned) {
+		live = live || stepLive
+	}
+	return live, false, nil
+}
+
+func (s *Service) reconcileStepRecord(ctx context.Context, id contract.OperationID, op contract.Operation, record StepRecord, input operations.TestInput) (live, stop bool, err error) {
+	exec := engine.Execution{
+		OperationID: id,
+		Attempt:     op.Attempt,
+		Step:        record.Step,
+		RequestID:   newRequestID(),
+	}
+	status, err := s.transport.Call(
+		ctx,
+		node.Request{Method: node.MethodStatus, RequestID: exec.RequestID, Execution: exec},
+		nil,
+	)
+	if err != nil {
+		return false, false, s.reconcileStepStatusError(ctx, id, op.Attempt, err)
+	}
+	if status.InputsHash != "" && status.InputsHash != record.InputsHash {
+		err := s.failReconciliationInputs(ctx, id, op.Attempt)
+		if errors.Is(err, errNotOwned) {
+			return false, true, nil
+		}
+		if err != nil {
+			return false, false, err
+		}
+		return false, true, nil
+	}
+	if status.Status != engine.StatusCompleted {
+		return status.Status == engine.StatusRunning, false, nil
+	}
+	err = s.ackStep(
+		ctx,
+		id,
+		op.Attempt,
+		record.Step,
+		record.InputsHash,
+		status.ExecutionID,
+		status.Result,
+		input.Steps,
+	)
+	if errors.Is(err, errNotOwned) {
+		return false, true, nil
+	}
+	return false, false, err
+}
+
+func (s *Service) reconcileStepStatusError(ctx context.Context, id contract.OperationID, attempt uint32, statusErr error) error {
+	switch {
+	case errors.Is(statusErr, engine.ErrJournalCorrupt):
+		err := s.failOperation(ctx, id, attempt, contract.PreconditionFailed, "Node journal is corrupt; inspect it before retrying.")
+		if errors.Is(err, errNotOwned) {
+			return errNotOwned
+		}
+		return err
+	case node.IsPermanentTransport(statusErr):
+		err := s.failOperation(ctx, id, attempt, contract.PreconditionFailed, "The node transport refused the request: "+statusErr.Error())
+		if errors.Is(err, errNotOwned) {
+			return errNotOwned
+		}
+		return err
+	default:
+		return unavailable(statusErr)
+	}
+}
+
+func (s *Service) failReconciliationInputs(ctx context.Context, id contract.OperationID, attempt uint32) error {
+	// The write is attempt-fenced like every other worker write: a newer
+	// attempt owns the operation and must not be overwritten.
+	_, owned, err := s.mutateOwned(
+		ctx,
+		id,
+		attempt,
+		func(tx *entities.StoreTx, current *contract.Operation) error {
+			if current.State.Terminal() {
 				return nil
 			}
-			return err
-		}
-		if status.Status == engine.StatusCompleted {
-			if _, err := s.ackStep(
+			return transition(
 				ctx,
-				id,
-				op.Attempt,
-				record.Step,
-				record.InputsHash,
-				status.ExecutionID,
-				status.Result,
-				input.Steps,
-			); err != nil {
-				if errors.Is(err, errNotOwned) {
-					return nil
-				}
-				return err
-			}
-			continue
-		}
-		if status.Status == engine.StatusRunning {
-			live = true
-		}
+				tx,
+				current,
+				contract.Failed,
+				contract.PreconditionFailed,
+				"Node effect inputs changed during reconciliation; inspect the node journal.",
+			)
+		},
+	)
+	if !owned || errors.Is(err, errNotOwned) {
+		return errNotOwned
 	}
-	var completed int
-	if completed, err = s.entities.Steps().CountCompleted(ctx, id); err != nil {
+	return err
+}
+
+func (s *Service) finishReconciledOperation(ctx context.Context, id contract.OperationID, op contract.Operation, input operations.TestInput, live bool) error {
+	completed, err := s.entities.Steps().CountCompleted(ctx, id)
+	if err != nil {
 		return unavailable(err)
 	}
 	if completed == input.Steps {
-		_, err := s.finishSucceeded(ctx, id, op.Attempt)
+		err := s.finishSucceeded(ctx, id, op.Attempt)
 		if errors.Is(err, errNotOwned) {
 			return nil
 		}
 		return err
 	}
 	if live {
-		_, owned, err := s.mutateOwned(
-			ctx,
-			id,
-			op.Attempt,
-			func(tx *entities.StoreTx, current *contract.Operation) error {
-				if current.State.Terminal() {
-					return nil
-				}
-				if current.State == contract.Queued {
-					if err := transition(
-						ctx,
-						tx,
-						current,
-						contract.Running,
-						"",
-						"Reconciled a live node task after its job ended.",
-					); err != nil {
-						return err
-					}
-				}
-				return appendEvent(
-					ctx,
-					tx,
-					current,
-					contract.Event{
-						Kind:    "warning",
-						Message: "Execution ended without a domain result, but the node task is still running; cancellation and failure wait for the in-flight step boundary.",
-					},
-				)
-			},
-		)
-		if !owned || errors.Is(err, errNotOwned) {
-			return nil
-		}
-		return err
+		return s.markReconciliationLive(ctx, id, op.Attempt)
 	}
 	if op.State == contract.Cancelling {
-		_, err := s.finishCancelled(ctx, id, op.Attempt, input.Steps)
+		err := s.finishCancelled(ctx, id, op.Attempt, input.Steps)
 		if errors.Is(err, errNotOwned) {
 			return nil
 		}
 		return err
 	}
+	return s.failReconciliationIncomplete(ctx, id, op.Attempt)
+}
+
+func (s *Service) markReconciliationLive(ctx context.Context, id contract.OperationID, attempt uint32) error {
 	_, owned, err := s.mutateOwned(
 		ctx,
 		id,
-		op.Attempt,
+		attempt,
+		func(tx *entities.StoreTx, current *contract.Operation) error {
+			if current.State.Terminal() {
+				return nil
+			}
+			if current.State == contract.Queued {
+				if err := transition(
+					ctx,
+					tx,
+					current,
+					contract.Running,
+					"",
+					"Reconciled a live node task after its job ended.",
+				); err != nil {
+					return err
+				}
+			}
+			return appendEvent(
+				ctx,
+				tx,
+				current,
+				contract.Event{
+					Kind:    "warning",
+					Message: "Execution ended without a domain result, but the node task is still running; cancellation and failure wait for the in-flight step boundary.",
+				},
+			)
+		},
+	)
+	if !owned || errors.Is(err, errNotOwned) {
+		return nil
+	}
+	return err
+}
+
+func (s *Service) failReconciliationIncomplete(ctx context.Context, id contract.OperationID, attempt uint32) error {
+	_, owned, err := s.mutateOwned(
+		ctx,
+		id,
+		attempt,
 		func(tx *entities.StoreTx, current *contract.Operation) error {
 			if current.State.Terminal() {
 				return nil

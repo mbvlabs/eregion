@@ -69,7 +69,10 @@ func (s Shell) Run(ctx context.Context, stepID, script string, env map[string]st
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
-	command := exec.Command("/bin/bash", "-s") //nolint:gosec // G204: fixed interpreter; the script comes from Go source.
+	// Cancellation is handled below by signalling the whole process group with
+	// SIGTERM and a grace period, so the command must not be killed directly on
+	// ctx.Done.
+	command := exec.CommandContext(context.WithoutCancel(ctx), "/bin/bash", "-s")
 	command.Stdin = strings.NewReader(script)
 	command.Env = []string{"PATH=" + scriptPath, "LANG=C.UTF-8", "LC_ALL=C.UTF-8", "HOME=/root", "DEBIAN_FRONTEND=noninteractive"}
 	for _, key := range keys {

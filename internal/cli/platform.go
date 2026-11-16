@@ -2,11 +2,8 @@ package cli
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/url"
 	"sort"
 	"strings"
@@ -57,10 +54,10 @@ func platformOneName(label string) cobra.PositionalArgs {
 	}
 }
 
-func platformTwoNames(first, second string) cobra.PositionalArgs {
+func platformTwoNames() cobra.PositionalArgs {
 	return func(_ *cobra.Command, args []string) error {
 		if len(args) != 2 {
-			return contract.NewFault(contract.InputRequired, first+" and "+second+" are required", "Supply exactly two positional names.")
+			return contract.NewFault(contract.InputRequired, "app and environment are required", "Supply exactly two positional names.")
 		}
 		if err := platform.ValidateName(args[0]); err != nil {
 			return err
@@ -69,10 +66,10 @@ func platformTwoNames(first, second string) cobra.PositionalArgs {
 	}
 }
 
-func platformThreeNames(first, second, third string) cobra.PositionalArgs {
+func platformThreeNames() cobra.PositionalArgs {
 	return func(_ *cobra.Command, args []string) error {
 		if len(args) != 3 {
-			return contract.NewFault(contract.InputRequired, first+", "+second+" and "+third+" are required", "Supply exactly three positional names.")
+			return contract.NewFault(contract.InputRequired, "app, environment and resource are required", "Supply exactly three positional names.")
 		}
 		if err := platform.ValidateName(args[0]); err != nil {
 			return err
@@ -160,19 +157,6 @@ func platformSelectItem(raw json.RawMessage, name string) (json.RawMessage, erro
 		}
 	}
 	return nil, contract.NewFault(contract.NotFound, "platform item not found", "List the collection to choose an existing name.")
-}
-
-// platformConfirmationToken binds a domain mutation to a dry-run plan. It is
-// used by domain remove, which still takes a plan-bound token rather than a
-// target-name confirmation.
-func platformConfirmationToken(kind, target string, input json.RawMessage) string {
-	digest := sha256.New()
-	_, _ = io.WriteString(digest, kind)
-	_, _ = io.WriteString(digest, "\x00")
-	_, _ = io.WriteString(digest, target)
-	_, _ = io.WriteString(digest, "\x00")
-	_, _ = digest.Write(input)
-	return hex.EncodeToString(digest.Sum(nil))
 }
 
 func platformWithConfirmation(data json.RawMessage, token string) (json.RawMessage, string) {

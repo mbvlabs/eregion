@@ -10,7 +10,6 @@ import (
 	"os/user"
 	"path/filepath"
 	"strconv"
-	"strings"
 
 	"github.com/mbvlabs/eregion/internal/engine"
 )
@@ -26,7 +25,7 @@ func ensureDir(path string, mode os.FileMode) error {
 	if !info.IsDir() {
 		return fmt.Errorf("%s is not a real directory", path)
 	}
-	return os.Chmod(path, mode) //nolint:gosec // G302: the caller chooses a private mode for host state.
+	return os.Chmod(path, mode)
 }
 
 // writeFile writes atomically and applies ownership when bootstrap runs as
@@ -109,7 +108,7 @@ func fileState(path string) ([]byte, os.FileMode, bool, error) {
 	if !info.Mode().IsRegular() {
 		return nil, 0, false, fmt.Errorf("%s is not a regular file", path)
 	}
-	raw, err := os.ReadFile(path) //nolint:gosec // G304: fixed host configuration path.
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, 0, false, err
 	}
@@ -127,27 +126,6 @@ func sameFileContent(path string, want []byte) (bool, os.FileMode, error) {
 		return false, mode, err
 	}
 	return bytes.Equal(raw, want), mode, nil
-}
-
-// writeSecretOnce writes a credential export only if it does not already exist
-// with different content. It never overwrites an existing token.
-func writeSecretOnce(path string, data []byte, owner, group string) (bool, error) {
-	raw, mode, exists, err := fileState(path)
-	if err != nil {
-		return false, err
-	}
-	if exists {
-		if !bytes.Equal(raw, data) {
-			return false, fmt.Errorf("%s already contains a different credential; remove it deliberately or choose another output path", path)
-		}
-		if mode&0o077 != 0 {
-			if err := os.Chmod(path, 0o600); err != nil {
-				return false, err
-			}
-		}
-		return false, chownIfRoot(path, owner, group)
-	}
-	return true, writeFile(path, data, 0o600, owner, group)
 }
 
 // writeReplacingSecret is used only for service configuration that must track
@@ -170,7 +148,7 @@ func readPrivateFile(path string, max int64) ([]byte, error) {
 	if info.Size() > max {
 		return nil, fmt.Errorf("%s is too large", path)
 	}
-	raw, err := os.ReadFile(path) //nolint:gosec // G304: operator-provided private input file.
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
@@ -180,19 +158,6 @@ func readPrivateFile(path string, max int64) ([]byte, error) {
 // ReadPrivateInput reads bounded, owner-only bootstrap input without following symlinks.
 func ReadPrivateInput(path string) ([]byte, error) { return readPrivateFile(path, 64<<10) }
 
-func writePublicFile(path string, data []byte, owner, group string) error {
-	return writeFile(path, data, 0o644, owner, group)
-}
-
-// removeIfEmpty removes a file only when it exists and is empty. It is used to
-// roll back a partially handed-off credential file.
-func removeIfEmpty(path string) {
-	info, err := os.Stat(path)
-	if err == nil && info.Mode().IsRegular() && info.Size() == 0 {
-		_ = os.Remove(path)
-	}
-}
-
-func trimTrailingNewline(raw []byte) []byte {
-	return []byte(strings.TrimSuffix(string(raw), "\n"))
+func writePublicFile(path string, data []byte, group string) error {
+	return writeFile(path, data, 0o644, "root", group)
 }

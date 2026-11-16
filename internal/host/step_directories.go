@@ -112,8 +112,9 @@ func (s *directoriesStep) Inputs() ([]byte, error) {
 		Owner string `json:"owner"`
 		Group string `json:"group"`
 	}
-	var entries []entry
-	for _, spec := range s.specs() {
+	specs := s.specs()
+	entries := make([]entry, 0, len(specs))
+	for _, spec := range specs {
 		entries = append(entries, entry{spec.Path, uint32(spec.Mode), spec.Owner, spec.Group})
 	}
 	return canonicalInput(entries)

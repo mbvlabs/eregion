@@ -202,7 +202,7 @@ func (s *CloudflareSetup) ConfigureCloudflareCredential(ctx context.Context, act
 // failure remains Internal; every audit persistence failure is Unavailable and
 // means the credential was not activated.
 func providerAuditFault(err error) error {
-	var fault *contract.Fault
+	var fault *contract.FaultError
 	if errors.As(err, &fault) && fault.Code == contract.Internal {
 		return fault
 	}
@@ -214,7 +214,7 @@ func providerAuditFault(err error) error {
 // error may have committed, so the operator must inspect the observed revision
 // before retrying. The cause is never attached, avoiding DB error details and
 // any credential material reaching the CLI.
-func providerCommitFault(err error) *contract.Fault {
+func providerCommitFault(err error) *contract.FaultError {
 	if entities.IsDefiniteRollback(err) {
 		return contract.NewFault(contract.Unavailable,
 			"provider credential commit was rolled back",

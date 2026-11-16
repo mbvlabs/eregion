@@ -11,31 +11,31 @@ import (
 // insertEnvironmentRevisionTx appends one immutable revision. The environment
 // row lock held by the caller (or the just-inserted row in this transaction)
 // serializes the per-environment number.
-func insertEnvironmentRevisionTx(ctx context.Context, tx *entities.StoreTx, envID platform.EnvironmentID, opID contract.OperationID, actor contract.Actor, operation, summary string, state platform.RevisionState) (platform.RevisionID, int, error) {
+func insertEnvironmentRevisionTx(ctx context.Context, tx *entities.StoreTx, envID platform.EnvironmentID, opID contract.OperationID, actor contract.Actor, operation, summary string, state platform.RevisionState) (platform.RevisionID, error) {
 	if err := actor.Validate(); err != nil {
-		return "", 0, err
+		return "", err
 	}
 	if len(operation) < 1 || len(operation) > 64 {
-		return "", 0, contract.NewFault(contract.ValidationFailed, "invalid revision operation", "Use an operation name between 1 and 64 bytes.")
+		return "", contract.NewFault(contract.ValidationFailed, "invalid revision operation", "Use an operation name between 1 and 64 bytes.")
 	}
 	if err := platform.NormalizeRevisionState(&state); err != nil {
-		return "", 0, err
+		return "", err
 	}
 	revisionID, err := platform.NewEnvironmentRevisionID()
 	if err != nil {
-		return "", 0, unavailable()
+		return "", unavailable()
 	}
-	var number int
-	if number, err = tx.Platform().Revisions().NextNumber(ctx, envID); err != nil {
-		return "", 0, unavailable(err)
+	number, err := tx.Platform().Revisions().NextNumber(ctx, envID)
+	if err != nil {
+		return "", unavailable(err)
 	}
 	if _, err := tx.Platform().Revisions().Insert(ctx, entities.RevisionInsert{
 		ID: revisionID, EnvironmentID: envID, Number: number, OperationID: opID,
 		Actor: actor, Operation: operation, Summary: summary, State: state,
 	}); err != nil {
-		return "", 0, platformWriteError(err, "environment revision could not be recorded")
+		return "", platformWriteError(err, "environment revision could not be recorded")
 	}
-	return revisionID, number, nil
+	return revisionID, nil
 }
 
 func nullableOperationID(id contract.OperationID) any {
@@ -48,31 +48,17 @@ func nullableOperationID(id contract.OperationID) any {
 // insertEnvironmentTx writes the environment row, its first revision and the
 // current-revision pointer in one transaction.
 func (s *Service) insertEnvironmentTx(ctx context.Context, tx *entities.StoreTx, app platform.App, spec *platform.EnvironmentSpec, opID contract.OperationID, actor contract.Actor, operation, summary string, deployIntent bool) (platform.EnvironmentID, error) {
-	node, err := nodeByNameTx(ctx, tx, spec.Node)
+	nodeName, buildNode, err := s.resolveEnvironmentPlacement(ctx, tx, spec)
 	if err != nil {
 		return "", err
 	}
-	spec.Node = node.Name
-	spec.Runtime.Node = node.Name
-	if err := s.checkPlacement(node, platform.RoleApplication, platform.CapabilityDocker); err != nil {
-		return "", err
-	}
+	spec.Node = nodeName
+	spec.Runtime.Node = nodeName
 	hostPort, candidatePort, err := allocatePorts(ctx, tx, spec.HostPort)
 	if err != nil {
 		return "", err
 	}
-	buildNode := ""
-	if spec.BuildNode != "" {
-		builder, err := nodeByNameTx(ctx, tx, spec.BuildNode)
-		if err != nil {
-			return "", err
-		}
-		if err := s.checkPlacement(builder, platform.RoleBuilder, platform.CapabilityBuildpacks); err != nil {
-			return "", err
-		}
-		buildNode = builder.Name
-	}
-	state := revisionStateFromSpec(*spec, node.Name, deployIntent)
+	state := revisionStateFromSpec(*spec, nodeName, deployIntent)
 	if err := platform.NormalizeRevisionState(&state); err != nil {
 		return "", err
 	}
@@ -80,13 +66,7 @@ func (s *Service) insertEnvironmentTx(ctx context.Context, tx *entities.StoreTx,
 	if err != nil {
 		return "", unavailable()
 	}
-	secretRefs := spec.SecretRefs
-	if secretRefs == nil {
-		secretRefs = map[string]string{}
-	}
-	if len(state.SecretNames) > 0 {
-		secretRefs = map[string]string{}
-	}
+	secretRefs := environmentSecretRefs(spec, state)
 	containerPort := spec.ContainerPort
 	for _, process := range state.Processes {
 		if process.Kind == "web" && process.ContainerPort > 0 {
@@ -99,7 +79,7 @@ func (s *Service) insertEnvironmentTx(ctx context.Context, tx *entities.StoreTx,
 		protected = *spec.Protected
 	}
 	if _, err := tx.Platform().Environments().Insert(ctx, entities.EnvironmentInsert{
-		ID: envID, AppID: app.ID, Name: spec.Name, Node: node.Name, BuildNode: buildNode,
+		ID: envID, AppID: app.ID, Name: spec.Name, Node: nodeName, BuildNode: buildNode,
 		HostPort: hostPort, CandidatePort: candidatePort, ContainerPort: containerPort,
 		Bind: spec.Bind, HealthType: state.Runtime.HealthType, HealthPath: state.Runtime.HealthPath,
 		HealthTimeoutSeconds: state.Runtime.HealthTimeoutSeconds, Env: state.Config,
@@ -107,7 +87,7 @@ func (s *Service) insertEnvironmentTx(ctx context.Context, tx *entities.StoreTx,
 	}); err != nil {
 		return "", platformWriteError(err, "environment name or port already exists")
 	}
-	revisionID, _, err := insertEnvironmentRevisionTx(ctx, tx, envID, opID, actor, operation, summary, state)
+	revisionID, err := insertEnvironmentRevisionTx(ctx, tx, envID, opID, actor, operation, summary, state)
 	if err != nil {
 		return "", err
 	}
@@ -122,26 +102,66 @@ func (s *Service) insertEnvironmentTx(ctx context.Context, tx *entities.StoreTx,
 	}
 	// The optional first domain bindings commit before the caller queues a
 	// first deploy, so the deploy's deployability gate sees the primary binding.
-	if len(spec.Domains) > 0 {
-		env := platform.Environment{ID: envID, App: app.Name, Name: spec.Name, Node: node.Name}
-		for _, declaration := range spec.Domains {
-			if _, err := s.insertDomainTx(ctx, tx, env, platform.DomainInput{
-				App: app.Name, Environment: spec.Name, Domain: declaration.Domain,
-				Primary: declaration.Primary, Addresses: spec.DomainAddresses, CheckPath: declaration.CheckPath,
-			}); err != nil {
-				return "", err
-			}
-		}
-	} else if spec.Domain != "" {
-		env := platform.Environment{ID: envID, App: app.Name, Name: spec.Name, Node: node.Name}
-		if _, err := s.insertDomainTx(ctx, tx, env, platform.DomainInput{
-			App: app.Name, Environment: spec.Name, Domain: spec.Domain,
-			Primary: spec.DomainPrimary, Addresses: spec.DomainAddresses, CheckPath: spec.DomainCheckPath,
-		}); err != nil {
-			return "", err
-		}
+	if err := s.insertEnvironmentDomains(ctx, tx, app, envID, spec); err != nil {
+		return "", err
 	}
 	return envID, nil
+}
+
+func (s *Service) resolveEnvironmentPlacement(ctx context.Context, tx *entities.StoreTx, spec *platform.EnvironmentSpec) (string, string, error) {
+	node, err := nodeByNameTx(ctx, tx, spec.Node)
+	if err != nil {
+		return "", "", err
+	}
+	if err := s.checkPlacement(node, platform.RoleApplication, platform.CapabilityDocker); err != nil {
+		return "", "", err
+	}
+	buildNode := ""
+	if spec.BuildNode != "" {
+		builder, err := nodeByNameTx(ctx, tx, spec.BuildNode)
+		if err != nil {
+			return "", "", err
+		}
+		if err := s.checkPlacement(builder, platform.RoleBuilder, platform.CapabilityBuildpacks); err != nil {
+			return "", "", err
+		}
+		buildNode = builder.Name
+	}
+	return node.Name, buildNode, nil
+}
+
+func environmentSecretRefs(spec *platform.EnvironmentSpec, state platform.RevisionState) map[string]string {
+	secretRefs := spec.SecretRefs
+	if secretRefs == nil {
+		secretRefs = map[string]string{}
+	}
+	if len(state.SecretNames) > 0 {
+		return map[string]string{}
+	}
+	return secretRefs
+}
+
+func (s *Service) insertEnvironmentDomains(ctx context.Context, tx *entities.StoreTx, app platform.App, envID platform.EnvironmentID, spec *platform.EnvironmentSpec) error {
+	env := platform.Environment{ID: envID, App: app.Name, Name: spec.Name, Node: spec.Node}
+	if len(spec.Domains) == 0 {
+		if spec.Domain == "" {
+			return nil
+		}
+		_, err := s.insertDomainTx(ctx, tx, env, platform.DomainInput{
+			App: app.Name, Environment: spec.Name, Domain: spec.Domain,
+			Primary: spec.DomainPrimary, Addresses: spec.DomainAddresses, CheckPath: spec.DomainCheckPath,
+		})
+		return err
+	}
+	for _, declaration := range spec.Domains {
+		if _, err := s.insertDomainTx(ctx, tx, env, platform.DomainInput{
+			App: app.Name, Environment: spec.Name, Domain: declaration.Domain,
+			Primary: declaration.Primary, Addresses: spec.DomainAddresses, CheckPath: declaration.CheckPath,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func revisionStateFromSpec(spec platform.EnvironmentSpec, node string, deployIntent bool) platform.RevisionState {
@@ -183,7 +203,7 @@ func publishEnvironmentRevisionTx(ctx context.Context, tx *entities.StoreTx, env
 	if err := platform.NormalizeRevisionState(&state); err != nil {
 		return "", err
 	}
-	revisionID, _, err := insertEnvironmentRevisionTx(ctx, tx, env.ID, opID, actor, operation, summary, state)
+	revisionID, err := insertEnvironmentRevisionTx(ctx, tx, env.ID, opID, actor, operation, summary, state)
 	if err != nil {
 		return "", err
 	}
@@ -221,14 +241,7 @@ func publishEnvironmentRevisionTx(ctx context.Context, tx *entities.StoreTx, env
 	return revisionID, nil
 }
 
-func nullableString(value string) any {
-	if value == "" {
-		return nil
-	}
-	return value
-}
-
-func currentRevisionStateTx(ctx context.Context, tx *entities.StoreTx, env platform.Environment) (platform.RevisionState, error) {
+func currentRevisionStateTx(_ *entities.StoreTx, env platform.Environment) (platform.RevisionState, error) {
 	if env.Revision != nil && env.RevisionID != "" && env.Revision.ID == env.RevisionID {
 		return platform.CloneRevisionState(env.Revision.RevisionState), nil
 	}

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/vault"
@@ -34,18 +35,7 @@ func TestIntegrationEntitiesSecretPortCiphertextMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for table, want := range map[string]string{
-		"eregion_secrets":          "eregion_secrets_pkey",
-		"eregion_secret_revisions": "eregion_secret_revisions_pkey",
-	} {
-		var got string
-		if err := pool.QueryRow(ctx, `SELECT conname FROM pg_constraint WHERE conrelid=$1::regclass AND contype='p'`, table).Scan(&got); err != nil {
-			t.Fatal(err)
-		}
-		if got != want {
-			t.Fatalf("primary key on %s = %s, want %s", table, got, want)
-		}
-	}
+	checkSecretSchema(t, ctx, pool)
 	namespace := vault.Namespace{App: "demo", Environment: "staging", Name: "API_TOKEN"}
 	first, keyID, err := ring.Seal(namespace, 1, []byte("first-secret-value"))
 	if err != nil {
@@ -58,6 +48,36 @@ func TestIntegrationEntitiesSecretPortCiphertextMetadata(t *testing.T) {
 		Actor:            testActor,
 	}
 
+	seedFirstSecret(t, ctx, store, namespace, firstInput)
+	checkFirstSecret(t, ctx, store, ring, namespace, keyID, firstInput)
+
+	secondInput := rotateSecret(t, ctx, store, ring, namespace)
+	checkRotatedSecretReads(t, ctx, store, ring, namespace, secondInput)
+
+	checkSecretDuplicateConflicts(t, ctx, store, namespace, firstInput)
+
+	checkSecretArchive(t, ctx, store, namespace)
+	checkSecretMissingAndRange(t, ctx, store)
+}
+
+func checkSecretSchema(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
+	t.Helper()
+	for table, want := range map[string]string{
+		"eregion_secrets":          "eregion_secrets_pkey",
+		"eregion_secret_revisions": "eregion_secret_revisions_pkey",
+	} {
+		var got string
+		if err := pool.QueryRow(ctx, `SELECT conname FROM pg_constraint WHERE conrelid=$1::regclass AND contype='p'`, table).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("primary key on %s = %s, want %s", table, got, want)
+		}
+	}
+}
+
+func seedFirstSecret(t *testing.T, ctx context.Context, store *entities.Store, namespace vault.Namespace, firstInput vault.SecretRevisionInput) {
+	t.Helper()
 	if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
 		secrets := tx.Secrets()
 		if err := secrets.InsertSecretNamespace(ctx, namespace, testActor); err != nil {
@@ -70,7 +90,10 @@ func TestIntegrationEntitiesSecretPortCiphertextMetadata(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+}
 
+func checkFirstSecret(t *testing.T, ctx context.Context, store *entities.Store, ring *vault.KeyRing, namespace vault.Namespace, keyID string, firstInput vault.SecretRevisionInput) {
+	t.Helper()
 	metadata, found, err := store.Secrets().SecretMetadata(ctx, namespace)
 	if err != nil || !found {
 		t.Fatalf("metadata: %v found=%v", err, found)
@@ -99,8 +122,10 @@ func TestIntegrationEntitiesSecretPortCiphertextMetadata(t *testing.T) {
 	if err != nil || openedKey != keyID || string(plaintext) != "first-secret-value" {
 		t.Fatalf("open first ciphertext = %q key %q err %v", plaintext, openedKey, err)
 	}
+}
 
-	// Rotation appends revision 2 under the locked CAS pointer.
+func rotateSecret(t *testing.T, ctx context.Context, store *entities.Store, ring *vault.KeyRing, namespace vault.Namespace) vault.SecretRevisionInput {
+	t.Helper()
 	second, secondKeyID, err := ring.Seal(namespace, 2, []byte("rotated-secret-value"))
 	if err != nil {
 		t.Fatal(err)
@@ -147,8 +172,12 @@ func TestIntegrationEntitiesSecretPortCiphertextMetadata(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	return secondInput
+}
 
-	metadata, found, err = store.Secrets().SecretMetadata(ctx, namespace)
+func checkRotatedSecretReads(t *testing.T, ctx context.Context, store *entities.Store, ring *vault.KeyRing, namespace vault.Namespace, secondInput vault.SecretRevisionInput) {
+	t.Helper()
+	metadata, found, err := store.Secrets().SecretMetadata(ctx, namespace)
 	if err != nil || !found || metadata.LatestRevision != 2 || metadata.Revision.Revision != 2 ||
 		metadata.Revision.Hash != secondInput.RevisionHash {
 		t.Fatalf("rotated metadata = %+v found=%v err=%v", metadata, found, err)
@@ -157,7 +186,7 @@ func TestIntegrationEntitiesSecretPortCiphertextMetadata(t *testing.T) {
 	if err != nil || !found || latest.Revision != 2 {
 		t.Fatalf("latest ciphertext = %+v found=%v err=%v", latest, found, err)
 	}
-	plaintext, _, err = ring.Open(latest.Namespace, latest.Revision, latest.Ciphertext)
+	plaintext, _, err := ring.Open(latest.Namespace, latest.Revision, latest.Ciphertext)
 	if err != nil || string(plaintext) != "rotated-secret-value" {
 		t.Fatalf("open rotated ciphertext = %q err %v", plaintext, err)
 	}
@@ -189,65 +218,74 @@ func TestIntegrationEntitiesSecretPortCiphertextMetadata(t *testing.T) {
 	if err != nil || len(listed) != 1 || listed[0].LatestRevision != 2 {
 		t.Fatalf("list metadata = %+v err %v", listed, err)
 	}
+}
 
+func checkSecretDuplicateConflicts(t *testing.T, ctx context.Context, store *entities.Store, namespace vault.Namespace, firstInput vault.SecretRevisionInput) {
+	t.Helper()
 	// Duplicate expected-PK conflicts are typed Conflict errors. PostgreSQL has
 	// already aborted the transaction at that point; the next statement must
 	// fail with 25P02, and the rejected transaction must not commit its marker.
-	duplicateNamespaceMarker := mustOperationID(t)
-	duplicateNamespaceKey := entities.OperationKey{
+	checkDuplicateSecretNamespace(t, ctx, store, namespace)
+	checkDuplicateSecretRevision(t, ctx, store, namespace, firstInput)
+	checkLockedSecretNamespace(t, ctx, store, namespace)
+}
+
+func checkDuplicateSecretNamespace(t *testing.T, ctx context.Context, store *entities.Store, namespace vault.Namespace) {
+	t.Helper()
+	checkDuplicateSecretConflict(t, ctx, store, namespace, "secret-duplicate-namespace", "duplicate-namespace",
+		func(tx *entities.StoreTx) error {
+			return tx.Secrets().InsertSecretNamespace(ctx, namespace, testActor)
+		})
+}
+
+func checkDuplicateSecretRevision(t *testing.T, ctx context.Context, store *entities.Store, namespace vault.Namespace, firstInput vault.SecretRevisionInput) {
+	t.Helper()
+	checkDuplicateSecretConflict(t, ctx, store, namespace, "secret-duplicate-revision", "duplicate-revision",
+		func(tx *entities.StoreTx) error {
+			return tx.Secrets().InsertSecretRevision(ctx, namespace, firstInput)
+		})
+}
+
+func checkDuplicateSecretConflict(
+	t *testing.T,
+	ctx context.Context,
+	store *entities.Store,
+	namespace vault.Namespace,
+	idempotencyKey, inputHash string,
+	insert func(*entities.StoreTx) error,
+) {
+	t.Helper()
+	marker := mustOperationID(t)
+	key := entities.OperationKey{
 		Kind: "diagnostic.test", Target: "control-plane", Actor: testActor,
-		IdempotencyKey: "secret-duplicate-namespace",
+		IdempotencyKey: idempotencyKey,
 	}
 	if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
 		inserted, err := tx.Operations().Insert(ctx, entities.OperationInsert{
-			ID: duplicateNamespaceMarker, Key: duplicateNamespaceKey,
-			InputHash: "duplicate-namespace", Input: json.RawMessage(`{"steps":1}`),
+			ID: marker, Key: key,
+			InputHash: inputHash, Input: json.RawMessage(`{"steps":1}`),
 		})
 		if err != nil || !inserted {
 			t.Fatalf("duplicate marker insert = %v err %v", inserted, err)
 		}
-		duplicateErr := tx.Secrets().InsertSecretNamespace(ctx, namespace, testActor)
+		duplicateErr := insert(tx)
 		if contract.Classify(duplicateErr).Code != contract.Conflict {
-			t.Fatalf("duplicate namespace error = %v, want Conflict", duplicateErr)
+			t.Fatalf("duplicate insert error = %v, want Conflict", duplicateErr)
 		}
 		if _, _, afterErr := tx.Secrets().LockSecretLatestRevision(ctx, namespace); !isPostgresCode(afterErr, "25P02") {
-			t.Fatalf("statement after duplicate namespace = %v, want SQLSTATE 25P02", afterErr)
+			t.Fatalf("statement after duplicate insert = %v, want SQLSTATE 25P02", afterErr)
 		}
 		return duplicateErr
 	}); contract.Classify(err).Code != contract.Conflict {
-		t.Fatalf("duplicate namespace transaction error = %v", err)
+		t.Fatalf("duplicate transaction error = %v", err)
 	}
-	if _, found, err := store.Operations().Get(ctx, duplicateNamespaceMarker); err != nil || found {
-		t.Fatalf("duplicate namespace marker found=%v err=%v", found, err)
+	if _, found, err := store.Operations().Get(ctx, marker); err != nil || found {
+		t.Fatalf("duplicate marker found=%v err=%v", found, err)
 	}
+}
 
-	duplicateRevisionMarker := mustOperationID(t)
-	duplicateRevisionKey := entities.OperationKey{
-		Kind: "diagnostic.test", Target: "control-plane", Actor: testActor,
-		IdempotencyKey: "secret-duplicate-revision",
-	}
-	if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
-		inserted, err := tx.Operations().Insert(ctx, entities.OperationInsert{
-			ID: duplicateRevisionMarker, Key: duplicateRevisionKey,
-			InputHash: "duplicate-revision", Input: json.RawMessage(`{"steps":1}`),
-		})
-		if err != nil || !inserted {
-			t.Fatalf("duplicate revision marker insert = %v err %v", inserted, err)
-		}
-		duplicateErr := tx.Secrets().InsertSecretRevision(ctx, namespace, firstInput)
-		if contract.Classify(duplicateErr).Code != contract.Conflict {
-			t.Fatalf("duplicate revision error = %v, want Conflict", duplicateErr)
-		}
-		if _, _, afterErr := tx.Secrets().LockSecretLatestRevision(ctx, namespace); !isPostgresCode(afterErr, "25P02") {
-			t.Fatalf("statement after duplicate revision = %v, want SQLSTATE 25P02", afterErr)
-		}
-		return duplicateErr
-	}); contract.Classify(err).Code != contract.Conflict {
-		t.Fatalf("duplicate revision transaction error = %v", err)
-	}
-	if _, found, err := store.Operations().Get(ctx, duplicateRevisionMarker); err != nil || found {
-		t.Fatalf("duplicate revision marker found=%v err=%v", found, err)
-	}
+func checkLockedSecretNamespace(t *testing.T, ctx context.Context, store *entities.Store, namespace vault.Namespace) {
+	t.Helper()
 	if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
 		locked, found, err := tx.Secrets().LockSecretNamespace(ctx, namespace)
 		if err != nil || !found || locked.LatestRevision != 2 || locked.State != vault.StateActive {
@@ -261,7 +299,10 @@ func TestIntegrationEntitiesSecretPortCiphertextMetadata(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+}
 
+func checkSecretArchive(t *testing.T, ctx context.Context, store *entities.Store, namespace vault.Namespace) {
+	t.Helper()
 	// Archive is a required CAS guard and keeps the revisions. It runs through
 	// the standalone SecretTransactions port, which owns the short transaction.
 	if err := store.Secrets().WithinSecretTx(ctx, func(tx vault.SecretTx) error {
@@ -280,22 +321,24 @@ func TestIntegrationEntitiesSecretPortCiphertextMetadata(t *testing.T) {
 	if err != nil || !found || archived.State != vault.StateArchived || archived.ArchivedAt == nil {
 		t.Fatalf("archived metadata = %+v found=%v err=%v", archived, found, err)
 	}
-	active, err = store.Secrets().ListActiveSecretCiphertexts(ctx, "demo", "staging", 10)
+	active, err := store.Secrets().ListActiveSecretCiphertexts(ctx, "demo", "staging", 10)
 	if err != nil || len(active) != 0 {
 		t.Fatalf("active after archive = %+v err %v", active, err)
 	}
-	pinned, err = store.Secrets().ListPinnedSecretCiphertexts(ctx, "demo", "staging", vault.RevisionMap{"API_TOKEN": 1})
+	pinned, err := store.Secrets().ListPinnedSecretCiphertexts(ctx, "demo", "staging", vault.RevisionMap{"API_TOKEN": 1})
 	if err != nil || len(pinned) != 1 || pinned[0].State != vault.StateArchived {
 		t.Fatalf("archived revision read = %+v err %v", pinned, err)
 	}
+}
 
+func checkSecretMissingAndRange(t *testing.T, ctx context.Context, store *entities.Store) {
+	t.Helper()
 	if _, found, err := store.Secrets().SecretMetadata(ctx, vault.Namespace{App: "demo", Environment: "staging", Name: "MISSING"}); err != nil || found {
 		t.Fatalf("missing metadata = found %v err %v", found, err)
 	}
 	if _, found, err := store.Secrets().SecretCiphertext(ctx, vault.Namespace{App: "demo", Environment: "staging", Name: "MISSING"}); err != nil || found {
 		t.Fatalf("missing ciphertext = found %v err %v", found, err)
 	}
-
 	// A caller-supplied revision above the signed bigint range is rejected
 	// before any SQL runs.
 	tooLarge := vault.RevisionMap{"API_TOKEN": 1<<63 + 1}

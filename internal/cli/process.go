@@ -36,9 +36,9 @@ func (a *app) processSpecs() []spec {
 			{
 				use:  "list <app> <environment>",
 				meta: list,
-				args: platformTwoNames("app", "environment"),
+				args: platformTwoNames(),
 				run: func(cmd *cobra.Command, args []string) (result, error) {
-					env, _, err := a.readEnvironment(cmd, args[0], args[1])
+					env, err := a.readEnvironment(cmd, args[0], args[1])
 					if err != nil {
 						return result{}, err
 					}

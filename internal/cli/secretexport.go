@@ -118,7 +118,7 @@ func readIdentityFile(path string) (string, error) {
 	if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
 		return "", fmt.Errorf("%s is not an owner-only regular file", path)
 	}
-	raw, err := os.ReadFile(path) //nolint:gosec // G304: eregion's own identity file.
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		return "", err
 	}

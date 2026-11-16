@@ -24,13 +24,13 @@ func runNodeUnlockSSH(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if flags.NArg() != 0 {
-		fmt.Fprintln(stderr, "usage: eregion node unlock-ssh [--minutes N]")
+		_, _ = fmt.Fprintln(stderr, "usage: eregion node unlock-ssh [--minutes N]")
 		return 2
 	}
 	fail := func(code contract.Code, message, hint string) int {
-		fmt.Fprintf(stderr, "error [%s]: %s\n", code, message)
+		_, _ = fmt.Fprintf(stderr, "error [%s]: %s\n", code, message)
 		if hint != "" {
-			fmt.Fprintf(stderr, "hint: %s\n", hint)
+			_, _ = fmt.Fprintf(stderr, "hint: %s\n", hint)
 		}
 		return contract.ExitCode(contract.NewFault(code, message, hint))
 	}

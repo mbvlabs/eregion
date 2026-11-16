@@ -48,7 +48,7 @@ func AcquireFile(ctx context.Context, path string, mode LockMode, timeout time.D
 }
 
 func acquireFile(ctx context.Context, path string, mode LockMode, timeout time.Duration) (Release, error) {
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600) //nolint:gosec // G304: fixed node state path.
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		return nil, err
 	}
@@ -56,7 +56,7 @@ func acquireFile(ctx context.Context, path string, mode LockMode, timeout time.D
 	if mode == LockShared {
 		how = syscall.LOCK_SH
 	}
-	fd := int(f.Fd()) //nolint:gosec // G115: file descriptors fit in int.
+	fd := int(f.Fd())
 	deadline := time.Now().Add(timeout)
 	for {
 		err := syscall.Flock(fd, how|syscall.LOCK_NB)
@@ -90,12 +90,12 @@ func WithFileLock(path string, fn func() error) error {
 	if err := EnsureDir(filepath.Dir(path)); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600) //nolint:gosec // G304: fixed node state path.
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = f.Close() }()
-	fd := int(f.Fd()) //nolint:gosec // G115: file descriptors fit in int.
+	fd := int(f.Fd())
 	if err := syscall.Flock(fd, syscall.LOCK_EX); err != nil {
 		return err
 	}

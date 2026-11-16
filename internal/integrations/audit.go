@@ -77,14 +77,11 @@ func (f *FileAudit) Record(_ context.Context, entry AuditEntry) error {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := os.MkdirAll(filepath.Dir(f.path), 0750); err != nil {
-		return contract.NewFault(contract.Unavailable, "audit directory is unavailable", "Do not perform the action.")
-	}
-	file, err := os.OpenFile(f.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	file, err := f.open()
 	if err != nil {
-		return contract.NewFault(contract.Unavailable, "audit log is unavailable", "Do not perform the action.")
+		return err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	if _, err := file.Write(append(raw, '\n')); err != nil {
 		return contract.NewFault(contract.Unavailable, "audit log write failed", "Do not perform the action.")
 	}
@@ -92,6 +89,20 @@ func (f *FileAudit) Record(_ context.Context, entry AuditEntry) error {
 		return contract.NewFault(contract.Unavailable, "audit log sync failed", "Do not perform the action.")
 	}
 	return nil
+}
+
+// open uses the operator's configured absolute destination. Rotation may use
+// symlinks, so preserve normal filesystem resolution rather than inventing a
+// restricted root that the configuration contract does not require.
+func (f *FileAudit) open() (*os.File, error) {
+	if err := os.MkdirAll(filepath.Dir(f.path), 0o750); err != nil { //nolint:gosec // G703: the operator-configured absolute audit destination, never request data.
+		return nil, contract.NewFault(contract.Unavailable, "audit directory is unavailable", "Do not perform the action.")
+	}
+	file, err := os.OpenFile(f.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600) //nolint:gosec // G703: the operator-configured audit file; symlink-based rotation is intentional.
+	if err != nil {
+		return nil, contract.NewFault(contract.Unavailable, "audit log is unavailable", "Do not perform the action.")
+	}
+	return file, nil
 }
 
 // Authorizer decides whether an actor may perform an integration action. A nil

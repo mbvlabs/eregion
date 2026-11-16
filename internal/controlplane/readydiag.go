@@ -66,6 +66,8 @@ func normalizeReadinessRuntime(runtime ReadinessRuntime) ReadinessRuntime {
 	switch runtime {
 	case ReadinessRuntimeAPI, ReadinessRuntimeWorker, ReadinessRuntimeNodeRPC:
 		return runtime
+	case ReadinessRuntimeUnknown:
+		return ReadinessRuntimeUnknown
 	default:
 		return ReadinessRuntimeUnknown
 	}
@@ -75,6 +77,8 @@ func normalizeReadinessPhase(phase ReadinessPhase) ReadinessPhase {
 	switch phase {
 	case ReadinessPhaseStartup, ReadinessPhaseRequest:
 		return phase
+	case ReadinessPhaseUnknown:
+		return ReadinessPhaseUnknown
 	default:
 		return ReadinessPhaseUnknown
 	}
@@ -183,7 +187,9 @@ func (t *readinessTracer) TraceRelease(_ *pgxpool.Pool, data pgxpool.TraceReleas
 		return
 	}
 	if tracked, ok := t.leases.LoadAndDelete(data.Conn); ok {
-		tracked.(*readyTrace).recordRelease()
+		if trace, ok := tracked.(*readyTrace); ok {
+			trace.recordRelease()
+		}
 	}
 }
 
@@ -347,14 +353,6 @@ func (t *readyTrace) recordRelease() {
 	t.mu.Unlock()
 }
 
-func (t *readyTrace) finish(after readyPoolSnapshot, failed bool) {
-	errorClass := ""
-	if failed {
-		errorClass = readinessErrorOther
-	}
-	t.finishResult(after, failed, errorClass, readinessContextActive)
-}
-
 func (t *readyTrace) finishContext(ctx context.Context, after readyPoolSnapshot, err error) {
 	t.finishResult(after, err != nil, classifyReadinessError(err), readinessContextState(ctx))
 }
@@ -453,11 +451,7 @@ func (t *readyTrace) report() readyReport {
 			failed:         stage.failed,
 		}
 		for _, query := range stage.queryDetails {
-			stageReport.queryDetails = append(stageReport.queryDetails, readyQueryReport{
-				ordinal: query.ordinal,
-				elapsed: query.elapsed,
-				failed:  query.failed,
-			})
+			stageReport.queryDetails = append(stageReport.queryDetails, readyQueryReport(query))
 		}
 		report.stages = append(report.stages, stageReport)
 		if stage.failed && report.failedStage == "" {
@@ -526,19 +520,6 @@ func NewReadinessLog(logger *slog.Logger) *ReadinessLog {
 		slow:     defaultReadinessSlow,
 		interval: defaultReadinessInterval,
 	}
-}
-
-func newReadinessLog(logger *slog.Logger, now func() time.Time, slow, interval time.Duration) *ReadinessLog {
-	if now == nil {
-		now = time.Now
-	}
-	if slow <= 0 {
-		slow = defaultReadinessSlow
-	}
-	if interval <= 0 {
-		interval = defaultReadinessInterval
-	}
-	return &ReadinessLog{logger: logger, now: now, slow: slow, interval: interval}
 }
 
 func (l *ReadinessLog) report(report readyReport) {

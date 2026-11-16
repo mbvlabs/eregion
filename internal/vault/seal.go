@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"math"
 )
 
 const (
@@ -30,30 +31,43 @@ func (k *KeyRing) Seal(namespace Namespace, revision uint64, plaintext []byte) (
 	if revision == 0 {
 		return nil, "", contractFault("secret revision must be positive", "Create revision 1 through the vault store; revisions are never zero.")
 	}
+	return k.sealEnvelope("secret", revision, plaintext, func(keyID string, revision uint64) []byte {
+		return sealAAD(keyID, namespace, revision)
+	})
+}
+
+// sealEnvelope builds the authenticated envelope shared by application secrets
+// and provider credentials. kind labels faults, and aad binds the caller's
+// exact identity to the ciphertext.
+func (k *KeyRing) sealEnvelope(kind string, revision uint64, plaintext []byte, aad func(keyID string, revision uint64) []byte) ([]byte, string, error) {
 	key := k.keys[k.current]
 	if key == nil {
-		return nil, "", contractFault("secret encryption key is missing", "Repair the protected master-key file.")
+		return nil, "", contractFault(kind+" encryption key is missing", "Repair the protected master-key file.")
 	}
 	block, err := aes.NewCipher(key.key[:])
 	if err != nil {
-		return nil, "", contractFault("secret encryption is unavailable", "Check the binary build and master-key format.")
+		return nil, "", contractFault(kind+" encryption is unavailable", "Check the binary build and master-key format.")
 	}
 	aead, err := cipher.NewGCM(block)
 	if err != nil {
-		return nil, "", contractFault("secret encryption is unavailable", "Check the binary build.")
+		return nil, "", contractFault(kind+" encryption is unavailable", "Check the binary build.")
 	}
 	nonce := make([]byte, gcmNonceBytes)
 	if _, err := rand.Read(nonce); err != nil {
-		return nil, "", contractFault("could not generate a secret nonce", "Check the operating system random source.")
+		return nil, "", contractFault("could not generate a "+kind+" nonce", "Check the operating system random source.")
 	}
 	keyID := key.id
-	envelope := make([]byte, 0, headerFixed+len(keyID)+gcmNonceBytes+len(plaintext)+gcmTagBytes)
+	keyIDLen := len(keyID)
+	if keyIDLen > math.MaxUint8 {
+		return nil, "", contractFault(kind+" encryption key ID is too long", "Repair the protected master-key file.")
+	}
+	envelope := make([]byte, 0, headerFixed+keyIDLen+gcmNonceBytes+len(plaintext)+gcmTagBytes)
 	envelope = append(envelope, envelopeMagic[:]...)
 	envelope = append(envelope, EnvelopeVersion)
-	envelope = append(envelope, byte(len(keyID)))
+	envelope = append(envelope, byte(keyIDLen))
 	envelope = append(envelope, keyID...)
 	envelope = append(envelope, nonce...)
-	envelope = aead.Seal(envelope, nonce, plaintext, sealAAD(keyID, namespace, revision))
+	envelope = aead.Seal(envelope, nonce, plaintext, aad(keyID, revision))
 	return envelope, keyID, nil
 }
 
@@ -66,30 +80,9 @@ func (k *KeyRing) Open(namespace Namespace, revision uint64, envelope []byte) ([
 	if revision == 0 {
 		return nil, "", contractFault("secret revision must be positive", "Read an existing immutable revision.")
 	}
-	keyID, nonce, ciphertext, err := parseEnvelope(envelope)
-	if err != nil {
-		return nil, "", err
-	}
-	if k == nil {
-		return nil, "", contractFault("secret encryption key is not loaded", "Configure the protected master-key file.")
-	}
-	key := k.keys[keyID]
-	if key == nil {
-		return nil, "", contractFault("secret ciphertext references an unavailable key", "Restore the key ID from the protected key file; never delete an old key before re-encrypting its revisions.")
-	}
-	block, err := aes.NewCipher(key.key[:])
-	if err != nil {
-		return nil, "", ErrCiphertext
-	}
-	aead, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, "", ErrCiphertext
-	}
-	plaintext, err := aead.Open(nil, nonce, ciphertext, sealAAD(keyID, namespace, revision))
-	if err != nil {
-		return nil, "", ErrCiphertext
-	}
-	return plaintext, keyID, nil
+	return k.openEnvelope("secret", revision, envelope, func(keyID string, revision uint64) []byte {
+		return sealAAD(keyID, namespace, revision)
+	})
 }
 
 // SealProvider encrypts one provider credential for an exact typed scope and
@@ -105,31 +98,9 @@ func (k *KeyRing) SealProvider(scope ProviderScope, revision uint64, plaintext [
 	if revision == 0 {
 		return nil, "", contractFault("provider credential revision must be positive", "Create revision 1 through the provider store; revisions are never zero.")
 	}
-	key := k.keys[k.current]
-	if key == nil {
-		return nil, "", contractFault("provider credential encryption key is missing", "Repair the protected master-key file.")
-	}
-	block, err := aes.NewCipher(key.key[:])
-	if err != nil {
-		return nil, "", contractFault("provider credential encryption is unavailable", "Check the binary build and master-key format.")
-	}
-	aead, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, "", contractFault("provider credential encryption is unavailable", "Check the binary build.")
-	}
-	nonce := make([]byte, gcmNonceBytes)
-	if _, err := rand.Read(nonce); err != nil {
-		return nil, "", contractFault("could not generate a provider credential nonce", "Check the operating system random source.")
-	}
-	keyID := key.id
-	envelope := make([]byte, 0, headerFixed+len(keyID)+gcmNonceBytes+len(plaintext)+gcmTagBytes)
-	envelope = append(envelope, envelopeMagic[:]...)
-	envelope = append(envelope, EnvelopeVersion)
-	envelope = append(envelope, byte(len(keyID)))
-	envelope = append(envelope, keyID...)
-	envelope = append(envelope, nonce...)
-	envelope = aead.Seal(envelope, nonce, plaintext, providerSealAAD(keyID, scope, revision))
-	return envelope, keyID, nil
+	return k.sealEnvelope("provider credential", revision, plaintext, func(keyID string, revision uint64) []byte {
+		return providerSealAAD(keyID, scope, revision)
+	})
 }
 
 // OpenProvider authenticates and decrypts one provider credential envelope.
@@ -142,16 +113,24 @@ func (k *KeyRing) OpenProvider(scope ProviderScope, revision uint64, envelope []
 	if revision == 0 {
 		return nil, "", contractFault("provider credential revision must be positive", "Read an existing immutable revision.")
 	}
+	return k.openEnvelope("provider credential", revision, envelope, func(keyID string, revision uint64) []byte {
+		return providerSealAAD(keyID, scope, revision)
+	})
+}
+
+// openEnvelope authenticates and decrypts one envelope. kind labels faults, and
+// aad must exactly match the authenticated header used when it was sealed.
+func (k *KeyRing) openEnvelope(kind string, revision uint64, envelope []byte, aad func(keyID string, revision uint64) []byte) ([]byte, string, error) {
 	keyID, nonce, ciphertext, err := parseEnvelope(envelope)
 	if err != nil {
 		return nil, "", err
 	}
 	if k == nil {
-		return nil, "", contractFault("provider credential encryption key is not loaded", "Configure the protected master-key file.")
+		return nil, "", contractFault(kind+" encryption key is not loaded", "Configure the protected master-key file.")
 	}
 	key := k.keys[keyID]
 	if key == nil {
-		return nil, "", contractFault("provider credential ciphertext references an unavailable key", "Restore the key ID from the protected key file; never delete an old key before re-encrypting its revisions.")
+		return nil, "", contractFault(kind+" ciphertext references an unavailable key", "Restore the key ID from the protected key file; never delete an old key before re-encrypting its revisions.")
 	}
 	block, err := aes.NewCipher(key.key[:])
 	if err != nil {
@@ -161,7 +140,7 @@ func (k *KeyRing) OpenProvider(scope ProviderScope, revision uint64, envelope []
 	if err != nil {
 		return nil, "", ErrCiphertext
 	}
-	plaintext, err := aead.Open(nil, nonce, ciphertext, providerSealAAD(keyID, scope, revision))
+	plaintext, err := aead.Open(nil, nonce, ciphertext, aad(keyID, revision))
 	if err != nil {
 		return nil, "", ErrCiphertext
 	}
@@ -172,6 +151,7 @@ func providerSealAAD(keyID string, scope ProviderScope, revision uint64) []byte 
 	aad := make([]byte, 0, 64+len(keyID)+len(scope.Provider)+len(scope.ZoneID))
 	aad = append(aad, envelopeMagic[:]...)
 	aad = append(aad, EnvelopeVersion)
+	//nolint:gosec // G115: key IDs are bounded to 64 bytes by keyIDPattern and parseEnvelope.
 	aad = binary.BigEndian.AppendUint16(aad, uint16(len(keyID)))
 	aad = append(aad, keyID...)
 	aad = append(aad, []byte("provider-scope")...)
@@ -211,6 +191,7 @@ func sealAAD(keyID string, namespace Namespace, revision uint64) []byte {
 	aad := make([]byte, 0, 8+1+2+len(keyID)+len(namespace.App)+len(namespace.Environment)+len(namespace.Name)+8)
 	aad = append(aad, envelopeMagic[:]...)
 	aad = append(aad, EnvelopeVersion)
+	//nolint:gosec // G115: key IDs are bounded to 64 bytes by keyIDPattern and parseEnvelope.
 	aad = binary.BigEndian.AppendUint16(aad, uint16(len(keyID)))
 	aad = append(aad, keyID...)
 	aad = appendField(aad, namespace.App)
@@ -221,6 +202,7 @@ func sealAAD(keyID string, namespace Namespace, revision uint64) []byte {
 }
 
 func appendField(dst []byte, value string) []byte {
+	//nolint:gosec // G115: validated namespace and provider fields are bounded well below 65536 bytes.
 	dst = binary.BigEndian.AppendUint16(dst, uint16(len(value)))
 	return append(dst, value...)
 }
@@ -247,6 +229,7 @@ type hashWriter interface {
 
 func writeHashField(writer hashWriter, value string) {
 	var length [4]byte
+	//nolint:gosec // G115: secret and metadata fields are far below the 4 GiB uint32 limit.
 	binary.BigEndian.PutUint32(length[:], uint32(len(value)))
 	_, _ = writer.Write(length[:])
 	_, _ = writer.Write([]byte(value))

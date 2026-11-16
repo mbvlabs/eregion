@@ -110,7 +110,7 @@ func LoadOrCreateIdentity(root string) (ed25519.PrivateKey, error) {
 	}
 	encoded := base64.StdEncoding.EncodeToString(key.Seed()) + "\n"
 	// Create-once: the first writer wins and every later caller reads that key.
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) //nolint:gosec // G304: fixed path beneath the node state directory.
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		if os.IsExist(err) {
 			return readIdentity(path)
@@ -130,7 +130,7 @@ func LoadOrCreateIdentity(root string) (ed25519.PrivateKey, error) {
 }
 
 func readIdentity(path string) (ed25519.PrivateKey, error) {
-	raw, err := os.ReadFile(path) //nolint:gosec // G304: fixed path beneath the node state directory.
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
@@ -147,7 +147,10 @@ func Attest(root, nodeName, nonce string) (Attestation, error) {
 	if err != nil {
 		return Attestation{}, err
 	}
-	public := key.Public().(ed25519.PublicKey)
+	public, ok := key.Public().(ed25519.PublicKey)
+	if !ok {
+		return Attestation{}, errors.New("the node identity key is not an ed25519 key")
+	}
 	return Attestation{
 		PublicKey:   base64.StdEncoding.EncodeToString(public),
 		Fingerprint: Fingerprint(public),

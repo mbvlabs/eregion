@@ -28,7 +28,7 @@ func NewClient(endpoint, token string) (*Client, error) {
 		return nil, contract.NewFault(contract.ValidationFailed, "invalid API URL", "Use an origin URL without credentials, query, or path.")
 	}
 	ip := net.ParseIP(u.Hostname())
-	if u.Scheme != "https" && !(u.Scheme == "http" && ip != nil && ip.IsLoopback()) {
+	if u.Scheme != "https" && (u.Scheme != "http" || ip == nil || !ip.IsLoopback()) {
 		return nil, contract.NewFault(contract.ValidationFailed, "API transport must be encrypted", "Use HTTPS; plain HTTP is allowed only for literal loopback development hosts.")
 	}
 	if !tokenPattern.MatchString(token) {
@@ -141,7 +141,7 @@ func (c *Client) request(ctx context.Context, method, path string, body any, key
 		}
 		return nil, contract.NewFault(contract.Unavailable, "API request did not complete", "Inspect the existing operation or reuse the same submission key; a timed-out request may have committed.")
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	raw, err := io.ReadAll(io.LimitReader(response.Body, 1048577))
 	if err != nil || len(raw) > 1048576 {
 		return nil, contract.NewFault(contract.Unavailable, "API response is incomplete or too large", "Reconnect to the existing operation; do not blindly resubmit.")
@@ -183,7 +183,7 @@ func (c *Client) Ready(ctx context.Context) error {
 	if err != nil {
 		return contract.NewFault(contract.Unavailable, "the control plane did not answer", err.Error())
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
 	if resp.StatusCode != http.StatusOK {
 		return contract.NewFault(contract.Unavailable, "the control plane is not ready", "readyz answered "+strconv.Itoa(resp.StatusCode)+".")

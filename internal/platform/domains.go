@@ -292,13 +292,13 @@ func ObserveCertificate(ctx context.Context, host, address string) CertificateOb
 	if err != nil {
 		return CertificateObservation{State: CertificatePending, Error: err.Error()}
 	}
-	defer raw.Close()
-	conn := tls.Client(raw, &tls.Config{ //nolint:gosec // The chain is verified explicitly below so expiry and validity are both recorded.
+	defer func() { _ = raw.Close() }()
+	conn := tls.Client(raw, &tls.Config{
 		MinVersion: tls.VersionTLS12,
 		ServerName: host,
 		// Inspect the certificate even when verification fails so the
 		// observation can record the expiry instead of inventing one.
-		InsecureSkipVerify: true,
+		InsecureSkipVerify: true, //nolint:gosec // G402: the chain is verified explicitly below so expiry and validity are both recorded.
 	})
 	handshakeCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
 	defer cancel()
@@ -380,7 +380,7 @@ func ObservePublic(ctx context.Context, host, path, address string) PublicObserv
 	if err != nil {
 		return PublicObservation{State: PublicFailed, Error: err.Error()}
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 	observation := PublicObservation{Status: resp.StatusCode}
 	if resp.StatusCode >= 200 && resp.StatusCode < 400 {

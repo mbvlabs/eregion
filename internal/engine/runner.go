@@ -327,76 +327,116 @@ func (e *Engine) Run(ctx context.Context, step Step, exec Execution, report Repo
 	effectLock, err := Acquire(ctx, e.effectLockPath(exec), LockExclusive, e.lockTimeout())
 	if err != nil {
 		if errors.Is(err, ErrLockHeld) {
-			// Never present the request attempt as the observed owner. A live
-			// owner journals its own attempt identity before taking the effect.
-			status := e.observedTaskStatus(exec)
-			if status.InputsHash != "" && status.InputsHash != inputsHash {
-				return status, fmt.Errorf("%w: effect %s has different inputs", ErrInputsMismatch, exec.EffectKey())
-			}
-			if status.Status == StatusCompleted || status.Status == StatusFailed {
-				// The owner finished after this attempt's bounded wait. Report
-				// its terminal observation rather than a stale running claim.
-				if status.InputsHash == "" {
-					status.InputsHash = inputsHash
-				}
-				return status, nil
-			}
-			status.Status = StatusRunning
-			status.InputsHash = inputsHash
-			if status.Detail == "" {
-				status.Detail = "another local execution holds the effect lock"
-			}
-			return status, ErrLockHeld
+			return e.effectLockHeldStatus(exec, inputsHash)
 		}
 		return TaskStatus{}, err
 	}
 	defer effectLock()
 
 	// Re-read everything under the effect lock. This closes the status->run race.
-	if record, ok, err := LoadEffectRecord(e.EffectRecordPath(exec)); err != nil {
-		return TaskStatus{}, err
-	} else if ok {
-		if record.InputsHash != inputsHash {
-			return TaskStatus{}, fmt.Errorf("%w: effect %s completed with different inputs", ErrInputsMismatch, exec.EffectKey())
-		}
-		if err := e.completeFromRecord(exec, record); err != nil {
-			return TaskStatus{}, err
-		}
-		return TaskStatus{
-			Status:         StatusCompleted,
-			ExecutionID:    record.ExecutionID,
-			Attempt:        record.AppliedAttempt,
-			AppliedAttempt: record.AppliedAttempt,
-			InputsHash:     record.InputsHash,
-			Result:         record.Result,
-			Detail:         "recovered durable effect record",
-		}, nil
+	if status, recovered, err := e.recoveredEffectStatus(exec, inputsHash); recovered {
+		return status, err
 	}
-
 	journal, err := LoadJournal(e.JournalPath())
 	if err != nil {
 		return TaskStatus{}, err
 	}
-	if task, ok := journal.Tasks[exec.EffectKey()]; ok {
-		if task.InputsHash != "" && task.InputsHash != inputsHash {
-			return TaskStatus{}, fmt.Errorf("%w: effect %s has different inputs", ErrInputsMismatch, exec.EffectKey())
-		}
-		if task.Status == TaskCompleted {
-			return TaskStatus{
-				Status:         StatusCompleted,
-				ExecutionID:    task.ExecutionID,
-				Attempt:        task.Attempt,
-				AppliedAttempt: task.AppliedAttempt,
-				InputsHash:     task.InputsHash,
-				Result:         task.Result,
-				Detail:         "journal already completed",
-			}, nil
-		}
+	if status, completed, err := completedTaskStatus(journal, exec, inputsHash); completed {
+		return status, err
 	}
-
-	token, err := claimToken()
+	running, err := newRunningTask(exec, inputsHash, journal)
 	if err != nil {
 		return TaskStatus{}, err
+	}
+	release, status, err := e.acquireHostLocks(ctx, exec, step, &running)
+	if err != nil {
+		return status, err
+	}
+	defer release()
+
+	return e.checkApplyAndRecord(ctx, step, exec, &running, report, inputsHash, journal)
+}
+
+// effectLockHeldStatus reports the observed owner of an effect whose lock is
+// held. The request attempt is never presented as the observed owner.
+func (e *Engine) effectLockHeldStatus(exec Execution, inputsHash string) (TaskStatus, error) {
+	status := e.observedTaskStatus(exec)
+	if status.InputsHash != "" && status.InputsHash != inputsHash {
+		return status, fmt.Errorf("%w: effect %s has different inputs", ErrInputsMismatch, exec.EffectKey())
+	}
+	if status.Status == StatusCompleted || status.Status == StatusFailed {
+		// The owner finished after this attempt's bounded wait. Report its
+		// terminal observation rather than a stale running claim.
+		if status.InputsHash == "" {
+			status.InputsHash = inputsHash
+		}
+		return status, nil
+	}
+	status.Status = StatusRunning
+	status.InputsHash = inputsHash
+	if status.Detail == "" {
+		status.Detail = "another local execution holds the effect lock"
+	}
+	return status, ErrLockHeld
+}
+
+// recoveredEffectStatus recovers a durable effect record written by an earlier
+// attempt, after proving it describes the same inputs.
+func (e *Engine) recoveredEffectStatus(exec Execution, inputsHash string) (TaskStatus, bool, error) {
+	record, ok, err := LoadEffectRecord(e.EffectRecordPath(exec))
+	if err != nil {
+		return TaskStatus{}, true, err
+	}
+	if !ok {
+		return TaskStatus{}, false, nil
+	}
+	if record.InputsHash != inputsHash {
+		return TaskStatus{}, true, fmt.Errorf("%w: effect %s completed with different inputs", ErrInputsMismatch, exec.EffectKey())
+	}
+	if err := e.completeFromRecord(exec, record); err != nil {
+		return TaskStatus{}, true, err
+	}
+	return TaskStatus{
+		Status:         StatusCompleted,
+		ExecutionID:    record.ExecutionID,
+		Attempt:        record.AppliedAttempt,
+		AppliedAttempt: record.AppliedAttempt,
+		InputsHash:     record.InputsHash,
+		Result:         record.Result,
+		Detail:         "recovered durable effect record",
+	}, true, nil
+}
+
+// completedTaskStatus reports a journal task that already completed the
+// effect with the same inputs.
+func completedTaskStatus(journal *Journal, exec Execution, inputsHash string) (TaskStatus, bool, error) {
+	task, ok := journal.Tasks[exec.EffectKey()]
+	if !ok {
+		return TaskStatus{}, false, nil
+	}
+	if task.InputsHash != "" && task.InputsHash != inputsHash {
+		return TaskStatus{}, true, fmt.Errorf("%w: effect %s has different inputs", ErrInputsMismatch, exec.EffectKey())
+	}
+	if task.Status != TaskCompleted {
+		return TaskStatus{}, false, nil
+	}
+	return TaskStatus{
+		Status:         StatusCompleted,
+		ExecutionID:    task.ExecutionID,
+		Attempt:        task.Attempt,
+		AppliedAttempt: task.AppliedAttempt,
+		InputsHash:     task.InputsHash,
+		Result:         task.Result,
+		Detail:         "journal already completed",
+	}, true, nil
+}
+
+// newRunningTask claims the effect under a fresh owner token. Resuming the same
+// River attempt keeps its original start time and accumulated lock wait.
+func newRunningTask(exec Execution, inputsHash string, journal *Journal) (Task, error) {
+	token, err := claimToken()
+	if err != nil {
+		return Task{}, err
 	}
 	owner := Owner{PID: os.Getpid(), BootID: bootID(), Token: token}
 	running := Task{
@@ -411,9 +451,6 @@ func (e *Engine) Run(ctx context.Context, step Step, exec Execution, report Repo
 		StartedAt:   now(),
 	}
 	if existing, ok := journal.Tasks[exec.EffectKey()]; ok && existing.Attempt == exec.Attempt {
-		// Resuming the same River attempt keeps its original start time and
-		// accumulated lock wait. A benign waiter that exited must not rewrite
-		// the attempt's history when it is retried.
 		running = existing
 		running.Status = string(TaskRunning)
 		running.Owner = owner
@@ -432,96 +469,165 @@ func (e *Engine) Run(ctx context.Context, step Step, exec Execution, report Repo
 	} else {
 		running.WaitMS = 0
 	}
+	return running, nil
+}
 
-	independent, ok := step.(HostLockIndependent)
-	needsHostLock := !ok || !independent.IndependentOfHostLock()
-	if needsHostLock {
+// acquireHostLocks takes the host lock and every shared resource lock a step
+// needs, and returns their combined release.
+func (e *Engine) acquireHostLocks(ctx context.Context, exec Execution, step Step, running *Task) (Release, TaskStatus, error) {
+	if independent, ok := step.(HostLockIndependent); ok && independent.IndependentOfHostLock() {
+		return func() {}, TaskStatus{}, nil
+	}
+	mode, resources := hostLockMode(step)
+	hostLock, err := e.waitForHostLock(ctx, exec, running, mode)
+	if err != nil {
+		if errors.Is(err, ErrLockHeld) {
+			return nil, hostLockDeferredStatus(*running), err
+		}
+		return nil, TaskStatus{}, err
+	}
+	locks := []Release{hostLock}
+	if err := e.acquireResourceLocks(ctx, exec, running, resources, &locks); err != nil {
+		releaseLocks(locks)
+		if errors.Is(err, ErrLockHeld) {
+			return nil, resourceLockDeferredStatus(*running), err
+		}
+		return nil, TaskStatus{}, err
+	}
+	return func() { releaseLocks(locks) }, TaskStatus{}, nil
+}
+
+// hostLockMode returns the host lock mode and shared resource identities of a
+// step.
+func hostLockMode(step Step) (LockMode, []string) {
+	mode := LockExclusive
+	var resources []string
+	if shared, ok := step.(SharedHostResources); ok {
+		mode = LockShared
+		resources = shared.SharedHostResources()
+	}
+	return mode, resources
+}
+
+// waitForHostLock persists the wait and takes the host lock. A lock-holder
+// exits as a deferred, nonterminal task exactly as before.
+func (e *Engine) waitForHostLock(ctx context.Context, exec Execution, running *Task, mode LockMode) (Release, error) {
+	waitStarted := time.Now()
+	running.Phase = PhaseWaitingHostLock
+	running.PhaseStartedAt = waitStarted.UTC().Format(time.RFC3339Nano)
+	running.WaitMS = nonNegativeMillis(running.WaitMS)
+	if err := e.saveTask(exec, *running); err != nil {
+		return nil, err
+	}
+	hostLock, err := Acquire(ctx, e.hostLockPath(), mode, e.lockTimeout())
+	running.WaitMS = nonNegativeMillis(running.WaitMS) + elapsedMillis(waitStarted)
+	if err == nil {
+		return hostLock, nil
+	}
+	if !errors.Is(err, ErrLockHeld) {
+		return nil, err
+	}
+	// The process exits before Check or Apply. Persist that explicit
+	// nonterminal state before returning so status does not report a live owner
+	// or a stale interrupted effect.
+	running.Status = string(TaskDeferred)
+	running.Detail = "exited while waiting for the host lock before Check/Apply; no effect was attempted"
+	if saveErr := e.saveTask(exec, *running); saveErr != nil {
+		return nil, saveErr
+	}
+	return nil, ErrLockHeld
+}
+
+// acquireResourceLocks appends every acquired shared resource lock to locks.
+// A lock-holder exits as a deferred, nonterminal task exactly as before.
+func (e *Engine) acquireResourceLocks(ctx context.Context, exec Execution, running *Task, resources []string, locks *[]Release) error {
+	sort.Strings(resources)
+	last := ""
+	for _, resource := range resources {
+		if resource == "" {
+			return errors.New("empty shared host resource identity")
+		}
+		if resource == last {
+			continue
+		}
+		last = resource
+		path := e.resourceLockPath(resource)
 		waitStarted := time.Now()
 		running.Phase = PhaseWaitingHostLock
 		running.PhaseStartedAt = waitStarted.UTC().Format(time.RFC3339Nano)
-		running.WaitMS = nonNegativeMillis(running.WaitMS)
-		if err := e.saveTask(exec, running); err != nil {
-			return TaskStatus{}, err
+		running.Detail = "waiting for an exclusive resource lock"
+		if err := e.saveTask(exec, *running); err != nil {
+			return err
 		}
-		mode := LockExclusive
-		var resources []string
-		if shared, ok := step.(SharedHostResources); ok {
-			mode = LockShared
-			resources = shared.SharedHostResources()
-		}
-		hostLock, err := Acquire(ctx, e.hostLockPath(), mode, e.lockTimeout())
+		release, err := Acquire(ctx, path, LockExclusive, e.lockTimeout())
+		running.WaitMS += elapsedMillis(waitStarted)
 		if err != nil {
 			if errors.Is(err, ErrLockHeld) {
-				// The process exits before Check or Apply. Persist that explicit
-				// nonterminal state before returning so status does not report a
-				// live owner or a stale interrupted effect.
 				running.Status = string(TaskDeferred)
-				running.WaitMS = nonNegativeMillis(running.WaitMS) + elapsedMillis(waitStarted)
-				running.Detail = "exited while waiting for the host lock before Check/Apply; no effect was attempted"
-				if saveErr := e.saveTask(exec, running); saveErr != nil {
-					return TaskStatus{}, saveErr
+				running.Detail = "exited while waiting for a resource lock before Check/Apply; no effect was attempted"
+				if saveErr := e.saveTask(exec, *running); saveErr != nil {
+					return saveErr
 				}
-				return TaskStatus{
-					Status:         StatusDeferred,
-					ExecutionID:    running.ExecutionID,
-					Attempt:        running.Attempt,
-					AppliedAttempt: running.AppliedAttempt,
-					InputsHash:     running.InputsHash,
-					Phase:          PhaseWaitingHostLock,
-					PhaseStartedAt: running.PhaseStartedAt,
-					WaitMS:         running.WaitMS,
-					Detail:         running.Detail,
-				}, ErrLockHeld
 			}
-			return TaskStatus{}, err
+			return err
 		}
-		defer hostLock()
-		running.WaitMS = nonNegativeMillis(running.WaitMS) + elapsedMillis(waitStarted)
-		sort.Strings(resources)
-		last := ""
-		for _, resource := range resources {
-			if resource == "" {
-				return TaskStatus{}, errors.New("empty shared host resource identity")
-			}
-			if resource == last {
-				continue
-			}
-			last = resource
-			sum := sha256.Sum256([]byte(resource))
-			path := filepath.Join(e.StateDir, "resource-locks", hex.EncodeToString(sum[:])+".lock")
-			waitStarted = time.Now()
-			running.Phase = PhaseWaitingHostLock
-			running.PhaseStartedAt = waitStarted.UTC().Format(time.RFC3339Nano)
-			running.Detail = "waiting for an exclusive resource lock"
-			if err := e.saveTask(exec, running); err != nil {
-				return TaskStatus{}, err
-			}
-			release, err := Acquire(ctx, path, LockExclusive, e.lockTimeout())
-			running.WaitMS += elapsedMillis(waitStarted)
-			if err != nil {
-				if errors.Is(err, ErrLockHeld) {
-					running.Status = string(TaskDeferred)
-					running.Detail = "exited while waiting for a resource lock before Check/Apply; no effect was attempted"
-					if saveErr := e.saveTask(exec, running); saveErr != nil {
-						return TaskStatus{}, saveErr
-					}
-					return TaskStatus{Status: StatusDeferred, ExecutionID: running.ExecutionID, Attempt: running.Attempt, InputsHash: inputsHash, Phase: running.Phase, PhaseStartedAt: running.PhaseStartedAt, WaitMS: running.WaitMS, Detail: running.Detail}, ErrLockHeld
-				}
-				return TaskStatus{}, err
-			}
-			defer release()
-		}
+		*locks = append(*locks, release)
 	}
+	return nil
+}
+
+// resourceLockPath is the lock file of one shared host resource.
+func (e *Engine) resourceLockPath(resource string) string {
+	sum := sha256.Sum256([]byte(resource))
+	return filepath.Join(e.StateDir, "resource-locks", hex.EncodeToString(sum[:])+".lock")
+}
+
+// releaseLocks releases every lock in reverse acquisition order.
+func releaseLocks(locks []Release) {
+	for index := len(locks) - 1; index >= 0; index-- {
+		locks[index]()
+	}
+}
+
+func hostLockDeferredStatus(running Task) TaskStatus {
+	return TaskStatus{
+		Status:         StatusDeferred,
+		ExecutionID:    running.ExecutionID,
+		Attempt:        running.Attempt,
+		AppliedAttempt: running.AppliedAttempt,
+		InputsHash:     running.InputsHash,
+		Phase:          PhaseWaitingHostLock,
+		PhaseStartedAt: running.PhaseStartedAt,
+		WaitMS:         running.WaitMS,
+		Detail:         running.Detail,
+	}
+}
+
+func resourceLockDeferredStatus(running Task) TaskStatus {
+	return TaskStatus{
+		Status:         StatusDeferred,
+		ExecutionID:    running.ExecutionID,
+		Attempt:        running.Attempt,
+		InputsHash:     running.InputsHash,
+		Phase:          running.Phase,
+		PhaseStartedAt: running.PhaseStartedAt,
+		WaitMS:         running.WaitMS,
+		Detail:         running.Detail,
+	}
+}
+
+// checkApplyAndRecord runs Check, applies when needed, and records the result.
+func (e *Engine) checkApplyAndRecord(ctx context.Context, step Step, exec Execution, running *Task, report Reporter, inputsHash string, journal *Journal) (TaskStatus, error) {
 	running.Phase = PhaseChecking
 	running.PhaseStartedAt = now()
-	if err := e.saveTask(exec, running); err != nil {
+	if err := e.saveTask(exec, *running); err != nil {
 		return TaskStatus{}, err
 	}
 
 	// Check again after locking: another effect may have changed state.
-	check, err := step.Check(ctx, Runtime{DryRun: false, Secrets: e.registry(), Scripts: e.Scripts, SecretValues: e.SecretValues, Root: e.StateDir})
+	check, err := step.Check(ctx, e.stepRuntime())
 	if err != nil {
-		return e.fail(exec, running, fmt.Errorf("check %s: %w", step.ID(), err), nil)
+		return e.fail(exec, *running, fmt.Errorf("check %s: %w", step.ID(), err), nil)
 	}
 	executed := false
 	result := ApplyResult{}
@@ -532,25 +638,43 @@ func (e *Engine) Run(ctx context.Context, step Step, exec Execution, report Repo
 		result.Result = check.Result
 	}
 	if !check.Complete {
-		message := "applying: " + check.Detail
-		if progress, ok := step.(ApplyProgress); ok {
-			if description := progress.ApplyProgressMessage(); description != "" {
-				message = description
-			}
-		}
-		running.Phase = PhaseApplying
-		running.PhaseStartedAt = now()
-		if err := e.saveTask(exec, running); err != nil {
+		if err := e.beginApply(step, exec, running, report, check); err != nil {
 			return TaskStatus{}, err
 		}
-		report.emit(Event{Kind: "log", Step: step.ID(), Message: message})
-		result, err = step.Apply(ctx, Runtime{DryRun: false, Secrets: e.registry(), Scripts: e.Scripts, SecretValues: e.SecretValues, Root: e.StateDir}, report)
+		result, err = step.Apply(ctx, e.stepRuntime(), report)
 		if err != nil {
-			return e.fail(exec, running, err, result.Result)
+			return e.fail(exec, *running, err, result.Result)
 		}
 		executed = true
 	}
+	return e.recordCompletion(exec, running, check, result, executed, inputsHash, journal)
+}
 
+// stepRuntime is the execution context shared by Check and Apply.
+func (e *Engine) stepRuntime() Runtime {
+	return Runtime{DryRun: false, Secrets: e.registry(), Scripts: e.Scripts, SecretValues: e.SecretValues, Root: e.StateDir}
+}
+
+// beginApply journals the applying phase and emits its progress message.
+func (e *Engine) beginApply(step Step, exec Execution, running *Task, report Reporter, check CheckResult) error {
+	message := "applying: " + check.Detail
+	if progress, ok := step.(ApplyProgress); ok {
+		if description := progress.ApplyProgressMessage(); description != "" {
+			message = description
+		}
+	}
+	running.Phase = PhaseApplying
+	running.PhaseStartedAt = now()
+	if err := e.saveTask(exec, *running); err != nil {
+		return err
+	}
+	report.emit(Event{Kind: "log", Step: step.ID(), Message: message})
+	return nil
+}
+
+// recordCompletion stores the durable effect record and the terminal journal
+// task. The first writer of the effect record wins.
+func (e *Engine) recordCompletion(exec Execution, running *Task, check CheckResult, result ApplyResult, executed bool, inputsHash string, journal *Journal) (TaskStatus, error) {
 	encodedResult, err := safeTaskResult(e.registry(), result.Result)
 	if err != nil {
 		// The effect already happened. Do not turn an unserializable diagnostic
@@ -558,19 +682,7 @@ func (e *Engine) Run(ctx context.Context, step Step, exec Execution, report Repo
 		// record without it.
 		encodedResult = nil
 	}
-	appliedAttempt := AttemptUnknown
-	switch {
-	case executed:
-		appliedAttempt = exec.Attempt
-	case check.AppliedAttempt != AttemptUnknown:
-		// The step recovered a durable record of the attempt that applied the
-		// effect. Recording it keeps "which attempt applied this" honest.
-		appliedAttempt = check.AppliedAttempt
-	default:
-		if task, ok := journal.Tasks[exec.EffectKey()]; ok {
-			appliedAttempt = task.AppliedAttempt
-		}
-	}
+	appliedAttempt := appliedAttemptFor(exec, check, journal, executed)
 	record := EffectRecord{
 		OperationID:    string(exec.OperationID),
 		Step:           exec.Step,
@@ -582,44 +694,20 @@ func (e *Engine) Run(ctx context.Context, step Step, exec Execution, report Repo
 		Result:         encodedResult,
 	}
 	if err := EnsureDir(filepath.Dir(e.EffectRecordPath(exec))); err != nil {
-		return e.fail(exec, running, err, nil)
+		return e.fail(exec, *running, err, nil)
 	}
 	existed, err := SaveEffectRecord(e.EffectRecordPath(exec), record)
 	if err != nil {
-		return e.fail(exec, running, err, nil)
+		return e.fail(exec, *running, err, nil)
 	}
 	if existed {
-		// Another writer won the durable record. Never overwrite its history;
-		// accept it only when it describes the same effect and inputs.
-		existing, ok, err := LoadEffectRecord(e.EffectRecordPath(exec))
+		record, appliedAttempt, err = e.adoptEffectRecord(exec, inputsHash)
 		if err != nil {
 			return TaskStatus{}, err
 		}
-		if !ok || existing.InputsHash != inputsHash {
-			return TaskStatus{}, fmt.Errorf("%w: effect %s was published with different inputs", ErrInputsMismatch, exec.EffectKey())
-		}
-		record = existing
 		executed = false
-		appliedAttempt = existing.AppliedAttempt
 	}
-
-	// Verify ownership before the terminal journal write. The effect lock already
-	// serialises writers; this catches a claim that was replaced by an operator or
-	// a buggy caller.
-	current, err := LoadJournal(e.JournalPath())
-	if err != nil {
-		return TaskStatus{}, err
-	}
-	if task, ok := current.Tasks[exec.EffectKey()]; !ok || task.Owner.Token != token {
-		return TaskStatus{}, fmt.Errorf("effect %s claim was replaced before completion", exec.EffectKey())
-	}
-	completed := running
-	completed.Status = string(StatusCompleted)
-	completed.CompletedAt = record.CompletedAt
-	completed.AppliedAttempt = appliedAttempt
-	completed.Result = record.Result
-	completed.ExecutionID = record.ExecutionID
-	if err := e.saveTask(exec, completed); err != nil {
+	if err := e.completeTask(exec, *running, record, appliedAttempt); err != nil {
 		return TaskStatus{}, err
 	}
 	return TaskStatus{
@@ -631,6 +719,56 @@ func (e *Engine) Run(ctx context.Context, step Step, exec Execution, report Repo
 		Executed:       executed,
 		Result:         record.Result,
 	}, nil
+}
+
+// appliedAttemptFor prefers the attempt that actually applied the effect.
+func appliedAttemptFor(exec Execution, check CheckResult, journal *Journal, executed bool) uint32 {
+	switch {
+	case executed:
+		return exec.Attempt
+	case check.AppliedAttempt != AttemptUnknown:
+		// The step recovered a durable record of the attempt that applied the
+		// effect. Recording it keeps "which attempt applied this" honest.
+		return check.AppliedAttempt
+	default:
+		if task, ok := journal.Tasks[exec.EffectKey()]; ok {
+			return task.AppliedAttempt
+		}
+		return AttemptUnknown
+	}
+}
+
+// adoptEffectRecord reads the record another writer published. Never overwrite
+// its history; accept it only when it describes the same effect and inputs.
+func (e *Engine) adoptEffectRecord(exec Execution, inputsHash string) (EffectRecord, uint32, error) {
+	existing, ok, err := LoadEffectRecord(e.EffectRecordPath(exec))
+	if err != nil {
+		return EffectRecord{}, 0, err
+	}
+	if !ok || existing.InputsHash != inputsHash {
+		return EffectRecord{}, 0, fmt.Errorf("%w: effect %s was published with different inputs", ErrInputsMismatch, exec.EffectKey())
+	}
+	return existing, existing.AppliedAttempt, nil
+}
+
+// completeTask verifies ownership and writes the terminal journal task.
+func (e *Engine) completeTask(exec Execution, running Task, record EffectRecord, appliedAttempt uint32) error {
+	// The effect lock already serialises writers; this catches a claim that was
+	// replaced by an operator or a buggy caller.
+	current, err := LoadJournal(e.JournalPath())
+	if err != nil {
+		return err
+	}
+	if task, ok := current.Tasks[exec.EffectKey()]; !ok || task.Owner.Token != running.Owner.Token {
+		return fmt.Errorf("effect %s claim was replaced before completion", exec.EffectKey())
+	}
+	completed := running
+	completed.Status = string(StatusCompleted)
+	completed.CompletedAt = record.CompletedAt
+	completed.AppliedAttempt = appliedAttempt
+	completed.Result = record.Result
+	completed.ExecutionID = record.ExecutionID
+	return e.saveTask(exec, completed)
 }
 
 func (e *Engine) completeFromRecord(exec Execution, record EffectRecord) error {

@@ -19,8 +19,6 @@ type platformFixture struct {
 	env      platform.Environment
 	revision platform.EnvironmentRevision
 	node     string
-	domain   platform.DomainBinding
-	resource platform.Resource
 }
 
 func newPlatformFixture(t *testing.T, pool *pgxpool.Pool, suffix string) *platformFixture {
@@ -91,14 +89,21 @@ func TestIntegrationEntitiesPlatformStateParity(t *testing.T) {
 	pool, _ := testPool(t, true)
 	f := newPlatformFixture(t, pool, "state")
 	ctx := context.Background()
-	store := f.store
 
+	checkPlatformStateMapping(t, ctx, f)
+	domainID := seedStateParityDomainChange(t, ctx, f)
+	checkStateParityReads(t, ctx, f, domainID)
+}
+
+func checkPlatformStateMapping(t *testing.T, ctx context.Context, f *platformFixture) {
+	t.Helper()
 	if f.env.HostPort != 25000 || f.env.CandidatePort != 35000 || f.env.RevisionID != f.revision.ID {
 		t.Fatalf("unexpected environment mapping: %+v", f.env)
 	}
 	if f.revision.Number != 1 || f.revision.Operation != "environment.created" {
 		t.Fatalf("unexpected revision mapping: %+v", f.revision)
 	}
+	store := f.store
 	if resolved, found, err := store.Platform().Environments().ResolveID(ctx, f.app.Name, f.env.Name); err != nil || !found || resolved.ID != f.env.ID {
 		t.Fatalf("resolve environment = %+v, %v, %v", resolved, found, err)
 	}
@@ -124,7 +129,10 @@ func TestIntegrationEntitiesPlatformStateParity(t *testing.T) {
 	if next, found, err := ports.NextCandidatePort(ctx, 25000); err != nil || !found || next < 30000 || next > 39999 {
 		t.Fatalf("next candidate port = %d, %v, %v", next, found, err)
 	}
+}
 
+func seedStateParityDomainChange(t *testing.T, ctx context.Context, f *platformFixture) platform.DomainID {
+	t.Helper()
 	domainID, err := platform.NewDomainID()
 	if err != nil {
 		t.Fatal(err)
@@ -133,7 +141,7 @@ func TestIntegrationEntitiesPlatformStateParity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
+	if err := f.store.WithinTx(ctx, func(tx *entities.StoreTx) error {
 		if _, err := tx.Operations().Insert(ctx, entities.OperationInsert{
 			ID: changeOperationID, Key: entities.OperationKey{Kind: "platform.test", Target: "app/" + f.app.Name, Actor: contract.Actor{Kind: "system", Subject: "test"}, IdempotencyKey: "change-parity"},
 			InputHash: "hash", Input: json.RawMessage(`{}`),
@@ -163,17 +171,22 @@ func TestIntegrationEntitiesPlatformStateParity(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	domain, domainEnv, found, err := store.Platform().Domains().GetByName(ctx, "state.example.test")
-	if err != nil || !found || domain != domainID || domainEnv != f.env.ID {
+	return domainID
+}
+
+func checkStateParityReads(t *testing.T, ctx context.Context, f *platformFixture, wantDomain platform.DomainID) {
+	t.Helper()
+	domain, domainEnv, found, err := f.store.Platform().Domains().GetByName(ctx, "state.example.test")
+	if err != nil || !found || domain != wantDomain || domainEnv != f.env.ID {
 		t.Fatalf("domain = %v, %v, %v, %v", domain, domainEnv, found, err)
 	}
-	if summary, err := store.Platform().Inventory().Summary(ctx); err != nil || summary["apps"] != 1 || summary["environments"] != 1 {
+	if summary, err := f.store.Platform().Inventory().Summary(ctx); err != nil || summary["apps"] != 1 || summary["environments"] != 1 {
 		t.Fatalf("summary = %v, %v", summary, err)
 	}
-	if changes, err := store.Platform().Changes().List(ctx, entities.ChangeFilter{App: f.app.Name, Limit: 10}); err != nil || len(changes) != 1 {
+	if changes, err := f.store.Platform().Changes().List(ctx, entities.ChangeFilter{App: f.app.Name, Limit: 10}); err != nil || len(changes) != 1 {
 		t.Fatalf("changes = %d, %v", len(changes), err)
 	}
-	if domains, err := store.Platform().Domains().List(ctx, entities.DomainFilter{App: f.app.Name, Limit: 10}); err != nil || len(domains) != 1 {
+	if domains, err := f.store.Platform().Domains().List(ctx, entities.DomainFilter{App: f.app.Name, Limit: 10}); err != nil || len(domains) != 1 {
 		t.Fatalf("domains = %d, %v", len(domains), err)
 	}
 }
@@ -182,79 +195,101 @@ func TestIntegrationEntitiesPlatformReleaseDeploymentParity(t *testing.T) {
 	pool, _ := testPool(t, true)
 	f := newPlatformFixture(t, pool, "release")
 	ctx := context.Background()
-	store := f.store
 	operationID, err := contract.NewOperationID()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
+	seedReleaseDeploymentParity(t, ctx, f, operationID)
+	checkReleaseDeploymentParityReads(t, ctx, f, operationID)
+}
+
+func seedReleaseDeploymentParity(t *testing.T, ctx context.Context, f *platformFixture, operationID contract.OperationID) {
+	t.Helper()
+	if err := f.store.WithinTx(ctx, func(tx *entities.StoreTx) error {
 		if _, err := tx.Operations().Insert(ctx, entities.OperationInsert{
 			ID: operationID, Key: entities.OperationKey{Kind: platform.KindDeploy, Target: "env/" + f.app.Name + "/" + f.env.Name, Actor: contract.Actor{Kind: "ci", Subject: "platform"}, IdempotencyKey: "release-parity"},
 			InputHash: "hash", Input: json.RawMessage(`{}`),
 		}); err != nil {
 			return err
 		}
-		releaseID, err := platform.NewReleaseID()
+		releaseID, err := seedReleaseAndBuild(t, ctx, tx, f, operationID)
 		if err != nil {
 			return err
 		}
-		if _, err := tx.Platform().Releases().Insert(ctx, entities.ReleaseInsert{
-			ID: releaseID, OperationID: operationID, AppID: f.app.ID, EnvironmentID: f.env.ID,
-			Image: "example/app:tag", ImageID: "sha256:config", Source: json.RawMessage(`{"type":"image"}`),
-			Status: platform.ReleaseReady, CompletedAt: timePtr(time.Now().UTC()),
-		}); err != nil {
-			return err
-		}
-		release, found, err := tx.Platform().Releases().GetByID(ctx, releaseID)
-		if err != nil || !found || release.ID != releaseID {
-			return errors.New("release round trip failed")
-		}
-		buildID, err := platform.NewBuildID()
-		if err != nil {
-			return err
-		}
-		if _, err := tx.Platform().Builds().Insert(ctx, entities.BuildInsert{
-			ID: buildID, OperationID: operationID, AppID: f.app.ID, EnvironmentID: f.env.ID,
-			RevisionID: f.revision.ID, ReleaseID: releaseID, Source: json.RawMessage(`{"type":"git"}`), CommitSHA: "0123456789012345678901234567890123456789",
-		}); err != nil {
-			return err
-		}
-		deploymentID, err := platform.NewDeploymentID()
-		if err != nil {
-			return err
-		}
-		if _, err := tx.Platform().Deployments().Insert(ctx, entities.DeploymentInsert{
-			ID: deploymentID, OperationID: operationID, AppID: f.app.ID, EnvironmentID: f.env.ID,
-			Action: platform.ActionDeploy, ReleaseID: releaseID, RevisionID: f.revision.ID,
-			SecretRevisions: json.RawMessage(`{}`),
-		}); err != nil {
-			return err
-		}
-		if _, err := tx.Platform().Owners().Insert(ctx, entities.OwnerInsert{
-			EnvironmentID: f.env.ID, OperationID: operationID, DeploymentID: deploymentID,
-			Attempt: 1, Phase: "prepared", RestoreRelease: "", RestoreDeployment: "",
-		}); err != nil {
-			return err
-		}
-		if _, err := tx.Platform().Cleanup().RecordFailure(ctx, entities.CleanupRecord{
-			ContainerName: "candidate-" + string(deploymentID), EnvironmentID: f.env.ID, Node: f.node,
-			DeploymentID: deploymentID, Reason: "previous", LastError: "test",
-		}); err != nil {
-			return err
-		}
-		if _, err := tx.Platform().ReleaseCommands().Start(ctx, releaseID, "digest", operationID); err != nil {
-			return err
-		}
-		if run, found, err := tx.Platform().ReleaseCommands().Get(ctx, releaseID, "digest"); err != nil || !found || run.State != "running" {
-			return errors.New("release command start failed")
-		}
-		if _, err := tx.Platform().ReleaseCommands().Finish(ctx, releaseID, "digest", operationID, "succeeded", "", ""); err != nil {
-			return err
-		}
-		return nil
+		return seedDeploymentOwnerAndCommand(t, ctx, tx, f, operationID, releaseID)
 	}); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func seedReleaseAndBuild(t *testing.T, ctx context.Context, tx *entities.StoreTx, f *platformFixture, operationID contract.OperationID) (platform.ReleaseID, error) {
+	t.Helper()
+	releaseID, err := platform.NewReleaseID()
+	if err != nil {
+		return "", err
+	}
+	if _, err := tx.Platform().Releases().Insert(ctx, entities.ReleaseInsert{
+		ID: releaseID, OperationID: operationID, AppID: f.app.ID, EnvironmentID: f.env.ID,
+		Image: "example/app:tag", ImageID: "sha256:config", Source: json.RawMessage(`{"type":"image"}`),
+		Status: platform.ReleaseReady, CompletedAt: timePtr(time.Now().UTC()),
+	}); err != nil {
+		return "", err
+	}
+	release, found, err := tx.Platform().Releases().GetByID(ctx, releaseID)
+	if err != nil || !found || release.ID != releaseID {
+		return "", errors.New("release round trip failed")
+	}
+	buildID, err := platform.NewBuildID()
+	if err != nil {
+		return "", err
+	}
+	if _, err := tx.Platform().Builds().Insert(ctx, entities.BuildInsert{
+		ID: buildID, OperationID: operationID, AppID: f.app.ID, EnvironmentID: f.env.ID,
+		RevisionID: f.revision.ID, ReleaseID: releaseID, Source: json.RawMessage(`{"type":"git"}`), CommitSHA: "0123456789012345678901234567890123456789",
+	}); err != nil {
+		return "", err
+	}
+	return releaseID, nil
+}
+
+func seedDeploymentOwnerAndCommand(t *testing.T, ctx context.Context, tx *entities.StoreTx, f *platformFixture, operationID contract.OperationID, releaseID platform.ReleaseID) error {
+	t.Helper()
+	deploymentID, err := platform.NewDeploymentID()
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Platform().Deployments().Insert(ctx, entities.DeploymentInsert{
+		ID: deploymentID, OperationID: operationID, AppID: f.app.ID, EnvironmentID: f.env.ID,
+		Action: platform.ActionDeploy, ReleaseID: releaseID, RevisionID: f.revision.ID,
+		SecretRevisions: json.RawMessage(`{}`),
+	}); err != nil {
+		return err
+	}
+	if _, err := tx.Platform().Owners().Insert(ctx, entities.OwnerInsert{
+		EnvironmentID: f.env.ID, OperationID: operationID, DeploymentID: deploymentID,
+		Attempt: 1, Phase: "prepared", RestoreRelease: "", RestoreDeployment: "",
+	}); err != nil {
+		return err
+	}
+	if _, err := tx.Platform().Cleanup().RecordFailure(ctx, entities.CleanupRecord{
+		ContainerName: "candidate-" + string(deploymentID), EnvironmentID: f.env.ID, Node: f.node,
+		DeploymentID: deploymentID, Reason: "previous", LastError: "test",
+	}); err != nil {
+		return err
+	}
+	if _, err := tx.Platform().ReleaseCommands().Start(ctx, releaseID, "digest", operationID); err != nil {
+		return err
+	}
+	if run, found, err := tx.Platform().ReleaseCommands().Get(ctx, releaseID, "digest"); err != nil || !found || run.State != "running" {
+		return errors.New("release command start failed")
+	}
+	_, err = tx.Platform().ReleaseCommands().Finish(ctx, releaseID, "digest", operationID, "succeeded", "", "")
+	return err
+}
+
+func checkReleaseDeploymentParityReads(t *testing.T, ctx context.Context, f *platformFixture, operationID contract.OperationID) {
+	t.Helper()
+	store := f.store
 	if release, found, err := store.Platform().Releases().GetByOperation(ctx, operationID); err != nil || !found || release.Status != platform.ReleaseReady {
 		t.Fatalf("release by operation = %v, %v, %v", found, err, release.Status)
 	}
@@ -279,6 +314,13 @@ func TestIntegrationEntitiesPlatformResourceNodeFoundation(t *testing.T) {
 	pool, _ := testPool(t, true)
 	f := newPlatformFixture(t, pool, "resource")
 	ctx := context.Background()
+	checkNodeFoundationReads(t, ctx, f)
+	resourceID := seedResourceFoundation(t, ctx, f)
+	checkResourceFoundationReads(t, ctx, f, resourceID)
+}
+
+func checkNodeFoundationReads(t *testing.T, ctx context.Context, f *platformFixture) {
+	t.Helper()
 	store := f.store
 	if node, found, err := store.Nodes().Get(ctx, f.node); err != nil || !found || node.Name != f.node {
 		t.Fatalf("node = %v, %v, %v", found, err, node.Name)
@@ -298,6 +340,10 @@ func TestIntegrationEntitiesPlatformResourceNodeFoundation(t *testing.T) {
 	if addresses, err := store.Nodes().WireGuardAddresses(ctx); err != nil || len(addresses) != 0 {
 		t.Fatalf("wireguard addresses = %d, %v", len(addresses), err)
 	}
+}
+
+func seedResourceFoundation(t *testing.T, ctx context.Context, f *platformFixture) platform.ResourceID {
+	t.Helper()
 	resourceID, err := platform.NewResourceID()
 	if err != nil {
 		t.Fatal(err)
@@ -306,7 +352,7 @@ func TestIntegrationEntitiesPlatformResourceNodeFoundation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
+	if err := f.store.WithinTx(ctx, func(tx *entities.StoreTx) error {
 		if _, err := tx.Operations().Insert(ctx, entities.OperationInsert{
 			ID: operationID, Key: entities.OperationKey{Kind: platform.KindResourceApply, Target: "resource/" + f.app.Name + "/" + f.env.Name + "/cache", Actor: contract.Actor{Kind: "ci", Subject: "platform"}, IdempotencyKey: "resource-parity"},
 			InputHash: "hash", Input: json.RawMessage(`{}`),
@@ -323,6 +369,12 @@ func TestIntegrationEntitiesPlatformResourceNodeFoundation(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	return resourceID
+}
+
+func checkResourceFoundationReads(t *testing.T, ctx context.Context, f *platformFixture, resourceID platform.ResourceID) {
+	t.Helper()
+	store := f.store
 	resource, found, err := store.Resources().GetByName(ctx, f.app.Name, f.env.Name, "cache", false)
 	if err != nil || !found || resource.ID != resourceID {
 		t.Fatalf("resource = %v, %v, %v", found, err, resource.ID)

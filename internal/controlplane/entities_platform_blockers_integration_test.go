@@ -83,6 +83,33 @@ func seedPlatformChain(t *testing.T, f *platformFixture, suffix string) platform
 	return platformChain{ReleaseA: releaseA, ReleaseB: releaseB, Build: buildID, Deploy: deployID, OwnerOp: deployOp}
 }
 
+func seedResourceOperation(
+	t *testing.T,
+	ctx context.Context,
+	store *entities.Store,
+	f *platformFixture,
+	resourceID platform.ResourceID,
+	operationID contract.OperationID,
+	name, idempotencyKey string,
+) {
+	t.Helper()
+	if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		if _, err := tx.Operations().Insert(ctx, entities.OperationInsert{
+			ID: operationID, Key: entities.OperationKey{Kind: platform.KindResourceApply, Target: "resource/" + f.app.Name + "/" + f.env.Name + "/" + name, Actor: contract.Actor{Kind: "ci", Subject: "platform"}, IdempotencyKey: idempotencyKey},
+			InputHash: "hash", Input: json.RawMessage(`{}`),
+		}); err != nil {
+			return err
+		}
+		_, err := tx.Resources().Insert(ctx, entities.ResourceInsert{
+			ID: resourceID, AppID: f.app.ID, EnvironmentID: f.env.ID, Name: name, Node: f.node,
+			Spec: platform.ResourceSpec{Image: "redis:7"}, Image: "redis:7", OperationID: operationID,
+		})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func lockTimeoutTx(t *testing.T, pool *pgxpool.Pool) pgx.Tx {
 	t.Helper()
 	tx, err := pool.Begin(context.Background())
@@ -112,6 +139,46 @@ func TestIntegrationEntitiesPlatformBuildReleasePointerAndKeyShare(t *testing.T)
 	ctx := context.Background()
 	store := f.store
 
+	actualRelease := checkBuildPointerHolder(t, ctx, store, f, chain)
+	if actualRelease != chain.ReleaseA {
+		t.Fatalf("actual build release = %s, want %s", actualRelease, chain.ReleaseA)
+	}
+	if actualRelease == chain.ReleaseB {
+		t.Fatalf("actual build release aliased expected-B %s", chain.ReleaseB)
+	}
+
+	// The exact persisted reciprocal is A; an application boundary comparing
+	// against B must reject it without entities deciding policy.
+	if chain.ReleaseB == chain.ReleaseA {
+		t.Fatal("test releases must differ")
+	}
+
+	tx := lockTimeoutTx(t, pool)
+	defer func() { _ = tx.Rollback(ctx) }()
+	requireLockTimeout(t, tx, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, "DELETE FROM eregion_platform_builds WHERE id=$1", chain.Build)
+		return err
+	})
+	tx2 := lockTimeoutTx(t, pool)
+	defer func() { _ = tx2.Rollback(ctx) }()
+	requireLockTimeout(t, tx2, func(tx pgx.Tx) error {
+		var id string
+		return tx.QueryRow(ctx, "SELECT id FROM eregion_platform_builds WHERE id=$1 FOR UPDATE", chain.Build).Scan(&id)
+	})
+
+	// A non-key column update is not blocked by FOR KEY SHARE. release_id is a
+	// foreign-key column, not a key column; no key-changing/release_id test is
+	// claimed here.
+	tx3 := lockTimeoutTx(t, pool)
+	defer func() { _ = tx3.Rollback(ctx) }()
+	tag, err := tx3.Exec(ctx, "UPDATE eregion_platform_builds SET error='non-key update' WHERE id=$1", chain.Build)
+	if err != nil || tag.RowsAffected() != 1 {
+		t.Fatalf("non-key update = %v, %v", tag.RowsAffected(), err)
+	}
+}
+
+func checkBuildPointerHolder(t *testing.T, ctx context.Context, store *entities.Store, f *platformFixture, chain platformChain) platform.ReleaseID {
+	t.Helper()
 	held := make(chan struct{})
 	actualCh := make(chan platform.ReleaseID, 1)
 	release := make(chan struct{})
@@ -161,42 +228,7 @@ func TestIntegrationEntitiesPlatformBuildReleasePointerAndKeyShare(t *testing.T)
 	case <-holderCtx.Done():
 		t.Fatalf("holder did not acquire build pointer: %v", holderCtx.Err())
 	}
-	actualRelease := <-actualCh
-	if actualRelease != chain.ReleaseA {
-		t.Fatalf("actual build release = %s, want %s", actualRelease, chain.ReleaseA)
-	}
-	if actualRelease == chain.ReleaseB {
-		t.Fatalf("actual build release aliased expected-B %s", chain.ReleaseB)
-	}
-
-	// The exact persisted reciprocal is A; an application boundary comparing
-	// against B must reject it without entities deciding policy.
-	if chain.ReleaseB == chain.ReleaseA {
-		t.Fatal("test releases must differ")
-	}
-
-	tx := lockTimeoutTx(t, pool)
-	defer tx.Rollback(ctx)
-	requireLockTimeout(t, tx, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, "DELETE FROM eregion_platform_builds WHERE id=$1", chain.Build)
-		return err
-	})
-	tx2 := lockTimeoutTx(t, pool)
-	defer tx2.Rollback(ctx)
-	requireLockTimeout(t, tx2, func(tx pgx.Tx) error {
-		var id string
-		return tx.QueryRow(ctx, "SELECT id FROM eregion_platform_builds WHERE id=$1 FOR UPDATE", chain.Build).Scan(&id)
-	})
-
-	// A non-key column update is not blocked by FOR KEY SHARE. release_id is a
-	// foreign-key column, not a key column; no key-changing/release_id test is
-	// claimed here.
-	tx3 := lockTimeoutTx(t, pool)
-	defer tx3.Rollback(ctx)
-	tag, err := tx3.Exec(ctx, "UPDATE eregion_platform_builds SET error='non-key update' WHERE id=$1", chain.Build)
-	if err != nil || tag.RowsAffected() != 1 {
-		t.Fatalf("non-key update = %v, %v", tag.RowsAffected(), err)
-	}
+	return <-actualCh
 }
 
 func TestIntegrationEntitiesPlatformOwnerRouteCAS(t *testing.T) {
@@ -232,21 +264,7 @@ func TestIntegrationEntitiesPlatformResourceFencesAndValidation(t *testing.T) {
 	store := f.store
 	resourceID, _ := platform.NewResourceID()
 	operationID, _ := contract.NewOperationID()
-	if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
-		if _, err := tx.Operations().Insert(ctx, entities.OperationInsert{
-			ID: operationID, Key: entities.OperationKey{Kind: platform.KindResourceApply, Target: "resource/" + f.app.Name + "/" + f.env.Name + "/fenced", Actor: contract.Actor{Kind: "ci", Subject: "platform"}, IdempotencyKey: "resource-fence"},
-			InputHash: "hash", Input: json.RawMessage(`{}`),
-		}); err != nil {
-			return err
-		}
-		_, err := tx.Resources().Insert(ctx, entities.ResourceInsert{
-			ID: resourceID, AppID: f.app.ID, EnvironmentID: f.env.ID, Name: "fenced", Node: f.node,
-			Spec: platform.ResourceSpec{Image: "redis:7"}, Image: "redis:7", OperationID: operationID,
-		})
-		return err
-	}); err != nil {
-		t.Fatal(err)
-	}
+	seedResourceOperation(t, ctx, store, f, resourceID, operationID, "fenced", "resource-fence")
 	wrongOperation, _ := contract.NewOperationID()
 	if rows, err := store.Resources().MarkReady(ctx, entities.ResourceReady{ID: resourceID, OperationID: wrongOperation}); err != nil || rows != 0 {
 		t.Fatalf("wrong-operation ready = %d, %v", rows, err)
@@ -372,21 +390,7 @@ func TestIntegrationEntitiesPlatformCorruptSentinels(t *testing.T) {
 	}
 	resourceID, _ := platform.NewResourceID()
 	resourceOperation, _ := contract.NewOperationID()
-	if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
-		if _, err := tx.Operations().Insert(ctx, entities.OperationInsert{
-			ID: resourceOperation, Key: entities.OperationKey{Kind: platform.KindResourceApply, Target: "resource/" + f.app.Name + "/" + f.env.Name + "/corrupt", Actor: contract.Actor{Kind: "ci", Subject: "platform"}, IdempotencyKey: "corrupt-resource"},
-			InputHash: "hash", Input: json.RawMessage(`{}`),
-		}); err != nil {
-			return err
-		}
-		_, err := tx.Resources().Insert(ctx, entities.ResourceInsert{
-			ID: resourceID, AppID: f.app.ID, EnvironmentID: f.env.ID, Name: "corrupt", Node: f.node,
-			Spec: platform.ResourceSpec{Image: "redis:7"}, Image: "redis:7", OperationID: resourceOperation,
-		})
-		return err
-	}); err != nil {
-		t.Fatal(err)
-	}
+	seedResourceOperation(t, ctx, store, f, resourceID, resourceOperation, "corrupt", "corrupt-resource")
 	if _, err := pool.Exec(ctx, "UPDATE eregion_platform_resources SET spec='[]'::jsonb WHERE id=$1", resourceID); err != nil {
 		t.Fatal(err)
 	}
@@ -400,7 +404,7 @@ func advisoryKeyParts(key int64) (uint32, uint32) {
 	return uint32(raw >> 32), uint32(raw)
 }
 
-func waitCatalogCondition(ctx context.Context, conn *pgx.Conn, condition func(context.Context) (bool, error)) error {
+func waitCatalogCondition(ctx context.Context, condition func(context.Context) (bool, error)) error {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	for {
@@ -426,7 +430,7 @@ func TestIntegrationEntitiesPlatformSessionLeaseUncertainty(t *testing.T) {
 	store := f.store
 	baseKey := time.Now().UnixNano()
 	key1, key2, key3 := baseKey, baseKey+1, baseKey+2
-	if !(key1 < key2) {
+	if key1 >= key2 {
 		t.Fatalf("test requires key1 < key2: %d >= %d", key1, key2)
 	}
 	if high, low := advisoryKeyParts(-1); high != ^uint32(0) || low != ^uint32(0) {
@@ -437,18 +441,25 @@ func TestIntegrationEntitiesPlatformSessionLeaseUncertainty(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer witness.Close(ctx)
+	defer func() { _ = witness.Close(ctx) }()
 	if _, err := witness.Exec(ctx, "SELECT pg_advisory_lock($1)", key2); err != nil {
 		t.Fatal(err)
 	}
-	defer witness.Exec(context.Background(), "SELECT pg_advisory_unlock($1)", key2)
+	defer func() { _, _ = witness.Exec(ctx, "SELECT pg_advisory_unlock($1)", key2) }()
 
 	check, err := pgx.Connect(ctx, dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer check.Close(ctx)
+	defer func() { _ = check.Close(ctx) }()
 
+	capturedPID := witnessLeaseAcquisition(t, ctx, pool, store, check, key1, key2)
+	checkLeaseCleanup(t, ctx, check, capturedPID, key1, key2)
+	checkLeaseReleaseUncertainty(t, ctx, store, check, key1, key3)
+}
+
+func witnessLeaseAcquisition(t *testing.T, ctx context.Context, pool *pgxpool.Pool, store *entities.Store, check *pgx.Conn, key1, key2 int64) int {
+	t.Helper()
 	acqCtx, cancelAcq := context.WithCancel(ctx)
 	acqDone := make(chan error, 1)
 	acqConsumed := false
@@ -463,7 +474,7 @@ func TestIntegrationEntitiesPlatformSessionLeaseUncertainty(t *testing.T) {
 		}
 		if t.Failed() && capturedPID != 0 {
 			var terminated bool
-			_ = pool.QueryRow(context.Background(), "SELECT pg_terminate_backend($1, 2000)", capturedPID).Scan(&terminated)
+			_ = pool.QueryRow(ctx, "SELECT pg_terminate_backend($1, 2000)", capturedPID).Scan(&terminated)
 		}
 	})
 	go func() {
@@ -471,10 +482,10 @@ func TestIntegrationEntitiesPlatformSessionLeaseUncertainty(t *testing.T) {
 		acqDone <- err
 	}()
 
-	witnessCtx, cancelWitness := context.WithTimeout(context.Background(), 2*time.Second)
+	witnessCtx, cancelWitness := context.WithTimeout(ctx, 2*time.Second)
 	high1, low1 := advisoryKeyParts(key1)
 	high2, low2 := advisoryKeyParts(key2)
-	err = waitCatalogCondition(witnessCtx, check, func(conditionCtx context.Context) (bool, error) {
+	err := waitCatalogCondition(witnessCtx, func(conditionCtx context.Context) (bool, error) {
 		err := check.QueryRow(conditionCtx, `SELECT l1.pid
 			FROM pg_locks l1
 			JOIN pg_locks l2 ON l2.pid=l1.pid
@@ -510,9 +521,14 @@ func TestIntegrationEntitiesPlatformSessionLeaseUncertainty(t *testing.T) {
 	if !errors.Is(acqErr, entities.ErrPlatformLeaseUncertain) {
 		t.Fatalf("partial acquisition cancellation = %v, want ErrPlatformLeaseUncertain", acqErr)
 	}
+	return capturedPID
+}
 
-	absenceCtx, cancelAbsence := context.WithTimeout(context.Background(), 2*time.Second)
-	err = waitCatalogCondition(absenceCtx, check, func(conditionCtx context.Context) (bool, error) {
+func checkLeaseCleanup(t *testing.T, ctx context.Context, check *pgx.Conn, capturedPID int, key1, key2 int64) {
+	t.Helper()
+	high1, low1 := advisoryKeyParts(key1)
+	absenceCtx, cancelAbsence := context.WithTimeout(ctx, 2*time.Second)
+	err := waitCatalogCondition(absenceCtx, func(conditionCtx context.Context) (bool, error) {
 		var absent bool
 		err := check.QueryRow(conditionCtx, `SELECT NOT EXISTS (
 			SELECT 1 FROM pg_locks
@@ -545,7 +561,10 @@ func TestIntegrationEntitiesPlatformSessionLeaseUncertainty(t *testing.T) {
 	if err := tx.Rollback(ctx); err != nil {
 		t.Fatal(err)
 	}
+}
 
+func checkLeaseReleaseUncertainty(t *testing.T, ctx context.Context, store *entities.Store, check *pgx.Conn, key1, key3 int64) {
+	t.Helper()
 	lease, err := store.Platform().Locks().AcquireTargets(ctx, []int64{key3})
 	if err != nil {
 		t.Fatal(err)
@@ -576,26 +595,23 @@ func TestIntegrationEntitiesPlatformSessionLeaseUncertainty(t *testing.T) {
 	}
 }
 
-func TestIntegrationEntitiesPlatformBuildSlotsAndTargetContention(t *testing.T) {
-	pool, _ := testPool(t, true)
-	f := newPlatformFixture(t, pool, "slots")
-	ctx := context.Background()
-	store := f.store
-	if _, err := store.Nodes().SetBuildConcurrency(ctx, f.node, 2); err != nil {
+func checkBuildSlotCapacity(t *testing.T, ctx context.Context, store *entities.Store, node string) {
+	t.Helper()
+	if _, err := store.Nodes().SetBuildConcurrency(ctx, node, 2); err != nil {
 		t.Fatal(err)
 	}
-	first, err := store.Nodes().ProbeBuildSlots(ctx, f.node, platform.MaxBuildConcurrency)
+	first, err := store.Nodes().ProbeBuildSlots(ctx, node, platform.MaxBuildConcurrency)
 	if err != nil || first.Lease == nil {
 		t.Fatalf("first probe = %+v, %v", first, err)
 	}
-	second, err := store.Nodes().ProbeBuildSlots(ctx, f.node, platform.MaxBuildConcurrency)
+	second, err := store.Nodes().ProbeBuildSlots(ctx, node, platform.MaxBuildConcurrency)
 	if err != nil || second.Lease == nil {
 		t.Fatalf("second probe = %+v, %v", second, err)
 	}
-	if _, err := store.Nodes().SetBuildConcurrency(ctx, f.node, 1); err != nil {
+	if _, err := store.Nodes().SetBuildConcurrency(ctx, node, 1); err != nil {
 		t.Fatal(err)
 	}
-	third, err := store.Nodes().ProbeBuildSlots(ctx, f.node, platform.MaxBuildConcurrency)
+	third, err := store.Nodes().ProbeBuildSlots(ctx, node, platform.MaxBuildConcurrency)
 	if err != nil || third.Lease != nil || third.Busy < 2 {
 		t.Fatalf("reduced-capacity probe = %+v, %v", third, err)
 	}
@@ -605,13 +621,21 @@ func TestIntegrationEntitiesPlatformBuildSlotsAndTargetContention(t *testing.T) 
 	if err := second.Release(); err != nil {
 		t.Fatal(err)
 	}
-	fourth, err := store.Nodes().ProbeBuildSlots(ctx, f.node, platform.MaxBuildConcurrency)
+	fourth, err := store.Nodes().ProbeBuildSlots(ctx, node, platform.MaxBuildConcurrency)
 	if err != nil || fourth.Lease == nil {
 		t.Fatalf("post-release probe = %+v, %v", fourth, err)
 	}
 	if err := fourth.Release(); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestIntegrationEntitiesPlatformBuildSlotsAndTargetContention(t *testing.T) {
+	pool, _ := testPool(t, true)
+	f := newPlatformFixture(t, pool, "slots")
+	ctx := context.Background()
+	store := f.store
+	checkBuildSlotCapacity(t, ctx, store, f.node)
 	lease, acquired, err := store.Platform().Locks().TryTargets(ctx, []int64{92001})
 	if err != nil || !acquired {
 		t.Fatalf("first target = %v, %v", acquired, err)

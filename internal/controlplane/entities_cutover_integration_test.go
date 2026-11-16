@@ -326,7 +326,6 @@ func TestIntegrationCutoverProductionSubmissionAtomicity(t *testing.T) {
 	}
 	t.Cleanup(run.Close)
 	s := run.Service
-	ctx := context.Background()
 
 	platformSubmit(t, s, platform.KindNodeRegister, "platform", "cutover-node", map[string]any{
 		"name":         "local",
@@ -343,10 +342,18 @@ func TestIntegrationCutoverProductionSubmissionAtomicity(t *testing.T) {
 	// The seam runs after the app, environment, revision, domain, River job and
 	// queued event are all written. Any one surviving would prove a partial
 	// commit.
+	checkCutoverSubmissionRollback(t, pool, s, appSubmission, appKey, baselineJobs, baselineEvents)
+	op := checkCutoverAdmission(t, pool, s, appSubmission, appKey, baselineJobs, baselineEvents)
+	checkCutoverReplayAndConflict(t, pool, s, appSubmission, appInput, appKey, op, baselineJobs, baselineEvents)
+}
+
+func checkCutoverSubmissionRollback(t *testing.T, pool *pgxpool.Pool, s *Service, submission operations.Submission, appKey string, baselineJobs, baselineEvents int) {
+	t.Helper()
+	ctx := context.Background()
 	s.beforeSubmissionCommit = func() error {
 		return errors.New("injected production cutover rollback")
 	}
-	if _, err := s.Submit(ctx, appSubmission); err == nil {
+	if _, err := s.Submit(ctx, submission); err == nil {
 		t.Fatal("injected submission rollback succeeded")
 	}
 	cutoverRequireCount(t, pool, 0, `SELECT count(*) FROM eregion_operations WHERE idempotency_key=$1`, appKey)
@@ -357,8 +364,12 @@ func TestIntegrationCutoverProductionSubmissionAtomicity(t *testing.T) {
 	cutoverRequireCount(t, pool, baselineJobs, `SELECT count(*) FROM river_job`)
 	cutoverRequireCount(t, pool, baselineEvents, `SELECT count(*) FROM eregion_operation_events`)
 	s.beforeSubmissionCommit = nil
+}
 
-	result, err := s.SubmitWithReceipt(ctx, appSubmission)
+func checkCutoverAdmission(t *testing.T, pool *pgxpool.Pool, s *Service, submission operations.Submission, appKey string, baselineJobs, baselineEvents int) contract.Operation {
+	t.Helper()
+	ctx := context.Background()
+	result, err := s.SubmitWithReceipt(ctx, submission)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -385,39 +396,18 @@ func TestIntegrationCutoverProductionSubmissionAtomicity(t *testing.T) {
 		t.Fatalf("admitted operation has no River job binding: %d", boundJobID)
 	}
 
-	// The application boundary, not the entities mapper, evaluates policy from
-	// the exact primary-domain DNS fact. The fresh environment has a primary
-	// domain with pending DNS and no ready release.
-	wantDeployability := func(t *testing.T, env platform.Environment) {
-		t.Helper()
-		if env.Deployability.DNS != string(platform.DNSPending) {
-			t.Fatalf("deployability DNS = %q, want pending", env.Deployability.DNS)
-		}
-		if env.Deployability.Deployable {
-			t.Fatal("fresh environment with no ready release is deployable")
-		}
-		foundArtifact := false
-		for _, missing := range env.Deployability.Missing {
-			if missing == "artifact" {
-				foundArtifact = true
-			}
-		}
-		if !foundArtifact {
-			t.Fatalf("deployability missing = %v, want artifact", env.Deployability.Missing)
-		}
-	}
 	env, err := s.environment(ctx, "cutover", "production")
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantDeployability(t, env)
+	requireCutoverDeployability(t, env)
 	inventory, err := s.inventoryEnvironments(ctx, platform.InventoryQuery{
 		App: "cutover", Environment: "production", Limit: 10,
 	})
 	if err != nil || len(inventory) != 1 {
 		t.Fatalf("inventory environments = %d, %v", len(inventory), err)
 	}
-	wantDeployability(t, inventory[0])
+	requireCutoverDeployability(t, inventory[0])
 
 	// The production Service read/follow projection sees the committed event.
 	got, err := s.Get(ctx, testActor, op.ID)
@@ -431,11 +421,38 @@ func TestIntegrationCutoverProductionSubmissionAtomicity(t *testing.T) {
 	if len(page.Events) != 1 || page.Events[0].Sequence != 1 || page.Events[0].State != contract.Queued {
 		t.Fatalf("follow projection = %+v", page.Events)
 	}
+	return op
+}
 
+// The application boundary, not the entities mapper, evaluates policy from
+// the exact primary-domain DNS fact. The fresh environment has a primary
+// domain with pending DNS and no ready release.
+func requireCutoverDeployability(t *testing.T, env platform.Environment) {
+	t.Helper()
+	if env.Deployability.DNS != string(platform.DNSPending) {
+		t.Fatalf("deployability DNS = %q, want pending", env.Deployability.DNS)
+	}
+	if env.Deployability.Deployable {
+		t.Fatal("fresh environment with no ready release is deployable")
+	}
+	foundArtifact := false
+	for _, missing := range env.Deployability.Missing {
+		if missing == "artifact" {
+			foundArtifact = true
+		}
+	}
+	if !foundArtifact {
+		t.Fatalf("deployability missing = %v, want artifact", env.Deployability.Missing)
+	}
+}
+
+func checkCutoverReplayAndConflict(t *testing.T, pool *pgxpool.Pool, s *Service, submission operations.Submission, appInput, appKey string, op contract.Operation, baselineJobs, baselineEvents int) {
+	t.Helper()
+	ctx := context.Background()
 	// A replayed submission returns the same operation and adds no domain,
 	// River or event row.
 	operationsBefore := cutoverCount(t, pool, `SELECT count(*) FROM eregion_operations`)
-	replay, err := s.SubmitWithReceipt(ctx, appSubmission)
+	replay, err := s.SubmitWithReceipt(ctx, submission)
 	if err != nil {
 		t.Fatal(err)
 	}

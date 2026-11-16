@@ -131,74 +131,81 @@ func TestIntegrationPointerBuildCompletionVersusRevisionPublication(t *testing.T
 	}
 }
 
+type pointerTerminalCase struct {
+	name, operationState, buildState, deploymentState string
+	cancel                                            bool
+}
+
 func TestIntegrationPointerTerminalOutcomeVersusRevisionPublication(t *testing.T) {
-	for _, tc := range []struct {
-		name, operationState, buildState, deploymentState string
-		cancel                                            bool
-	}{
+	for _, tc := range []pointerTerminalCase{
 		{name: "failure", operationState: "failed", buildState: "failed", deploymentState: "failed"},
 		{name: "cancellation", operationState: "cancelled", buildState: "cancelled", deploymentState: "cancelled", cancel: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			f := newPointerBuildFixture(t)
-			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			defer cancel()
-			if _, _, ok, err := f.service.claimPlatform(ctx, f.op.ID, 1); err != nil || !ok {
-				t.Fatalf("claim=%t err=%v", ok, err)
+			runPointerTerminalOutcomeCase(t, tc)
+		})
+	}
+}
+
+func runPointerTerminalOutcomeCase(t *testing.T, tc pointerTerminalCase) {
+	t.Helper()
+	f := newPointerBuildFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if _, _, ok, err := f.service.claimPlatform(ctx, f.op.ID, 1); err != nil || !ok {
+		t.Fatalf("claim=%t err=%v", ok, err)
+	}
+	if tc.cancel {
+		if _, err := f.service.RequestCancel(ctx, testActor, f.op.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	locked := make(chan struct{})
+	release := make(chan struct{})
+	publisher := make(chan error, 1)
+	go func() {
+		publisher <- f.service.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+			if _, err := lockPointerEnvironmentTx(ctx, tx, f.env.ID); err != nil {
+				return err
 			}
-			if tc.cancel {
-				if _, err := f.service.RequestCancel(ctx, testActor, f.op.ID); err != nil {
-					t.Fatal(err)
-				}
-			}
-			locked := make(chan struct{})
-			release := make(chan struct{})
-			publisher := make(chan error, 1)
-			go func() {
-				publisher <- f.service.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
-					if _, err := lockPointerEnvironmentTx(ctx, tx, f.env.ID); err != nil {
-						return err
-					}
-					close(locked)
-					<-release
-					_, err := publishEnvironmentRevisionTx(ctx, tx, f.env, "", testActor, "environment.updated", "pointer concurrency test", f.env.Revision.RevisionState, nil)
-					return err
-				})
-			}()
-			<-locked
-			done := make(chan error, 1)
-			go func() {
-				if tc.cancel {
-					done <- f.service.cancelPlatform(ctx, f.op.ID, 1, "cancelled at boundary")
-				} else {
-					done <- f.service.failPlatformOperation(ctx, f.op.ID, 1, contract.Internal, "known failure")
-				}
-			}()
-			waitPointerLockWaiter(t, ctx, f.pool, "current_revision_id,desired_release_id,applied_release_id")
-			close(release)
-			if err := <-publisher; err != nil {
-				assertNoDeadlock(t, err)
-				t.Fatal(err)
-			}
-			if err := <-done; err != nil {
-				assertNoDeadlock(t, err)
-				t.Fatal(err)
-			}
-			var opState, buildState, depState, releaseState string
-			if err := f.pool.QueryRow(ctx, `SELECT o.state,b.state,d.state,r.status
+			close(locked)
+			<-release
+			_, err := publishEnvironmentRevisionTx(ctx, tx, f.env, "", testActor, "environment.updated", "pointer concurrency test", f.env.Revision.RevisionState, nil)
+			return err
+		})
+	}()
+	<-locked
+	done := make(chan error, 1)
+	go func() {
+		if tc.cancel {
+			done <- f.service.cancelPlatform(ctx, f.op.ID, 1, "cancelled at boundary")
+		} else {
+			done <- f.service.failPlatformOperation(ctx, f.op.ID, 1, contract.Internal, "known failure")
+		}
+	}()
+	waitPointerLockWaiter(t, ctx, f.pool, "current_revision_id,desired_release_id,applied_release_id")
+	close(release)
+	if err := <-publisher; err != nil {
+		assertNoDeadlock(t, err)
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		assertNoDeadlock(t, err)
+		t.Fatal(err)
+	}
+	var opState, buildState, depState, releaseState string
+	if err := f.pool.QueryRow(ctx, `SELECT o.state,b.state,d.state,r.status
 				FROM eregion_operations o JOIN eregion_platform_builds b ON b.operation_id=o.id
 				JOIN eregion_platform_deployments d ON d.operation_id=o.id
 				JOIN eregion_platform_releases r ON r.id=b.release_id WHERE o.id=$1`, f.op.ID).
-				Scan(&opState, &buildState, &depState, &releaseState); err != nil {
-				t.Fatal(err)
-			}
-			if opState != tc.operationState || buildState != tc.buildState || depState != tc.deploymentState || releaseState != "failed" {
-				t.Fatalf("operation=%s build=%s deployment=%s release=%s", opState, buildState, depState, releaseState)
-			}
-			if err := f.service.failPlatformOperation(ctx, f.op.ID, 2, contract.Internal, "stale"); !errors.Is(err, errNotOwned) {
-				t.Fatalf("stale attempt changed terminal operation: %v", err)
-			}
-		})
+		Scan(&opState, &buildState, &depState, &releaseState); err != nil {
+		t.Fatal(err)
+	}
+	if opState != tc.operationState || buildState != tc.buildState || depState != tc.deploymentState || releaseState != "failed" {
+		t.Fatalf("operation=%s build=%s deployment=%s release=%s", opState, buildState, depState, releaseState)
+	}
+	if err := f.service.failPlatformOperation(ctx, f.op.ID, 2, contract.Internal, "stale"); !errors.Is(err, errNotOwned) {
+		t.Fatalf("stale attempt changed terminal operation: %v", err)
 	}
 }
 
@@ -251,7 +258,7 @@ func TestIntegrationPointerBuildCompletionWinsAgainstDeletion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer blocker.Rollback(context.Background())
+	defer func() { _ = blocker.Rollback(context.Background()) }()
 	var locked string
 	if err := blocker.QueryRow(ctx, `SELECT id FROM eregion_platform_builds WHERE id=$1 FOR UPDATE`, f.build).Scan(&locked); err != nil {
 		t.Fatal(err)
@@ -428,84 +435,113 @@ func TestIntegrationPointerInvalidTargetsRollback(t *testing.T) {
 	if err := f.pool.QueryRow(ctx, `SELECT health_detail FROM eregion_platform_environments WHERE id=$1`, f.env.ID).Scan(&original); err != nil {
 		t.Fatal(err)
 	}
-	type invalidCase struct {
-		name string
-		run  func(*entities.StoreTx, string) error
+	for _, tc := range pointerInvalidTargetCases(ctx, pointerInvalidTargets{
+		envID: f.env.ID, release: f.release, build: f.build, dep: f.dep,
+		stagingRevision: staging.RevisionID, otherRevision: other.RevisionID,
+		stagingRelease: stagingRelease, otherRelease: otherRelease,
+		stagingDeployment: stagingDeployment, otherBuild: otherBuild,
+		sameEnvRelease: sameEnvRelease,
+	}) {
+		t.Run(tc.name, func(t *testing.T) {
+			assertPointerInvalidTarget(t, f, ctx, tc, original)
+		})
 	}
-	cases := []invalidCase{
+}
+
+type invalidCase struct {
+	name string
+	run  func(*entities.StoreTx, string) error
+}
+
+type pointerInvalidTargets struct {
+	envID             platform.EnvironmentID
+	release           platform.ReleaseID
+	build             platform.BuildID
+	dep               platform.DeploymentID
+	stagingRevision   platform.RevisionID
+	otherRevision     platform.RevisionID
+	stagingRelease    platform.ReleaseID
+	otherRelease      platform.ReleaseID
+	stagingDeployment platform.DeploymentID
+	otherBuild        platform.BuildID
+	sameEnvRelease    platform.ReleaseID
+}
+
+func pointerInvalidTargetCases(ctx context.Context, x pointerInvalidTargets) []invalidCase {
+	return []invalidCase{
 		{"current missing", func(tx *entities.StoreTx, _ string) error {
-			return lockRevisionPointerTx(ctx, tx, f.env.ID, "erv_ffffffffffffffffffffffffffffffff")
+			return lockRevisionPointerTx(ctx, tx, x.envID, "erv_ffffffffffffffffffffffffffffffff")
 		}},
 		{"current cross environment", func(tx *entities.StoreTx, _ string) error {
-			return lockRevisionPointerTx(ctx, tx, f.env.ID, staging.RevisionID)
+			return lockRevisionPointerTx(ctx, tx, x.envID, x.stagingRevision)
 		}},
 		{"current cross application", func(tx *entities.StoreTx, _ string) error {
-			return lockRevisionPointerTx(ctx, tx, f.env.ID, other.RevisionID)
+			return lockRevisionPointerTx(ctx, tx, x.envID, x.otherRevision)
 		}},
 		{"desired missing", func(tx *entities.StoreTx, app string) error {
-			return lockReleasePointerTx(ctx, tx, app, f.env.ID, "rel_ffffffffffffffffffffffffffffffff")
+			return lockReleasePointerTx(ctx, tx, app, x.envID, "rel_ffffffffffffffffffffffffffffffff")
 		}},
 		{"desired cross environment", func(tx *entities.StoreTx, app string) error {
-			return lockReleasePointerTx(ctx, tx, app, f.env.ID, stagingRelease)
+			return lockReleasePointerTx(ctx, tx, app, x.envID, x.stagingRelease)
 		}},
 		{"desired cross application", func(tx *entities.StoreTx, app string) error {
-			return lockReleasePointerTx(ctx, tx, app, f.env.ID, otherRelease)
+			return lockReleasePointerTx(ctx, tx, app, x.envID, x.otherRelease)
 		}},
 		{"shared serving/applied release validator: missing", func(tx *entities.StoreTx, _ string) error {
-			return lockServingPointersTx(ctx, tx, f.env.ID, "rel_ffffffffffffffffffffffffffffffff", f.dep)
+			return lockServingPointersTx(ctx, tx, x.envID, "rel_ffffffffffffffffffffffffffffffff", x.dep)
 		}},
 		{"serving deployment missing", func(tx *entities.StoreTx, _ string) error {
-			return lockServingPointersTx(ctx, tx, f.env.ID, f.release, "dep_ffffffffffffffffffffffffffffffff")
+			return lockServingPointersTx(ctx, tx, x.envID, x.release, "dep_ffffffffffffffffffffffffffffffff")
 		}},
 		{"serving pair mismatch", func(tx *entities.StoreTx, _ string) error {
-			return lockServingPointersTx(ctx, tx, f.env.ID, sameEnvRelease, f.dep)
+			return lockServingPointersTx(ctx, tx, x.envID, x.sameEnvRelease, x.dep)
 		}},
 		{"serving deployment cross environment", func(tx *entities.StoreTx, _ string) error {
-			return lockServingPointersTx(ctx, tx, f.env.ID, f.release, stagingDeployment)
+			return lockServingPointersTx(ctx, tx, x.envID, x.release, x.stagingDeployment)
 		}},
 		{"build missing", func(tx *entities.StoreTx, _ string) error {
-			return setReleaseBuildPointerTx(ctx, tx, f.env.ID, f.release, "bld_ffffffffffffffffffffffffffffffff")
+			return setReleaseBuildPointerTx(ctx, tx, x.envID, x.release, "bld_ffffffffffffffffffffffffffffffff")
 		}},
 		{"build reciprocal mismatch", func(tx *entities.StoreTx, _ string) error {
-			return setReleaseBuildPointerTx(ctx, tx, f.env.ID, sameEnvRelease, f.build)
+			return setReleaseBuildPointerTx(ctx, tx, x.envID, x.sameEnvRelease, x.build)
 		}},
 		{"build cross application", func(tx *entities.StoreTx, _ string) error {
-			return setReleaseBuildPointerTx(ctx, tx, f.env.ID, f.release, otherBuild)
+			return setReleaseBuildPointerTx(ctx, tx, x.envID, x.release, x.otherBuild)
 		}},
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			err := f.service.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
-				appID, err := lockPointerEnvironmentTx(ctx, tx, f.env.ID)
-				if err != nil {
-					return err
-				}
-				observation, found, err := tx.Platform().Environments().GetByID(ctx, f.env.ID)
-				if err != nil {
-					return err
-				}
-				if !found {
-					return unavailable(err)
-				}
-				current := observation.Environment
-				if _, err := tx.Platform().Environments().SetServing(ctx, entities.EnvironmentServing{
-					ID: current.ID, ReleaseID: current.ServingRelease,
-					DeploymentID: current.ServingDeploymentID, HealthState: current.HealthState,
-					HealthDetail: "rollback sentinel", CheckedAt: time.Now().UTC(),
-				}); err != nil {
-					return err
-				}
-				return tc.run(tx, appID)
-			})
-			assertNoDeadlock(t, err)
-			var fault *contract.Fault
-			if !errors.As(err, &fault) || fault.Code != contract.Unavailable || fault.Message != pointerIntegrityFault().Error() || fault.Cause != nil {
-				t.Fatalf("expected pointer-integrity fault without cause, got %v", err)
-			}
-			var actual string
-			if err := f.pool.QueryRow(ctx, `SELECT health_detail FROM eregion_platform_environments WHERE id=$1`, f.env.ID).Scan(&actual); err != nil || actual != original {
-				t.Fatalf("rollback detail=%q original=%q err=%v", actual, original, err)
-			}
-		})
+}
+
+func assertPointerInvalidTarget(t *testing.T, f pointerBuildFixture, ctx context.Context, tc invalidCase, original string) {
+	t.Helper()
+	err := f.service.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		appID, err := lockPointerEnvironmentTx(ctx, tx, f.env.ID)
+		if err != nil {
+			return err
+		}
+		observation, found, err := tx.Platform().Environments().GetByID(ctx, f.env.ID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return unavailable(err)
+		}
+		current := observation.Environment
+		if _, err := tx.Platform().Environments().SetServing(ctx, entities.EnvironmentServing{
+			ID: current.ID, ReleaseID: current.ServingRelease,
+			DeploymentID: current.ServingDeploymentID, HealthState: current.HealthState,
+			HealthDetail: "rollback sentinel", CheckedAt: time.Now().UTC(),
+		}); err != nil {
+			return err
+		}
+		return tc.run(tx, appID)
+	})
+	assertNoDeadlock(t, err)
+	var fault *contract.FaultError
+	if !errors.As(err, &fault) || fault.Code != contract.Unavailable || fault.Message != pointerIntegrityFault().Error() || fault.Cause != nil {
+		t.Fatalf("expected pointer-integrity fault without cause, got %v", err)
+	}
+	var actual string
+	if err := f.pool.QueryRow(ctx, `SELECT health_detail FROM eregion_platform_environments WHERE id=$1`, f.env.ID).Scan(&actual); err != nil || actual != original {
+		t.Fatalf("rollback detail=%q original=%q err=%v", actual, original, err)
 	}
 }

@@ -28,25 +28,39 @@ func applicationInventory(current int) (tables, indexes []string, err error) {
 			return nil, nil, err
 		}
 		for _, statement := range strings.Split(migrationComment.ReplaceAllString(string(data), ""), ";") {
-			statement = strings.TrimSpace(statement)
-			if statement == "" {
-				continue
+			table, index, err := applicationInventoryStatement(statement, seen)
+			if err != nil {
+				return nil, nil, err
 			}
-			match := migrationCreate.FindStringSubmatch(statement)
-			if match == nil || seen[match[2]] {
-				return nil, nil, fmt.Errorf("unsupported application migration statement")
+			if table != "" {
+				tables = append(tables, table)
 			}
-			seen[match[2]] = true
-			if match[1] == "TABLE" {
-				tables = append(tables, match[2])
-			} else {
-				index := migrationIndexOwner.FindStringSubmatch(statement)
-				if index == nil || !seen[index[2]] {
-					return nil, nil, fmt.Errorf("unsupported application index owner")
-				}
-				indexes = append(indexes, index[1]+":"+index[2])
+			if index != "" {
+				indexes = append(indexes, index)
 			}
 		}
 	}
 	return tables, indexes, nil
+}
+
+// applicationInventoryStatement classifies one CREATE-only migration
+// statement. Index ownership is emitted as "index:table" for inventory checks.
+func applicationInventoryStatement(statement string, seen map[string]bool) (table, index string, err error) {
+	statement = strings.TrimSpace(statement)
+	if statement == "" {
+		return "", "", nil
+	}
+	match := migrationCreate.FindStringSubmatch(statement)
+	if match == nil || seen[match[2]] {
+		return "", "", fmt.Errorf("unsupported application migration statement")
+	}
+	seen[match[2]] = true
+	if match[1] == "TABLE" {
+		return match[2], "", nil
+	}
+	owner := migrationIndexOwner.FindStringSubmatch(statement)
+	if owner == nil || !seen[owner[2]] {
+		return "", "", fmt.Errorf("unsupported application index owner")
+	}
+	return "", owner[1] + ":" + owner[2], nil
 }

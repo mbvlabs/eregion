@@ -135,18 +135,56 @@ func (s *Service) candidateCaptureStep(ctx context.Context, env platform.Environ
 
 func (s *Service) readCandidateDiagnostics(ctx context.Context, env platform.Environment, dep platform.Deployment, op contract.Operation, step string) (platform.CandidateDiagnosticResult, bool) {
 	var empty platform.CandidateDiagnosticResult
-	// Re-read the deployment after secret snapshot/instance writes; only the
-	// immutable pinned revision and pinned secret revisions can prove redaction.
-	var has bool
-	var err error
-	expectedID := dep.ID
-	dep, has, err = s.deploymentByOperation(ctx, op.ID)
-	if err != nil || !has || dep.ID != expectedID || dep.App != env.App || dep.Environment != env.Name || dep.RevisionID == "" || s.resolver == nil {
+	env, dep, values, metadataOnly, plan, ok := s.candidateDiagnosticContext(ctx, env, dep, op)
+	if !ok {
 		return empty, false
 	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return empty, false
+	}
+	truncated := len(plan) > 64
+	if truncated {
+		plan = plan[:64]
+	}
+	payload := platform.CandidateDiagnosticPayload{Step: step, App: env.App, Environment: env.Name, ReleaseID: dep.ReleaseID, DeploymentID: dep.ID, Deadline: deadline, MetadataOnly: metadataOnly}
+	for _, p := range plan {
+		payload.Containers = append(payload.Containers, platform.CandidateDiagnosticContainer{Name: p.Name, Process: p.Process.Name, Kind: p.Process.Kind, Replica: p.Replica})
+	}
+	result, ok := s.requestCandidateDiagnostics(ctx, op, dep, env, payload, values)
+	if !ok {
+		return empty, false
+	}
+	// This marker comes from the caller's verified historical context, never
+	// from the node's response or from current secret revisions.
+	switch {
+	case metadataOnly:
+		result.RedactionContext = "unavailable"
+		result.Lines = nil
+		result.Unavailable = true
+	case len(values) == 0:
+		result.RedactionContext = "not_required"
+	default:
+		result.RedactionContext = "original"
+	}
+	if !validCandidateDiagnostics(&result, payload, values, truncated) {
+		return empty, false
+	}
+	return result, true
+}
+
+func (s *Service) candidateDiagnosticContext(ctx context.Context, env platform.Environment, dep platform.Deployment, op contract.Operation) (platform.Environment, platform.Deployment, map[string]string, bool, []platform.PlannedContainer, bool) {
+	// Re-read the deployment after secret snapshot/instance writes; only the
+	// immutable pinned revision and pinned secret revisions can prove redaction.
+	expectedID := dep.ID
+	refreshed, has, err := s.deploymentByOperation(ctx, op.ID)
+	if err != nil || !has || refreshed.ID != expectedID || refreshed.App != env.App || refreshed.Environment != env.Name || refreshed.RevisionID == "" || s.resolver == nil {
+		return env, dep, nil, false, nil, false
+	}
+	dep = refreshed
 	revision, err := s.revisionByID(ctx, dep.RevisionID)
 	if err != nil || revision.App != dep.App || revision.Environment != dep.Environment {
-		return empty, false
+		return env, dep, nil, false, nil, false
 	}
 	env.Revision = &revision
 	metadataOnly := false
@@ -183,20 +221,13 @@ func (s *Service) readCandidateDiagnostics(ctx context.Context, env platform.Env
 	}
 	plan, err := platform.PlanDeployment(env.App, env.Name, revision.RevisionState, dep.ReleaseID, dep.ID)
 	if err != nil {
-		return empty, false
+		return env, dep, nil, false, nil, false
 	}
-	deadline, ok := ctx.Deadline()
-	if !ok {
-		return empty, false
-	}
-	payload := platform.CandidateDiagnosticPayload{Step: step, App: env.App, Environment: env.Name, ReleaseID: dep.ReleaseID, DeploymentID: dep.ID, Deadline: deadline, MetadataOnly: metadataOnly}
-	truncated := len(plan) > 64
-	if truncated {
-		plan = plan[:64]
-	}
-	for _, p := range plan {
-		payload.Containers = append(payload.Containers, platform.CandidateDiagnosticContainer{Name: p.Name, Process: p.Process.Name, Kind: p.Process.Kind, Replica: p.Replica})
-	}
+	return env, dep, values, metadataOnly, plan, true
+}
+
+func (s *Service) requestCandidateDiagnostics(ctx context.Context, op contract.Operation, dep platform.Deployment, env platform.Environment, payload platform.CandidateDiagnosticPayload, values map[string]string) (platform.CandidateDiagnosticResult, bool) {
+	var empty platform.CandidateDiagnosticResult
 	nodeName, err := deploymentCleanupNode(ctx, s, dep, env.Node)
 	if err != nil || nodeName == "" {
 		return empty, false
@@ -218,23 +249,15 @@ func (s *Service) readCandidateDiagnostics(ctx context.Context, env platform.Env
 	if json.Unmarshal(response.Result, &result) != nil {
 		return empty, false
 	}
-	// This marker comes from the caller's verified historical context, never
-	// from the node's response or from current secret revisions.
-	switch {
-	case metadataOnly:
-		result.RedactionContext = "unavailable"
-		result.Lines = nil
-		result.Unavailable = true
-	case len(values) == 0:
-		result.RedactionContext = "not_required"
-	default:
-		result.RedactionContext = "original"
-	}
+	return result, true
+}
+
+func validCandidateDiagnostics(result *platform.CandidateDiagnosticResult, payload platform.CandidateDiagnosticPayload, values map[string]string, truncatedPlan bool) bool {
 	if len(result.Lines) > 0 && result.LogTimestampSource != "observation_time" {
-		return empty, false
+		return false
 	}
 	if len(result.Lines) > 512 {
-		return empty, false
+		return false
 	}
 	registry := &secrets.Registry{}
 	for _, value := range values {
@@ -245,45 +268,61 @@ func (s *Service) readCandidateDiagnostics(ctx context.Context, env platform.Env
 		expected[container.Name] = container
 	}
 	if len(result.Observations) > len(expected) {
-		return empty, false
+		return false
 	}
 	seen := make(map[string]bool)
 	for _, observation := range result.Observations {
-		container, ok := expected[observation.Container]
-		if !ok || seen[observation.Container] || observation.Process != container.Process || observation.Replica != container.Replica || observation.ContainerID == "" || observation.ObservedAt.IsZero() {
-			return empty, false
+		if !validCandidateObservation(observation, expected, seen) {
+			return false
 		}
-		switch observation.State {
-		case "created", "running", "paused", "restarting", "removing", "exited", "dead":
-		default:
-			return empty, false
-		}
-		switch observation.Health {
-		case "", "starting", "healthy", "unhealthy":
-		default:
-			return empty, false
-		}
-		seen[observation.Container] = true
 	}
+	lines, unavailable, truncated := sanitizeCandidateLines(result.Lines, expected, registry)
+	if unavailable {
+		result.Unavailable = true
+	}
+	result.Lines = lines
+	result.Truncated = result.Truncated || truncated || truncatedPlan
+	return true
+}
+
+func validCandidateObservation(observation platform.CandidateObservation, expected map[string]platform.CandidateDiagnosticContainer, seen map[string]bool) bool {
+	container, ok := expected[observation.Container]
+	if !ok || seen[observation.Container] || observation.Process != container.Process || observation.Replica != container.Replica || observation.ContainerID == "" || observation.ObservedAt.IsZero() {
+		return false
+	}
+	switch observation.State {
+	case "created", "running", "paused", "restarting", "removing", "exited", "dead":
+	default:
+		return false
+	}
+	switch observation.Health {
+	case "", "starting", "healthy", "unhealthy":
+	default:
+		return false
+	}
+	seen[observation.Container] = true
+	return true
+}
+
+func sanitizeCandidateLines(lines []platform.CandidateDiagnosticLine, expected map[string]platform.CandidateDiagnosticContainer, registry *secrets.Registry) ([]platform.CandidateDiagnosticLine, bool, bool) {
 	counts := make(map[string]int)
 	bytes := 0
-	lines := make([]platform.CandidateDiagnosticLine, 0, len(result.Lines))
-	for _, line := range result.Lines {
+	kept := make([]platform.CandidateDiagnosticLine, 0, len(lines))
+	unavailable, truncated := false, false
+	for _, line := range lines {
 		container, ok := expected[line.Container]
 		if !ok || line.Process != container.Process || line.Replica != container.Replica || line.ContainerID == "" || line.Timestamp.IsZero() {
-			result.Unavailable = true
+			unavailable = true
 			continue
 		}
 		line.Message = registry.Redact(line.Message)
 		counts[line.Container]++
 		if counts[line.Container] > 200 || len(line.Message) > 32*1024 || bytes+len(line.Message) > 64*1024-512 || !utf8.ValidString(line.Message) {
-			result.Truncated = true
+			truncated = true
 			continue
 		}
 		bytes += len(line.Message)
-		lines = append(lines, line)
+		kept = append(kept, line)
 	}
-	result.Lines = lines
-	result.Truncated = result.Truncated || truncated
-	return result, true
+	return kept, unavailable, truncated
 }

@@ -5,6 +5,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/api"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/vault"
@@ -96,46 +97,8 @@ func TestIntegrationDefinitionDNSPolicyAuditAtomicityAndFences(t *testing.T) {
 		t.Fatalf("stale revision audit=%d revision=%d", got, revision())
 	}
 
-	if _, err := pool.Exec(ctx, `CREATE FUNCTION eregion_test_fail_policy_audit() RETURNS trigger LANGUAGE plpgsql AS $$
-		BEGIN RAISE EXCEPTION 'policy audit unavailable'; END $$`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := pool.Exec(ctx, `CREATE TRIGGER eregion_test_fail_policy_audit BEFORE INSERT ON eregion_integration_audit
-		FOR EACH ROW EXECUTE FUNCTION eregion_test_fail_policy_audit()`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.SetDefinitionDNSPolicy(ctx, actor, api.DefinitionDNSPolicyInput{ExpectedRevision: 1}); contract.Classify(err).Code != contract.Unavailable {
-		t.Fatalf("audit failure = %v", err)
-	}
-	if got := audits(); got != 1 || revision() != 1 {
-		t.Fatalf("audit failure audit=%d revision=%d", got, revision())
-	}
-	if _, err := pool.Exec(ctx, `DROP TRIGGER eregion_test_fail_policy_audit ON eregion_integration_audit`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := pool.Exec(ctx, `DROP FUNCTION eregion_test_fail_policy_audit()`); err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := pool.Exec(ctx, `INSERT INTO eregion_operations
-		(id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state,attempt,completed_steps,last_sequence,error_code,created_at,updated_at)
-		VALUES('op_active_policy_fixture','fixture','platform','system','fixture','active-policy-fixture','fixture','{}','queued',0,0,0,'',clock_timestamp(),clock_timestamp())`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := pool.Exec(ctx, `INSERT INTO eregion_definition_runs
-		(operation_id,plan_nonce,environment_id,approved,next_step,failure_code,failure_message,finished_at)
-		VALUES('op_active_policy_fixture','nonce-active-policy','env-active-policy','{}'::jsonb,0,'','',NULL)`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.SetDefinitionDNSPolicy(ctx, actor, api.DefinitionDNSPolicyInput{ExpectedRevision: 1}); contract.Classify(err).Code != contract.Conflict {
-		t.Fatalf("active definition run = %v", err)
-	}
-	if got := audits(); got != 1 || revision() != 1 {
-		t.Fatalf("active run audit=%d revision=%d", got, revision())
-	}
-	if _, err := pool.Exec(ctx, `UPDATE eregion_definition_runs SET finished_at=clock_timestamp() WHERE operation_id='op_active_policy_fixture'`); err != nil {
-		t.Fatal(err)
-	}
+	assertDefinitionPolicyAuditFailure(t, ctx, pool, store, actor)
+	assertDefinitionPolicyActiveRunFence(t, ctx, pool, store, actor)
 
 	policy, err = store.SetDefinitionDNSPolicy(ctx, actor, api.DefinitionDNSPolicyInput{ExpectedRevision: 1})
 	if err != nil || policy.Revision != 2 || policy.Enabled {
@@ -199,6 +162,80 @@ func TestIntegrationDefinitionDNSPolicyEnabledPath(t *testing.T) {
 		}
 	}
 
+	assertDefinitionPolicyEnabledPath(t, ctx, pool, policyStore, actor, zoneID)
+	assertDefinitionPolicyZoneFences(t, ctx, pool, policyStore, actor, zoneID, ambiguousID, assertInitial)
+	assertDefinitionPolicyAuditTriggerFence(t, ctx, pool, policyStore, actor, zoneID, assertInitial)
+	assertDefinitionPolicyNegativeRevision(t, ctx, pool, policyStore, actor)
+}
+
+func definitionPolicyAuditCount(t *testing.T, ctx context.Context, pool *pgxpool.Pool) int64 {
+	t.Helper()
+	var count int64
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_integration_audit
+		WHERE entry->>'action'='cloudflare.definition-dns-policy' AND entry->>'outcome'='succeeded'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	return count
+}
+
+func definitionPolicyRevision(t *testing.T, ctx context.Context, pool *pgxpool.Pool) int64 {
+	t.Helper()
+	var current int64
+	if err := pool.QueryRow(ctx, `SELECT revision FROM eregion_definition_dns_policy WHERE singleton=true`).Scan(&current); err != nil {
+		t.Fatal(err)
+	}
+	return current
+}
+
+func assertDefinitionPolicyAuditFailure(t *testing.T, ctx context.Context, pool *pgxpool.Pool, store *DefinitionDNSPolicyStore, actor contract.Actor) {
+	t.Helper()
+	if _, err := pool.Exec(ctx, `CREATE FUNCTION eregion_test_fail_policy_audit() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN RAISE EXCEPTION 'policy audit unavailable'; END $$`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `CREATE TRIGGER eregion_test_fail_policy_audit BEFORE INSERT ON eregion_integration_audit
+		FOR EACH ROW EXECUTE FUNCTION eregion_test_fail_policy_audit()`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SetDefinitionDNSPolicy(ctx, actor, api.DefinitionDNSPolicyInput{ExpectedRevision: 1}); contract.Classify(err).Code != contract.Unavailable {
+		t.Fatalf("audit failure = %v", err)
+	}
+	if got := definitionPolicyAuditCount(t, ctx, pool); got != 1 || definitionPolicyRevision(t, ctx, pool) != 1 {
+		t.Fatalf("audit failure audit=%d revision=%d", got, definitionPolicyRevision(t, ctx, pool))
+	}
+	if _, err := pool.Exec(ctx, `DROP TRIGGER eregion_test_fail_policy_audit ON eregion_integration_audit`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `DROP FUNCTION eregion_test_fail_policy_audit()`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertDefinitionPolicyActiveRunFence(t *testing.T, ctx context.Context, pool *pgxpool.Pool, store *DefinitionDNSPolicyStore, actor contract.Actor) {
+	t.Helper()
+	if _, err := pool.Exec(ctx, `INSERT INTO eregion_operations
+		(id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state,attempt,completed_steps,last_sequence,error_code,created_at,updated_at)
+		VALUES('op_active_policy_fixture','fixture','platform','system','fixture','active-policy-fixture','fixture','{}','queued',0,0,0,'',clock_timestamp(),clock_timestamp())`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO eregion_definition_runs
+		(operation_id,plan_nonce,environment_id,approved,next_step,failure_code,failure_message,finished_at)
+		VALUES('op_active_policy_fixture','nonce-active-policy','env-active-policy','{}'::jsonb,0,'','',NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SetDefinitionDNSPolicy(ctx, actor, api.DefinitionDNSPolicyInput{ExpectedRevision: 1}); contract.Classify(err).Code != contract.Conflict {
+		t.Fatalf("active definition run = %v", err)
+	}
+	if got := definitionPolicyAuditCount(t, ctx, pool); got != 1 || definitionPolicyRevision(t, ctx, pool) != 1 {
+		t.Fatalf("active run audit=%d revision=%d", got, definitionPolicyRevision(t, ctx, pool))
+	}
+	if _, err := pool.Exec(ctx, `UPDATE eregion_definition_runs SET finished_at=clock_timestamp() WHERE operation_id='op_active_policy_fixture'`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertDefinitionPolicyEnabledPath(t *testing.T, ctx context.Context, pool *pgxpool.Pool, policyStore *DefinitionDNSPolicyStore, actor contract.Actor, zoneID string) {
+	t.Helper()
 	policy, err := policyStore.SetDefinitionDNSPolicy(ctx, actor, api.DefinitionDNSPolicyInput{
 		ExpectedRevision: 0, Enabled: true, Zone: zoneID,
 		Origins: []string{"8.8.8.8"}, ProxyMode: "dns-only",
@@ -208,7 +245,7 @@ func TestIntegrationDefinitionDNSPolicyEnabledPath(t *testing.T) {
 		policy.Origins[0] != "8.8.8.8" || policy.ProxyMode != "dns-only" {
 		t.Fatalf("enabled policy = %+v, %v", policy, err)
 	}
-	if got := audits(); got != 1 {
+	if got := definitionPolicyAuditCount(t, ctx, pool); got != 1 {
 		t.Fatalf("enabled policy audit = %d", got)
 	}
 	var provider, storedZone, proxyMode string
@@ -221,7 +258,10 @@ func TestIntegrationDefinitionDNSPolicyEnabledPath(t *testing.T) {
 		len(origins) != 1 || origins[0] != "8.8.8.8" || proxyMode != "dns-only" {
 		t.Fatalf("enabled policy row = %q %q %v %v %q, %v", provider, storedZone, enabled, origins, proxyMode, err)
 	}
+}
 
+func assertDefinitionPolicyZoneFences(t *testing.T, ctx context.Context, pool *pgxpool.Pool, policyStore *DefinitionDNSPolicyStore, actor contract.Actor, zoneID, ambiguousID string, assertInitial func()) {
+	t.Helper()
 	if _, err := policyStore.SetDefinitionDNSPolicy(ctx, actor, api.DefinitionDNSPolicyInput{
 		ExpectedRevision: 1, Enabled: true, Zone: "missing.example.com",
 		Origins: []string{"8.8.4.4"}, ProxyMode: "dns-only",
@@ -229,7 +269,6 @@ func TestIntegrationDefinitionDNSPolicyEnabledPath(t *testing.T) {
 		t.Fatalf("missing zone = %v", err)
 	}
 	assertInitial()
-
 	// An explicit corrupt provider row whose zone name equals the valid zone ID
 	// makes the reference ambiguous without weakening any constraint.
 	if _, err := pool.Exec(ctx, `INSERT INTO eregion_provider_credentials
@@ -248,7 +287,10 @@ func TestIntegrationDefinitionDNSPolicyEnabledPath(t *testing.T) {
 		WHERE provider='cloudflare' AND zone_id=$1`, ambiguousID); err != nil {
 		t.Fatal(err)
 	}
+}
 
+func assertDefinitionPolicyAuditTriggerFence(t *testing.T, ctx context.Context, pool *pgxpool.Pool, policyStore *DefinitionDNSPolicyStore, actor contract.Actor, zoneID string, assertInitial func()) {
+	t.Helper()
 	if _, err := pool.Exec(ctx, `CREATE FUNCTION eregion_test_fail_enabled_audit() RETURNS trigger LANGUAGE plpgsql AS $$
 		BEGIN RAISE EXCEPTION 'enabled policy audit unavailable'; END $$`); err != nil {
 		t.Fatal(err)
@@ -258,8 +300,7 @@ func TestIntegrationDefinitionDNSPolicyEnabledPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_, _ = pool.Exec(context.Background(), `DROP TRIGGER IF EXISTS eregion_test_fail_enabled_audit ON eregion_integration_audit`)
-		_, _ = pool.Exec(context.Background(), `DROP FUNCTION IF EXISTS eregion_test_fail_enabled_audit()`)
+		dropDefinitionPolicyAuditTrigger(t, ctx, pool)
 	})
 	if _, err := policyStore.SetDefinitionDNSPolicy(ctx, actor, api.DefinitionDNSPolicyInput{
 		ExpectedRevision: 1, Enabled: true, Zone: zoneID,
@@ -274,7 +315,10 @@ func TestIntegrationDefinitionDNSPolicyEnabledPath(t *testing.T) {
 	if _, err := pool.Exec(ctx, `DROP FUNCTION eregion_test_fail_enabled_audit()`); err != nil {
 		t.Fatal(err)
 	}
+}
 
+func assertDefinitionPolicyNegativeRevision(t *testing.T, ctx context.Context, pool *pgxpool.Pool, policyStore *DefinitionDNSPolicyStore, actor contract.Actor) {
+	t.Helper()
 	if _, err := pool.Exec(ctx, `UPDATE eregion_definition_dns_policy SET revision=-1 WHERE singleton=true`); err != nil {
 		t.Fatal(err)
 	}
@@ -288,4 +332,11 @@ func TestIntegrationDefinitionDNSPolicyEnabledPath(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT revision FROM eregion_definition_dns_policy WHERE singleton=true`).Scan(&negativeRevision); err != nil || negativeRevision != -1 {
 		t.Fatalf("negative policy revision changed to %d, %v", negativeRevision, err)
 	}
+}
+
+func dropDefinitionPolicyAuditTrigger(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
+	t.Helper()
+	cleanupCtx := context.WithoutCancel(ctx)
+	_, _ = pool.Exec(cleanupCtx, `DROP TRIGGER IF EXISTS eregion_test_fail_enabled_audit ON eregion_integration_audit`)
+	_, _ = pool.Exec(cleanupCtx, `DROP FUNCTION IF EXISTS eregion_test_fail_enabled_audit()`)
 }

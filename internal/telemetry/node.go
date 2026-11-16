@@ -145,6 +145,16 @@ type NodeSnapshot struct {
 // Validate refuses a snapshot that is not safe to present as a node
 // observation. It does not turn an unavailable field into a value.
 func (s NodeSnapshot) Validate() error {
+	if err := s.validateIdentity(); err != nil {
+		return err
+	}
+	if err := s.validateFreshness(); err != nil {
+		return err
+	}
+	return s.validateObservations()
+}
+
+func (s NodeSnapshot) validateIdentity() error {
 	if s.Schema != NodeMetricsSchema {
 		return fmt.Errorf("unexpected node-metrics schema %q", s.Schema)
 	}
@@ -160,6 +170,10 @@ func (s NodeSnapshot) Validate() error {
 	if s.Scrape.Public {
 		return fmt.Errorf("node_exporter scrape is marked public")
 	}
+	return nil
+}
+
+func (s NodeSnapshot) validateFreshness() error {
 	switch s.Freshness.State {
 	case FreshnessFresh, FreshnessStale, FreshnessUnknown:
 	default:
@@ -168,6 +182,10 @@ func (s NodeSnapshot) Validate() error {
 	if s.Freshness.AgeSeconds != nil && (*s.Freshness.AgeSeconds < 0 || math.IsNaN(*s.Freshness.AgeSeconds)) {
 		return fmt.Errorf("invalid freshness age")
 	}
+	return nil
+}
+
+func (s NodeSnapshot) validateObservations() error {
 	if s.CPU != nil && s.CPU.UtilizationPercent != nil {
 		if math.IsNaN(*s.CPU.UtilizationPercent) || *s.CPU.UtilizationPercent < 0 || *s.CPU.UtilizationPercent > 100 {
 			return fmt.Errorf("invalid CPU utilization")
@@ -199,30 +217,74 @@ type NodeExporterConfig struct {
 // gap, computes CPU utilization from the counter delta and returns one snapshot.
 // It never stores the samples or contacts an external backend.
 func CollectNodeExporter(ctx context.Context, cfg NodeExporterConfig) (NodeSnapshot, error) {
-	endpoint, err := validateNodeExporterURL(cfg.Endpoint)
+	collection, err := prepareNodeExporterCollection(cfg)
 	if err != nil {
 		return NodeSnapshot{}, err
+	}
+	firstAt := collection.now().UTC()
+	first, err := fetchNodeExporter(ctx, collection.client, collection.endpoint, collection.maxBody)
+	if err != nil {
+		return NodeSnapshot{}, err
+	}
+	timer := time.NewTimer(collection.interval)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return NodeSnapshot{}, ctx.Err()
+	case <-timer.C:
+	}
+	second, err := fetchNodeExporter(ctx, collection.client, collection.endpoint, collection.maxBody)
+	if err != nil {
+		return NodeSnapshot{}, err
+	}
+	// Completion time is recorded only after the second response is fully read.
+	secondAt := collection.now().UTC()
+	snapshot, err := ParseNodeExporter(first, second, firstAt, secondAt)
+	if err != nil {
+		return NodeSnapshot{}, err
+	}
+	snapshot.Scrape = cfg.Scrape
+	snapshot.Freshness.ThresholdSeconds = collection.staleAfter.Seconds()
+	if snapshot.ObservedAt != nil {
+		applyObservationFreshness(&snapshot.Freshness, *snapshot.ObservedAt, secondAt, collection.staleAfter)
+	}
+	return snapshot, nil
+}
+
+type nodeExporterCollection struct {
+	endpoint   string
+	interval   time.Duration
+	maxBody    int64
+	staleAfter time.Duration
+	now        func() time.Time
+	client     *http.Client
+}
+
+func prepareNodeExporterCollection(cfg NodeExporterConfig) (nodeExporterCollection, error) {
+	endpoint, err := validateNodeExporterURL(cfg.Endpoint)
+	if err != nil {
+		return nodeExporterCollection{}, err
 	}
 	interval := cfg.SampleInterval
 	if interval == 0 {
 		interval = DefaultNodeSampleInterval
 	}
 	if interval < 100*time.Millisecond || interval > 30*time.Second {
-		return NodeSnapshot{}, contract.NewFault(contract.ValidationFailed, "invalid node metrics sample interval", "Use 100 milliseconds–30 seconds.")
+		return nodeExporterCollection{}, contract.NewFault(contract.ValidationFailed, "invalid node metrics sample interval", "Use 100 milliseconds–30 seconds.")
 	}
 	maxBody := cfg.MaxBody
 	if maxBody == 0 {
 		maxBody = DefaultNodeMaxBody
 	}
 	if maxBody < 4096 || maxBody > 32<<20 {
-		return NodeSnapshot{}, contract.NewFault(contract.ValidationFailed, "invalid node metrics response bound", "Use 4 KiB–32 MiB.")
+		return nodeExporterCollection{}, contract.NewFault(contract.ValidationFailed, "invalid node metrics response bound", "Use 4 KiB–32 MiB.")
 	}
 	staleAfter := cfg.StaleAfter
 	if staleAfter == 0 {
 		staleAfter = DefaultNodeStaleAfter
 	}
 	if staleAfter < time.Second || staleAfter > 24*time.Hour {
-		return NodeSnapshot{}, contract.NewFault(contract.ValidationFailed, "invalid node metrics freshness threshold", "Use 1 second–24 hours.")
+		return nodeExporterCollection{}, contract.NewFault(contract.ValidationFailed, "invalid node metrics freshness threshold", "Use 1 second–24 hours.")
 	}
 	now := cfg.Now
 	if now == nil {
@@ -232,45 +294,23 @@ func CollectNodeExporter(ctx context.Context, cfg NodeExporterConfig) (NodeSnaps
 	if client == nil {
 		client = defaultNodeExporterClient(5 * time.Second)
 	}
+	return nodeExporterCollection{
+		endpoint: endpoint, interval: interval, maxBody: maxBody,
+		staleAfter: staleAfter, now: now, client: client,
+	}, nil
+}
 
-	firstAt := now().UTC()
-	first, err := fetchNodeExporter(ctx, client, endpoint, maxBody)
-	if err != nil {
-		return NodeSnapshot{}, err
+func applyObservationFreshness(freshness *Freshness, observed, now time.Time, staleAfter time.Duration) {
+	age := now.Sub(observed)
+	if age < 0 {
+		age = 0
 	}
-	timer := time.NewTimer(interval)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return NodeSnapshot{}, ctx.Err()
-	case <-timer.C:
+	seconds := age.Seconds()
+	state := FreshnessFresh
+	if age > staleAfter {
+		state = FreshnessStale
 	}
-	second, err := fetchNodeExporter(ctx, client, endpoint, maxBody)
-	if err != nil {
-		return NodeSnapshot{}, err
-	}
-	// Completion time is recorded only after the second response is fully read.
-	secondAt := now().UTC()
-	snapshot, err := ParseNodeExporter(first, second, firstAt, secondAt)
-	if err != nil {
-		return NodeSnapshot{}, err
-	}
-	snapshot.Scrape = cfg.Scrape
-	snapshot.Freshness.ThresholdSeconds = staleAfter.Seconds()
-	if snapshot.ObservedAt != nil {
-		age := secondAt.Sub(*snapshot.ObservedAt)
-		if age < 0 {
-			age = 0
-		}
-		seconds := age.Seconds()
-		snapshot.Freshness.AgeSeconds = &seconds
-		state := FreshnessFresh
-		if age > staleAfter {
-			state = FreshnessStale
-		}
-		snapshot.Freshness.State = state
-	}
-	return snapshot, nil
+	*freshness = Freshness{State: state, AgeSeconds: &seconds, ThresholdSeconds: staleAfter.Seconds()}
 }
 
 func defaultNodeExporterClient(timeout time.Duration) *http.Client {
@@ -325,13 +365,34 @@ func ProbeLocal(ctx context.Context, endpoint string) (LocalProbe, error) {
 		return probe, err
 	}
 	probe.Reachable = true
+	found, textfileError, err := scanLocalProbe(body, &probe)
+	if err != nil {
+		return probe, err
+	}
+	if !found {
+		return probe, contract.NewFault(contract.Unavailable, "node_exporter returned no recognized health metrics", "Check that the configured endpoint is node_exporter, not another HTTP service.")
+	}
+	if textfileError.seen {
+		if textfileError.ambiguous {
+			probe.TextfileScrapeErrorAmbiguous = true
+		} else {
+			value := textfileError.value
+			probe.TextfileScrapeError = &value
+		}
+	}
+	return probe, nil
+}
+
+type localTextfileGauge struct {
+	seen      bool
+	ambiguous bool
+	value     float64
+}
+
+func scanLocalProbe(body string, probe *LocalProbe) (bool, localTextfileGauge, error) {
 	found := false
 	seenCollectors := map[string]bool{}
-	textfileError := struct {
-		seen      bool
-		ambiguous bool
-		value     float64
-	}{}
+	textfileError := localTextfileGauge{}
 	scanner := bufio.NewScanner(strings.NewReader(body))
 	scanner.Buffer(make([]byte, 0, 64*1024), 1<<20)
 	for scanner.Scan() {
@@ -339,17 +400,7 @@ func ProbeLocal(ctx context.Context, endpoint string) (LocalProbe, error) {
 		name := nodeExporterMetricName(line)
 		if name == "node_textfile_scrape_error" {
 			found = true
-			if textfileError.seen {
-				textfileError.ambiguous = true
-				continue
-			}
-			textfileError.seen = true
-			parsedName, labels, value, timestamped, ok := parsePrometheusLine(line)
-			if !ok || parsedName != name || timestamped || len(labels) != 0 || (value != 0 && value != 1) {
-				textfileError.ambiguous = true
-				continue
-			}
-			textfileError.value = value
+			consumeTextfileGauge(line, &textfileError)
 			continue
 		}
 		parsedName, labels, value, timestamped, ok := parsePrometheusLine(line)
@@ -366,34 +417,41 @@ func ProbeLocal(ctx context.Context, endpoint string) (LocalProbe, error) {
 			found = true
 		case "node_scrape_collector_success":
 			found = true
-			collector := sanitizeNodeExporterLabel(labels["collector"])
-			if timestamped || collector == "" {
-				probe.CollectorsAmbiguous["*"] = true
-				continue
-			}
-			if seenCollectors[collector] {
-				probe.CollectorsAmbiguous[collector] = true
-				continue
-			}
-			seenCollectors[collector] = true
-			probe.Collectors[collector] = value == 1
+			consumeCollectorMetric(probe, labels, value, timestamped, seenCollectors)
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return probe, contract.NewFault(contract.Unavailable, "node_exporter response is not readable", "Check node-exporter.service and retry.")
+		return false, textfileError, contract.NewFault(contract.Unavailable, "node_exporter response is not readable", "Check node-exporter.service and retry.")
 	}
-	if !found {
-		return probe, contract.NewFault(contract.Unavailable, "node_exporter returned no recognized health metrics", "Check that the configured endpoint is node_exporter, not another HTTP service.")
+	return found, textfileError, nil
+}
+
+func consumeTextfileGauge(line string, gauge *localTextfileGauge) {
+	if gauge.seen {
+		gauge.ambiguous = true
+		return
 	}
-	if textfileError.seen {
-		if textfileError.ambiguous {
-			probe.TextfileScrapeErrorAmbiguous = true
-		} else {
-			value := textfileError.value
-			probe.TextfileScrapeError = &value
-		}
+	gauge.seen = true
+	parsedName, labels, value, timestamped, ok := parsePrometheusLine(line)
+	if !ok || parsedName != "node_textfile_scrape_error" || timestamped || len(labels) != 0 || (value != 0 && value != 1) {
+		gauge.ambiguous = true
+		return
 	}
-	return probe, nil
+	gauge.value = value
+}
+
+func consumeCollectorMetric(probe *LocalProbe, labels map[string]string, value float64, timestamped bool, seen map[string]bool) {
+	collector := sanitizeNodeExporterLabel(labels["collector"])
+	if timestamped || collector == "" {
+		probe.CollectorsAmbiguous["*"] = true
+		return
+	}
+	if seen[collector] {
+		probe.CollectorsAmbiguous[collector] = true
+		return
+	}
+	seen[collector] = true
+	probe.Collectors[collector] = value == 1
 }
 
 func validateNodeExporterURL(value string) (string, error) {
@@ -417,7 +475,7 @@ func fetchNodeExporter(ctx context.Context, client *http.Client, endpoint string
 		}
 		return "", contract.NewFault(contract.Unavailable, "node_exporter is unreachable on the loopback address", "Check node-exporter.service; the exporter is loopback-only.")
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode != http.StatusOK {
 		return "", contract.NewFault(contract.Unavailable, "node_exporter returned an error", fmt.Sprintf("node_exporter answered HTTP %d; check node-exporter.service.", response.StatusCode))
 	}
@@ -459,33 +517,7 @@ func ParseNodeExporter(first, second string, firstAt, secondAt time.Time) (NodeS
 		snapshot.ExporterVersion = firstScrape.exporterVersion
 	}
 
-	observed := secondScrape.nodeTime
-	snapshot.Freshness.ThresholdSeconds = DefaultNodeStaleAfter.Seconds()
-	if !observed.IsZero() {
-		observed = observed.UTC()
-		age := secondAt.Sub(observed)
-		if age < -DefaultNodeFutureSkew {
-			// A materially future exporter clock is not evidence that the
-			// sample is fresh now. Do not expose a future observed_at or let
-			// CollectNodeExporter recompute a clamped zero age.
-			snapshot.Issues = append(snapshot.Issues, Issue{
-				Field: "timestamp", Reason: "node_time_seconds is materially in the future; freshness is unknown",
-			})
-		} else {
-			snapshot.ObservedAt = &observed
-			if age < 0 {
-				age = 0
-			}
-			seconds := age.Seconds()
-			state := FreshnessFresh
-			if age > DefaultNodeStaleAfter {
-				state = FreshnessStale
-			}
-			snapshot.Freshness = Freshness{State: state, AgeSeconds: &seconds, ThresholdSeconds: DefaultNodeStaleAfter.Seconds()}
-		}
-	} else {
-		snapshot.Issues = append(snapshot.Issues, Issue{Field: "timestamp", Reason: "node_time_seconds is missing; freshness is unknown"})
-	}
+	applyParsedFreshness(&snapshot, secondScrape.nodeTime, secondAt)
 
 	if identity.nodename == "" {
 		snapshot.Node = "local"
@@ -498,6 +530,35 @@ func ParseNodeExporter(first, second string, firstAt, secondAt time.Time) (NodeS
 	snapshot.CPU, snapshot.Memory, snapshot.Load, snapshot.UptimeSeconds = secondScrape.values(firstScrape, firstAt, secondAt, &snapshot.Issues)
 	snapshot.Filesystems = secondScrape.filesystems(&snapshot.Issues)
 	return snapshot, nil
+}
+
+func applyParsedFreshness(snapshot *NodeSnapshot, observed, secondAt time.Time) {
+	snapshot.Freshness.ThresholdSeconds = DefaultNodeStaleAfter.Seconds()
+	if observed.IsZero() {
+		snapshot.Issues = append(snapshot.Issues, Issue{Field: "timestamp", Reason: "node_time_seconds is missing; freshness is unknown"})
+		return
+	}
+	observed = observed.UTC()
+	age := secondAt.Sub(observed)
+	if age < -DefaultNodeFutureSkew {
+		// A materially future exporter clock is not evidence that the
+		// sample is fresh now. Do not expose a future observed_at or let
+		// CollectNodeExporter recompute a clamped zero age.
+		snapshot.Issues = append(snapshot.Issues, Issue{
+			Field: "timestamp", Reason: "node_time_seconds is materially in the future; freshness is unknown",
+		})
+		return
+	}
+	snapshot.ObservedAt = &observed
+	if age < 0 {
+		age = 0
+	}
+	seconds := age.Seconds()
+	state := FreshnessFresh
+	if age > DefaultNodeStaleAfter {
+		state = FreshnessStale
+	}
+	snapshot.Freshness = Freshness{State: state, AgeSeconds: &seconds, ThresholdSeconds: DefaultNodeStaleAfter.Seconds()}
 }
 
 type nodeExporterScrape struct {
@@ -565,100 +626,13 @@ func parseNodeExporterScrape(text string) (nodeExporterScrape, error) {
 		if timestamped && relevantNodeExporterMetric(name) {
 			return nodeExporterScrape{}, timestampedNodeExporterSample(name)
 		}
-		switch name {
-		case "node_cpu_seconds_total":
-			cpu := sanitizeNodeExporterLabel(labels["cpu"])
-			mode := sanitizeNodeExporterLabel(labels["mode"])
-			if cpu == "" || mode == "" || value < 0 {
-				return nodeExporterScrape{}, malformedNodeExporterSample(name)
-			}
-			key := cpuMode{cpu: cpu, mode: mode}
-			if _, exists := scrape.cpu[key]; exists {
-				return nodeExporterScrape{}, duplicateNodeExporterSeries(name)
-			}
-			scrape.cpu[key] = value
-		case "node_memory_MemTotal_bytes":
-			if !once(name) {
-				return nodeExporterScrape{}, duplicateNodeExporterSeries(name)
-			}
-			scrape.memoryTotal = floatPointer(value)
-		case "node_memory_MemAvailable_bytes":
-			if !once(name) {
-				return nodeExporterScrape{}, duplicateNodeExporterSeries(name)
-			}
-			scrape.memoryAvailable = floatPointer(value)
-		case "node_load1":
-			if !once(name) {
-				return nodeExporterScrape{}, duplicateNodeExporterSeries(name)
-			}
-			scrape.load1 = floatPointer(value)
-		case "node_load5":
-			if !once(name) {
-				return nodeExporterScrape{}, duplicateNodeExporterSeries(name)
-			}
-			scrape.load5 = floatPointer(value)
-		case "node_load15":
-			if !once(name) {
-				return nodeExporterScrape{}, duplicateNodeExporterSeries(name)
-			}
-			scrape.load15 = floatPointer(value)
-		case "node_time_seconds":
-			if value <= 0 {
-				return nodeExporterScrape{}, malformedNodeExporterSample(name)
-			}
-			if !once(name) {
-				return nodeExporterScrape{}, duplicateNodeExporterSeries(name)
-			}
-			scrape.nodeTime = unixFloat(value)
-		case "node_boot_time_seconds":
-			if value <= 0 {
-				return nodeExporterScrape{}, malformedNodeExporterSample(name)
-			}
-			if !once(name) {
-				return nodeExporterScrape{}, duplicateNodeExporterSeries(name)
-			}
-			scrape.bootTime = unixFloat(value)
-		case "node_filesystem_size_bytes":
-			key, usable := filesystemKeyFor(labels)
-			if !usable {
-				return nodeExporterScrape{}, malformedNodeExporterSample(name)
-			}
-			if skipFilesystem(key) {
-				continue
-			}
-			if _, exists := scrape.filesystemSize[key]; exists {
-				return nodeExporterScrape{}, duplicateNodeExporterSeries(name)
-			}
-			scrape.filesystemSize[key] = value
-		case "node_filesystem_avail_bytes":
-			key, usable := filesystemKeyFor(labels)
-			if !usable {
-				return nodeExporterScrape{}, malformedNodeExporterSample(name)
-			}
-			if skipFilesystem(key) {
-				continue
-			}
-			if _, exists := scrape.filesystemAvail[key]; exists {
-				return nodeExporterScrape{}, duplicateNodeExporterSeries(name)
-			}
-			scrape.filesystemAvail[key] = value
-		case "node_uname_info":
-			if !once(name) {
-				return nodeExporterScrape{}, duplicateNodeExporterSeries(name)
-			}
-			scrape.identity = unameInfo{
-				sysname: sanitizeNodeExporterLabel(labels["sysname"]), nodename: sanitizeNodeExporterLabel(labels["nodename"]),
-				release: sanitizeNodeExporterLabel(labels["release"]), machine: sanitizeNodeExporterLabel(labels["machine"]),
-			}
-		case "node_exporter_build_info":
-			if !once(name) {
-				return nodeExporterScrape{}, duplicateNodeExporterSeries(name)
-			}
-			scrape.exporterVersion = sanitizeNodeExporterLabel(labels["version"])
-		default:
-			continue
+		recognized, err := scrape.consumeMetric(name, labels, value, once)
+		if err != nil {
+			return nodeExporterScrape{}, err
 		}
-		scrape.found = true
+		if recognized {
+			scrape.found = true
+		}
 	}
 	if err := scanner.Err(); err != nil {
 		return nodeExporterScrape{}, contract.NewFault(contract.Unavailable, "node_exporter response is not readable", "The response contained an overlong or unreadable line; retry and check the exporter.")
@@ -667,6 +641,109 @@ func parseNodeExporterScrape(text string) (nodeExporterScrape, error) {
 		return nodeExporterScrape{}, contract.NewFault(contract.Unavailable, "node_exporter returned no recognized host metrics", "Check that the configured endpoint is node_exporter, not another HTTP service.")
 	}
 	return scrape, nil
+}
+
+func (s *nodeExporterScrape) consumeMetric(name string, labels map[string]string, value float64, once func(string) bool) (bool, error) {
+	switch name {
+	case "node_cpu_seconds_total":
+		return true, s.consumeCPU(labels, value)
+	case "node_memory_MemTotal_bytes", "node_memory_MemAvailable_bytes", "node_load1", "node_load5", "node_load15":
+		return true, s.consumeSimpleMetric(name, value, once)
+	case "node_time_seconds":
+		return true, s.consumeTimestamp(name, value, once, &s.nodeTime)
+	case "node_boot_time_seconds":
+		return true, s.consumeTimestamp(name, value, once, &s.bootTime)
+	case "node_filesystem_size_bytes", "node_filesystem_avail_bytes":
+		return s.consumeFilesystem(name, labels, value)
+	case "node_uname_info":
+		return true, s.consumeUname(labels, once)
+	case "node_exporter_build_info":
+		return true, s.consumeBuildInfo(labels, once)
+	default:
+		return false, nil
+	}
+}
+
+func (s *nodeExporterScrape) consumeCPU(labels map[string]string, value float64) error {
+	cpu := sanitizeNodeExporterLabel(labels["cpu"])
+	mode := sanitizeNodeExporterLabel(labels["mode"])
+	if cpu == "" || mode == "" || value < 0 {
+		return malformedNodeExporterSample("node_cpu_seconds_total")
+	}
+	key := cpuMode{cpu: cpu, mode: mode}
+	if _, exists := s.cpu[key]; exists {
+		return duplicateNodeExporterSeries("node_cpu_seconds_total")
+	}
+	s.cpu[key] = value
+	return nil
+}
+
+func (s *nodeExporterScrape) consumeSimpleMetric(name string, value float64, once func(string) bool) error {
+	if !once(name) {
+		return duplicateNodeExporterSeries(name)
+	}
+	switch name {
+	case "node_memory_MemTotal_bytes":
+		s.memoryTotal = floatPointer(value)
+	case "node_memory_MemAvailable_bytes":
+		s.memoryAvailable = floatPointer(value)
+	case "node_load1":
+		s.load1 = floatPointer(value)
+	case "node_load5":
+		s.load5 = floatPointer(value)
+	case "node_load15":
+		s.load15 = floatPointer(value)
+	}
+	return nil
+}
+
+func (s *nodeExporterScrape) consumeTimestamp(name string, value float64, once func(string) bool, target *time.Time) error {
+	if value <= 0 {
+		return malformedNodeExporterSample(name)
+	}
+	if !once(name) {
+		return duplicateNodeExporterSeries(name)
+	}
+	*target = unixFloat(value)
+	return nil
+}
+
+func (s *nodeExporterScrape) consumeFilesystem(name string, labels map[string]string, value float64) (bool, error) {
+	key, usable := filesystemKeyFor(labels)
+	if !usable {
+		return true, malformedNodeExporterSample(name)
+	}
+	if skipFilesystem(key) {
+		return false, nil
+	}
+	values := s.filesystemSize
+	if name == "node_filesystem_avail_bytes" {
+		values = s.filesystemAvail
+	}
+	if _, exists := values[key]; exists {
+		return true, duplicateNodeExporterSeries(name)
+	}
+	values[key] = value
+	return true, nil
+}
+
+func (s *nodeExporterScrape) consumeUname(labels map[string]string, once func(string) bool) error {
+	if !once("node_uname_info") {
+		return duplicateNodeExporterSeries("node_uname_info")
+	}
+	s.identity = unameInfo{
+		sysname: sanitizeNodeExporterLabel(labels["sysname"]), nodename: sanitizeNodeExporterLabel(labels["nodename"]),
+		release: sanitizeNodeExporterLabel(labels["release"]), machine: sanitizeNodeExporterLabel(labels["machine"]),
+	}
+	return nil
+}
+
+func (s *nodeExporterScrape) consumeBuildInfo(labels map[string]string, once func(string) bool) error {
+	if !once("node_exporter_build_info") {
+		return duplicateNodeExporterSeries("node_exporter_build_info")
+	}
+	s.exporterVersion = sanitizeNodeExporterLabel(labels["version"])
+	return nil
 }
 
 func floatPointer(value float64) *float64 { return &value }
@@ -779,52 +856,13 @@ func (s nodeExporterScrape) cpuStats(first nodeExporterScrape, firstAt, secondAt
 		addIssue(issues, "cpu", "node_cpu_seconds_total is missing; CPU utilization is unavailable")
 		return nil
 	}
-	var totalDelta, idleDelta float64
-	seenCPUs := map[string]bool{}
-	for key := range first.cpu {
-		if _, ok := s.cpu[key]; !ok {
-			addIssue(issues, "cpu", "the CPU counter set changed between samples; CPU utilization is unavailable")
-			return nil
-		}
+	seenCPUs, ok := validateCPUSeries(first, s, issues)
+	if !ok {
+		return nil
 	}
-	for key := range s.cpu {
-		seenCPUs[key.cpu] = true
-		if _, ok := first.cpu[key]; !ok {
-			addIssue(issues, "cpu", "the CPU counter set changed between samples; CPU utilization is unavailable")
-			return nil
-		}
-	}
-	// Every observed CPU must have the full Linux counter mode set in both
-	// reads. A partial family (for example idle-only) would otherwise look
-	// numerical while silently fabricating a zero-utilization sample.
-	for cpu := range seenCPUs {
-		for _, mode := range linuxCPUModes {
-			key := cpuMode{cpu: cpu, mode: mode}
-			if _, ok := first.cpu[key]; !ok {
-				addIssue(issues, "cpu", "node_cpu_seconds_total has no "+mode+"-mode series for cpu "+cpu+"; CPU utilization is unavailable")
-				return nil
-			}
-			if _, ok := s.cpu[key]; !ok {
-				addIssue(issues, "cpu", "node_cpu_seconds_total has no "+mode+"-mode series for cpu "+cpu+"; CPU utilization is unavailable")
-				return nil
-			}
-		}
-	}
-	for key, secondValue := range s.cpu {
-		firstValue := first.cpu[key]
-		if secondValue < firstValue {
-			addIssue(issues, "cpu", "a CPU counter reset between samples; CPU utilization is unavailable")
-			return nil
-		}
-		// Linux counts guest time inside user/nice, so summing guest and
-		// guest_nice would double-count it. Every other mode contributes to
-		// the CPU-seconds denominator.
-		if key.mode != "guest" && key.mode != "guest_nice" {
-			totalDelta += secondValue - firstValue
-		}
-		if key.mode == "idle" {
-			idleDelta += secondValue - firstValue
-		}
+	totalDelta, idleDelta, ok := cpuCounterDeltas(first, s, issues)
+	if !ok {
+		return nil
 	}
 	if idleDelta < 0 {
 		addIssue(issues, "cpu", "node_cpu_seconds_total has no usable idle-mode delta; CPU utilization is unavailable")
@@ -848,6 +886,61 @@ func (s nodeExporterScrape) cpuStats(first nodeExporterScrape, firstAt, secondAt
 		UtilizationPercent: &utilization, LogicalCPUs: len(seenCPUs),
 		WindowSeconds: window, TotalSeconds: totalDelta, IdleSeconds: idleDelta,
 	}
+}
+
+func validateCPUSeries(first, second nodeExporterScrape, issues *[]Issue) (map[string]bool, bool) {
+	seenCPUs := map[string]bool{}
+	for key := range first.cpu {
+		if _, ok := second.cpu[key]; !ok {
+			addIssue(issues, "cpu", "the CPU counter set changed between samples; CPU utilization is unavailable")
+			return nil, false
+		}
+	}
+	for key := range second.cpu {
+		seenCPUs[key.cpu] = true
+		if _, ok := first.cpu[key]; !ok {
+			addIssue(issues, "cpu", "the CPU counter set changed between samples; CPU utilization is unavailable")
+			return nil, false
+		}
+	}
+	// Every observed CPU must have the full Linux counter mode set in both
+	// reads. A partial family (for example idle-only) would otherwise look
+	// numerical while silently fabricating a zero-utilization sample.
+	for cpu := range seenCPUs {
+		for _, mode := range linuxCPUModes {
+			key := cpuMode{cpu: cpu, mode: mode}
+			if _, ok := first.cpu[key]; !ok {
+				addIssue(issues, "cpu", "node_cpu_seconds_total has no "+mode+"-mode series for cpu "+cpu+"; CPU utilization is unavailable")
+				return nil, false
+			}
+			if _, ok := second.cpu[key]; !ok {
+				addIssue(issues, "cpu", "node_cpu_seconds_total has no "+mode+"-mode series for cpu "+cpu+"; CPU utilization is unavailable")
+				return nil, false
+			}
+		}
+	}
+	return seenCPUs, true
+}
+
+func cpuCounterDeltas(first, second nodeExporterScrape, issues *[]Issue) (float64, float64, bool) {
+	var totalDelta, idleDelta float64
+	for key, secondValue := range second.cpu {
+		firstValue := first.cpu[key]
+		if secondValue < firstValue {
+			addIssue(issues, "cpu", "a CPU counter reset between samples; CPU utilization is unavailable")
+			return 0, 0, false
+		}
+		// Linux counts guest time inside user/nice, so summing guest and
+		// guest_nice would double-count it. Every other mode contributes to
+		// the CPU-seconds denominator.
+		if key.mode != "guest" && key.mode != "guest_nice" {
+			totalDelta += secondValue - firstValue
+		}
+		if key.mode == "idle" {
+			idleDelta += secondValue - firstValue
+		}
+	}
+	return totalDelta, idleDelta, true
 }
 
 func (s nodeExporterScrape) memoryStats(issues *[]Issue) *MemoryStats {
@@ -950,49 +1043,8 @@ func splitPrometheusSample(line string) (string, string, bool) {
 	if line == "" {
 		return "", "", false
 	}
-	braceOpen, braceClosed, quoted, escaped := false, false, false, false
-	headEnd := -1
-	for index := 0; index < len(line); index++ {
-		ch := line[index]
-		if quoted {
-			switch {
-			case escaped:
-				escaped = false
-			case ch == '\\':
-				escaped = true
-			case ch == '"':
-				quoted = false
-			}
-			continue
-		}
-		switch ch {
-		case '"':
-			quoted = true
-		case '{':
-			if braceOpen || braceClosed {
-				return "", "", false
-			}
-			braceOpen = true
-		case '}':
-			if !braceOpen {
-				return "", "", false
-			}
-			braceOpen = false
-			braceClosed = true
-			headEnd = index + 1
-			if headEnd >= len(line) || (line[headEnd] != ' ' && line[headEnd] != '\t') {
-				return "", "", false
-			}
-		case ' ', '\t':
-			if !braceOpen && !braceClosed {
-				headEnd = index
-			}
-		}
-		if headEnd >= 0 {
-			break
-		}
-	}
-	if quoted || braceOpen || headEnd <= 0 {
+	headEnd, ok := prometheusSampleHeadEnd(line)
+	if !ok || headEnd <= 0 {
 		return "", "", false
 	}
 	head := strings.TrimSpace(line[:headEnd])
@@ -1001,6 +1053,69 @@ func splitPrometheusSample(line string) (string, string, bool) {
 		return "", "", false
 	}
 	return head, rest, true
+}
+
+func prometheusSampleHeadEnd(line string) (int, bool) {
+	braceOpen, braceClosed, quoted, escaped := false, false, false, false
+	headEnd := -1
+	for index := 0; index < len(line); index++ {
+		ch := line[index]
+		if advancePrometheusQuote(ch, &quoted, &escaped) {
+			continue
+		}
+		if ch == '"' {
+			quoted = true
+		} else if !advancePrometheusBrace(ch, &braceOpen, &braceClosed, &headEnd, line, index) {
+			return 0, false
+		}
+		if headEnd >= 0 {
+			break
+		}
+	}
+	if quoted || braceOpen || headEnd <= 0 {
+		return 0, false
+	}
+	return headEnd, true
+}
+
+func advancePrometheusQuote(ch byte, quoted, escaped *bool) bool {
+	if !*quoted {
+		return false
+	}
+	switch {
+	case *escaped:
+		*escaped = false
+	case ch == '\\':
+		*escaped = true
+	case ch == '"':
+		*quoted = false
+	}
+	return true
+}
+
+func advancePrometheusBrace(ch byte, braceOpen, braceClosed *bool, headEnd *int, line string, index int) bool {
+	switch ch {
+	case '{':
+		if *braceOpen || *braceClosed {
+			return false
+		}
+		*braceOpen = true
+	case '}':
+		if !*braceOpen {
+			return false
+		}
+		*braceOpen = false
+		*braceClosed = true
+		*headEnd = index + 1
+		if *headEnd >= len(line) || (line[*headEnd] != ' ' && line[*headEnd] != '\t') {
+			return false
+		}
+	case ' ', '\t':
+		if !*braceOpen && !*braceClosed {
+			*headEnd = index
+		}
+	}
+	return true
 }
 
 // parsePrometheusLine parses one bounded Prometheus text sample. Metric names
@@ -1048,85 +1163,113 @@ func parsePrometheusLine(line string) (string, map[string]string, float64, bool,
 func parsePrometheusLabels(text string) (map[string]string, bool) {
 	labels := map[string]string{}
 	index := 0
-	skipSpace := func() {
-		for index < len(text) && (text[index] == ' ' || text[index] == '\t') {
-			index++
-		}
-	}
 	for {
-		skipSpace()
+		index = skipPrometheusSpace(text, index)
 		if index >= len(text) {
 			return labels, true
 		}
 		if len(labels) > 0 {
-			if text[index] != ',' {
+			next, trailing, ok := consumePrometheusLabelSeparator(text, index)
+			if !ok {
 				return nil, false
 			}
-			index++
-			skipSpace()
-			if index >= len(text) {
+			if trailing {
 				// Prometheus accepts one trailing comma after the final label.
 				return labels, true
 			}
+			index = next
 		} else if text[index] == ',' {
 			return nil, false
 		}
-		keyStart := index
-		for index < len(text) && validLabelNameByte(text[index]) {
-			index++
-		}
-		key := text[keyStart:index]
-		if !validLabelName(key) {
+		key, value, next, ok := parsePrometheusLabel(text, index)
+		if !ok {
 			return nil, false
 		}
-		skipSpace()
-		if index >= len(text) || text[index] != '=' {
-			return nil, false
-		}
-		index++
-		skipSpace()
-		if index >= len(text) || text[index] != '"' {
-			return nil, false
-		}
-		index++
-		var value strings.Builder
-		closed := false
-		for index < len(text) {
-			ch := text[index]
-			if ch == '\\' {
-				if index+1 >= len(text) {
-					return nil, false
-				}
-				switch text[index+1] {
-				case 'n':
-					value.WriteByte('\n')
-				case '\\', '"':
-					value.WriteByte(text[index+1])
-				default:
-					return nil, false
-				}
-				index += 2
-				continue
-			}
-			if ch == '"' {
-				index++
-				closed = true
-				break
-			}
-			if ch == '\n' || ch == '\r' {
-				return nil, false
-			}
-			value.WriteByte(ch)
-			index++
-		}
-		if !closed || key == "" {
-			return nil, false
-		}
+		index = next
 		if _, exists := labels[key]; exists {
 			return nil, false
 		}
-		labels[key] = value.String()
+		labels[key] = value
 	}
+}
+
+func skipPrometheusSpace(text string, index int) int {
+	for index < len(text) && (text[index] == ' ' || text[index] == '\t') {
+		index++
+	}
+	return index
+}
+
+func consumePrometheusLabelSeparator(text string, index int) (int, bool, bool) {
+	if text[index] != ',' {
+		return index, false, false
+	}
+	index = skipPrometheusSpace(text, index+1)
+	if index >= len(text) {
+		return index, true, true
+	}
+	return index, false, true
+}
+
+func parsePrometheusLabel(text string, index int) (string, string, int, bool) {
+	key, next, ok := parsePrometheusLabelName(text, index)
+	if !ok {
+		return "", "", index, false
+	}
+	index = skipPrometheusSpace(text, next)
+	if index >= len(text) || text[index] != '=' {
+		return "", "", index, false
+	}
+	index = skipPrometheusSpace(text, index+1)
+	value, next, ok := parsePrometheusLabelValue(text, index)
+	if !ok {
+		return "", "", index, false
+	}
+	return key, value, next, true
+}
+
+func parsePrometheusLabelName(text string, index int) (string, int, bool) {
+	start := index
+	for index < len(text) && validLabelNameByte(text[index]) {
+		index++
+	}
+	name := text[start:index]
+	return name, index, validLabelName(name)
+}
+
+func parsePrometheusLabelValue(text string, index int) (string, int, bool) {
+	if index >= len(text) || text[index] != '"' {
+		return "", index, false
+	}
+	index++
+	var value strings.Builder
+	for index < len(text) {
+		ch := text[index]
+		if ch == '\\' {
+			if index+1 >= len(text) {
+				return "", index, false
+			}
+			switch text[index+1] {
+			case 'n':
+				value.WriteByte('\n')
+			case '\\', '"':
+				value.WriteByte(text[index+1])
+			default:
+				return "", index, false
+			}
+			index += 2
+			continue
+		}
+		if ch == '"' {
+			return value.String(), index + 1, true
+		}
+		if ch == '\n' || ch == '\r' {
+			return "", index, false
+		}
+		value.WriteByte(ch)
+		index++
+	}
+	return "", index, false
 }
 
 func validLabelNameByte(ch byte) bool {

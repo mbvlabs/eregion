@@ -75,7 +75,7 @@ func MarkerPath(root string, exec engine.Execution) string {
 }
 
 func (s *DiagnosticStep) Check(_ context.Context, rt engine.Runtime) (engine.CheckResult, error) {
-	raw, err := os.ReadFile(MarkerPath(rt.Root, s.exec)) //nolint:gosec // G304: path is derived from a validated operation ID and step ID.
+	raw, err := os.ReadFile(MarkerPath(rt.Root, s.exec))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return engine.CheckResult{Complete: false, Detail: "diagnostic marker is absent"}, nil
@@ -137,7 +137,7 @@ func (s *DiagnosticStep) Apply(ctx context.Context, rt engine.Runtime, report en
 	if existed {
 		// The marker is create-once. Accept only an identical prior effect; never
 		// overwrite the record that says which attempt actually applied it.
-		existing, err := os.ReadFile(path) //nolint:gosec // G304: same validated effect path.
+		existing, err := os.ReadFile(path)
 		if err != nil {
 			return engine.ApplyResult{}, err
 		}

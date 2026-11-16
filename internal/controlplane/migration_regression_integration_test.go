@@ -66,13 +66,13 @@ func requiredApplicationVersion(t *testing.T) int {
 	return len(files)
 }
 
-func migrationPool(t *testing.T, ctx context.Context, dsn, path string, max int32) *pgxpool.Pool {
+func migrationPool(t *testing.T, ctx context.Context, dsn, path string) *pgxpool.Pool {
 	t.Helper()
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg.MaxConns = max
+	cfg.MaxConns = 2
 	if path != "" {
 		cfg.ConnConfig.RuntimeParams["search_path"] = path
 	}
@@ -89,19 +89,7 @@ func TestIntegrationReadinessRoundTripsPreserveInspection(t *testing.T) {
 	ctx := migrationContext(t)
 	check := func(wantQueries int, wantCode contract.Code) {
 		t.Helper()
-		trace := newReadyTrace(time.Now)
-		traced := context.WithValue(ctx, readyTraceKey{}, trace)
-		_, err := PlanMigrations(traced, pool)
-		if wantCode == "" {
-			if err != nil {
-				t.Fatalf("plan: %v", err)
-			}
-		} else {
-			requireMigrationCode(t, err, wantCode)
-		}
-		if got := trace.report().queries; got != wantQueries {
-			t.Fatalf("traced commands = %d, want %d", got, wantQueries)
-		}
+		assertMigrationPlanInspection(t, ctx, pool, wantQueries, wantCode)
 	}
 	check(8, "")
 	if migrationExists(t, ctx, pool, "goose_db_version") || migrationExists(t, ctx, pool, "river_migration") {
@@ -145,6 +133,29 @@ func TestIntegrationReadinessRoundTripsPreserveInspection(t *testing.T) {
 	wrong = identity
 	wrong.schema += "_different"
 	requireMigrationCode(t, readRiverMigrations(ctx, pool, m, wrong, &plan), contract.PreconditionFailed)
+	assertFutureRiverHistoryRejected(t, ctx, pool, plan)
+	assertCanceledMigrationPlan(t, ctx, pool)
+}
+
+func assertMigrationPlanInspection(t *testing.T, ctx context.Context, pool *pgxpool.Pool, wantQueries int, wantCode contract.Code) {
+	t.Helper()
+	trace := newReadyTrace(time.Now)
+	traced := context.WithValue(ctx, readyTraceKey{}, trace)
+	_, err := PlanMigrations(traced, pool)
+	if wantCode == "" {
+		if err != nil {
+			t.Fatalf("plan: %v", err)
+		}
+	} else {
+		requireMigrationCode(t, err, wantCode)
+	}
+	if got := trace.report().queries; got != wantQueries {
+		t.Fatalf("traced commands = %d, want %d", got, wantQueries)
+	}
+}
+
+func assertFutureRiverHistoryRejected(t *testing.T, ctx context.Context, pool *pgxpool.Pool, plan MigrationPlan) {
+	t.Helper()
 	if _, err := pool.Exec(ctx, `INSERT INTO river_migration (line, version, created_at) VALUES ('main', $1, now())`, plan.RiverRequired+1); err != nil {
 		t.Fatal(err)
 	}
@@ -164,6 +175,10 @@ func TestIntegrationReadinessRoundTripsPreserveInspection(t *testing.T) {
 	if _, err := pool.Exec(ctx, `DELETE FROM river_migration WHERE line = 'main' AND version = $1`, plan.RiverRequired+1); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func assertCanceledMigrationPlan(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
+	t.Helper()
 	canceled, cancel := context.WithCancel(ctx)
 	cancel()
 	if _, err := PlanMigrations(canceled, pool); !errors.Is(err, context.Canceled) {
@@ -374,41 +389,46 @@ func TestIntegrationGoosePartialPrefixRefusesOrphans(t *testing.T) {
 		{"river-populated", `CREATE TABLE river_migration (version int); INSERT INTO river_migration VALUES (1)`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			pool, _ := testPool(t, false)
-			ctx := migrationContext(t)
-			files, err := fs.Glob(dbschema.GooseFS, "migrations/*.sql")
-			if err != nil {
-				t.Fatal(err)
-			}
-			broken := fstest.MapFS{}
-			for _, file := range files {
-				data, err := fs.ReadFile(dbschema.GooseFS, file)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if strings.HasPrefix(file, "migrations/00008_") {
-					data = append(data, []byte("\nSELECT no_such_migration_function();\n")...)
-				}
-				broken[strings.TrimPrefix(file, "migrations/")] = &fstest.MapFile{Data: data}
-			}
-			_, err = migrateWithFS(ctx, pool, broken, nil)
-			requireMigrationPostgresError(t, err, "42883")
-			migrationExec(t, ctx, pool, tc.setup)
-			var before, after, max int
-			if err := pool.QueryRow(ctx, `SELECT count(*) FROM goose_db_version`).Scan(&before); err != nil {
-				t.Fatal(err)
-			}
-			_, err = PlanMigrations(ctx, pool)
-			requireMigrationCode(t, err, contract.PreconditionFailed)
-			_, err = Migrate(ctx, pool)
-			requireMigrationCode(t, err, contract.PreconditionFailed)
-			if err := pool.QueryRow(ctx, `SELECT count(*), max(version_id) FROM goose_db_version`).Scan(&after, &max); err != nil || before != after || max != 7 {
-				t.Fatalf("history changed: %d -> %d, max %d, %v", before, after, max, err)
-			}
-			if tc.name != "river-empty" && tc.name != "river-populated" && migrationExists(t, ctx, pool, "river_migration") {
-				t.Fatal("refusal created River metadata")
-			}
+			assertPartialPrefixRefusesOrphan(t, tc.name, tc.setup)
 		})
+	}
+}
+
+func assertPartialPrefixRefusesOrphan(t *testing.T, name, setup string) {
+	t.Helper()
+	pool, _ := testPool(t, false)
+	ctx := migrationContext(t)
+	files, err := fs.Glob(dbschema.GooseFS, "migrations/*.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	broken := fstest.MapFS{}
+	for _, file := range files {
+		data, err := fs.ReadFile(dbschema.GooseFS, file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.HasPrefix(file, "migrations/00008_") {
+			data = append(data, []byte("\nSELECT no_such_migration_function();\n")...)
+		}
+		broken[strings.TrimPrefix(file, "migrations/")] = &fstest.MapFile{Data: data}
+	}
+	_, err = migrateWithFS(ctx, pool, broken, nil)
+	requireMigrationPostgresError(t, err, "42883")
+	migrationExec(t, ctx, pool, setup)
+	var before, after, max int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM goose_db_version`).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	_, err = PlanMigrations(ctx, pool)
+	requireMigrationCode(t, err, contract.PreconditionFailed)
+	_, err = Migrate(ctx, pool)
+	requireMigrationCode(t, err, contract.PreconditionFailed)
+	if err := pool.QueryRow(ctx, `SELECT count(*), max(version_id) FROM goose_db_version`).Scan(&after, &max); err != nil || before != after || max != 7 {
+		t.Fatalf("history changed: %d -> %d, max %d, %v", before, after, max, err)
+	}
+	if name != "river-empty" && name != "river-populated" && migrationExists(t, ctx, pool, "river_migration") {
+		t.Fatal("refusal created River metadata")
 	}
 }
 
@@ -460,7 +480,7 @@ func TestIntegrationMigrationSingleSchemaSearchPath(t *testing.T) {
 	ctx := migrationContext(t)
 	migrationExec(t, ctx, base, `CREATE SCHEMA tenant`)
 	migrationExec(t, ctx, base, `CREATE TABLE public.eregion_schema_migrations (version int)`)
-	ambiguous := migrationPool(t, ctx, dsn, "tenant,public", 2)
+	ambiguous := migrationPool(t, ctx, dsn, "tenant,public")
 	_, err := PlanMigrations(ctx, ambiguous)
 	requireMigrationCode(t, err, contract.PreconditionFailed)
 	if !strings.Contains(err.Error(), "search_path") {
@@ -474,7 +494,7 @@ func TestIntegrationMigrationSingleSchemaSearchPath(t *testing.T) {
 	if migrationExists(t, ctx, base, "tenant.goose_db_version") || migrationExists(t, ctx, base, "public.goose_db_version") || migrationExists(t, ctx, base, "tenant.river_migration") {
 		t.Fatal("ambiguous search_path created metadata")
 	}
-	tenant := migrationPool(t, ctx, dsn, "tenant", 2)
+	tenant := migrationPool(t, ctx, dsn, "tenant")
 	if _, err := Migrate(ctx, tenant); err != nil {
 		t.Fatal(err)
 	}
@@ -489,67 +509,82 @@ func TestIntegrationMigrationSingleSchemaSearchPath(t *testing.T) {
 func TestIntegrationMigrationTwoConnectionsConcurrencyAndCancellation(t *testing.T) {
 	for _, separate := range []bool{false, true} {
 		t.Run(map[bool]string{false: "shared", true: "separate"}[separate], func(t *testing.T) {
-			_, dsn := testPool(t, false)
-			ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
-			defer cancel()
-			first := migrationPool(t, ctx, dsn, "", 2)
-			second := first
-			if separate {
-				second = migrationPool(t, ctx, dsn, "", 2)
-			}
-			var wg sync.WaitGroup
-			for _, p := range []*pgxpool.Pool{first, second} {
-				wg.Add(1)
-				go func(p *pgxpool.Pool) {
-					defer wg.Done()
-					if _, err := Migrate(ctx, p); err != nil {
-						t.Errorf("concurrent migration: %v", err)
-					}
-				}(p)
-			}
-			wg.Wait()
-			if err := Ready(ctx, first); err != nil {
-				t.Fatal(err)
-			}
-			lock, err := first.Acquire(ctx)
-			if err != nil {
-				t.Fatal(err)
-			}
-			locked := false
-			released := false
-			defer func() {
-				if released {
-					return
-				}
-				if locked {
-					cleanupCtx, stop := context.WithTimeout(context.Background(), 5*time.Second)
-					defer stop()
-					if _, err := lock.Exec(cleanupCtx, `SELECT pg_advisory_unlock($1)`, migrationLock); err != nil {
-						_ = lock.Conn().Close(cleanupCtx)
-					}
-				}
-				lock.Release()
-			}()
-			if _, err := lock.Exec(ctx, `SELECT pg_advisory_lock($1)`, migrationLock); err != nil {
-				t.Fatal(err)
-			}
-			locked = true
-			waitCtx, stop := context.WithTimeout(ctx, 250*time.Millisecond)
-			_, err = Migrate(waitCtx, second)
-			stop()
-			if !errors.Is(err, context.DeadlineExceeded) {
-				t.Errorf("lock wait error = %v, want deadline exceeded", err)
-			}
-			requireMigrationCode(t, err, contract.Unavailable)
-			if _, err := lock.Exec(ctx, `SELECT pg_advisory_unlock($1)`, migrationLock); err != nil {
-				t.Fatal(err)
-			}
-			locked = false
-			lock.Release()
-			released = true
-			if _, err := Migrate(ctx, first); err != nil {
-				t.Fatalf("pool unusable after wrapper close/cancellation: %v", err)
-			}
+			runMigrationConcurrencyCase(t, separate)
 		})
 	}
+}
+
+func runMigrationConcurrencyCase(t *testing.T, separate bool) {
+	t.Helper()
+	_, dsn := testPool(t, false)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	first := migrationPool(t, ctx, dsn, "")
+	second := first
+	if separate {
+		second = migrationPool(t, ctx, dsn, "")
+	}
+	runConcurrentMigrations(t, ctx, first, second)
+	if err := Ready(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	assertMigrationLockCancellation(t, ctx, first, second)
+	if _, err := Migrate(ctx, first); err != nil {
+		t.Fatalf("pool unusable after wrapper close/cancellation: %v", err)
+	}
+}
+
+func runConcurrentMigrations(t *testing.T, ctx context.Context, pools ...*pgxpool.Pool) {
+	t.Helper()
+	var wg sync.WaitGroup
+	for _, pool := range pools {
+		wg.Add(1)
+		go func(pool *pgxpool.Pool) {
+			defer wg.Done()
+			if _, err := Migrate(ctx, pool); err != nil {
+				t.Errorf("concurrent migration: %v", err)
+			}
+		}(pool)
+	}
+	wg.Wait()
+}
+
+func assertMigrationLockCancellation(t *testing.T, ctx context.Context, first, second *pgxpool.Pool) {
+	t.Helper()
+	lock, err := first.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	locked := false
+	released := false
+	defer func() {
+		if released {
+			return
+		}
+		if locked {
+			cleanupCtx, stop := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer stop()
+			if _, err := lock.Exec(cleanupCtx, `SELECT pg_advisory_unlock($1)`, migrationLock); err != nil {
+				_ = lock.Conn().Close(cleanupCtx)
+			}
+		}
+		lock.Release()
+	}()
+	if _, err := lock.Exec(ctx, `SELECT pg_advisory_lock($1)`, migrationLock); err != nil {
+		t.Fatal(err)
+	}
+	locked = true
+	waitCtx, stop := context.WithTimeout(ctx, 250*time.Millisecond)
+	_, err = Migrate(waitCtx, second)
+	stop()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("lock wait error = %v, want deadline exceeded", err)
+	}
+	requireMigrationCode(t, err, contract.Unavailable)
+	if _, err := lock.Exec(ctx, `SELECT pg_advisory_unlock($1)`, migrationLock); err != nil {
+		t.Fatal(err)
+	}
+	locked = false
+	lock.Release()
+	released = true
 }

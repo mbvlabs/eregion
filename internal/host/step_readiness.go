@@ -62,7 +62,7 @@ func doProbe(client *http.Client, request *http.Request) error {
 	if err != nil {
 		return err
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode != http.StatusOK {
 		return fmt.Errorf("HTTP %d", response.StatusCode)
 	}
@@ -114,7 +114,7 @@ func (s *readinessStep) Inputs() ([]byte, error) {
 }
 
 func (s *readinessStep) Check(ctx context.Context, _ engine.Runtime) (engine.CheckResult, error) {
-	output, err := checkOutput(ctx, engine.Runtime{}, s.exec, `if systemctl is-active --quiet eregion-api.service; then echo api:ok; else echo api:missing; fi
+	output, err := checkOutput(ctx, s.exec, `if systemctl is-active --quiet eregion-api.service; then echo api:ok; else echo api:missing; fi
 if systemctl is-active --quiet eregion-worker.service; then echo worker:ok; else echo worker:missing; fi`)
 	if err != nil {
 		return engine.CheckResult{}, err

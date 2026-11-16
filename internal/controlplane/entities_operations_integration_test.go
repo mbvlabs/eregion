@@ -40,109 +40,32 @@ func TestIntegrationEntitiesOperationEventStepFoundation(t *testing.T) {
 	}
 	input := json.RawMessage(`{"steps":2,"step_delay_ms":0,"fail_until_attempt":0}`)
 
-	if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
-		inserted, err := tx.Operations().Insert(ctx, entities.OperationInsert{
-			ID: id, Key: key, InputHash: "hash-one", Input: input,
-		})
-		if err != nil {
-			return err
-		}
-		if !inserted {
-			t.Fatalf("first operation insert reported a conflict")
-		}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
+	seedFoundationOperation(t, ctx, store, id, key, input)
+	checkFoundationAdmission(t, ctx, store, id, key, input)
 
-	// The uniqueness constraint arbitrates a replay; the typed identity read
-	// returns the accepted operation and hash for the caller's comparison.
-	if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
-		inserted, err := tx.Operations().Insert(ctx, entities.OperationInsert{
-			ID: mustOperationID(t), Key: key, InputHash: "hash-two", Input: input,
-		})
-		if err != nil {
-			return err
-		}
-		if inserted {
-			t.Fatalf("duplicate operation insert was not rejected")
-		}
-		identity, found, err := tx.Operations().Identity(ctx, key)
-		if err != nil {
-			return err
-		}
-		if !found || identity.ID != id || identity.InputHash != "hash-one" {
-			t.Fatalf("identity = %+v, found=%v, want %s/hash-one", identity, found, id)
-		}
-		raw, found, err := tx.Operations().ClaimAttempt(ctx, id, 1)
-		if err != nil {
-			return err
-		}
-		if !found {
-			t.Fatalf("claim input was not found")
-		}
-		var decoded, expected any
-		if err := json.Unmarshal(raw, &decoded); err != nil {
-			return err
-		}
-		if err := json.Unmarshal(input, &expected); err != nil {
-			return err
-		}
-		if !reflect.DeepEqual(decoded, expected) {
-			t.Fatalf("claim input = %s, want %s", raw, input)
-		}
-		op, found, err := tx.Operations().Lock(ctx, id)
-		if err != nil {
-			return err
-		}
-		if !found {
-			t.Fatalf("locked operation disappeared")
-		}
-		if op.Attempt != 1 || op.LastSequence != 0 {
-			t.Fatalf("locked operation = attempt %d sequence %d", op.Attempt, op.LastSequence)
-		}
-		if job, bound, err := tx.Operations().JobID(ctx, id); err != nil || bound || job != 0 {
-			t.Fatalf("unbound job = %d bound=%v err=%v", job, bound, err)
-		}
-		if err := tx.Operations().SetJob(ctx, id, 4242); err != nil {
-			return err
-		}
-		if job, bound, err := tx.Operations().JobID(ctx, id); err != nil || !bound || job != 4242 {
-			t.Fatalf("bound job = %d bound=%v err=%v", job, bound, err)
-		}
-		if err := tx.Operations().SetState(ctx, id, contract.Running, ""); err != nil {
-			return err
-		}
-		if err := tx.Operations().AppendEvent(ctx, &op, contract.Event{
-			Kind: "step", Stage: "foundation", Message: "foundation step started",
-		}); err != nil {
-			return err
-		}
-		if op.LastSequence != 1 {
-			t.Fatalf("append advanced sequence to %d", op.LastSequence)
-		}
-		result := &contract.ActionResult{
-			OperationID: id, Action: "diagnostic.test", Target: "control-plane",
-			Attempt: 1, Status: contract.Failed, Final: true,
-			StartedAt: op.CreatedAt, CompletedAt: time.Now().UTC(),
-			History: contract.Cursor{OperationID: id},
-		}
-		if err := tx.Operations().AppendEvent(ctx, &op, contract.Event{
-			Kind: "state", State: contract.Failed, Result: result,
-		}); err != nil {
-			return err
-		}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
+	checkFoundationReads(t, ctx, store, id, key)
 
+	checkFoundationSteps(t, ctx, store, id)
+
+	checkFoundationClaimRace(t, ctx, store, id)
+
+	checkFoundationHistoryFilters(t, ctx, store, id, input)
+	checkFoundationAdmissionRace(t, ctx, store, input)
+}
+
+func checkFoundationReads(t *testing.T, ctx context.Context, store *entities.Store, id contract.OperationID, key entities.OperationKey) {
+	t.Helper()
+	op := checkFoundationOperationSnapshot(t, ctx, store, id, key)
+	checkFoundationResultReads(t, ctx, store, id, op.LastSequence)
+}
+
+func checkFoundationOperationSnapshot(t *testing.T, ctx context.Context, store *entities.Store, id contract.OperationID, key entities.OperationKey) contract.Operation {
+	t.Helper()
 	// The share-locking replay read returns the same accepted identity.
 	if shared, found, err := store.Operations().IdentityForShare(ctx, key); err != nil || !found ||
 		shared.ID != id || shared.InputHash != "hash-one" {
 		t.Fatalf("shared identity = %+v found=%v err=%v", shared, found, err)
 	}
-
 	op, found, err := store.Operations().Get(ctx, id)
 	if err != nil || !found {
 		t.Fatalf("get operation: %v found=%v", err, found)
@@ -153,11 +76,9 @@ func TestIntegrationEntitiesOperationEventStepFoundation(t *testing.T) {
 	if op.Actor != testActor || op.CreatedAt.IsZero() || op.UpdatedAt.IsZero() {
 		t.Fatalf("operation mapping lost actor or timestamps: %+v", op)
 	}
-
 	if _, found, err := store.Operations().Get(ctx, mustOperationID(t)); err != nil || found {
 		t.Fatalf("missing operation = found %v err %v", found, err)
 	}
-
 	events, err := store.Operations().Events(ctx, contract.Cursor{OperationID: id}, op.LastSequence, 10)
 	if err != nil {
 		t.Fatal(err)
@@ -171,25 +92,38 @@ func TestIntegrationEntitiesOperationEventStepFoundation(t *testing.T) {
 	if message, err := store.Operations().LatestEventMessageForStage(ctx, id, "foundation"); err != nil || message != "foundation step started" {
 		t.Fatalf("latest stage message = %q err %v", message, err)
 	}
+	return op
+}
 
+func checkFoundationResultReads(t *testing.T, ctx context.Context, store *entities.Store, id contract.OperationID, lastSequence uint64) {
+	t.Helper()
 	exists, err := store.Operations().ResultExists(ctx, id, 1, contract.Failed, true)
 	if err != nil || !exists {
 		t.Fatalf("result exists = %v err %v", exists, err)
 	}
-	latest, found, err := store.Operations().LatestResult(ctx, id, op.LastSequence)
+	latest, found, err := store.Operations().LatestResult(ctx, id, lastSequence)
 	if err != nil || !found || latest.Status != contract.Failed || latest.Attempt != 1 {
 		t.Fatalf("latest result = %+v found=%v err=%v", latest, found, err)
 	}
 	if started, found, err := store.Operations().AttemptStartedAt(ctx, id, 1); err != nil || !found || started.After(time.Now()) {
 		t.Fatalf("attempt start = %v found=%v err=%v", started, found, err)
 	}
-	if failed, found, err := store.Operations().FailedStateEvent(ctx, id, op.LastSequence, 1); err != nil || !found || failed.State != contract.Failed {
+	if failed, found, err := store.Operations().FailedStateEvent(ctx, id, lastSequence, 1); err != nil || !found || failed.State != contract.Failed {
 		t.Fatalf("failed state event = %+v found=%v err=%v", failed, found, err)
 	}
 	if outputExists, err := store.Operations().ActionOutputExists(ctx, id); err != nil || outputExists {
 		t.Fatalf("action output exists = %v err %v", outputExists, err)
 	}
+}
 
+func checkFoundationSteps(t *testing.T, ctx context.Context, store *entities.Store, id contract.OperationID) {
+	t.Helper()
+	mutateFoundationSteps(t, ctx, store, id)
+	checkFoundationStepReads(t, ctx, store, id)
+}
+
+func mutateFoundationSteps(t *testing.T, ctx context.Context, store *entities.Store, id contract.OperationID) {
+	t.Helper()
 	// Steps are persistence primitives: insert a running step, complete it once,
 	// count the acknowledgement, then fail a second step that never completed.
 	if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
@@ -220,14 +154,14 @@ func TestIntegrationEntitiesOperationEventStepFoundation(t *testing.T) {
 		if completedSteps, err := tx.Steps().CountCompleted(ctx, id); err != nil || completedSteps != 1 {
 			t.Fatalf("duplicate count = %d err %v", completedSteps, err)
 		}
-		if err := tx.Operations().SetCompletedSteps(ctx, id, 1); err != nil {
-			return err
-		}
-		return nil
+		return tx.Operations().SetCompletedSteps(ctx, id, 1)
 	}); err != nil {
 		t.Fatal(err)
 	}
+}
 
+func checkFoundationStepReads(t *testing.T, ctx context.Context, store *entities.Store, id contract.OperationID) {
+	t.Helper()
 	first, found, err := store.Steps().Get(ctx, id, "platform-foundation-1")
 	if err != nil || !found {
 		t.Fatalf("get step: %v found=%v", err, found)
@@ -253,7 +187,10 @@ func TestIntegrationEntitiesOperationEventStepFoundation(t *testing.T) {
 	if err != nil || len(prefixed) != 2 {
 		t.Fatalf("list steps by prefix = %d err %v", len(prefixed), err)
 	}
+}
 
+func checkFoundationClaimRace(t *testing.T, ctx context.Context, store *entities.Store, id contract.OperationID) {
+	t.Helper()
 	// The row lock serializes two claimers: the later attempt is the one that
 	// remains, and neither transaction observes a partial operation.
 	locked := make(chan struct{})
@@ -290,11 +227,14 @@ func TestIntegrationEntitiesOperationEventStepFoundation(t *testing.T) {
 	if firstErr != nil || secondErr != nil {
 		t.Fatalf("claim race errors: %v / %v", firstErr, secondErr)
 	}
-	op, found, err = store.Operations().Get(ctx, id)
+	op, found, err := store.Operations().Get(ctx, id)
 	if err != nil || !found || op.Attempt != 3 {
 		t.Fatalf("final attempt = %+v found=%v err=%v", op, found, err)
 	}
+}
 
+func checkFoundationHistoryFilters(t *testing.T, ctx context.Context, store *entities.Store, id contract.OperationID, input json.RawMessage) {
+	t.Helper()
 	// History filters are SQL parameters, not assembled statement text.
 	otherID := mustOperationID(t)
 	otherKey := entities.OperationKey{Kind: "diagnostic.test", Target: "app/demo", Actor: testActor, IdempotencyKey: "foundation-op-2"}
@@ -333,7 +273,10 @@ func TestIntegrationEntitiesOperationEventStepFoundation(t *testing.T) {
 	if _, err := store.Operations().List(ctx, entities.OperationFilter{AllActors: true}); err == nil {
 		t.Fatalf("unbounded operation list was accepted")
 	}
+}
 
+func checkFoundationAdmissionRace(t *testing.T, ctx context.Context, store *entities.Store, input json.RawMessage) {
+	t.Helper()
 	// Concurrent first admissions of one key: exactly one insert wins, every
 	// loser reads the same accepted identity.
 	raceKey := entities.OperationKey{Kind: "diagnostic.test", Target: "control-plane", Actor: testActor, IdempotencyKey: "foundation-race"}
@@ -346,32 +289,13 @@ func TestIntegrationEntitiesOperationEventStepFoundation(t *testing.T) {
 		raceWG.Add(1)
 		go func() {
 			defer raceWG.Done()
-			candidate, err := contract.NewOperationID()
+			inserted, identity, err := admitFoundationRaceOnce(ctx, store, raceKey, input)
 			if err != nil {
 				errs <- err
 				return
 			}
-			err = store.WithinTx(ctx, func(tx *entities.StoreTx) error {
-				inserted, err := tx.Operations().Insert(ctx, entities.OperationInsert{
-					ID: candidate, Key: raceKey, InputHash: "race-hash", Input: input,
-				})
-				if err != nil {
-					return err
-				}
-				insertedCount <- inserted
-				identity, found, err := tx.Operations().Identity(ctx, raceKey)
-				if err != nil {
-					return err
-				}
-				if !found {
-					return errors.New("race identity missing")
-				}
-				results <- identity.ID
-				return nil
-			})
-			if err != nil {
-				errs <- err
-			}
+			insertedCount <- inserted
+			results <- identity
 		}()
 	}
 	raceWG.Wait()
@@ -399,4 +323,153 @@ func TestIntegrationEntitiesOperationEventStepFoundation(t *testing.T) {
 			t.Fatalf("race identities diverged: %s vs %s", identity, accepted)
 		}
 	}
+}
+
+func admitFoundationRaceOnce(ctx context.Context, store *entities.Store, raceKey entities.OperationKey, input json.RawMessage) (bool, contract.OperationID, error) {
+	candidate, err := contract.NewOperationID()
+	if err != nil {
+		return false, "", err
+	}
+	var inserted bool
+	var identity contract.OperationID
+	err = store.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		inserted, err = tx.Operations().Insert(ctx, entities.OperationInsert{
+			ID: candidate, Key: raceKey, InputHash: "race-hash", Input: input,
+		})
+		if err != nil {
+			return err
+		}
+		record, found, err := tx.Operations().Identity(ctx, raceKey)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return errors.New("race identity missing")
+		}
+		identity = record.ID
+		return nil
+	})
+	return inserted, identity, err
+}
+
+func seedFoundationOperation(t *testing.T, ctx context.Context, store *entities.Store, id contract.OperationID, key entities.OperationKey, input json.RawMessage) {
+	t.Helper()
+	if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		inserted, err := tx.Operations().Insert(ctx, entities.OperationInsert{
+			ID: id, Key: key, InputHash: "hash-one", Input: input,
+		})
+		if err != nil {
+			return err
+		}
+		if !inserted {
+			t.Fatalf("first operation insert reported a conflict")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The uniqueness constraint arbitrates a replay; the typed identity read
+// returns the accepted operation and hash for the caller's comparison.
+func checkFoundationAdmission(t *testing.T, ctx context.Context, store *entities.Store, id contract.OperationID, key entities.OperationKey, input json.RawMessage) {
+	t.Helper()
+	if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		if err := checkDuplicateFoundationOperation(t, ctx, tx, id, key, input); err != nil {
+			return err
+		}
+		op, err := claimFoundationOperation(t, ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		return appendFoundationEvents(t, ctx, tx, id, op)
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func checkDuplicateFoundationOperation(t *testing.T, ctx context.Context, tx *entities.StoreTx, id contract.OperationID, key entities.OperationKey, input json.RawMessage) error {
+	t.Helper()
+	inserted, err := tx.Operations().Insert(ctx, entities.OperationInsert{
+		ID: mustOperationID(t), Key: key, InputHash: "hash-two", Input: input,
+	})
+	if err != nil {
+		return err
+	}
+	if inserted {
+		t.Fatalf("duplicate operation insert was not rejected")
+	}
+	identity, found, err := tx.Operations().Identity(ctx, key)
+	if err != nil {
+		return err
+	}
+	if !found || identity.ID != id || identity.InputHash != "hash-one" {
+		t.Fatalf("identity = %+v, found=%v, want %s/hash-one", identity, found, id)
+	}
+	raw, found, err := tx.Operations().ClaimAttempt(ctx, id, 1)
+	if err != nil {
+		return err
+	}
+	if !found {
+		t.Fatalf("claim input was not found")
+	}
+	var decoded, expected any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return err
+	}
+	if err := json.Unmarshal(input, &expected); err != nil {
+		return err
+	}
+	if !reflect.DeepEqual(decoded, expected) {
+		t.Fatalf("claim input = %s, want %s", raw, input)
+	}
+	return nil
+}
+
+func claimFoundationOperation(t *testing.T, ctx context.Context, tx *entities.StoreTx, id contract.OperationID) (contract.Operation, error) {
+	t.Helper()
+	op, found, err := tx.Operations().Lock(ctx, id)
+	if err != nil {
+		return contract.Operation{}, err
+	}
+	if !found {
+		t.Fatalf("locked operation disappeared")
+	}
+	if op.Attempt != 1 || op.LastSequence != 0 {
+		t.Fatalf("locked operation = attempt %d sequence %d", op.Attempt, op.LastSequence)
+	}
+	if job, bound, err := tx.Operations().JobID(ctx, id); err != nil || bound || job != 0 {
+		t.Fatalf("unbound job = %d bound=%v err=%v", job, bound, err)
+	}
+	if err := tx.Operations().SetJob(ctx, id, 4242); err != nil {
+		return contract.Operation{}, err
+	}
+	if job, bound, err := tx.Operations().JobID(ctx, id); err != nil || !bound || job != 4242 {
+		t.Fatalf("bound job = %d bound=%v err=%v", job, bound, err)
+	}
+	if err := tx.Operations().SetState(ctx, id, contract.Running, ""); err != nil {
+		return contract.Operation{}, err
+	}
+	return op, nil
+}
+
+func appendFoundationEvents(t *testing.T, ctx context.Context, tx *entities.StoreTx, id contract.OperationID, op contract.Operation) error {
+	t.Helper()
+	if err := tx.Operations().AppendEvent(ctx, &op, contract.Event{
+		Kind: "step", Stage: "foundation", Message: "foundation step started",
+	}); err != nil {
+		return err
+	}
+	if op.LastSequence != 1 {
+		t.Fatalf("append advanced sequence to %d", op.LastSequence)
+	}
+	result := &contract.ActionResult{
+		OperationID: id, Action: "diagnostic.test", Target: "control-plane",
+		Attempt: 1, Status: contract.Failed, Final: true,
+		StartedAt: op.CreatedAt, CompletedAt: time.Now().UTC(),
+		History: contract.Cursor{OperationID: id},
+	}
+	return tx.Operations().AppendEvent(ctx, &op, contract.Event{
+		Kind: "state", State: contract.Failed, Result: result,
+	})
 }

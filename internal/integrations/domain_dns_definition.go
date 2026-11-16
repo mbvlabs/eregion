@@ -65,36 +65,23 @@ func definitionRecords(ctx context.Context, client *Cloudflare, host, marker str
 			return nil, err
 		}
 		if records == nil {
-			return nil, cloudflareFailure("invalid-response", 0, contract.Unavailable, "Retry the read before planning DNS changes.")
+			return nil, cloudflareFailure("invalid-response", 0, "Retry the read before planning DNS changes.")
 		}
 		if info.TotalPages > 100 {
-			return nil, cloudflareFailure("invalid-response", 0, contract.Unavailable, "The hostname recordset exceeds the read limit; review provider state before planning.")
+			return nil, cloudflareFailure("invalid-response", 0, "The hostname recordset exceeds the read limit; review provider state before planning.")
 		}
-		for _, r := range records {
-			if !hostnameEqual(r.Name, host) {
-				continue
-			}
-			t := strings.ToUpper(r.Type)
-			if t != "A" && t != "AAAA" && t != "CNAME" {
-				continue
-			}
-			if r.ID == "" || seen[r.ID] {
-				return nil, cloudflareFailure("invalid-response", 0, contract.Unavailable, "Retry the read before planning DNS changes.")
-			}
-			seen[r.ID] = true
-			owner := "foreign"
-			if t != "CNAME" && r.Comment == marker {
-				owner = "owned"
-			}
-			out = append(out, DomainDNSRecord{ID: r.ID, Name: r.Name, Type: t, Content: r.Content, TTL: r.TTL, Proxied: r.Proxied, Comment: r.Comment, Ownership: owner})
+		pageRecords, err := definitionPageRecords(records, host, marker, seen)
+		if err != nil {
+			return nil, err
 		}
+		out = append(out, pageRecords...)
 		if (info.TotalPages > 0 && page >= info.TotalPages) || (info.TotalPages == 0 && len(records) < 100) {
 			complete = true
 			break
 		}
 	}
 	if !complete {
-		return nil, cloudflareFailure("invalid-response", 0, contract.Unavailable, "The hostname recordset exceeds the read limit; review provider state before planning.")
+		return nil, cloudflareFailure("invalid-response", 0, "The hostname recordset exceeds the read limit; review provider state before planning.")
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Type != out[j].Type {
@@ -105,16 +92,55 @@ func definitionRecords(ctx context.Context, client *Cloudflare, host, marker str
 	return out, nil
 }
 
+func definitionPageRecords(records []DNSRecord, host, marker string, seen map[string]bool) ([]DomainDNSRecord, error) {
+	var out []DomainDNSRecord
+	for _, r := range records {
+		if !hostnameEqual(r.Name, host) {
+			continue
+		}
+		t := strings.ToUpper(r.Type)
+		if t != "A" && t != "AAAA" && t != "CNAME" {
+			continue
+		}
+		if r.ID == "" || seen[r.ID] {
+			return nil, cloudflareFailure("invalid-response", 0, "Retry the read before planning DNS changes.")
+		}
+		seen[r.ID] = true
+		owner := "foreign"
+		if t != "CNAME" && r.Comment == marker {
+			owner = "owned"
+		}
+		out = append(out, DomainDNSRecord{ID: r.ID, Name: r.Name, Type: t, Content: r.Content, TTL: r.TTL, Proxied: r.Proxied, Comment: r.Comment, Ownership: owner})
+	}
+	return out, nil
+}
+
 func definitionPlan(zone DNSZone, req DomainDNSRequest, before []DomainDNSRecord) (DefinitionDNSPlan, error) {
 	host, desired, marker, err := domainDNSDesired(zone, req)
 	if err != nil {
 		return DefinitionDNSPlan{}, err
 	}
-	p := DefinitionDNSPlan{Zone: zone.ZoneName, ZoneID: zone.ZoneID, DomainID: req.DomainID, Host: host, Ownership: marker, Before: before, Desired: desired, Changes: []DomainDNSChange{}, ExternalSatisfaction: []DomainDNSRecord{}, Warnings: []string{
+	plan := DefinitionDNSPlan{Zone: zone.ZoneName, ZoneID: zone.ZoneID, DomainID: req.DomainID, Host: host, Ownership: marker, Before: before, Desired: desired, Changes: []DomainDNSChange{}, ExternalSatisfaction: []DomainDNSRecord{}, Warnings: []string{
 		"Matching foreign records remain unowned and will not be removed by managed cleanup.",
 		"Cloudflare has no conditional-write API; an external writer can race the final request.",
 		"DNS provider state is not route, TLS or public readiness.",
 	}}
+	if err := definitionProxyConflicts(desired, before); err != nil {
+		return DefinitionDNSPlan{}, err
+	}
+	planner := definitionPlanner{plan: &plan, before: before, desired: desired, used: make([]bool, len(before))}
+	planner.markExternalSatisfaction()
+	for _, want := range desired {
+		if err := planner.planDesired(want); err != nil {
+			return DefinitionDNSPlan{}, err
+		}
+	}
+	planner.planObsolete()
+	sortDefinitionChanges(plan.Changes)
+	return plan, nil
+}
+
+func definitionProxyConflicts(desired []DNSRecord, before []DomainDNSRecord) error {
 	for _, want := range desired {
 		count, conflict := 0, false
 		for _, r := range before {
@@ -124,113 +150,145 @@ func definitionPlan(zone DNSZone, req DomainDNSRequest, before []DomainDNSRecord
 			}
 		}
 		if conflict && count > 1 {
-			return DefinitionDNSPlan{}, contract.NewFault(contract.PreconditionFailed, "ambiguous DNS proxy conflict", "Resolve duplicate records before obtaining a new definition plan.")
+			return contract.NewFault(contract.PreconditionFailed, "ambiguous DNS proxy conflict", "Resolve duplicate records before obtaining a new definition plan.")
 		}
 	}
-	used := make([]bool, len(before))
-	// Every matching foreign record remains external, even when an owned
-	// record or another foreign duplicate already satisfies the same address.
-	for i, r := range before {
+	return nil
+}
+
+type definitionPlanner struct {
+	plan    *DefinitionDNSPlan
+	before  []DomainDNSRecord
+	desired []DNSRecord
+	used    []bool
+}
+
+// markExternalSatisfaction records every matching foreign record as external,
+// even when an owned record or another foreign duplicate already satisfies the
+// same address.
+func (p *definitionPlanner) markExternalSatisfaction() {
+	for i, r := range p.before {
 		if r.Ownership != "foreign" || (r.Type != "A" && r.Type != "AAAA") {
 			continue
 		}
-		for _, want := range desired {
+		for _, want := range p.desired {
 			if r.Type == want.Type && r.Proxied == want.Proxied && domainDNSContentEqual(r.Type, r.Content, want.Content) {
-				used[i] = true
-				p.ExternalSatisfaction = append(p.ExternalSatisfaction, r)
+				p.used[i] = true
+				p.plan.ExternalSatisfaction = append(p.plan.ExternalSatisfaction, r)
 				break
 			}
 		}
 	}
-	// Prefer an owned match; otherwise any preserved foreign match satisfies
-	// the desired address without adoption or a new record.
-	for _, want := range desired {
-		found := -1
-		for i, r := range before {
-			if !used[i] && r.Ownership == "owned" && r.Type == want.Type && domainDNSContentEqual(r.Type, r.Content, want.Content) {
-				found = i
-				break
-			}
+}
+
+func (p *definitionPlanner) planDesired(want DNSRecord) error {
+	found := p.ownedMatch(want)
+	if found < 0 {
+		if p.externallySatisfied(want) {
+			return nil
 		}
-		if found < 0 {
-			satisfied := false
-			for _, r := range p.ExternalSatisfaction {
-				if r.Type == want.Type && domainDNSContentEqual(r.Type, r.Content, want.Content) {
-					satisfied = true
-					break
-				}
-			}
-			if satisfied {
-				continue
-			}
-			// A proxy-mode conflict for the same address cannot be created
-			// alongside the old Cloudflare record. Only a unique candidate may
-			// be transferred, and the concrete before/after requires approval.
-			candidate, count := -1, 0
-			for i, r := range before {
-				if r.Type == want.Type && domainDNSContentEqual(r.Type, r.Content, want.Content) {
-					candidate, count = i, count+1
-				}
-			}
-			if count > 1 {
-				return DefinitionDNSPlan{}, contract.NewFault(contract.PreconditionFailed, "ambiguous DNS proxy conflict", "Resolve duplicate records before obtaining a new definition plan.")
-			}
-			if count == 1 && before[candidate].Ownership == "foreign" && before[candidate].Proxied != want.Proxied {
-				r := before[candidate]
-				a := want
-				a.ID, a.Name, a.Content, a.TTL = r.ID, r.Name, r.Content, r.TTL
-				if a.Proxied {
-					// Cloudflare requires automatic TTL for proxied records.
-					a.TTL = 1
-				}
-				p.Changes = append(p.Changes, DomainDNSChange{Action: "update", Type: want.Type, Before: &r, After: &a})
-				p.RequiresApproval = true
-				p.Warnings = append(p.Warnings, "The proxy-conflicting foreign record will be updated in place and transferred to this binding; managed cleanup may later delete it.")
-				if r.TTL != a.TTL {
-					p.Warnings = append(p.Warnings, "Proxying changes the record TTL to Cloudflare automatic TTL.")
-				}
-				used[candidate] = true
-				continue
-			}
-			a := want
-			p.Changes = append(p.Changes, DomainDNSChange{Action: "create", Type: want.Type, After: &a})
-			continue
-		}
-		used[found] = true
-		r := before[found]
-		if r.TTL != want.TTL || r.Proxied != want.Proxied || r.Comment != want.Comment {
-			a := want
-			a.ID = r.ID
-			b := r
-			p.Changes = append(p.Changes, DomainDNSChange{Action: "update", Type: want.Type, Before: &b, After: &a})
-			p.RequiresApproval = true
+		return p.planUnmatchedDesired(want)
+	}
+	p.used[found] = true
+	r := p.before[found]
+	if r.TTL != want.TTL || r.Proxied != want.Proxied || r.Comment != want.Comment {
+		a := want
+		a.ID = r.ID
+		b := r
+		p.plan.Changes = append(p.plan.Changes, DomainDNSChange{Action: "update", Type: want.Type, Before: &b, After: &a})
+		p.plan.RequiresApproval = true
+	}
+	return nil
+}
+
+func (p *definitionPlanner) ownedMatch(want DNSRecord) int {
+	for i, r := range p.before {
+		if !p.used[i] && r.Ownership == "owned" && r.Type == want.Type && domainDNSContentEqual(r.Type, r.Content, want.Content) {
+			return i
 		}
 	}
-	for i, r := range before {
-		if used[i] {
+	return -1
+}
+
+func (p *definitionPlanner) externallySatisfied(want DNSRecord) bool {
+	for _, r := range p.plan.ExternalSatisfaction {
+		if r.Type == want.Type && domainDNSContentEqual(r.Type, r.Content, want.Content) {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *definitionPlanner) planUnmatchedDesired(want DNSRecord) error {
+	// A proxy-mode conflict for the same address cannot be created alongside
+	// the old Cloudflare record. Only a unique candidate may be transferred,
+	// and the concrete before/after requires approval.
+	candidate, count := p.proxyConflictCandidate(want)
+	if count > 1 {
+		return contract.NewFault(contract.PreconditionFailed, "ambiguous DNS proxy conflict", "Resolve duplicate records before obtaining a new definition plan.")
+	}
+	if count == 1 && p.before[candidate].Ownership == "foreign" && p.before[candidate].Proxied != want.Proxied {
+		r := p.before[candidate]
+		a := want
+		a.ID, a.Name, a.Content, a.TTL = r.ID, r.Name, r.Content, r.TTL
+		if a.Proxied {
+			// Cloudflare requires automatic TTL for proxied records.
+			a.TTL = 1
+		}
+		p.plan.Changes = append(p.plan.Changes, DomainDNSChange{Action: "update", Type: want.Type, Before: &r, After: &a})
+		p.plan.RequiresApproval = true
+		p.plan.Warnings = append(p.plan.Warnings, "The proxy-conflicting foreign record will be updated in place and transferred to this binding; managed cleanup may later delete it.")
+		if r.TTL != a.TTL {
+			p.plan.Warnings = append(p.plan.Warnings, "Proxying changes the record TTL to Cloudflare automatic TTL.")
+		}
+		p.used[candidate] = true
+		return nil
+	}
+	a := want
+	p.plan.Changes = append(p.plan.Changes, DomainDNSChange{Action: "create", Type: want.Type, After: &a})
+	return nil
+}
+
+func (p *definitionPlanner) proxyConflictCandidate(want DNSRecord) (int, int) {
+	candidate, count := -1, 0
+	for i, r := range p.before {
+		if r.Type == want.Type && domainDNSContentEqual(r.Type, r.Content, want.Content) {
+			candidate, count = i, count+1
+		}
+	}
+	return candidate, count
+}
+
+func (p *definitionPlanner) planObsolete() {
+	for i, r := range p.before {
+		if p.used[i] {
 			continue
 		}
 		b := r
-		p.Changes = append(p.Changes, DomainDNSChange{Action: "delete", Type: r.Type, Before: &b})
-		p.RequiresApproval = true
+		p.plan.Changes = append(p.plan.Changes, DomainDNSChange{Action: "delete", Type: r.Type, Before: &b})
+		p.plan.RequiresApproval = true
 		if r.Type == "CNAME" {
-			p.Warnings = append(p.Warnings, "Replacing a CNAME requires deleting it before creating addresses; DNS can be unavailable during this gap and recovery must resume the approved plan.")
+			p.plan.Warnings = append(p.plan.Warnings, "Replacing a CNAME requires deleting it before creating addresses; DNS can be unavailable during this gap and recovery must resume the approved plan.")
 		}
 	}
-	// CNAMEs must go first; other obsolete addresses go last.
-	sort.SliceStable(p.Changes, func(i, j int) bool {
-		rank := func(c DomainDNSChange) int {
-			if c.Action == "delete" && c.Type == "CNAME" {
-				return 0
-			}
-			if c.Action == "delete" {
-				return 2
-			}
-			return 1
-		}
-		return rank(p.Changes[i]) < rank(p.Changes[j])
+}
+
+// sortDefinitionChanges orders CNAME deletions first and other obsolete
+// addresses last.
+func sortDefinitionChanges(changes []DomainDNSChange) {
+	sort.SliceStable(changes, func(i, j int) bool {
+		return definitionChangeRank(changes[i]) < definitionChangeRank(changes[j])
 	})
-	return p, nil
+}
+
+func definitionChangeRank(change DomainDNSChange) int {
+	if change.Action == "delete" && change.Type == "CNAME" {
+		return 0
+	}
+	if change.Action == "delete" {
+		return 2
+	}
+	return 1
 }
 
 // PlanDefinitionApply authorizes read access before resolving credentials and
@@ -263,53 +321,69 @@ func definitionDrift() error {
 func definitionPost(before, after []DomainDNSRecord, change DomainDNSChange, marker string) bool {
 	expected := append([]DomainDNSRecord{}, before...)
 	if change.Before != nil {
-		index := -1
-		for i, r := range expected {
-			if reflect.DeepEqual(r, *change.Before) {
-				index = i
-				break
-			}
-		}
+		index := definitionExpectedIndex(expected, *change.Before)
 		if index < 0 {
 			return false
 		}
 		expected = append(expected[:index], expected[index+1:]...)
 	}
 	if change.After != nil {
-		a := change.After
-		var matches []DomainDNSRecord
-		for _, r := range after {
-			if r.Name == a.Name && r.Type == a.Type && r.Content == a.Content && r.TTL == a.TTL && r.Proxied == a.Proxied && r.Comment == a.Comment && (a.ID == "" || a.ID == r.ID) {
-				matches = append(matches, r)
-			}
-		}
+		matches := definitionPostMatches(change.After, after)
+		added := definitionPostAdded(matches, expected)
 		// The matching record must be new relative to the pre-state, not an
 		// arbitrary pre-existing owned record or an ambiguous duplicate.
-		var added []DomainDNSRecord
-		for _, r := range matches {
-			exists := false
-			for _, old := range expected {
-				if old.ID == r.ID {
-					exists = true
-					break
-				}
-			}
-			if !exists {
-				added = append(added, r)
-			}
-		}
 		if len(added) != 1 || added[0].Ownership != "owned" || added[0].Comment != marker {
 			return false
 		}
 		expected = append(expected, added[0])
 	}
-	sort.Slice(expected, func(i, j int) bool {
-		if expected[i].Type != expected[j].Type {
-			return expected[i].Type < expected[j].Type
-		}
-		return expected[i].ID < expected[j].ID
-	})
+	definitionSortRecords(expected)
 	return reflect.DeepEqual(expected, after)
+}
+
+func definitionExpectedIndex(expected []DomainDNSRecord, before DomainDNSRecord) int {
+	for i, r := range expected {
+		if reflect.DeepEqual(r, before) {
+			return i
+		}
+	}
+	return -1
+}
+
+func definitionPostMatches(a *DNSRecord, after []DomainDNSRecord) []DomainDNSRecord {
+	var matches []DomainDNSRecord
+	for _, r := range after {
+		if r.Name == a.Name && r.Type == a.Type && r.Content == a.Content && r.TTL == a.TTL && r.Proxied == a.Proxied && r.Comment == a.Comment && (a.ID == "" || a.ID == r.ID) {
+			matches = append(matches, r)
+		}
+	}
+	return matches
+}
+
+func definitionPostAdded(matches, expected []DomainDNSRecord) []DomainDNSRecord {
+	var added []DomainDNSRecord
+	for _, r := range matches {
+		exists := false
+		for _, old := range expected {
+			if old.ID == r.ID {
+				exists = true
+				break
+			}
+		}
+		if !exists {
+			added = append(added, r)
+		}
+	}
+	return added
+}
+
+func definitionSortRecords(records []DomainDNSRecord) {
+	sort.Slice(records, func(i, j int) bool {
+		if records[i].Type != records[j].Type {
+			return records[i].Type < records[j].Type
+		}
+		return records[i].ID < records[j].ID
+	})
 }
 
 // DefinitionDNSObserved verifies the exact approved transition in durable
@@ -349,121 +423,177 @@ func (d *DomainDNS) ExecuteApprovedDefinitionDNS(ctx context.Context, actor cont
 	if len(entries) > len(plan.Changes) {
 		return 0, definitionDrift()
 	}
-	expected := plan.Before
-	for i, e := range entries {
-		if e.Index != i || !reflect.DeepEqual(e.Before, expected) || !reflect.DeepEqual(e.Expected, plan.Changes[i]) {
-			return i, definitionDrift()
+	failedIndex, expected, err := verifyDefinitionProgress(entries, plan)
+	if err != nil {
+		return failedIndex, err
+	}
+	current, err := definitionReadCurrent(ctx, client, plan, entries)
+	if err != nil {
+		return 0, err
+	}
+	execution := definitionExecution{
+		d: d, ctx: ctx, actor: actor, opID: opID,
+		zone: zone, client: client, plan: plan, progress: progress,
+	}
+	start, expected, err := execution.resolvePending(entries, current, expected)
+	if err != nil {
+		return start, err
+	}
+	for i := start; i < len(plan.Changes); i++ {
+		expected, err = execution.executeChange(i, entries, expected)
+		if err != nil {
+			return i, err
 		}
-		if e.Result == nil {
+	}
+	return len(plan.Changes), nil
+}
+
+// definitionReadCurrent reads the exact hostname state. A pending write makes a
+// read rejection an unknown outcome: a deterministic provider error cannot
+// settle it without a successful exact-record readback.
+func definitionReadCurrent(ctx context.Context, client *Cloudflare, plan DefinitionDNSPlan, entries []DefinitionDNSProgress) ([]DomainDNSRecord, error) {
+	current, err := definitionRecords(ctx, client, plan.Host, plan.Ownership)
+	if err != nil {
+		if len(entries) > 0 && entries[len(entries)-1].Result == nil {
+			var failure *ProviderError
+			if errors.As(err, &failure) {
+				return nil, cloudflareFailure(failure.Category, failure.Status, "Restore provider read access and reconcile the pending write before deciding its outcome.")
+			}
+		}
+		return nil, err
+	}
+	return current, nil
+}
+
+type definitionExecution struct {
+	d        *DomainDNS
+	ctx      context.Context
+	actor    contract.Actor
+	opID     contract.OperationID
+	zone     DNSZone
+	client   *Cloudflare
+	plan     DefinitionDNSPlan
+	progress DefinitionDNSProgressStore
+}
+
+// verifyDefinitionProgress checks that the durable prefix is contiguous and
+// describes exactly the approved changes. It returns the index of a mismatch.
+func verifyDefinitionProgress(entries []DefinitionDNSProgress, plan DefinitionDNSPlan) (int, []DomainDNSRecord, error) {
+	expected := plan.Before
+	for i, entry := range entries {
+		if entry.Index != i || !reflect.DeepEqual(entry.Before, expected) || !reflect.DeepEqual(entry.Expected, plan.Changes[i]) {
+			return i, nil, definitionDrift()
+		}
+		if entry.Result == nil {
 			if i != len(entries)-1 {
-				return i, definitionDrift()
+				return i, nil, definitionDrift()
 			}
 			break
 		}
-		if !definitionPost(e.Before, e.Result, plan.Changes[i], plan.Ownership) {
-			return i, definitionDrift()
+		if !definitionPost(entry.Before, entry.Result, plan.Changes[i], plan.Ownership) {
+			return i, nil, definitionDrift()
 		}
-		expected = e.Result
+		expected = entry.Result
 	}
-	current, err := definitionRecords(ctx, client, plan.Host, plan.Ownership)
-	if err != nil {
-		// A previous request may have taken effect. Even a deterministic read
-		// rejection cannot settle that unknown write without a successful
-		// exact-record readback.
-		if len(entries) > 0 && entries[len(entries)-1].Result == nil {
-			var failure *ProviderFailure
-			if errors.As(err, &failure) {
-				return 0, cloudflareFailure(failure.Category, failure.Status, contract.Unavailable, "Restore provider read access and reconcile the pending write before deciding its outcome.")
-			}
-		}
-		return 0, err
-	}
+	return 0, expected, nil
+}
+
+// resolvePending settles the single trailing intent by observing its exact
+// approved post-state.
+func (x *definitionExecution) resolvePending(entries []DefinitionDNSProgress, current, expected []DomainDNSRecord) (int, []DomainDNSRecord, error) {
 	start := len(entries)
-	if start > 0 && entries[start-1].Result == nil {
-		e := entries[start-1]
-		c := plan.Changes[start-1]
-		if definitionPost(e.Before, current, c, plan.Ownership) {
-			e.Result = current
-			action, target := domainDNSChangeTarget(plan.Host, c)
-			if err := d.audit.Record(ctx, AuditEntry{At: d.now().UTC(), Actor: actor.Subject, Action: action, Target: target, Outcome: "succeeded", Detail: auditDetail(opID, "recovered observed result")}); err != nil {
-				return start - 1, err
-			}
-			if err := progress.Observed(ctx, e); err != nil {
-				return start - 1, err
-			}
-			expected = current
-		} else if reflect.DeepEqual(current, e.Before) {
-			return start - 1, contract.NewFault(contract.Unavailable, "approved DNS write outcome remains unknown", "Keep the operation and reservation; retry read-only reconciliation.")
-		} else {
-			return start - 1, definitionDrift()
-		}
-	} else if !reflect.DeepEqual(current, expected) {
-		return start, definitionDrift()
-	}
-	for i := start; i < len(plan.Changes); i++ {
-		change := plan.Changes[i]
-		current, err = definitionRecords(ctx, client, plan.Host, plan.Ownership)
-		if err != nil {
-			return i, err
-		}
+	if start == 0 || entries[start-1].Result != nil {
 		if !reflect.DeepEqual(current, expected) {
-			return i, definitionDrift()
+			return start, expected, definitionDrift()
 		}
-		action, target := domainDNSChangeTarget(plan.Host, change)
-		if err = d.authz.Authorize(ctx, actor, action, target); err != nil {
-			_ = d.audit.Record(ctx, AuditEntry{At: d.now().UTC(), Actor: actor.Subject, Action: action, Target: target, Outcome: "denied", Detail: auditDetail(opID, "authorization denied")})
-			return i, err
-		}
-		if err = d.audit.Record(ctx, AuditEntry{At: d.now().UTC(), Actor: actor.Subject, Action: action, Target: target, Outcome: "intent", Detail: auditDetail(opID, "zone="+zone.ZoneName)}); err != nil {
-			return i, err
-		}
-		e := DefinitionDNSProgress{Index: i, Before: expected, Expected: change}
-		if i >= len(entries) {
-			if err = progress.Intent(ctx, e); err != nil {
-				return i, err
-			}
-		}
-		if err = progress.Guard(ctx); err != nil {
-			return i, err
-		}
-		if change.Action == "update" && change.Before != nil && change.Before.Ownership == "foreign" {
-			err = client.patchDefinitionProxy(ctx, change)
-		} else {
-			err = client.apply(ctx, domainDNSChangeToDNSChange(change))
-		}
-		if err != nil {
-			_ = d.audit.Record(ctx, AuditEntry{At: d.now().UTC(), Actor: actor.Subject, Action: action, Target: target, Outcome: "failed", Detail: auditDetail(opID, "provider outcome unknown")})
-			var failure *ProviderFailure
-			if errors.As(err, &failure) && (contract.Classify(err).Code == contract.Forbidden || contract.Classify(err).Code == contract.PreconditionFailed) {
-				copy := *failure
-				copy.DefinitiveWrite = true
-				return i, &copy
-			}
-			return i, err
-		}
-		current, err = definitionRecords(ctx, client, plan.Host, plan.Ownership)
-		if err != nil {
-			_ = d.audit.Record(ctx, AuditEntry{At: d.now().UTC(), Actor: actor.Subject, Action: action, Target: target, Outcome: "failed", Detail: auditDetail(opID, "provider result unverified")})
-			var failure *ProviderFailure
-			if errors.As(err, &failure) {
-				return i, cloudflareFailure(failure.Category, failure.Status, contract.Unavailable, "Restore provider read access and reconcile the pending write before deciding its outcome.")
-			}
-			return i, err
-		}
-		if !definitionPost(expected, current, change, plan.Ownership) {
-			_ = d.audit.Record(ctx, AuditEntry{At: d.now().UTC(), Actor: actor.Subject, Action: action, Target: target, Outcome: "failed", Detail: auditDetail(opID, "provider result differs from approved transition")})
-			return i, definitionDrift()
-		}
-		e.Result = current
-		if err = d.audit.Record(ctx, AuditEntry{At: d.now().UTC(), Actor: actor.Subject, Action: action, Target: target, Outcome: "succeeded", Detail: auditDetail(opID, "zone="+zone.ZoneName)}); err != nil {
-			return i, fmt.Errorf("DNS effect observed but audit failed: %w", err)
-		}
-		if err = progress.Observed(ctx, e); err != nil {
-			return i, err
-		}
-		expected = current
+		return start, expected, nil
 	}
-	return len(plan.Changes), nil
+	return x.resolvePendingEntry(start, entries[start-1], current)
+}
+
+func (x *definitionExecution) resolvePendingEntry(start int, entry DefinitionDNSProgress, current []DomainDNSRecord) (int, []DomainDNSRecord, error) {
+	change := x.plan.Changes[start-1]
+	if definitionPost(entry.Before, current, change, x.plan.Ownership) {
+		entry.Result = current
+		action, target := domainDNSChangeTarget(x.plan.Host, change)
+		if err := x.d.audit.Record(x.ctx, AuditEntry{At: x.d.now().UTC(), Actor: x.actor.Subject, Action: action, Target: target, Outcome: "succeeded", Detail: auditDetail(x.opID, "recovered observed result")}); err != nil {
+			return start - 1, nil, err
+		}
+		if err := x.progress.Observed(x.ctx, entry); err != nil {
+			return start - 1, nil, err
+		}
+		return start, current, nil
+	}
+	if reflect.DeepEqual(current, entry.Before) {
+		return start - 1, nil, contract.NewFault(contract.Unavailable, "approved DNS write outcome remains unknown", "Keep the operation and reservation; retry read-only reconciliation.")
+	}
+	return start - 1, nil, definitionDrift()
+}
+
+func (x *definitionExecution) executeChange(index int, entries []DefinitionDNSProgress, expected []DomainDNSRecord) ([]DomainDNSRecord, error) {
+	change := x.plan.Changes[index]
+	current, err := definitionRecords(x.ctx, x.client, x.plan.Host, x.plan.Ownership)
+	if err != nil {
+		return expected, err
+	}
+	if !reflect.DeepEqual(current, expected) {
+		return expected, definitionDrift()
+	}
+	action, target := domainDNSChangeTarget(x.plan.Host, change)
+	if err = x.d.authz.Authorize(x.ctx, x.actor, action, target); err != nil {
+		_ = x.d.audit.Record(x.ctx, AuditEntry{At: x.d.now().UTC(), Actor: x.actor.Subject, Action: action, Target: target, Outcome: "denied", Detail: auditDetail(x.opID, "authorization denied")})
+		return expected, err
+	}
+	if err = x.d.audit.Record(x.ctx, AuditEntry{At: x.d.now().UTC(), Actor: x.actor.Subject, Action: action, Target: target, Outcome: "intent", Detail: auditDetail(x.opID, "zone="+x.zone.ZoneName)}); err != nil {
+		return expected, err
+	}
+	entry := DefinitionDNSProgress{Index: index, Before: expected, Expected: change}
+	if index >= len(entries) {
+		if err = x.progress.Intent(x.ctx, entry); err != nil {
+			return expected, err
+		}
+	}
+	if err = x.progress.Guard(x.ctx); err != nil {
+		return expected, err
+	}
+	if err = x.apply(change); err != nil {
+		_ = x.d.audit.Record(x.ctx, AuditEntry{At: x.d.now().UTC(), Actor: x.actor.Subject, Action: action, Target: target, Outcome: "failed", Detail: auditDetail(x.opID, "provider outcome unknown")})
+		var failure *ProviderError
+		if errors.As(err, &failure) && (contract.Classify(err).Code == contract.Forbidden || contract.Classify(err).Code == contract.PreconditionFailed) {
+			copy := *failure
+			copy.DefinitiveWrite = true
+			return expected, &copy
+		}
+		return expected, err
+	}
+	current, err = definitionRecords(x.ctx, x.client, x.plan.Host, x.plan.Ownership)
+	if err != nil {
+		_ = x.d.audit.Record(x.ctx, AuditEntry{At: x.d.now().UTC(), Actor: x.actor.Subject, Action: action, Target: target, Outcome: "failed", Detail: auditDetail(x.opID, "provider result unverified")})
+		var failure *ProviderError
+		if errors.As(err, &failure) {
+			return expected, cloudflareFailure(failure.Category, failure.Status, "Restore provider read access and reconcile the pending write before deciding its outcome.")
+		}
+		return expected, err
+	}
+	if !definitionPost(expected, current, change, x.plan.Ownership) {
+		_ = x.d.audit.Record(x.ctx, AuditEntry{At: x.d.now().UTC(), Actor: x.actor.Subject, Action: action, Target: target, Outcome: "failed", Detail: auditDetail(x.opID, "provider result differs from approved transition")})
+		return expected, definitionDrift()
+	}
+	entry.Result = current
+	if err = x.d.audit.Record(x.ctx, AuditEntry{At: x.d.now().UTC(), Actor: x.actor.Subject, Action: action, Target: target, Outcome: "succeeded", Detail: auditDetail(x.opID, "zone="+x.zone.ZoneName)}); err != nil {
+		return expected, fmt.Errorf("DNS effect observed but audit failed: %w", err)
+	}
+	if err = x.progress.Observed(x.ctx, entry); err != nil {
+		return expected, err
+	}
+	return current, nil
+}
+
+func (x *definitionExecution) apply(change DomainDNSChange) error {
+	if change.Action == "update" && change.Before != nil && change.Before.Ownership == "foreign" {
+		return x.client.patchDefinitionProxy(x.ctx, change)
+	}
+	return x.client.apply(x.ctx, domainDNSChangeToDNSChange(change))
 }
 
 // ResolveApprovedDefinitionDNS performs no mutations. A pending intent is
@@ -491,35 +621,28 @@ func (d *DomainDNS) ResolveApprovedDefinitionDNS(ctx context.Context, actor cont
 	if len(entries) > len(plan.Changes) {
 		return definitionDrift()
 	}
-	expected := plan.Before
-	for i, entry := range entries {
-		if entry.Index != i || !reflect.DeepEqual(entry.Before, expected) || !reflect.DeepEqual(entry.Expected, plan.Changes[i]) {
-			return definitionDrift()
-		}
-		if entry.Result == nil {
-			if i != len(entries)-1 {
-				return definitionDrift()
-			}
-			if err := progress.Guard(ctx); err != nil {
-				return err
-			}
-			current, err := definitionRecords(ctx, client, plan.Host, plan.Ownership)
-			if err != nil {
-				return contract.NewFault(contract.Unavailable, "approved DNS write outcome remains unknown", "Restore provider read access; the reservation remains held.")
-			}
-			if !definitionPost(entry.Before, current, entry.Expected, plan.Ownership) {
-				return contract.NewFault(contract.Unavailable, "approved DNS write outcome remains unknown", "Keep the reservation and retry read-only recovery; no provider write will be repeated.")
-			}
-			entry.Result = current
-			if err := progress.Observed(ctx, entry); err != nil {
-				return err
-			}
-			return nil
-		}
-		if !definitionPost(entry.Before, entry.Result, entry.Expected, plan.Ownership) {
-			return definitionDrift()
-		}
-		expected = entry.Result
+	if _, _, err := verifyDefinitionProgress(entries, plan); err != nil {
+		return err
 	}
-	return nil
+	if len(entries) == 0 || entries[len(entries)-1].Result != nil {
+		return nil
+	}
+	return resolveDefinitionPending(ctx, client, progress, plan, entries[len(entries)-1])
+}
+
+// resolveDefinitionPending resolves the trailing intent only by observing its
+// exact approved post-state; a pre-state read cannot exclude a delayed effect.
+func resolveDefinitionPending(ctx context.Context, client *Cloudflare, progress DefinitionDNSProgressStore, plan DefinitionDNSPlan, entry DefinitionDNSProgress) error {
+	if err := progress.Guard(ctx); err != nil {
+		return err
+	}
+	current, err := definitionRecords(ctx, client, plan.Host, plan.Ownership)
+	if err != nil {
+		return contract.NewFault(contract.Unavailable, "approved DNS write outcome remains unknown", "Restore provider read access; the reservation remains held.")
+	}
+	if !definitionPost(entry.Before, current, entry.Expected, plan.Ownership) {
+		return contract.NewFault(contract.Unavailable, "approved DNS write outcome remains unknown", "Keep the reservation and retry read-only recovery; no provider write will be repeated.")
+	}
+	entry.Result = current
+	return progress.Observed(ctx, entry)
 }

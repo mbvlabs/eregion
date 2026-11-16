@@ -31,7 +31,7 @@ type Runner struct {
 	// a remote apply can be followed while the final envelope stays on stdout.
 	Reporter engine.Reporter
 	// SpawnWatchdog exists for tests; production starts a detached shell.
-	SpawnWatchdog func(string) error
+	SpawnWatchdog func(context.Context, string) error
 
 	// SkipRootCheck exists only for unit tests. Real apply is root-only.
 	SkipRootCheck bool
@@ -189,11 +189,11 @@ func (r *Runner) now() time.Time {
 	return r.Now()
 }
 
-func (r *Runner) spawnWatchdog(path string) error {
+func (r *Runner) spawnWatchdog(ctx context.Context, path string) error {
 	if r.SpawnWatchdog != nil {
-		return r.SpawnWatchdog(path)
+		return r.SpawnWatchdog(ctx, path)
 	}
-	return spawnDetached(path)
+	return spawnDetached(ctx, path)
 }
 
 func (r *Runner) steps(credentials Credentials) ([]Step, error) {
@@ -364,25 +364,30 @@ func (r *Runner) preflightWorkspace(ctx context.Context) error {
 	if identity.Configured && identity.Name != r.Config.Workspace {
 		return workspaceNameConflict(identity.Name, r.Config.Workspace)
 	}
-	if identity.Configured {
-		observed := r.RegistryHostIdentity
-		if observed == nil {
-			derived, err := BootstrapRegistryIdentity(r.Config)
-			if err != nil {
-				return err
-			}
-			observed = &derived
+	return r.verifyWorkspaceRegistryHost(identity)
+}
+
+func (r *Runner) verifyWorkspaceRegistryHost(identity controlplane.WorkspaceIdentity) error {
+	if !identity.Configured {
+		return nil
+	}
+	observed := r.RegistryHostIdentity
+	if observed == nil {
+		derived, err := BootstrapRegistryIdentity(r.Config)
+		if err != nil {
+			return err
 		}
-		if identity.RegistryHost == nil {
-			return contract.NewFault(contract.PreconditionFailed,
-				"the workspace has no verified registry host binding",
-				"This workspace remains unverified and is never backfilled. Use a fresh installation.")
-		}
-		if !identity.RegistryHost.Equal(*observed) {
-			return contract.NewFault(contract.Conflict,
-				"this physical host is not the workspace's bound registry host",
-				"Use the original bootstrap host; node names alone are not sufficient.")
-		}
+		observed = &derived
+	}
+	if identity.RegistryHost == nil {
+		return contract.NewFault(contract.PreconditionFailed,
+			"the workspace has no verified registry host binding",
+			"This workspace remains unverified and is never backfilled. Use a fresh installation.")
+	}
+	if !identity.RegistryHost.Equal(*observed) {
+		return contract.NewFault(contract.Conflict,
+			"this physical host is not the workspace's bound registry host",
+			"Use the original bootstrap host; node names alone are not sufficient.")
 	}
 	return nil
 }
@@ -420,8 +425,7 @@ func (r *Runner) Apply(ctx context.Context, confirmation string, acceptAccessRis
 	if err != nil {
 		return ApplyReport{}, err
 	}
-	risks := append(append([]string(nil), r.Config.AccessRisks()...), changeStrings(changes)...)
-	if err := verifyConfirmation(confirmation, "host.apply", r.Config.Node+"/"+string(r.Config.Role), configHash, planInputs(configHash, projected.Generation, risks), r.now()); err != nil {
+	if err := r.verifyApplyConfirmation(confirmation, configHash, projected.Generation, changes); err != nil {
 		return ApplyReport{}, err
 	}
 	// Fail early on a conflicting explicit workspace before waiting for an
@@ -435,24 +439,29 @@ func (r *Runner) Apply(ctx context.Context, confirmation string, acceptAccessRis
 		return ApplyReport{}, err
 	}
 	defer releaseApply()
-	// Revalidate under the whole-apply lock, not just per-effect locks.
-	projected, err = projectState(r.Config, configHash, r.now())
+	return r.applyLocked(ctx, confirmation, configHash, changes)
+}
+
+func (r *Runner) verifyApplyConfirmation(confirmation, configHash string, generation uint32, changes []AccessChange) error {
+	risks := append(append([]string(nil), r.Config.AccessRisks()...), changeStrings(changes)...)
+	return verifyConfirmation(confirmation, "host.apply", r.Config.Node+"/"+string(r.Config.Role), configHash, planInputs(configHash, generation, risks), r.now())
+}
+
+func (r *Runner) applyLocked(ctx context.Context, confirmation, configHash string, changes []AccessChange) (ApplyReport, error) {
+	// Revalidate under the whole-apply lock, not just per-effect locks. The
+	// first read may be stale if another apply changed the workspace while this
+	// call waited.
+	projected, err := projectState(r.Config, configHash, r.now())
 	if err != nil {
 		return ApplyReport{}, err
 	}
-	if err := verifyConfirmation(confirmation, "host.apply", r.Config.Node+"/"+string(r.Config.Role), configHash, planInputs(configHash, projected.Generation, risks), r.now()); err != nil {
+	if err := r.verifyApplyConfirmation(confirmation, configHash, projected.Generation, changes); err != nil {
 		return ApplyReport{}, err
 	}
-	// The first read may be stale if another apply changed the workspace while
-	// this call waited. Re-read and refuse before credentials, state, journal,
-	// rollback reconciliation or any host step can mutate.
 	if err := r.preflightWorkspace(ctx); err != nil {
 		return ApplyReport{}, err
 	}
-	if err := ensureState(r.Config); err != nil {
-		return ApplyReport{}, err
-	}
-	if err := r.reconcileCommits(projected.OperationID); err != nil {
+	if err := r.prepareApplyState(ctx, projected.OperationID); err != nil {
 		return ApplyReport{}, err
 	}
 	credentials, err := LoadCredentials(r.Config, true)
@@ -465,7 +474,7 @@ func (r *Runner) Apply(ctx context.Context, confirmation string, acceptAccessRis
 		return ApplyReport{}, err
 	}
 	if state.OperationID != projected.OperationID {
-		if err := verifyConfirmation(confirmation, "host.apply", r.Config.Node+"/"+string(r.Config.Role), configHash, planInputs(configHash, state.Generation, risks), r.now()); err != nil {
+		if err := r.verifyApplyConfirmation(confirmation, configHash, state.Generation, changes); err != nil {
 			return ApplyReport{}, err
 		}
 	}
@@ -479,21 +488,22 @@ func (r *Runner) Apply(ctx context.Context, confirmation string, acceptAccessRis
 	if err := ensureState(r.Config); err != nil {
 		return ApplyReport{}, err
 	}
-	// Share the node execution host lock when bootstrap and node state are
-	// separate. A bootstrap drop never races a live node effect on the host.
-	releaseHost := func() {}
-	if filepath.Clean(r.Config.Layout.StateDir) != filepath.Clean(r.Config.Layout.NodeStateDir) {
-		release, lockErr := engine.Acquire(ctx, filepath.Join(r.Config.Layout.NodeStateDir, "host.lock"), engine.LockExclusive, 30*time.Second)
-		if lockErr == nil {
-			releaseHost = release
-		} else if errors.Is(lockErr, engine.ErrLockHeld) {
-			return ApplyReport{}, contract.NewFault(contract.Unavailable, "another local host mutation is running", "Wait for the other node/bootstrap operation to finish; bootstrap holds the same host lock as node effects.")
-		} else if !r.SkipRootCheck {
-			return ApplyReport{}, lockErr
-		}
+	return r.runApplySteps(ctx, state, changes, credentials)
+}
+
+func (r *Runner) prepareApplyState(ctx context.Context, operationID string) error {
+	if err := ensureState(r.Config); err != nil {
+		return err
+	}
+	return r.reconcileCommits(ctx, operationID)
+}
+
+func (r *Runner) runApplySteps(ctx context.Context, state State, changes []AccessChange, credentials Credentials) (ApplyReport, error) {
+	releaseHost, err := r.acquireHostLock(ctx)
+	if err != nil {
+		return ApplyReport{}, err
 	}
 	defer releaseHost()
-
 	hostEngine, err := engine.New(r.Config.Layout.StateDir, r.Config.Node, r.Secrets)
 	if err != nil {
 		return ApplyReport{}, err
@@ -505,34 +515,18 @@ func (r *Runner) Apply(ctx context.Context, confirmation string, acceptAccessRis
 	report := ApplyReport{Node: r.Config.Node, Role: r.Config.Role, OperationID: state.OperationID, Generation: state.Generation, AccessChanges: changes}
 	commit := CommitState{}
 	if len(changes) > 0 {
-		commit, err = r.armCommit(state.OperationID, changes)
+		commit, err = r.armCommit(ctx, state.OperationID, changes)
 		if err != nil {
 			return report, contract.NewFault(contract.PreconditionFailed, "could not arm the rollback watchdog", "No host mutation was started. Check that the bootstrap state directory is writable and the host can start a detached process; then re-run apply.")
 		}
 		report.CommitDeadline = commit.Deadline
 	}
 	for _, step := range steps {
-		execution := engine.Execution{OperationID: contract.OperationID(state.OperationID), Attempt: state.Generation, Step: step.ID(), RequestID: fmt.Sprintf("bootstrap-%d", state.Generation)}
-		status, runErr := hostEngine.Run(ctx, step, execution, r.Reporter)
-		if runErr != nil {
+		if err := r.runApplyStep(ctx, hostEngine, step, state, &report); err != nil {
 			if len(changes) > 0 {
-				_ = r.rollbackCommit(state.OperationID)
+				_ = r.rollbackCommit(ctx, state.OperationID)
 			}
-			return report, r.applyFault(step, execution, status, report, runErr)
-		}
-		entry := ApplyEntry{ID: step.ID(), Complete: status.Status == engine.StatusCompleted, Executed: status.Executed, Detail: status.Detail}
-		report.Steps = append(report.Steps, entry)
-		report.Total++
-		if entry.Executed {
-			report.Applied++
-		} else {
-			report.Skipped++
-		}
-		if !entry.Complete {
-			if len(changes) > 0 {
-				_ = r.rollbackCommit(state.OperationID)
-			}
-			return report, contract.NewFault(contract.Internal, "host step did not complete", "Inspect the bootstrap journal and re-run apply with a fresh plan.")
+			return report, err
 		}
 	}
 	// Record the non-secret host intent on the node so later plan/apply runs
@@ -541,6 +535,49 @@ func (r *Runner) Apply(ctx context.Context, confirmation string, acceptAccessRis
 	if err := saveIntent(r.Config); err != nil {
 		return report, contract.NewFault(contract.PreconditionFailed, "the host converged but its intent could not be recorded", err.Error())
 	}
+	return r.finishApply(report, state, commit, changes)
+}
+
+func (r *Runner) acquireHostLock(ctx context.Context) (func(), error) {
+	if filepath.Clean(r.Config.Layout.StateDir) == filepath.Clean(r.Config.Layout.NodeStateDir) {
+		return func() {}, nil
+	}
+	// Share the node execution host lock when bootstrap and node state are
+	// separate. A bootstrap drop never races a live node effect on the host.
+	release, err := engine.Acquire(ctx, filepath.Join(r.Config.Layout.NodeStateDir, "host.lock"), engine.LockExclusive, 30*time.Second)
+	if err == nil {
+		return release, nil
+	}
+	if errors.Is(err, engine.ErrLockHeld) {
+		return nil, contract.NewFault(contract.Unavailable, "another local host mutation is running", "Wait for the other node/bootstrap operation to finish; bootstrap holds the same host lock as node effects.")
+	}
+	if !r.SkipRootCheck {
+		return nil, err
+	}
+	return func() {}, nil
+}
+
+func (r *Runner) runApplyStep(ctx context.Context, hostEngine *engine.Engine, step Step, state State, report *ApplyReport) error {
+	execution := engine.Execution{OperationID: contract.OperationID(state.OperationID), Attempt: state.Generation, Step: step.ID(), RequestID: fmt.Sprintf("bootstrap-%d", state.Generation)}
+	status, runErr := hostEngine.Run(ctx, step, execution, r.Reporter)
+	if runErr != nil {
+		return r.applyFault(step, execution, status, *report, runErr)
+	}
+	entry := ApplyEntry{ID: step.ID(), Complete: status.Status == engine.StatusCompleted, Executed: status.Executed, Detail: status.Detail}
+	report.Steps = append(report.Steps, entry)
+	report.Total++
+	if entry.Executed {
+		report.Applied++
+	} else {
+		report.Skipped++
+	}
+	if !entry.Complete {
+		return contract.NewFault(contract.Internal, "host step did not complete", "Inspect the bootstrap journal and re-run apply with a fresh plan.")
+	}
+	return nil
+}
+
+func (r *Runner) finishApply(report ApplyReport, state State, commit CommitState, changes []AccessChange) (ApplyReport, error) {
 	if len(changes) > 0 {
 		if err := markCommitPending(r.Config, state.OperationID, commit); err != nil {
 			return report, err
@@ -564,7 +601,7 @@ func changeStrings(changes []AccessChange) []string {
 }
 
 func pendingCommitFault(report ApplyReport, message string) error {
-	return &contract.Fault{
+	return &contract.FaultError{
 		Code:    contract.ConfirmationRequired,
 		Message: message,
 		Hint:    "Verify the host is reachable over the new access path, then run: eregion node bootstrap confirm " + report.OperationID,
@@ -583,8 +620,8 @@ func (r *Runner) applyFault(step Step, execution engine.Execution, status engine
 	if cause != nil {
 		message += ": " + cause.Error()
 	}
-	fault := &contract.Fault{Code: contract.Unavailable, Message: message, Hint: "Completed steps are not re-applied.", Cause: cause}
-	var existing *contract.Fault
+	fault := &contract.FaultError{Code: contract.Unavailable, Message: message, Hint: "Completed steps are not re-applied.", Cause: cause}
+	var existing *contract.FaultError
 	if errors.As(cause, &existing) && contract.KnownCode(existing.Code) {
 		copy := *existing
 		copy.Message = "host step " + step.ID() + ": " + existing.Message

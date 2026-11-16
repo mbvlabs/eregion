@@ -166,12 +166,12 @@ func (a *app) configureCloudflareCredential(cmd *cobra.Command, prompts cloudfla
 	if err != nil {
 		return result{}, err
 	}
-	fmt.Fprintf(cmd.ErrOrStderr(), "Cloudflare credential %s (%s)\n  current revision: %d\n  next revision:    %d\n  validation:       %s\n",
+	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Cloudflare credential %s (%s)\n  current revision: %d\n  next revision:    %d\n  validation:       %s\n",
 		zoneName, zoneID, preview.CurrentRevision, preview.NextRevision, preview.Validation)
 	if preview.CurrentRevision == 0 {
-		fmt.Fprintln(cmd.ErrOrStderr(), "  status:           new credential")
+		_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "  status:           new credential")
 	} else {
-		fmt.Fprintf(cmd.ErrOrStderr(), "  status:           replaces revision %d only if it is still current\n", preview.CurrentRevision)
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "  status:           replaces revision %d only if it is still current\n", preview.CurrentRevision)
 	}
 	confirmed, err := prompts.confirm("Save this Cloudflare credential?", "The token was read-validated. A concurrent replacement will be refused rather than overwritten.", false)
 	if err != nil {

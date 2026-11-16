@@ -10,6 +10,7 @@ import (
 	"github.com/mbvlabs/eregion/internal/api"
 	"github.com/mbvlabs/eregion/internal/appdef"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/integrations"
 	"github.com/mbvlabs/eregion/internal/operations"
 	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/spf13/cobra"
@@ -55,11 +56,11 @@ func definitionInputForTarget(cmd *cobra.Command, app, env string) (api.Definiti
 	if err != nil || !info.Mode().IsRegular() {
 		return api.DefinitionPlanInput{}, contract.NewFault(contract.InputRequired, "cannot read the app definition", "Pass --from with a readable regular file.")
 	}
-	f, err := os.Open(path) //nolint:gosec // The operator explicitly selects this input.
+	f, err := os.Open(path)
 	if err != nil {
 		return api.DefinitionPlanInput{}, contract.NewFault(contract.InputRequired, "cannot read the app definition", "Pass --from with a readable regular file.")
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	info, err = f.Stat()
 	if err != nil || !info.Mode().IsRegular() {
 		return api.DefinitionPlanInput{}, contract.NewFault(contract.InputRequired, "the app definition is not a regular file", "Pass --from with a readable regular file.")
@@ -121,10 +122,7 @@ func definitionPlanOutput(path string, plan api.DefinitionPlan) result {
 	}
 	data := definitionPlanResult{DefinitionPlan: plan, NextCommands: next}
 	var out strings.Builder
-	fmt.Fprintf(&out, "Definition plan for %s/%s\ncan apply: %t (eligibility, not readiness)\ndigest: %s\nplan nonce: %s\n", plan.App, plan.Environment, plan.CanApply, plan.Digest, plan.PlanNonce)
-	if plan.ConfirmTarget != "" {
-		fmt.Fprintf(&out, "required removal confirmation: %s\n", plan.ConfirmTarget)
-	}
+	writeDefinitionPlanHeader(&out, plan)
 	for _, line := range plan.Diff {
 		fmt.Fprintf(&out, "  %s\n", line)
 	}
@@ -132,43 +130,10 @@ func definitionPlanOutput(path string, plan api.DefinitionPlan) result {
 		fmt.Fprintf(&out, "domain %s: %s\n", d.Action, d.Name)
 	}
 	for _, dns := range plan.DNS {
-		fmt.Fprintf(&out, "DNS %s:\n", dns.Host)
-		for _, r := range dns.Before {
-			fmt.Fprintf(&out, "  before: %s %s (%s)\n", r.Type, r.Content, r.Ownership)
-		}
-		for _, r := range dns.Desired {
-			fmt.Fprintf(&out, "  desired: %s %s\n", r.Type, r.Content)
-		}
-		for _, r := range dns.ExternalSatisfaction {
-			fmt.Fprintf(&out, "  unchanged external, unowned: %s %s\n", r.Type, r.Content)
-		}
-		for _, change := range dns.Changes {
-			before, after := "-", "-"
-			if change.Before != nil {
-				before = change.Before.Type + " " + change.Before.Content
-			}
-			if change.After != nil {
-				after = change.After.Type + " " + change.After.Content
-			}
-			fmt.Fprintf(&out, "  %s: %s -> %s\n", change.Action, before, after)
-		}
-		for _, w := range dns.Warnings {
-			fmt.Fprintf(&out, "  warning: %s\n", w)
-		}
+		writeDefinitionDNS(&out, dns)
 	}
 	for _, dns := range plan.DNSCleanup {
-		fmt.Fprintf(&out, "DNS cleanup %s:\n", dns.Host)
-		for _, change := range dns.Changes {
-			if change.Before != nil {
-				fmt.Fprintf(&out, "  %s: %s %s -> -\n", change.Action, change.Before.Type, change.Before.Content)
-			}
-		}
-		for _, w := range dns.Warnings {
-			fmt.Fprintf(&out, "  warning: %s\n", w)
-		}
-		for _, c := range dns.Conflicts {
-			fmt.Fprintf(&out, "  conflict: %s\n", c)
-		}
+		writeDefinitionDNSCleanup(&out, dns)
 	}
 	for _, w := range plan.Warnings {
 		fmt.Fprintf(&out, "warning: %s\n", w)
@@ -180,6 +145,54 @@ func definitionPlanOutput(path string, plan api.DefinitionPlan) result {
 		fmt.Fprintf(&out, "next: %s\n", n)
 	}
 	return result{data: data, plain: out.String(), next: next}
+}
+
+func writeDefinitionPlanHeader(out *strings.Builder, plan api.DefinitionPlan) {
+	fmt.Fprintf(out, "Definition plan for %s/%s\ncan apply: %t (eligibility, not readiness)\ndigest: %s\nplan nonce: %s\n", plan.App, plan.Environment, plan.CanApply, plan.Digest, plan.PlanNonce)
+	if plan.ConfirmTarget != "" {
+		fmt.Fprintf(out, "required removal confirmation: %s\n", plan.ConfirmTarget)
+	}
+}
+
+func writeDefinitionDNS(out *strings.Builder, dns integrations.DefinitionDNSPlan) {
+	fmt.Fprintf(out, "DNS %s:\n", dns.Host)
+	for _, r := range dns.Before {
+		fmt.Fprintf(out, "  before: %s %s (%s)\n", r.Type, r.Content, r.Ownership)
+	}
+	for _, r := range dns.Desired {
+		fmt.Fprintf(out, "  desired: %s %s\n", r.Type, r.Content)
+	}
+	for _, r := range dns.ExternalSatisfaction {
+		fmt.Fprintf(out, "  unchanged external, unowned: %s %s\n", r.Type, r.Content)
+	}
+	for _, change := range dns.Changes {
+		before, after := "-", "-"
+		if change.Before != nil {
+			before = change.Before.Type + " " + change.Before.Content
+		}
+		if change.After != nil {
+			after = change.After.Type + " " + change.After.Content
+		}
+		fmt.Fprintf(out, "  %s: %s -> %s\n", change.Action, before, after)
+	}
+	for _, w := range dns.Warnings {
+		fmt.Fprintf(out, "  warning: %s\n", w)
+	}
+}
+
+func writeDefinitionDNSCleanup(out *strings.Builder, dns integrations.DomainDNSPlan) {
+	fmt.Fprintf(out, "DNS cleanup %s:\n", dns.Host)
+	for _, change := range dns.Changes {
+		if change.Before != nil {
+			fmt.Fprintf(out, "  %s: %s %s -> -\n", change.Action, change.Before.Type, change.Before.Content)
+		}
+	}
+	for _, w := range dns.Warnings {
+		fmt.Fprintf(out, "  warning: %s\n", w)
+	}
+	for _, c := range dns.Conflicts {
+		fmt.Fprintf(out, "  conflict: %s\n", c)
+	}
 }
 
 func (a *app) definitionPlan(cmd *cobra.Command) (result, error) {

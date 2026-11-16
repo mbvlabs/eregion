@@ -297,172 +297,177 @@ type diagnosticPayloadResult struct {
 // actionPayloadTx projects durable, operation-linked facts while settlement
 // holds the operation lock. Absence is represented explicitly; it is not
 // inferred from the action's requested input or from unrelated current rows.
-func (s *Service) actionPayloadTx(ctx context.Context, tx *entities.StoreTx, op *contract.Operation, status contract.State) (json.RawMessage, error) {
-	var payload any
+func (s *Service) actionPayloadTx(ctx context.Context, tx *entities.StoreTx, op *contract.Operation, _ contract.State) (json.RawMessage, error) {
+	payload, err := s.actionPayloadForKind(ctx, tx, op)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(payload)
+}
+
+func (s *Service) actionPayloadForKind(ctx context.Context, tx *entities.StoreTx, op *contract.Operation) (any, error) {
 	switch op.Kind {
 	case platform.KindAppDelete, platform.KindEnvironmentDelete:
-		payload = unavailablePayload{Availability: "unavailable", Reason: "Deletion outcome requires the pre-delete snapshot supplied by the deletion worker."}
+		return unavailablePayload{Availability: "unavailable", Reason: "Deletion outcome requires the pre-delete snapshot supplied by the deletion worker."}, nil
 	case platform.KindEnvironmentProtect:
-		result, err := protectionActionPayload(ctx, tx, op)
-		if err != nil {
-			return nil, err
-		}
-		payload = result
+		return protectionActionPayload(ctx, tx, op)
 	case platform.KindNodeRegister, platform.KindNodeEnroll, platform.KindNodeReconcile, platform.KindNodeCheck:
-		result, err := nodeActionPayload(ctx, tx, op)
-		if err != nil {
-			return nil, err
-		}
-		payload = result
+		return nodeActionPayload(ctx, tx, op)
 	case platform.KindDomainAdd, platform.KindDomainRemove:
-		result, err := domainActionPayload(ctx, tx, op)
-		if err != nil {
-			return nil, err
-		}
-		payload = result
+		return domainActionPayload(ctx, tx, op)
 	case platform.KindResourceApply, platform.KindResourceDestroy:
-		result, err := resourceActionPayload(ctx, tx, op)
-		if err != nil {
-			return nil, err
-		}
-		payload = result
+		return resourceActionPayload(ctx, tx, op)
 	case platform.KindBuildStop:
-		result, err := buildStopActionPayload(ctx, tx, op)
-		if err != nil {
-			return nil, err
-		}
-		payload = result
+		return buildStopActionPayload(ctx, tx, op)
 	case operations.TestKind:
-		result, err := diagnosticActionPayload(ctx, tx, op)
-		if err != nil {
-			return nil, err
-		}
-		payload = result
+		return diagnosticActionPayload(ctx, tx, op)
 	case platform.KindAppCreate, platform.KindEnvironmentCreate, platform.KindEnvironmentUpdate,
 		platform.KindProcessScale, platform.KindConfigSet, platform.KindConfigUnset,
 		platform.KindEnvironmentSecretAttach, platform.KindEnvironmentResourceAttach, platform.KindEnvironmentResourceDetach:
-		result := revisionPayload{Availability: "unavailable", Reason: "No revision was recorded for this operation, or its revision no longer exists."}
-		if op.Kind == platform.KindAppCreate {
-			var in platform.AppCreateInput
-			if err := actionInputTx(ctx, tx, op.ID, &in); err != nil {
-				return nil, err
-			}
-			result.AppName = in.Name
-			app, found, err := tx.Platform().Apps().ActionTimestamps(ctx, in.Name)
-			if err != nil {
-				return nil, err
-			}
-			if found {
-				result.CurrentApp = &appObservation{ID: string(app.ID), ObservedAt: app.Now, UpdatedAt: app.UpdatedAt}
-			}
-			result.Availability = "partial"
-		}
-		rows, err := tx.Platform().Revisions().FirstDeployActionRows(ctx, op.ID)
-		if err != nil {
-			return nil, err
-		}
-		for _, row := range rows {
-			revision := actionRevision{
-				ID: string(row.RevisionID), EnvironmentID: string(row.EnvironmentID), Environment: row.Environment,
-				AppID: string(row.AppID), App: row.App, Number: row.Number, DeployIntent: row.DeployIntent,
-				FirstDeployOperationID: string(row.DeployOpID), ChangedConfigAvailable: row.HasPrevious,
-				SecretNames: row.SecretNames, Resources: row.Resources,
-			}
-			for _, process := range row.Processes {
-				revision.Processes = append(revision.Processes, actionProcess{Name: process.Name, Kind: process.Kind, Replicas: process.Replicas})
-			}
-			currentConfig, err := rawConfig(row.Config)
-			if err != nil {
-				return nil, err
-			}
-			previousConfig, err := rawConfig(row.PreviousConfig)
-			if err != nil {
-				return nil, err
-			}
-			if revision.ChangedConfigAvailable {
-				for key, value := range currentConfig {
-					if old, ok := previousConfig[key]; !ok || !bytes.Equal(value, old) {
-						revision.ChangedConfigKeys = append(revision.ChangedConfigKeys, key)
-					}
-				}
-				for key := range previousConfig {
-					if _, ok := currentConfig[key]; !ok {
-						revision.ChangedConfigKeys = append(revision.ChangedConfigKeys, key)
-					}
-				}
-			}
-			sort.Strings(revision.ChangedConfigKeys)
-			result.Revisions = append(result.Revisions, revision)
-		}
-		if len(result.Revisions) > 0 {
-			result.Availability = "available"
-			result.Reason = ""
-		}
-		payload = result
+		return revisionActionPayload(ctx, tx, op)
 	case platform.KindReleaseCreate, platform.KindBuildRetry, platform.KindDeploy, platform.KindRollback, platform.KindRestart, platform.KindPromote:
-		result := executionPayload{Availability: "unavailable", Reason: "No build, release or deployment linked to this operation remains available."}
-		facts, found, err := tx.Platform().Deployments().BuildDeploymentFacts(ctx, op.ID)
-		if err != nil {
-			return nil, err
-		}
-		if found {
-			result.BuildID = string(facts.BuildID)
-			result.BuildState = string(facts.BuildState)
-			result.CommitSHA = facts.CommitSHA
-			result.DeploymentID = string(facts.DeploymentID)
-			result.DeployState = string(facts.DeployState)
-			result.RevisionID = string(facts.RevisionID)
-			result.ReleaseID = string(facts.ReleaseID)
-			result.Image = facts.Image
-			result.ImageID = facts.ImageID
-		}
-		if result.BuildID != "" || result.DeploymentID != "" || result.ReleaseID != "" {
-			result.Availability = "partial"
-			result.Reason = "Step and serving facts are limited to durable records and current observations."
-		}
-		if result.DeploymentID != "" {
-			if err := executionDeploymentFacts(ctx, tx, op, &result); err != nil {
-				return nil, err
-			}
-		}
-		payload = result
+		return executionActionPayload(ctx, tx, op)
 	case platform.KindDefinitionApply:
-		result := definitionPayload{Availability: "unavailable", Reason: "No definition run linked to this operation remains available."}
-		run, found, err := tx.DefinitionRuns().Get(ctx, op.ID)
-		if err != nil {
-			return nil, err
-		}
-		if found {
-			result.Availability = "available"
-			result.Reason = ""
-			result.EnvironmentID = run.EnvironmentID
-			result.FinishedAt = run.FinishedAt
-			rows, err := tx.DefinitionSteps().ListChildJournal(ctx, op.ID)
-			if err != nil {
-				return nil, err
-			}
-			for _, row := range rows {
-				result.Children = append(result.Children, definitionChild{
-					Ordinal: row.Ordinal, Kind: row.Kind, Target: row.Target,
-					OperationID: string(row.ChildID), Status: row.ChildState,
-				})
-			}
-		}
-		payload = result
+		return definitionActionPayload(ctx, tx, op)
 	case platform.KindRetentionPrune:
-		result, err := s.retentionActionPayload(ctx, tx, op)
-		if err != nil {
-			return nil, err
-		}
-		payload = result
+		return s.retentionActionPayload(ctx, tx, op)
 	default:
 		reason := "This operation kind is not registered and has no built-in result projector."
 		if def, ok := platform.Default().Lookup(op.Kind); ok && def.Executor != nil {
 			reason = "The extension did not provide result data; the platform has no extension-specific projector."
 		}
-		payload = unavailablePayload{Availability: "unavailable", Reason: reason}
+		return unavailablePayload{Availability: "unavailable", Reason: reason}, nil
 	}
-	return json.Marshal(payload)
+}
+
+func revisionActionPayload(ctx context.Context, tx *entities.StoreTx, op *contract.Operation) (revisionPayload, error) {
+	result := revisionPayload{Availability: "unavailable", Reason: "No revision was recorded for this operation, or its revision no longer exists."}
+	if op.Kind == platform.KindAppCreate {
+		var in platform.AppCreateInput
+		if err := actionInputTx(ctx, tx, op.ID, &in); err != nil {
+			return result, err
+		}
+		result.AppName = in.Name
+		app, found, err := tx.Platform().Apps().ActionTimestamps(ctx, in.Name)
+		if err != nil {
+			return result, err
+		}
+		if found {
+			result.CurrentApp = &appObservation{ID: string(app.ID), ObservedAt: app.Now, UpdatedAt: app.UpdatedAt}
+		}
+		result.Availability = "partial"
+	}
+	rows, err := tx.Platform().Revisions().FirstDeployActionRows(ctx, op.ID)
+	if err != nil {
+		return result, err
+	}
+	for _, row := range rows {
+		revision, err := actionRevisionFromRow(row)
+		if err != nil {
+			return result, err
+		}
+		result.Revisions = append(result.Revisions, revision)
+	}
+	if len(result.Revisions) > 0 {
+		result.Availability = "available"
+		result.Reason = ""
+	}
+	return result, nil
+}
+
+func actionRevisionFromRow(row entities.FirstDeployActionRow) (actionRevision, error) {
+	revision := actionRevision{
+		ID: string(row.RevisionID), EnvironmentID: string(row.EnvironmentID), Environment: row.Environment,
+		AppID: string(row.AppID), App: row.App, Number: row.Number, DeployIntent: row.DeployIntent,
+		FirstDeployOperationID: string(row.DeployOpID), ChangedConfigAvailable: row.HasPrevious,
+		SecretNames: row.SecretNames, Resources: row.Resources,
+	}
+	for _, process := range row.Processes {
+		revision.Processes = append(revision.Processes, actionProcess{Name: process.Name, Kind: process.Kind, Replicas: process.Replicas})
+	}
+	currentConfig, err := rawConfig(row.Config)
+	if err != nil {
+		return revision, err
+	}
+	previousConfig, err := rawConfig(row.PreviousConfig)
+	if err != nil {
+		return revision, err
+	}
+	if revision.ChangedConfigAvailable {
+		revision.ChangedConfigKeys = changedConfigKeys(currentConfig, previousConfig)
+	}
+	sort.Strings(revision.ChangedConfigKeys)
+	return revision, nil
+}
+
+func changedConfigKeys(current, previous map[string]json.RawMessage) []string {
+	keys := make([]string, 0, len(current))
+	for key, value := range current {
+		if old, ok := previous[key]; !ok || !bytes.Equal(value, old) {
+			keys = append(keys, key)
+		}
+	}
+	for key := range previous {
+		if _, ok := current[key]; !ok {
+			keys = append(keys, key)
+		}
+	}
+	return keys
+}
+
+func executionActionPayload(ctx context.Context, tx *entities.StoreTx, op *contract.Operation) (executionPayload, error) {
+	result := executionPayload{Availability: "unavailable", Reason: "No build, release or deployment linked to this operation remains available."}
+	facts, found, err := tx.Platform().Deployments().BuildDeploymentFacts(ctx, op.ID)
+	if err != nil {
+		return result, err
+	}
+	if found {
+		result.BuildID = string(facts.BuildID)
+		result.BuildState = string(facts.BuildState)
+		result.CommitSHA = facts.CommitSHA
+		result.DeploymentID = string(facts.DeploymentID)
+		result.DeployState = string(facts.DeployState)
+		result.RevisionID = string(facts.RevisionID)
+		result.ReleaseID = string(facts.ReleaseID)
+		result.Image = facts.Image
+		result.ImageID = facts.ImageID
+	}
+	if result.BuildID != "" || result.DeploymentID != "" || result.ReleaseID != "" {
+		result.Availability = "partial"
+		result.Reason = "Step and serving facts are limited to durable records and current observations."
+	}
+	if result.DeploymentID != "" {
+		if err := executionDeploymentFacts(ctx, tx, op, &result); err != nil {
+			return result, err
+		}
+	}
+	return result, nil
+}
+
+func definitionActionPayload(ctx context.Context, tx *entities.StoreTx, op *contract.Operation) (definitionPayload, error) {
+	result := definitionPayload{Availability: "unavailable", Reason: "No definition run linked to this operation remains available."}
+	run, found, err := tx.DefinitionRuns().Get(ctx, op.ID)
+	if err != nil {
+		return result, err
+	}
+	if !found {
+		return result, nil
+	}
+	result.Availability = "available"
+	result.Reason = ""
+	result.EnvironmentID = run.EnvironmentID
+	result.FinishedAt = run.FinishedAt
+	rows, err := tx.DefinitionSteps().ListChildJournal(ctx, op.ID)
+	if err != nil {
+		return result, err
+	}
+	for _, row := range rows {
+		result.Children = append(result.Children, definitionChild{
+			Ordinal: row.Ordinal, Kind: row.Kind, Target: row.Target,
+			OperationID: string(row.ChildID), Status: row.ChildState,
+		})
+	}
+	return result, nil
 }
 
 func rawConfig(values map[string]string) (map[string]json.RawMessage, error) {
@@ -614,28 +619,8 @@ func (s *Service) retentionActionPayload(ctx context.Context, tx *entities.Store
 
 func nodeActionPayload(ctx context.Context, tx *entities.StoreTx, op *contract.Operation) (nodePayload, error) {
 	result := nodePayload{Availability: "partial", Reason: "The selected node has no current record; registration is not authentication."}
-	if op.Kind == platform.KindNodeRegister {
-		var in platform.NodeRegisterInput
-		if err := actionInputTx(ctx, tx, op.ID, &in); err != nil {
-			return result, err
-		}
-		if err := platform.ValidateName(in.Name); err != nil {
-			return result, err
-		}
-		result.Name, result.DeclaredRoles, result.DeclaredCapabilities = in.Name, in.Roles, in.Capabilities
-	} else {
-		target, err := platform.ParseTarget(op.Target)
-		if err != nil || target.Kind != platform.TargetNode {
-			return result, errors.New("invalid node action target")
-		}
-		result.Name = target.Node
-		if op.Kind == platform.KindNodeEnroll {
-			var in platform.NodeEnrollInput
-			if err := actionInputTx(ctx, tx, op.ID, &in); err != nil {
-				return result, err
-			}
-			result.DeclaredRoles = in.Roles
-		}
+	if err := nodeActionPayloadInput(ctx, tx, op, &result); err != nil {
+		return result, err
 	}
 	facts, found, err := tx.Nodes().ActionFacts(ctx, result.Name)
 	if err != nil {
@@ -653,6 +638,34 @@ func nodeActionPayload(ctx context.Context, tx *entities.StoreTx, op *contract.O
 		result.Reason = "Current node facts may have changed since this operation; registration alone is not verification."
 	}
 	return result, nil
+}
+
+func nodeActionPayloadInput(ctx context.Context, tx *entities.StoreTx, op *contract.Operation, result *nodePayload) error {
+	if op.Kind == platform.KindNodeRegister {
+		var in platform.NodeRegisterInput
+		if err := actionInputTx(ctx, tx, op.ID, &in); err != nil {
+			return err
+		}
+		if err := platform.ValidateName(in.Name); err != nil {
+			return err
+		}
+		result.Name, result.DeclaredRoles, result.DeclaredCapabilities = in.Name, in.Roles, in.Capabilities
+		return nil
+	}
+	target, err := platform.ParseTarget(op.Target)
+	if err != nil || target.Kind != platform.TargetNode {
+		return errors.New("invalid node action target")
+	}
+	result.Name = target.Node
+	if op.Kind != platform.KindNodeEnroll {
+		return nil
+	}
+	var in platform.NodeEnrollInput
+	if err := actionInputTx(ctx, tx, op.ID, &in); err != nil {
+		return err
+	}
+	result.DeclaredRoles = in.Roles
+	return nil
 }
 
 func domainActionPayload(ctx context.Context, tx *entities.StoreTx, op *contract.Operation) (domainPayload, error) {
@@ -714,47 +727,56 @@ func resourceActionPayload(ctx context.Context, tx *entities.StoreTx, op *contra
 	if err != nil {
 		return result, err
 	}
-	if found {
-		observation := resourceObservation{
-			ObservedAt: facts.Now, UpdatedAt: facts.UpdatedAt, ID: string(facts.ID), EnvironmentID: string(facts.EnvironmentID),
-			Node: facts.Node, State: string(facts.State), Image: facts.Image, ImageID: facts.ImageID,
-			ContainerName: facts.ContainerName, NetworkName: facts.NetworkName,
-			HealthState: string(facts.HealthState), HealthCheckedAt: facts.HealthCheckedAt,
-			LastOperationID: string(facts.OperationID), DestroyedAt: facts.DestroyedAt,
-		}
-		var owned []platform.ResourceVolumeStatus
-		if err := json.Unmarshal(facts.Volumes, &owned); err != nil {
-			return result, err
-		}
-		var spec platform.ResourceSpec
-		if err := json.Unmarshal(facts.Spec, &spec); err != nil {
-			return result, err
-		}
-		if err := validateStoredResource(platform.Resource{
-			ID: facts.ID, App: result.App, Environment: result.Environment, Name: result.Name,
-			Node: facts.Node, State: facts.State, Spec: spec, Image: facts.Image, ImageID: facts.ImageID,
-			ContainerName: facts.ContainerName, NetworkName: facts.NetworkName, Volumes: owned,
-			HealthState: facts.HealthState, HealthChecked: facts.HealthCheckedAt,
-			OperationID: facts.OperationID, DestroyedAt: facts.DestroyedAt,
-		}); err != nil {
-			return result, err
-		}
-		for _, volume := range owned {
-			if platform.ResourceVolumeNameValid(volume.Name) && strings.HasPrefix(volume.Name, "er-res-"+strings.TrimPrefix(observation.ID, "res_")+"-") {
-				observation.VolumeNames = append(observation.VolumeNames, volume.Name)
-			}
-		}
-		result.CurrentObservation = &observation
-		result.Reason = "Resource state is a current observation and may have changed since this operation."
-		if result.DeleteDataRequested != nil && observation.LastOperationID == string(op.ID) && observation.State == string(platform.ResourceDestroyed) {
-			if *result.DeleteDataRequested {
-				result.DataOutcome = "delete_completed"
-			} else {
-				result.DataOutcome = "retained"
-			}
+	if !found {
+		return result, nil
+	}
+	observation, err := resourceActionObservation(result.App, result.Environment, result.Name, facts)
+	if err != nil {
+		return result, err
+	}
+	result.CurrentObservation = observation
+	result.Reason = "Resource state is a current observation and may have changed since this operation."
+	if result.DeleteDataRequested != nil && observation.LastOperationID == string(op.ID) && observation.State == string(platform.ResourceDestroyed) {
+		if *result.DeleteDataRequested {
+			result.DataOutcome = "delete_completed"
+		} else {
+			result.DataOutcome = "retained"
 		}
 	}
 	return result, nil
+}
+
+func resourceActionObservation(app, environment, name string, facts entities.ResourceActionFacts) (*resourceObservation, error) {
+	observation := &resourceObservation{
+		ObservedAt: facts.Now, UpdatedAt: facts.UpdatedAt, ID: string(facts.ID), EnvironmentID: string(facts.EnvironmentID),
+		Node: facts.Node, State: string(facts.State), Image: facts.Image, ImageID: facts.ImageID,
+		ContainerName: facts.ContainerName, NetworkName: facts.NetworkName,
+		HealthState: string(facts.HealthState), HealthCheckedAt: facts.HealthCheckedAt,
+		LastOperationID: string(facts.OperationID), DestroyedAt: facts.DestroyedAt,
+	}
+	var owned []platform.ResourceVolumeStatus
+	if err := json.Unmarshal(facts.Volumes, &owned); err != nil {
+		return nil, err
+	}
+	var spec platform.ResourceSpec
+	if err := json.Unmarshal(facts.Spec, &spec); err != nil {
+		return nil, err
+	}
+	if err := validateStoredResource(platform.Resource{
+		ID: facts.ID, App: app, Environment: environment, Name: name,
+		Node: facts.Node, State: facts.State, Spec: spec, Image: facts.Image, ImageID: facts.ImageID,
+		ContainerName: facts.ContainerName, NetworkName: facts.NetworkName, Volumes: owned,
+		HealthState: facts.HealthState, HealthChecked: facts.HealthCheckedAt,
+		OperationID: facts.OperationID, DestroyedAt: facts.DestroyedAt,
+	}); err != nil {
+		return nil, err
+	}
+	for _, volume := range owned {
+		if platform.ResourceVolumeNameValid(volume.Name) && strings.HasPrefix(volume.Name, "er-res-"+strings.TrimPrefix(observation.ID, "res_")+"-") {
+			observation.VolumeNames = append(observation.VolumeNames, volume.Name)
+		}
+	}
+	return observation, nil
 }
 
 func buildStopActionPayload(ctx context.Context, tx *entities.StoreTx, op *contract.Operation) (buildStopPayload, error) {

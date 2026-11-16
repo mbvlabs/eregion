@@ -223,41 +223,15 @@ func Parse(raw []byte) (Definition, error) {
 // The decoder may leave a pointer nil for `key = []` and an empty table, so the
 // document's key set is consulted after the strict structural decode.
 func markPresence(definition *Definition, present map[string]any) {
-	if hasKey(present, "node") && definition.Node == nil {
-		definition.Node = ptrValue("")
-	}
-	if hasKey(present, "build_node") && definition.BuildNode == nil {
-		definition.BuildNode = ptrValue("")
-	}
+	markStringPresence(present, "node", &definition.Node)
+	markStringPresence(present, "build_node", &definition.BuildNode)
 	if hasKey(present, "source") {
-		source := tableValue(present, "source")
-		if definition.Source == nil {
-			definition.Source = &Source{}
-		}
-		markSourcePresence(definition.Source, source)
+		markSourcePresence(ensureSource(&definition.Source), tableValue(present, "source"))
 	}
 	if hasKey(present, "runtime") {
-		runtime := tableValue(present, "runtime")
-		if definition.Runtime == nil {
-			definition.Runtime = &Runtime{}
-		}
-		markRuntimePresence(definition.Runtime, runtime)
+		markRuntimePresence(ensureRuntime(&definition.Runtime), tableValue(present, "runtime"))
 	}
-	if hasKey(present, "processes") && definition.Processes == nil {
-		definition.Processes = &[]Process{}
-	}
-	if hasKey(present, "config") && definition.Config == nil {
-		definition.Config = &map[string]string{}
-	}
-	if hasKey(present, "secret_names") && definition.SecretNames == nil {
-		definition.SecretNames = &[]string{}
-	}
-	if hasKey(present, "domains") && definition.Domains == nil {
-		definition.Domains = &[]Domain{}
-	}
-	if hasKey(present, "resources") && definition.Resources == nil {
-		definition.Resources = &[]Resource{}
-	}
+	markCollectionPresence(present, &definition.Processes, &definition.Config, &definition.SecretNames, &definition.Domains, &definition.Resources)
 	if definition.Resources != nil {
 		if _, err := convertResources(*definition.Resources); err != nil {
 			// Parse remains a schema check; Resolve repeats validation with
@@ -267,52 +241,66 @@ func markPresence(definition *Definition, present map[string]any) {
 		}
 	}
 	if hasKey(present, "environments") {
-		environments := tableValue(present, "environments")
-		for name, raw := range environments {
-			override, ok := definition.Environments[name]
-			if !ok {
-				override = Environment{}
-			}
-			table, _ := raw.(map[string]any)
-			if hasKey(table, "node") && override.Node == nil {
-				override.Node = ptrValue("")
-			}
-			if hasKey(table, "build_node") && override.BuildNode == nil {
-				override.BuildNode = ptrValue("")
-			}
-			if hasKey(table, "source") {
-				if override.Source == nil {
-					override.Source = &Source{}
-				}
-				markSourcePresence(override.Source, tableValue(table, "source"))
-			}
-			if hasKey(table, "runtime") {
-				if override.Runtime == nil {
-					override.Runtime = &Runtime{}
-				}
-				markRuntimePresence(override.Runtime, tableValue(table, "runtime"))
-			}
-			if hasKey(table, "processes") && override.Processes == nil {
-				override.Processes = &[]Process{}
-			}
-			if hasKey(table, "config") && override.Config == nil {
-				override.Config = &map[string]string{}
-			}
-			if hasKey(table, "secret_names") && override.SecretNames == nil {
-				override.SecretNames = &[]string{}
-			}
-			if hasKey(table, "domains") && override.Domains == nil {
-				override.Domains = &[]Domain{}
-			}
-			if hasKey(table, "resources") && override.Resources == nil {
-				override.Resources = &[]Resource{}
-			}
-			if definition.Environments == nil {
-				definition.Environments = map[string]Environment{}
-			}
-			definition.Environments[name] = override
-		}
+		markEnvironmentsPresence(definition, tableValue(present, "environments"))
 	}
+}
+
+func markStringPresence(table map[string]any, key string, target **string) {
+	if hasKey(table, key) && *target == nil {
+		*target = ptrValue("")
+	}
+}
+
+func markCollectionPresence(
+	present map[string]any,
+	processes **[]Process,
+	config **map[string]string,
+	secretNames **[]string,
+	domains **[]Domain,
+	resources **[]Resource,
+) {
+	if hasKey(present, "processes") && *processes == nil {
+		*processes = &[]Process{}
+	}
+	if hasKey(present, "config") && *config == nil {
+		*config = &map[string]string{}
+	}
+	if hasKey(present, "secret_names") && *secretNames == nil {
+		*secretNames = &[]string{}
+	}
+	if hasKey(present, "domains") && *domains == nil {
+		*domains = &[]Domain{}
+	}
+	if hasKey(present, "resources") && *resources == nil {
+		*resources = &[]Resource{}
+	}
+}
+
+func markEnvironmentsPresence(definition *Definition, environments map[string]any) {
+	for name, raw := range environments {
+		override, ok := definition.Environments[name]
+		if !ok {
+			override = Environment{}
+		}
+		table, _ := raw.(map[string]any)
+		markEnvironmentPresence(&override, table)
+		if definition.Environments == nil {
+			definition.Environments = map[string]Environment{}
+		}
+		definition.Environments[name] = override
+	}
+}
+
+func markEnvironmentPresence(override *Environment, table map[string]any) {
+	markStringPresence(table, "node", &override.Node)
+	markStringPresence(table, "build_node", &override.BuildNode)
+	if hasKey(table, "source") {
+		markSourcePresence(ensureSource(&override.Source), tableValue(table, "source"))
+	}
+	if hasKey(table, "runtime") {
+		markRuntimePresence(ensureRuntime(&override.Runtime), tableValue(table, "runtime"))
+	}
+	markCollectionPresence(table, &override.Processes, &override.Config, &override.SecretNames, &override.Domains, &override.Resources)
 }
 
 func markSourcePresence(source *Source, present map[string]any) {
@@ -321,9 +309,7 @@ func markSourcePresence(source *Source, present map[string]any) {
 		"credential_secret": &source.CredentialSecret, "context_path": &source.ContextPath,
 		"builder": &source.Builder,
 	} {
-		if hasKey(present, key) && *target == nil {
-			*target = ptrValue("")
-		}
+		markStringPresence(present, key, target)
 	}
 	if hasKey(present, "build_env") && source.BuildEnv == nil {
 		source.BuildEnv = &map[string]string{}
@@ -332,48 +318,79 @@ func markSourcePresence(source *Source, present map[string]any) {
 		source.GoTargets = &[]buildpacks.GoTarget{}
 	}
 	if hasKey(present, "buildpacks") {
-		if source.Buildpacks == nil {
-			source.Buildpacks = &BuildpackSettings{}
-		}
-		table := tableValue(present, "buildpacks")
-		settings := source.Buildpacks
-		if hasKey(table, "order") && settings.Order == nil {
-			settings.Order = &[]string{}
-		}
-		if hasKey(table, "keep_files") && settings.KeepFiles == nil {
-			settings.KeepFiles = &[]string{}
-		}
-		if hasKey(table, "frontend") {
-			if settings.Frontend == nil {
-				settings.Frontend = &BuildpackFrontend{}
-			}
-			frontend, fields := settings.Frontend, tableValue(table, "frontend")
-			if hasKey(fields, "directory") && frontend.Directory == nil {
-				frontend.Directory = ptrValue("")
-			}
-			if hasKey(fields, "scripts") && frontend.Scripts == nil {
-				frontend.Scripts = &[]string{}
-			}
-			if hasKey(fields, "start_script") && frontend.StartScript == nil {
-				frontend.StartScript = ptrValue("")
-			}
-		}
-		if hasKey(table, "advanced") {
-			if settings.Advanced == nil {
-				settings.Advanced = &BuildpackAdvanced{}
-			}
-			advanced, fields := settings.Advanced, tableValue(table, "advanced")
-			if hasKey(fields, "go_version") && advanced.GoVersion == nil {
-				advanced.GoVersion = ptrValue("")
-			}
-			if hasKey(fields, "go_build_flags") && advanced.GoBuildFlags == nil {
-				advanced.GoBuildFlags = ptrValue("")
-			}
-			if hasKey(fields, "node_version") && advanced.NodeVersion == nil {
-				advanced.NodeVersion = ptrValue("")
-			}
-		}
+		markBuildpackPresence(source, tableValue(present, "buildpacks"))
 	}
+}
+
+func markBuildpackPresence(source *Source, table map[string]any) {
+	if source.Buildpacks == nil {
+		source.Buildpacks = &BuildpackSettings{}
+	}
+	settings := source.Buildpacks
+	if hasKey(table, "order") && settings.Order == nil {
+		settings.Order = &[]string{}
+	}
+	if hasKey(table, "keep_files") && settings.KeepFiles == nil {
+		settings.KeepFiles = &[]string{}
+	}
+	if hasKey(table, "frontend") {
+		markFrontendPresence(ensureFrontend(&settings.Frontend), tableValue(table, "frontend"))
+	}
+	if hasKey(table, "advanced") {
+		markAdvancedPresence(ensureAdvanced(&settings.Advanced), tableValue(table, "advanced"))
+	}
+}
+
+func markFrontendPresence(frontend *BuildpackFrontend, fields map[string]any) {
+	if hasKey(fields, "directory") && frontend.Directory == nil {
+		frontend.Directory = ptrValue("")
+	}
+	if hasKey(fields, "scripts") && frontend.Scripts == nil {
+		frontend.Scripts = &[]string{}
+	}
+	if hasKey(fields, "start_script") && frontend.StartScript == nil {
+		frontend.StartScript = ptrValue("")
+	}
+}
+
+func markAdvancedPresence(advanced *BuildpackAdvanced, fields map[string]any) {
+	if hasKey(fields, "go_version") && advanced.GoVersion == nil {
+		advanced.GoVersion = ptrValue("")
+	}
+	if hasKey(fields, "go_build_flags") && advanced.GoBuildFlags == nil {
+		advanced.GoBuildFlags = ptrValue("")
+	}
+	if hasKey(fields, "node_version") && advanced.NodeVersion == nil {
+		advanced.NodeVersion = ptrValue("")
+	}
+}
+
+func ensureSource(source **Source) *Source {
+	if *source == nil {
+		*source = &Source{}
+	}
+	return *source
+}
+
+func ensureRuntime(runtime **Runtime) *Runtime {
+	if *runtime == nil {
+		*runtime = &Runtime{}
+	}
+	return *runtime
+}
+
+func ensureFrontend(frontend **BuildpackFrontend) *BuildpackFrontend {
+	if *frontend == nil {
+		*frontend = &BuildpackFrontend{}
+	}
+	return *frontend
+}
+
+func ensureAdvanced(advanced **BuildpackAdvanced) *BuildpackAdvanced {
+	if *advanced == nil {
+		*advanced = &BuildpackAdvanced{}
+	}
+	return *advanced
 }
 
 func markRuntimePresence(runtime *Runtime, present map[string]any) {
@@ -408,22 +425,9 @@ func ptrValue[T any](value T) *T { return &value }
 // override is optional: a PR or any other environment can be created from the
 // shared recipe without first adding its name to the document.
 func (d Definition) Resolve(environment string) (*Resolved, error) {
-	if d.App != "" {
-		if err := platform.ValidateName(d.App); err != nil {
-			return nil, fmt.Errorf("app: %w", err)
-		}
+	if err := d.validateNames(environment); err != nil {
+		return nil, err
 	}
-	if environment != "" {
-		if err := platform.ValidateName(environment); err != nil {
-			return nil, fmt.Errorf("environment: %w", err)
-		}
-	}
-	for name := range d.Environments {
-		if err := platform.ValidateName(name); err != nil {
-			return nil, fmt.Errorf("environments.%s: %w", name, err)
-		}
-	}
-
 	resolved := &Resolved{App: d.App, Environment: environment}
 	if d.ImageRepository != nil {
 		repository, err := platform.NormalizeImageRepository(*d.ImageRepository)
@@ -438,25 +442,50 @@ func (d Definition) Resolve(environment string) (*Resolved, error) {
 	}); err != nil {
 		return nil, err
 	}
-	if override, ok := d.Environments[environment]; ok && environment != "" {
-		if err := resolved.apply(FileLayer{
-			Node: override.Node, BuildNode: override.BuildNode, Source: override.Source, Automation: override.Automation, Runtime: override.Runtime,
-			Processes: override.Processes, Config: override.Config, SecretNames: override.SecretNames, Domains: override.Domains, Resources: override.Resources,
-		}); err != nil {
-			return nil, fmt.Errorf("environments.%s: %w", environment, err)
+	if environment != "" {
+		if override, ok := d.Environments[environment]; ok {
+			if err := resolved.apply(FileLayer(override)); err != nil {
+				return nil, fmt.Errorf("environments.%s: %w", environment, err)
+			}
 		}
 	}
-	if resolved.NodeSet {
-		if err := platform.ValidateName(resolved.Node); err != nil {
-			return nil, fmt.Errorf("node: %w", err)
-		}
-	}
-	if resolved.BuildNodeSet && resolved.BuildNode != "" {
-		if err := platform.ValidateName(resolved.BuildNode); err != nil {
-			return nil, fmt.Errorf("build_node: %w", err)
-		}
+	if err := resolved.validateSelection(); err != nil {
+		return nil, err
 	}
 	return resolved, nil
+}
+
+func (d Definition) validateNames(environment string) error {
+	if d.App != "" {
+		if err := platform.ValidateName(d.App); err != nil {
+			return fmt.Errorf("app: %w", err)
+		}
+	}
+	if environment != "" {
+		if err := platform.ValidateName(environment); err != nil {
+			return fmt.Errorf("environment: %w", err)
+		}
+	}
+	for name := range d.Environments {
+		if err := platform.ValidateName(name); err != nil {
+			return fmt.Errorf("environments.%s: %w", name, err)
+		}
+	}
+	return nil
+}
+
+func (r *Resolved) validateSelection() error {
+	if r.NodeSet {
+		if err := platform.ValidateName(r.Node); err != nil {
+			return fmt.Errorf("node: %w", err)
+		}
+	}
+	if r.BuildNodeSet && r.BuildNode != "" {
+		if err := platform.ValidateName(r.BuildNode); err != nil {
+			return fmt.Errorf("build_node: %w", err)
+		}
+	}
+	return nil
 }
 
 // FileLayer is one shared or environment-specific set of fields.
@@ -475,15 +504,7 @@ type FileLayer struct {
 
 func (r *Resolved) apply(layer FileLayer) error {
 	if layer.Automation != nil {
-		if r.Automation == nil {
-			r.Automation = &Automation{}
-		}
-		if layer.Automation.AutoDeploy != nil {
-			r.Automation.AutoDeploy = layer.Automation.AutoDeploy
-		}
-		if layer.Automation.WebhookSecretName != nil {
-			r.Automation.WebhookSecretName = layer.Automation.WebhookSecretName
-		}
+		r.applyAutomation(layer.Automation)
 	}
 	if layer.Node != nil {
 		r.Node, r.NodeSet = *layer.Node, true
@@ -492,16 +513,7 @@ func (r *Resolved) apply(layer FileLayer) error {
 		r.BuildNode, r.BuildNodeSet = *layer.BuildNode, true
 	}
 	if layer.Source != nil {
-		if sourceLayerIsEmpty(layer.Source) {
-			// An explicitly empty [source] table clears the Git build recipe
-			// instead of inheriting every shared field.
-			r.Source = &Source{}
-		} else {
-			if r.Source == nil {
-				r.Source = &Source{}
-			}
-			mergeSource(r.Source, layer.Source)
-		}
+		r.applySource(layer.Source)
 	}
 	if layer.Runtime != nil {
 		if r.Runtime == nil {
@@ -517,17 +529,7 @@ func (r *Resolved) apply(layer FileLayer) error {
 		r.Processes, r.ProcessesSet = processes, true
 	}
 	if layer.Config != nil {
-		if r.Config == nil {
-			r.Config = map[string]string{}
-		}
-		r.ConfigSet = true
-		if len(*layer.Config) == 0 {
-			r.Config = map[string]string{}
-		} else {
-			for key, value := range *layer.Config {
-				r.Config[key] = value
-			}
-		}
+		r.applyConfig(*layer.Config)
 	}
 	if layer.SecretNames != nil {
 		names, err := normalizeNames(*layer.SecretNames)
@@ -550,6 +552,49 @@ func (r *Resolved) apply(layer FileLayer) error {
 		}
 		r.Resources, r.ResourcesSet = resources, true
 	}
+	return r.validateShapes()
+}
+
+func (r *Resolved) applyAutomation(automation *Automation) {
+	if r.Automation == nil {
+		r.Automation = &Automation{}
+	}
+	if automation.AutoDeploy != nil {
+		r.Automation.AutoDeploy = automation.AutoDeploy
+	}
+	if automation.WebhookSecretName != nil {
+		r.Automation.WebhookSecretName = automation.WebhookSecretName
+	}
+}
+
+func (r *Resolved) applySource(source *Source) {
+	if sourceLayerIsEmpty(source) {
+		// An explicitly empty [source] table clears the Git build recipe
+		// instead of inheriting every shared field.
+		r.Source = &Source{}
+		return
+	}
+	if r.Source == nil {
+		r.Source = &Source{}
+	}
+	mergeSource(r.Source, source)
+}
+
+func (r *Resolved) applyConfig(values map[string]string) {
+	if r.Config == nil {
+		r.Config = map[string]string{}
+	}
+	r.ConfigSet = true
+	if len(values) == 0 {
+		r.Config = map[string]string{}
+		return
+	}
+	for key, value := range values {
+		r.Config[key] = value
+	}
+}
+
+func (r *Resolved) validateShapes() error {
 	if r.Source != nil {
 		if err := validateSourceShape(r.Source); err != nil {
 			return err
@@ -625,43 +670,49 @@ func mergeBuildpacks(dst *Source, src *BuildpackSettings) {
 		out.KeepFiles = &values
 	}
 	if src.Frontend != nil {
-		f := src.Frontend
-		if f.Directory == nil && f.Scripts == nil && f.StartScript == nil {
-			out.Frontend = nil
-		} else {
-			if out.Frontend == nil {
-				out.Frontend = &BuildpackFrontend{}
-			}
-			if f.Directory != nil {
-				out.Frontend.Directory = ptrValue(*f.Directory)
-			}
-			if f.Scripts != nil {
-				values := append([]string{}, (*f.Scripts)...)
-				out.Frontend.Scripts = &values
-			}
-			if f.StartScript != nil {
-				out.Frontend.StartScript = ptrValue(*f.StartScript)
-			}
-		}
+		mergeFrontend(out, src.Frontend)
 	}
 	if src.Advanced != nil {
-		a := src.Advanced
-		if a.GoVersion == nil && a.GoBuildFlags == nil && a.NodeVersion == nil {
-			out.Advanced = nil
-		} else {
-			if out.Advanced == nil {
-				out.Advanced = &BuildpackAdvanced{}
-			}
-			if a.GoVersion != nil {
-				out.Advanced.GoVersion = ptrValue(*a.GoVersion)
-			}
-			if a.GoBuildFlags != nil {
-				out.Advanced.GoBuildFlags = ptrValue(*a.GoBuildFlags)
-			}
-			if a.NodeVersion != nil {
-				out.Advanced.NodeVersion = ptrValue(*a.NodeVersion)
-			}
-		}
+		mergeAdvanced(out, src.Advanced)
+	}
+}
+
+func mergeFrontend(dst *BuildpackSettings, src *BuildpackFrontend) {
+	if src.Directory == nil && src.Scripts == nil && src.StartScript == nil {
+		dst.Frontend = nil
+		return
+	}
+	if dst.Frontend == nil {
+		dst.Frontend = &BuildpackFrontend{}
+	}
+	if src.Directory != nil {
+		dst.Frontend.Directory = ptrValue(*src.Directory)
+	}
+	if src.Scripts != nil {
+		values := append([]string{}, (*src.Scripts)...)
+		dst.Frontend.Scripts = &values
+	}
+	if src.StartScript != nil {
+		dst.Frontend.StartScript = ptrValue(*src.StartScript)
+	}
+}
+
+func mergeAdvanced(dst *BuildpackSettings, src *BuildpackAdvanced) {
+	if src.GoVersion == nil && src.GoBuildFlags == nil && src.NodeVersion == nil {
+		dst.Advanced = nil
+		return
+	}
+	if dst.Advanced == nil {
+		dst.Advanced = &BuildpackAdvanced{}
+	}
+	if src.GoVersion != nil {
+		dst.Advanced.GoVersion = ptrValue(*src.GoVersion)
+	}
+	if src.GoBuildFlags != nil {
+		dst.Advanced.GoBuildFlags = ptrValue(*src.GoBuildFlags)
+	}
+	if src.NodeVersion != nil {
+		dst.Advanced.NodeVersion = ptrValue(*src.NodeVersion)
 	}
 }
 
@@ -909,18 +960,8 @@ func (r *Resolved) CreateSpec(domainAddresses []string) (platform.EnvironmentSpe
 	if r.Automation != nil && ((r.Automation.AutoDeploy != nil && *r.Automation.AutoDeploy) || (r.Automation.WebhookSecretName != nil && *r.Automation.WebhookSecretName != "")) {
 		return platform.EnvironmentSpec{}, errors.New("automation: create the environment first, then enable push to deploy with env update --auto-deploy")
 	}
-	app := r.App
-	if app == "" {
-		return platform.EnvironmentSpec{}, errors.New("app is required")
-	}
-	if r.Environment == "" {
-		return platform.EnvironmentSpec{}, errors.New("environment is required")
-	}
-	if err := platform.ValidateName(app); err != nil {
-		return platform.EnvironmentSpec{}, fmt.Errorf("app: %w", err)
-	}
-	if err := platform.ValidateName(r.Environment); err != nil {
-		return platform.EnvironmentSpec{}, fmt.Errorf("environment: %w", err)
+	if err := r.validateCreateIdentity(); err != nil {
+		return platform.EnvironmentSpec{}, err
 	}
 	node := r.Node
 	if node == "" {
@@ -930,49 +971,13 @@ func (r *Resolved) CreateSpec(domainAddresses []string) (platform.EnvironmentSpe
 	if r.Source != nil {
 		source = sourceBinding(r.Source)
 	}
-	runtime := platform.RuntimeSpec{
-		Node: node, HealthType: "http", HealthPath: platform.DefaultHealthPath,
-		HealthTimeoutSeconds: platform.DefaultHealthTimeout,
+	runtime := runtimeFromDefinition(r.Runtime, node)
+	processes, containerPort, err := createProcesses(r)
+	if err != nil {
+		return platform.EnvironmentSpec{}, err
 	}
-	if r.Runtime != nil {
-		if r.Runtime.HealthType != nil {
-			runtime.HealthType = *r.Runtime.HealthType
-		}
-		if r.Runtime.HealthPath != nil {
-			runtime.HealthPath = *r.Runtime.HealthPath
-		}
-		if r.Runtime.HealthTimeoutSeconds != nil {
-			runtime.HealthTimeoutSeconds = *r.Runtime.HealthTimeoutSeconds
-		}
-		if r.Runtime.ReleaseCommand != nil {
-			if len(*r.Runtime.ReleaseCommand) > 0 {
-				runtime.ReleaseCommand = &platform.CommandSpec{Argv: append([]string(nil), (*r.Runtime.ReleaseCommand)...)}
-			}
-		}
-	}
-	processes := append([]platform.ProcessSpec(nil), r.Processes...)
-	if !r.ProcessesSet {
-		processes = []platform.ProcessSpec{{Name: "web", Kind: "web", Args: []string{}, Replicas: 1, ContainerPort: platform.DefaultContainerPort}}
-	} else if len(processes) == 0 {
-		return platform.EnvironmentSpec{}, errors.New("processes: an explicit empty formation cannot be used to create an environment; omit processes for the default web process")
-	}
-	containerPort := platform.DefaultContainerPort
-	for _, process := range processes {
-		if process.Kind == "web" && process.ContainerPort > 0 {
-			containerPort = process.ContainerPort
-			break
-		}
-	}
-	if r.DomainsSet && len(r.Domains) > 0 {
-		primary := 0
-		for _, domain := range r.Domains {
-			if domain.Primary {
-				primary++
-			}
-		}
-		if primary != 1 {
-			return platform.EnvironmentSpec{}, errors.New("domains: mark exactly one domain as primary")
-		}
+	if err := validateCreateDomains(r.DomainsSet, r.Domains); err != nil {
+		return platform.EnvironmentSpec{}, err
 	}
 	config := map[string]string{}
 	if r.ConfigSet {
@@ -981,12 +986,8 @@ func (r *Resolved) CreateSpec(domainAddresses []string) (platform.EnvironmentSpe
 		}
 	}
 	secretNames := append([]string(nil), r.SecretNames...)
-	if r.Source != nil && r.Source.CredentialSecret != nil && *r.Source.CredentialSecret != "" {
-		for _, name := range secretNames {
-			if name == *r.Source.CredentialSecret {
-				return platform.EnvironmentSpec{}, errors.New("secret_names: the git read credential is not injected into the application")
-			}
-		}
+	if err := validateCreateSecretNames(r.Source, secretNames); err != nil {
+		return platform.EnvironmentSpec{}, err
 	}
 	domains := make([]platform.DomainDeclaration, 0, len(r.Domains))
 	for _, domain := range r.Domains {
@@ -1022,6 +1023,69 @@ func (r *Resolved) CreateSpec(domainAddresses []string) (platform.EnvironmentSpe
 	return spec, nil
 }
 
+func (r *Resolved) validateCreateIdentity() error {
+	app := r.App
+	if app == "" {
+		return errors.New("app is required")
+	}
+	if r.Environment == "" {
+		return errors.New("environment is required")
+	}
+	if err := platform.ValidateName(app); err != nil {
+		return fmt.Errorf("app: %w", err)
+	}
+	if err := platform.ValidateName(r.Environment); err != nil {
+		return fmt.Errorf("environment: %w", err)
+	}
+	return nil
+}
+
+func createProcesses(r *Resolved) ([]platform.ProcessSpec, int, error) {
+	processes := append([]platform.ProcessSpec(nil), r.Processes...)
+	if !r.ProcessesSet {
+		return []platform.ProcessSpec{{Name: "web", Kind: "web", Args: []string{}, Replicas: 1, ContainerPort: platform.DefaultContainerPort}}, platform.DefaultContainerPort, nil
+	}
+	if len(processes) == 0 {
+		return nil, 0, errors.New("processes: an explicit empty formation cannot be used to create an environment; omit processes for the default web process")
+	}
+	containerPort := platform.DefaultContainerPort
+	for _, process := range processes {
+		if process.Kind == "web" && process.ContainerPort > 0 {
+			containerPort = process.ContainerPort
+			break
+		}
+	}
+	return processes, containerPort, nil
+}
+
+func validateCreateDomains(set bool, domains []Domain) error {
+	if !set || len(domains) == 0 {
+		return nil
+	}
+	primary := 0
+	for _, domain := range domains {
+		if domain.Primary {
+			primary++
+		}
+	}
+	if primary != 1 {
+		return errors.New("domains: mark exactly one domain as primary")
+	}
+	return nil
+}
+
+func validateCreateSecretNames(source *Source, secretNames []string) error {
+	if source == nil || source.CredentialSecret == nil || *source.CredentialSecret == "" {
+		return nil
+	}
+	for _, name := range secretNames {
+		if name == *source.CredentialSecret {
+			return errors.New("secret_names: the git read credential is not injected into the application")
+		}
+	}
+	return nil
+}
+
 func validateDomainBinding(name string, addresses []string) error {
 	if name != "" {
 		if err := platform.ValidateDomain(name); err != nil {
@@ -1037,21 +1101,12 @@ func validateDomainBinding(name string, addresses []string) error {
 }
 
 func sourceBinding(source *Source) platform.SourceBinding {
-	binding := platform.SourceBinding{}
-	if source.URL != nil {
-		binding.URL = *source.URL
-	}
-	if source.Ref != nil {
-		binding.Ref = *source.Ref
-	}
-	if source.CredentialSecret != nil {
-		binding.CredentialSecretName = *source.CredentialSecret
-	}
-	if source.ContextPath != nil {
-		binding.ContextPath = *source.ContextPath
-	}
-	if source.Builder != nil {
-		binding.Builder = *source.Builder
+	binding := platform.SourceBinding{
+		URL:                  stringValue(source.URL),
+		Ref:                  stringValue(source.Ref),
+		CredentialSecretName: stringValue(source.CredentialSecret),
+		ContextPath:          stringValue(source.ContextPath),
+		Builder:              stringValue(source.Builder),
 	}
 	if source.BuildEnv != nil {
 		binding.BuildEnv = make(map[string]string, len(*source.BuildEnv))
@@ -1062,44 +1117,58 @@ func sourceBinding(source *Source) platform.SourceBinding {
 	if source.GoTargets != nil {
 		binding.GoTargets = append([]buildpacks.GoTarget{}, (*source.GoTargets)...)
 	}
-	if source.Buildpacks != nil {
-		s := source.Buildpacks
-		settings := &buildpacks.Settings{}
-		if s.KeepFiles != nil {
-			settings.KeepFiles = append([]string{}, (*s.KeepFiles)...)
-		}
-		if s.Order != nil {
-			settings.Order = append([]string{}, (*s.Order)...)
-		}
-		if s.Frontend != nil {
-			f := s.Frontend
-			settings.Frontend = &buildpacks.Frontend{}
-			if f.StartScript != nil {
-				settings.Frontend.StartScript = *f.StartScript
-			}
-			if f.Directory != nil {
-				settings.Frontend.Directory = *f.Directory
-			}
-			if f.Scripts != nil {
-				settings.Frontend.Scripts = append([]string{}, (*f.Scripts)...)
-			}
-		}
-		if s.Advanced != nil {
-			a := s.Advanced
-			settings.Advanced = &buildpacks.Advanced{}
-			if a.GoVersion != nil {
-				settings.Advanced.GoVersion = *a.GoVersion
-			}
-			if a.GoBuildFlags != nil {
-				settings.Advanced.GoBuildFlags = *a.GoBuildFlags
-			}
-			if a.NodeVersion != nil {
-				settings.Advanced.NodeVersion = *a.NodeVersion
-			}
-		}
-		binding.Buildpacks = settings
-	}
+	binding.Buildpacks = sourceBuildpackSettings(source.Buildpacks)
 	return binding
+}
+
+func stringValue(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
+}
+
+func sourceBuildpackSettings(settings *BuildpackSettings) *buildpacks.Settings {
+	if settings == nil {
+		return nil
+	}
+	out := &buildpacks.Settings{
+		KeepFiles: stringSliceValue(settings.KeepFiles),
+		Order:     stringSliceValue(settings.Order),
+		Frontend:  sourceFrontend(settings.Frontend),
+		Advanced:  sourceAdvanced(settings.Advanced),
+	}
+	return out
+}
+
+func stringSliceValue(values *[]string) []string {
+	if values == nil {
+		return nil
+	}
+	return append([]string{}, (*values)...)
+}
+
+func sourceFrontend(frontend *BuildpackFrontend) *buildpacks.Frontend {
+	if frontend == nil {
+		return nil
+	}
+	out := &buildpacks.Frontend{
+		Directory:   stringValue(frontend.Directory),
+		Scripts:     stringSliceValue(frontend.Scripts),
+		StartScript: stringValue(frontend.StartScript),
+	}
+	return out
+}
+
+func sourceAdvanced(advanced *BuildpackAdvanced) *buildpacks.Advanced {
+	if advanced == nil {
+		return nil
+	}
+	return &buildpacks.Advanced{
+		GoVersion:    stringValue(advanced.GoVersion),
+		GoBuildFlags: stringValue(advanced.GoBuildFlags),
+		NodeVersion:  stringValue(advanced.NodeVersion),
+	}
 }
 
 func decodeError(err error) error {
@@ -1123,5 +1192,5 @@ func decodeError(err error) error {
 		row, column := decode.Position()
 		return fmt.Errorf("invalid TOML at line %d, column %d: %s", row, column, decode.Error())
 	}
-	return fmt.Errorf("invalid TOML: %s", err)
+	return fmt.Errorf("invalid TOML: %w", err)
 }

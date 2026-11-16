@@ -29,23 +29,29 @@ func operationLastSequence(t *testing.T, pool *pgxpool.Pool, id contract.Operati
 // release the borrowed pool for the next transaction.
 func TestIntegrationEntitiesWithinTxOwnsRollback(t *testing.T) {
 	f := newCandidateCaptureFixture(t, "entities-tx-rollback", nil)
-	store := f.service.entities
-	ctx := context.Background()
 	fence := entities.CandidateCaptureFence{
 		OperationID:   f.op.ID,
 		Attempt:       1,
 		EnvironmentID: f.env.ID,
 		DeploymentID:  f.dep.ID,
 	}
+	before := operationLastSequence(t, f.pool, f.op.ID)
+
 	if rejected, err := entities.NewStore(nil); err == nil || rejected != nil {
 		t.Fatalf("nil pool store = %v, %v; want a rejection", rejected, err)
 	}
-	before := operationLastSequence(t, f.pool, f.op.ID)
+	checkCaptureCallbackRollback(t, f, fence, before)
+	checkCapturePanicRollback(t, f, fence, before)
+	checkCaptureCanceledContext(t, f.service.entities)
+	checkCaptureUnclaimedCompletion(t, f, fence)
+	checkCaptureNormalClaims(t, f, fence, before)
+}
 
-	// A callback error rolls back a claim that was already written inside the
-	// transaction, and the callback error is preserved rather than replaced.
+func checkCaptureCallbackRollback(t *testing.T, f candidateCaptureFixture, fence entities.CandidateCaptureFence, before int64) {
+	t.Helper()
+	ctx := context.Background()
 	callbackErr := errors.New("entities callback failure")
-	err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
+	err := f.service.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
 		claimed, err := tx.CandidateCapture(fence).Claim("entities-error-v1")
 		if err != nil || !claimed {
 			t.Fatalf("claim before callback error = %v, %v", claimed, err)
@@ -55,21 +61,20 @@ func TestIntegrationEntitiesWithinTxOwnsRollback(t *testing.T) {
 	if !errors.Is(err, callbackErr) {
 		t.Fatalf("callback error = %v, want %v", err, callbackErr)
 	}
-	if events := readCandidateCaptureEvents(t, f.pool, f.op.ID); events.claims != 0 {
-		t.Fatalf("callback error retained %d claims", events.claims)
-	}
-	if got := operationLastSequence(t, f.pool, f.op.ID); got != before {
-		t.Fatalf("callback error sequence = %d, want %d", got, before)
-	}
+	requireCaptureClaims(t, f.pool, f.op.ID, 0)
+	requireOperationSequence(t, f.pool, f.op.ID, before)
+}
 
-	// A panic unwinds the transaction before it escapes to the caller.
+func checkCapturePanicRollback(t *testing.T, f candidateCaptureFixture, fence entities.CandidateCaptureFence, before int64) {
+	t.Helper()
+	ctx := context.Background()
 	func() {
 		defer func() {
 			if recovered := recover(); recovered != "entities transaction panic" {
 				t.Fatalf("transaction panic = %v, want the caller-visible panic", recovered)
 			}
 		}()
-		_ = store.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		_ = f.service.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
 			claimed, err := tx.CandidateCapture(fence).Claim("entities-panic-v1")
 			if err != nil || !claimed {
 				t.Fatalf("claim before panic = %v, %v", claimed, err)
@@ -77,15 +82,13 @@ func TestIntegrationEntitiesWithinTxOwnsRollback(t *testing.T) {
 			panic("entities transaction panic")
 		})
 	}()
-	if events := readCandidateCaptureEvents(t, f.pool, f.op.ID); events.claims != 0 {
-		t.Fatalf("panic retained %d claims", events.claims)
-	}
-	if got := operationLastSequence(t, f.pool, f.op.ID); got != before {
-		t.Fatalf("panic sequence = %d, want %d", got, before)
-	}
+	requireCaptureClaims(t, f.pool, f.op.ID, 0)
+	requireOperationSequence(t, f.pool, f.op.ID, before)
+}
 
-	// A canceled caller context is rejected by begin, and does not poison the
-	// pool or the next transaction.
+func checkCaptureCanceledContext(t *testing.T, store *entities.Store) {
+	t.Helper()
+	ctx := context.Background()
 	canceled, cancel := context.WithCancel(ctx)
 	cancel()
 	if err := store.WithinTx(canceled, func(*entities.StoreTx) error {
@@ -94,10 +97,13 @@ func TestIntegrationEntitiesWithinTxOwnsRollback(t *testing.T) {
 	}); err == nil {
 		t.Fatal("canceled context opened a transaction")
 	}
+}
 
-	// Completion without the durable claim is refused before any event write.
+func checkCaptureUnclaimedCompletion(t *testing.T, f candidateCaptureFixture, fence entities.CandidateCaptureFence) {
+	t.Helper()
+	ctx := context.Background()
 	unclaimedStep := "entities-unclaimed-v1"
-	err = store.WithinTx(ctx, func(tx *entities.StoreTx) error {
+	err := f.service.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
 		return tx.CandidateCapture(fence).Complete(unclaimedStep, []contract.Event{{
 			Kind:    "warning",
 			Stage:   platform.CandidateDiagnosticStage,
@@ -111,11 +117,13 @@ func TestIntegrationEntitiesWithinTxOwnsRollback(t *testing.T) {
 	if events := readCandidateCaptureEvents(t, f.pool, f.op.ID); events.claims != 0 || events.summary != "" {
 		t.Fatalf("unclaimed completion wrote events: %+v", events)
 	}
+}
 
-	// The same pool still commits normal claims, including a second distinct
-	// step in the same attempt.
+func checkCaptureNormalClaims(t *testing.T, f candidateCaptureFixture, fence entities.CandidateCaptureFence, before int64) {
+	t.Helper()
+	ctx := context.Background()
 	for index, step := range []string{"entities-ok-v1", "entities-ok-v2"} {
-		err = store.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		err := f.service.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
 			claimed, err := tx.CandidateCapture(fence).Claim(step)
 			if err != nil {
 				return err
@@ -128,12 +136,22 @@ func TestIntegrationEntitiesWithinTxOwnsRollback(t *testing.T) {
 		if err != nil {
 			t.Fatalf("claim %s: %v", step, err)
 		}
-		if events := readCandidateCaptureEvents(t, f.pool, f.op.ID); events.claims != index+1 {
-			t.Fatalf("claims after %s = %d, want %d", step, events.claims, index+1)
-		}
+		requireCaptureClaims(t, f.pool, f.op.ID, index+1)
 	}
-	if got := operationLastSequence(t, f.pool, f.op.ID); got != before+2 {
-		t.Fatalf("committed sequence = %d, want %d", got, before+2)
+	requireOperationSequence(t, f.pool, f.op.ID, before+2)
+}
+
+func requireCaptureClaims(t *testing.T, pool *pgxpool.Pool, id contract.OperationID, want int) {
+	t.Helper()
+	if events := readCandidateCaptureEvents(t, pool, id); events.claims != want {
+		t.Fatalf("capture claims = %d, want %d", events.claims, want)
+	}
+}
+
+func requireOperationSequence(t *testing.T, pool *pgxpool.Pool, id contract.OperationID, want int64) {
+	t.Helper()
+	if got := operationLastSequence(t, pool, id); got != want {
+		t.Fatalf("operation sequence = %d, want %d", got, want)
 	}
 }
 

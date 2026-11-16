@@ -39,7 +39,21 @@ func (s *Service) repairServingWorkloads(ctx context.Context) error {
 	if err != nil {
 		return unavailable(err)
 	}
-	var workloads []servingWorkload
+	workloads, err := servingWorkloads(rows)
+	if err != nil {
+		return err
+	}
+	var failures []error
+	for _, workload := range workloads {
+		if err := s.repairServingWorkload(ctx, workload); err != nil {
+			failures = append(failures, err)
+		}
+	}
+	return errors.Join(failures...)
+}
+
+func servingWorkloads(rows []entities.RepairTarget) ([]servingWorkload, error) {
+	workloads := make([]servingWorkload, 0, len(rows))
 	for _, row := range rows {
 		workload := servingWorkload{
 			App: row.App, Environment: row.Environment,
@@ -47,57 +61,69 @@ func (s *Service) repairServingWorkloads(ctx context.Context) error {
 		}
 		if len(row.Instances) > 0 {
 			if err := json.Unmarshal(row.Instances, &workload.Instances); err != nil {
-				return unavailable(err)
+				return nil, unavailable(err)
 			}
 		}
 		workloads = append(workloads, workload)
 	}
-	var failures []error
-	for _, workload := range workloads {
-		if len(workload.Instances) == 0 {
-			continue
-		}
-		active, err := s.environmentHasActiveOperation(ctx, s.entities.Operations(), workload.App, workload.Environment, "")
-		if err != nil {
-			failures = append(failures, err)
-			continue
-		}
-		if active {
-			continue
-		}
-		observed, err := s.observeNodeWorkloads(ctx, workload.Node, workload.App, workload.Environment)
-		if err != nil {
-			// An unreachable node is not evidence that a container is missing.
-			failures = append(failures, fmt.Errorf("observe %s/%s on %s: %w", workload.App, workload.Environment, workload.Node, err))
-			continue
-		}
-		missing := missingServingInstances(workload, observed.Containers)
-		if len(missing) == 0 {
-			continue
-		}
-		input, _ := json.Marshal(platform.RestartInput{
-			App: workload.App, Environment: workload.Environment,
-			ExpectedServingDeploymentID: workload.Deployment,
-		})
-		_, err = s.Submit(ctx, operations.Submission{
-			Kind:           platform.KindRestart,
-			Target:         "env/" + workload.App + "/" + workload.Environment,
-			Actor:          maintenanceActor,
-			IdempotencyKey: repairIdempotencyKey(workload.Deployment, missing),
-			Input:          input,
-		})
-		if err != nil {
-			// A deploy accepted between observation and submission, a serving
-			// deployment change, or an active delete refuses the repair. The
-			// next maintenance run re-observes instead.
-			switch contract.Classify(err).Code {
-			case contract.Conflict, contract.PreconditionFailed:
-				continue
-			}
-			failures = append(failures, fmt.Errorf("queue repair for %s/%s: %w", workload.App, workload.Environment, err))
-		}
+	return workloads, nil
+}
+
+func (s *Service) repairServingWorkload(ctx context.Context, workload servingWorkload) error {
+	if len(workload.Instances) == 0 {
+		return nil
 	}
-	return errors.Join(failures...)
+	active, err := s.environmentHasActiveOperation(ctx, s.entities.Operations(), workload.App, workload.Environment, "")
+	if err != nil {
+		return err
+	}
+	if active {
+		return nil
+	}
+	observed, err := s.observeNodeWorkloads(ctx, workload.Node, workload.App, workload.Environment)
+	if err != nil {
+		// An unreachable node is not evidence that a container is missing.
+		return fmt.Errorf("observe %s/%s on %s: %w", workload.App, workload.Environment, workload.Node, err)
+	}
+	missing := missingServingInstances(workload, observed.Containers)
+	if len(missing) == 0 {
+		return nil
+	}
+	input, _ := json.Marshal(platform.RestartInput{
+		App: workload.App, Environment: workload.Environment,
+		ExpectedServingDeploymentID: workload.Deployment,
+	})
+	_, err = s.Submit(ctx, operations.Submission{
+		Kind:           platform.KindRestart,
+		Target:         "env/" + workload.App + "/" + workload.Environment,
+		Actor:          maintenanceActor,
+		IdempotencyKey: repairIdempotencyKey(workload.Deployment, missing),
+		Input:          input,
+	})
+	if err == nil {
+		return nil
+	}
+	// A deploy accepted between observation and submission, a serving
+	// deployment change, or an active delete refuses the repair. The next
+	// maintenance run re-observes instead.
+	if repairSubmissionIgnored(err) {
+		return nil
+	}
+	return fmt.Errorf("queue repair for %s/%s: %w", workload.App, workload.Environment, err)
+}
+
+func repairSubmissionIgnored(err error) bool {
+	switch contract.Classify(err).Code {
+	case contract.Conflict, contract.PreconditionFailed:
+		return true
+	case contract.Usage, contract.InvalidOutputMode, contract.InputRequired, contract.ValidationFailed,
+		contract.MissingTool, contract.NotFound, contract.Unauthenticated, contract.Forbidden,
+		contract.DoctorFailed, contract.ConfirmationRequired, contract.NodeVersionMismatch,
+		contract.RemoteUnreachable, contract.Unavailable, contract.Cancelled, contract.Internal:
+		return false
+	default:
+		return false
+	}
 }
 
 type activeOperation struct {

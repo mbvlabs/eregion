@@ -105,7 +105,7 @@ func (s *nodeConfigStep) authorizedKeys() ([]byte, bool, error) {
 	if !s.managesNodeKeys() || s.cfg.NodeAuthorizedKeysFile == "" {
 		return nil, false, nil
 	}
-	raw, err := os.ReadFile(s.cfg.NodeAuthorizedKeysFile) //nolint:gosec // G304: operator-provided public key file.
+	raw, err := os.ReadFile(s.cfg.NodeAuthorizedKeysFile)
 	if err != nil {
 		return nil, true, err
 	}

@@ -15,7 +15,7 @@ func IsolatedDockerEnvironment() ([]string, func(), error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("create isolated Docker configuration: %w", err)
 	}
-	if err := os.Chmod(dir, 0o700); err != nil {
+	if err := os.Chmod(dir, 0o700); err != nil { //nolint:gosec // G302: this is a private directory that the build user must traverse.
 		_ = os.RemoveAll(dir)
 		return nil, nil, fmt.Errorf("protect isolated Docker configuration: %w", err)
 	}

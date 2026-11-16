@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -142,7 +143,7 @@ func ReadWireGuardKey(path string) (WireGuardKey, error) {
 	if info.Mode().Perm()&0o077 != 0 {
 		return WireGuardKey{}, fmt.Errorf("the WireGuard private key %s must not be accessible by group or others", path)
 	}
-	raw, err := os.ReadFile(path) //nolint:gosec // G304: the operator's own key file.
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		return WireGuardKey{}, fmt.Errorf("read the WireGuard private key: %w", err)
 	}
@@ -277,42 +278,74 @@ type bringUp struct {
 
 // NewWireGuardDialer validates the configuration. It does not touch the
 // network: the tunnel comes up on the first dial.
-func NewWireGuardDialer(config WireGuardConfig) (*WireGuardDialer, error) {
+func NewWireGuardDialer(ctx context.Context, config WireGuardConfig) (*WireGuardDialer, error) {
+	if err := validateWireGuardConfig(config); err != nil {
+		return nil, err
+	}
+	if err := normalizeWireGuardConfig(&config); err != nil {
+		return nil, err
+	}
+	dialer := &WireGuardDialer{config: config}
+	if config.LockDir != "" {
+		release, err := lockKey(ctx, config.LockDir, config.PrivateKey.PublicKey())
+		if err != nil {
+			return nil, err
+		}
+		dialer.release = release
+	}
+	return dialer, nil
+}
+
+func validateWireGuardConfig(config WireGuardConfig) error {
 	if config.PrivateKey.IsZero() {
-		return nil, errors.New("the WireGuard private key is required")
+		return errors.New("the WireGuard private key is required")
 	}
 	if config.PeerPublicKey.IsZero() {
-		return nil, errors.New("the node's WireGuard public key is required")
+		return errors.New("the node's WireGuard public key is required")
 	}
 	if config.PeerPublicKey == config.PrivateKey.PublicKey() {
-		return nil, errors.New("the node's WireGuard public key is the control plane's own key")
+		return errors.New("the node's WireGuard public key is the control plane's own key")
 	}
 	if !config.Address.IsValid() {
-		return nil, errors.New("the control plane's WireGuard address is required")
+		return errors.New("the control plane's WireGuard address is required")
 	}
 	if !config.NodeAddress.IsValid() {
-		return nil, errors.New("the node's WireGuard address is required")
+		return errors.New("the node's WireGuard address is required")
 	}
+	return nil
+}
+
+func validateWireGuardEndpoint(endpoint string) error {
+	_, port, err := net.SplitHostPort(endpoint)
+	if err != nil || port == "" {
+		return fmt.Errorf("the WireGuard endpoint %q must be host:port", endpoint)
+	}
+	value, err := strconv.Atoi(port)
+	if err != nil || value < 1 || value > 65535 {
+		return fmt.Errorf("the WireGuard endpoint %q has an invalid port", endpoint)
+	}
+	return nil
+}
+
+func normalizeWireGuardConfig(config *WireGuardConfig) error {
 	config.Address, config.NodeAddress = config.Address.Unmap(), config.NodeAddress.Unmap()
 	if config.Address == config.NodeAddress {
-		return nil, errors.New("the control plane and the node cannot share a WireGuard address")
+		return errors.New("the control plane and the node cannot share a WireGuard address")
 	}
-	if _, port, err := net.SplitHostPort(config.Endpoint); err != nil || port == "" {
-		return nil, fmt.Errorf("the WireGuard endpoint %q must be host:port", config.Endpoint)
-	} else if value, err := strconv.Atoi(port); err != nil || value < 1 || value > 65535 {
-		return nil, fmt.Errorf("the WireGuard endpoint %q has an invalid port", config.Endpoint)
+	if err := validateWireGuardEndpoint(config.Endpoint); err != nil {
+		return err
 	}
 	if len(config.AllowedIPs) == 0 {
 		config.AllowedIPs = []netip.Prefix{netip.PrefixFrom(config.NodeAddress, config.NodeAddress.BitLen())}
 	}
 	if err := validateAllowedIPs(config.AllowedIPs, config.NodeAddress); err != nil {
-		return nil, err
+		return err
 	}
 	if config.Keepalive <= 0 {
 		config.Keepalive = DefaultKeepalive
 	}
 	if config.Keepalive < time.Second || config.Keepalive > time.Hour {
-		return nil, fmt.Errorf("the WireGuard keepalive %s must be between 1s and 1h", config.Keepalive)
+		return fmt.Errorf("the WireGuard keepalive %s must be between 1s and 1h", config.Keepalive)
 	}
 	if config.HandshakeTimeout <= 0 {
 		config.HandshakeTimeout = DefaultHandshakeTimeout
@@ -324,25 +357,17 @@ func NewWireGuardDialer(config WireGuardConfig) (*WireGuardDialer, error) {
 		config.LossAfter = DefaultLossAfter
 	}
 	if config.LossAfter < 2*config.ProbeInterval {
-		return nil, fmt.Errorf("the WireGuard loss threshold %s must be at least two probe intervals (%s)", config.LossAfter, 2*config.ProbeInterval)
+		return fmt.Errorf("the WireGuard loss threshold %s must be at least two probe intervals (%s)", config.LossAfter, 2*config.ProbeInterval)
 	}
-	dialer := &WireGuardDialer{config: config}
-	if config.LockDir != "" {
-		release, err := lockKey(config.LockDir, config.PrivateKey.PublicKey())
-		if err != nil {
-			return nil, err
-		}
-		dialer.release = release
-	}
-	return dialer, nil
+	return nil
 }
 
 // lockKey takes the host-local lock for one WireGuard key. The lock file is
 // named after a hash of the public key, never the private one.
-func lockKey(directory string, public WireGuardPublicKey) (engine.Release, error) {
+func lockKey(ctx context.Context, directory string, public WireGuardPublicKey) (engine.Release, error) {
 	sum := sha256.Sum256(public[:])
 	path := filepath.Join(directory, "eregion-wg-"+hex.EncodeToString(sum[:8])+".lock")
-	release, err := engine.Acquire(context.Background(), path, engine.LockExclusive, 0)
+	release, err := engine.Acquire(ctx, path, engine.LockExclusive, 0)
 	if errors.Is(err, engine.ErrLockHeld) {
 		return nil, fmt.Errorf("%w (%s, lock %s); give each control-plane process its own WireGuard key and tunnel address", ErrKeyInUse, public, path)
 	}
@@ -483,15 +508,10 @@ func (d *WireGuardDialer) up(ctx context.Context) (*tunnel, error) {
 		}
 		if pending := d.pending; pending != nil {
 			d.mu.Unlock()
-			select {
-			case <-pending.done:
-				if pending.err != nil {
-					return nil, pending.err
-				}
-				continue
-			case <-ctx.Done():
-				return nil, d.downError(ctx.Err())
+			if err := d.waitPending(ctx, pending); err != nil {
+				return nil, err
 			}
+			continue
 		}
 		pending := &bringUp{done: make(chan struct{})}
 		d.pending = pending
@@ -515,6 +535,15 @@ func (d *WireGuardDialer) up(ctx context.Context) (*tunnel, error) {
 			return nil, err
 		}
 		return current, nil
+	}
+}
+
+func (d *WireGuardDialer) waitPending(ctx context.Context, pending *bringUp) error {
+	select {
+	case <-pending.done:
+		return pending.err
+	case <-ctx.Done():
+		return d.downError(ctx.Err())
 	}
 }
 
@@ -698,7 +727,10 @@ func (t *tunnel) probe() {
 	if t.node.Is6() {
 		kind = 128 // ICMPv6 echo request
 	}
-	message := []byte{kind, 0, 0, 0, 0, 0, byte(seq >> 8), byte(seq), 'e', 'r', 'e', 'g', 'i', 'o', 'n', 0}
+	message := make([]byte, 16)
+	message[0] = kind
+	binary.BigEndian.PutUint16(message[6:8], seq)
+	copy(message[8:], "eregion")
 	_ = t.ping.SetWriteDeadline(time.Now().Add(time.Second))
 	_, _ = t.ping.Write(message)
 }

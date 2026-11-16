@@ -88,6 +88,8 @@ func releaseCommandRecoveryOutcome(record StepRecord, hasRecord bool, status eng
 		return releaseCommandRecoverySucceeded
 	case engine.StatusFailed:
 		return releaseCommandRecoveryFailed
+	case engine.StatusAbsent, engine.StatusRunning, engine.StatusDeferred, engine.StatusStale:
+		return releaseCommandRecoveryDeferred
 	default:
 		return releaseCommandRecoveryDeferred
 	}
@@ -252,43 +254,55 @@ func (w *platformWorker) recoverReleaseCommandRun(ctx context.Context, releaseID
 	if err != nil {
 		return 0, err
 	}
-	outcome := releaseCommandRecoveryOutcome(record, has, "", "")
-	if outcome == releaseCommandRecoveryDeferred {
-		if !has || record.ExecutionID == "" || record.InputsHash == "" {
-			return 0, contract.NewFault(contract.PreconditionFailed,
-				"the original release command has no recoverable execution identity",
-				"Inspect the original deployment and node journal; do not rerun the release command blindly.")
-		}
-		if w.service.resolver == nil {
-			return 0, contract.NewFault(contract.Unavailable,
-				"the worker cannot reach the original release command node",
-				"Run recovery in a worker configured with node transports; the release command stays owned by the original operation.")
-		}
-		tr, err := w.service.resolver.TransportFor(ctx, nodeName)
-		if err != nil {
-			return 0, releaseCommandRecoveryDeferredFault(nodeName, err)
-		}
-		execution := engine.Execution{
-			OperationID: run.OperationID, Attempt: record.Attempt,
-			Step: deploymentCommandStep, RequestID: newRequestID(),
-		}
-		response, err := tr.Call(ctx, node.Request{
-			Method: node.MethodStatus, RequestID: execution.RequestID, Execution: execution,
-		}, nil)
-		if err != nil {
-			return 0, releaseCommandRecoveryDeferredFault(nodeName, err)
-		}
-		// A failed retryable task is not evidence that the command did not run.
-		// In particular, the node can disappear after removing the command
-		// container but before recording the effect. Keep the original owner.
-		if response.Status == engine.StatusFailed && response.Retryable {
-			outcome = releaseCommandRecoveryDeferred
-		} else if !releaseCommandObservedIdentity(run.OperationID, record, response) {
-			outcome = releaseCommandRecoveryDeferred
-		} else {
-			outcome = releaseCommandRecoveryOutcome(record, has, response.Status, response.InputsHash)
-		}
+	outcome, err := w.observeReleaseCommandRecovery(ctx, run, nodeName, record, has)
+	if err != nil {
+		return 0, err
 	}
+	return w.finishReleaseCommandRecovery(ctx, releaseID, digest, run, outcome)
+}
+
+func (w *platformWorker) observeReleaseCommandRecovery(ctx context.Context, run releaseCommandRun, nodeName string, record StepRecord, has bool) (releaseCommandRecovery, error) {
+	outcome := releaseCommandRecoveryOutcome(record, has, "", "")
+	if outcome != releaseCommandRecoveryDeferred {
+		return outcome, nil
+	}
+	if !has || record.ExecutionID == "" || record.InputsHash == "" {
+		return 0, contract.NewFault(contract.PreconditionFailed,
+			"the original release command has no recoverable execution identity",
+			"Inspect the original deployment and node journal; do not rerun the release command blindly.")
+	}
+	if w.service.resolver == nil {
+		return 0, contract.NewFault(contract.Unavailable,
+			"the worker cannot reach the original release command node",
+			"Run recovery in a worker configured with node transports; the release command stays owned by the original operation.")
+	}
+	tr, err := w.service.resolver.TransportFor(ctx, nodeName)
+	if err != nil {
+		return 0, releaseCommandRecoveryDeferredFault(nodeName, err)
+	}
+	execution := engine.Execution{
+		OperationID: run.OperationID, Attempt: record.Attempt,
+		Step: deploymentCommandStep, RequestID: newRequestID(),
+	}
+	response, err := tr.Call(ctx, node.Request{
+		Method: node.MethodStatus, RequestID: execution.RequestID, Execution: execution,
+	}, nil)
+	if err != nil {
+		return 0, releaseCommandRecoveryDeferredFault(nodeName, err)
+	}
+	// A failed retryable task is not evidence that the command did not run.
+	// In particular, the node can disappear after removing the command
+	// container but before recording the effect. Keep the original owner.
+	if response.Status == engine.StatusFailed && response.Retryable {
+		return releaseCommandRecoveryDeferred, nil
+	}
+	if !releaseCommandObservedIdentity(run.OperationID, record, response) {
+		return releaseCommandRecoveryDeferred, nil
+	}
+	return releaseCommandRecoveryOutcome(record, has, response.Status, response.InputsHash), nil
+}
+
+func (w *platformWorker) finishReleaseCommandRecovery(ctx context.Context, releaseID platform.ReleaseID, digest string, run releaseCommandRun, outcome releaseCommandRecovery) (releaseCommandDecision, error) {
 	switch outcome {
 	case releaseCommandRecoverySucceeded:
 		updated, err := w.service.finishRecoveredReleaseCommandRun(ctx, releaseID, digest, run.OperationID, "succeeded", "", "")
@@ -313,6 +327,8 @@ func (w *platformWorker) recoverReleaseCommandRun(ctx context.Context, releaseID
 			return 0, releaseCommandRecoveryChangedFault()
 		}
 		return releaseCommandRunNow, nil
+	case releaseCommandRecoveryDeferred:
+		fallthrough
 	default:
 		return 0, contract.NewFault(contract.Unavailable,
 			"the original release command outcome is still unknown",

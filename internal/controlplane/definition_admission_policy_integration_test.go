@@ -62,7 +62,7 @@ func TestIntegrationDefinitionApplyConcurrentPolicyChange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer guard.Rollback(context.Background())
+	defer func() { _ = guard.Rollback(context.Background()) }()
 	if _, err := guard.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, definitionPolicyLock); err != nil {
 		t.Fatal(err)
 	}

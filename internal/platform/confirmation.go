@@ -48,6 +48,8 @@ func ConfirmationToken(target Target) (string, error) {
 		return target.Node, nil
 	case TargetResource:
 		return target.App + "/" + target.Environment + "/" + target.Resource, nil
+	case TargetPlatform, TargetBuild:
+		return "", contract.NewFault(contract.ValidationFailed, "this target does not take a target confirmation", "Use app/<app>, env/<app>/<env>, node/<server>, or resource/<app>/<env>/<name>.")
 	default:
 		return "", contract.NewFault(contract.ValidationFailed, "this target does not take a target confirmation", "Use app/<app>, env/<app>/<env>, node/<server>, or resource/<app>/<env>/<name>.")
 	}

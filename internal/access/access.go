@@ -8,6 +8,7 @@
 package access
 
 import (
+	"context"
 	"embed"
 	"fmt"
 	"io"
@@ -155,7 +156,7 @@ func Relock(stdout, stderr io.Writer) error {
 }
 
 func run(name string, env map[string]string, stdout, stderr io.Writer) error {
-	cmd := exec.Command("/bin/bash", "-s") //nolint:gosec // G204: an embedded script.
+	cmd := exec.CommandContext(context.Background(), "/bin/bash", "-s")
 	cmd.Stdin = strings.NewReader(Program(name, env))
 	cmd.Stdout, cmd.Stderr = stdout, stderr
 	cmd.Env = append(os.Environ(), "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")

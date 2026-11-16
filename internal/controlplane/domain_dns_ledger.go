@@ -319,26 +319,10 @@ func (s *Service) applyDomainDNSLedger(ctx context.Context, op contract.Operatio
 		Ownership: ledger.Ownership, Host: ledger.Domain, Addresses: ledger.DesiredOrigins,
 		Proxied: ledger.DesiredProxied,
 	}
-	step, err := s.definitionDNSChild(ctx, op.ID)
-	if err != nil {
-		return err
-	}
 	guard := func(mutationCtx context.Context) error {
 		return s.checkDomainDNSBoundary(mutationCtx, op.ID, attempt)
 	}
-	var applied, unchanged int
-	var store *definitionDNSProgressStore
-	if step != nil {
-		if step.Plan == nil {
-			return definitionDNSConflict()
-		}
-		store = newDefinitionDNSProgressStore(s, op, attempt, ledger, step)
-		applied, err = s.domainDNS.ExecuteApprovedDefinitionDNS(ctx, op.Actor, op.ID, request, *step.Plan, store)
-	} else {
-		var plan integrations.DomainDNSPlan
-		plan, err = s.domainDNS.ApplyWithGuard(ctx, op.Actor, op.ID, request, guard)
-		applied, unchanged = plan.Applied, plan.Unchanged
-	}
+	applied, unchanged, store, err := s.executeDomainDNSLedgerEffect(ctx, op, attempt, ledger, request, guard)
 	if err != nil {
 		if !dnsBoundaryStop(err) {
 			if recordErr := s.recordDomainDNSFailure(ctx, op, attempt, ledger, err); recordErr != nil {
@@ -378,6 +362,29 @@ func (s *Service) applyDomainDNSLedger(ctx context.Context, op contract.Operatio
 	}
 	s.appendWorkerEvent(ctx, op.ID, attempt, "dns", "Managed DNS applied generation "+fmt.Sprint(ledger.Generation)+" for "+ledger.Domain+" ("+fmt.Sprint(applied)+" changed, "+fmt.Sprint(unchanged)+" unchanged); provider state is separate from public readiness.")
 	return nil
+}
+
+func (s *Service) executeDomainDNSLedgerEffect(ctx context.Context, op contract.Operation, attempt uint32, ledger domainDNSLedger, request integrations.DomainDNSRequest, guard func(context.Context) error) (int, int, *definitionDNSProgressStore, error) {
+	step, err := s.definitionDNSChild(ctx, op.ID)
+	if err != nil {
+		return 0, 0, nil, err
+	}
+	if step == nil {
+		plan, err := s.domainDNS.ApplyWithGuard(ctx, op.Actor, op.ID, request, guard)
+		if err != nil {
+			return 0, 0, nil, err
+		}
+		return plan.Applied, plan.Unchanged, nil, nil
+	}
+	if step.Plan == nil {
+		return 0, 0, nil, definitionDNSConflict()
+	}
+	store := newDefinitionDNSProgressStore(s, op, attempt, ledger, step)
+	applied, err := s.domainDNS.ExecuteApprovedDefinitionDNS(ctx, op.Actor, op.ID, request, *step.Plan, store)
+	if err != nil {
+		return 0, 0, store, err
+	}
+	return applied, 0, store, nil
 }
 
 // preflightDomainDNSLedger performs every read-only check and ownership plan
@@ -449,18 +456,7 @@ func (s *Service) cleanupDomainDNSLedger(ctx context.Context, op contract.Operat
 	}
 	zone := integrations.DNSZone{ZoneID: ledger.ZoneID, ZoneName: ledger.ZoneName}
 	if err := integrations.ValidateDomainDNSHost(zone, ledger.Domain); err != nil {
-		if step != nil {
-			return definitionDNSConflict()
-		}
-		// A pending/failed intent that never applied cannot own a provider
-		// record in this zone. Record verification without touching Cloudflare.
-		if marked, markErr := s.markDomainDNSCleanupVerified(ctx, ledger, op.ID); markErr != nil {
-			return markErr
-		} else if !marked {
-			return contract.NewFault(contract.Conflict, "managed DNS cleanup ledger changed before recovery was recorded", "A newer operation owns the binding; retry the current intent.")
-		}
-		s.appendWorkerEvent(ctx, op.ID, attempt, "dns", "Discarded invalid pending managed-DNS intent for "+ledger.Domain+" without provider access; the zone does not contain the hostname.")
-		return nil
+		return s.cleanupInvalidDomainDNSIntent(ctx, op, attempt, ledger, step)
 	}
 	request := integrations.DomainDNSRequest{
 		ZoneID: ledger.ZoneID, ZoneName: ledger.ZoneName, DomainID: string(ledger.DomainID),
@@ -476,31 +472,8 @@ func (s *Service) cleanupDomainDNSLedger(ctx context.Context, op contract.Operat
 		return nil
 	}
 	if step != nil {
-		if err := guard(ctx); err != nil {
+		if err := s.fenceDefinitionDNSCleanup(ctx, op, attempt, ledger, step, guard); err != nil {
 			return err
-		}
-		if len(step.Cleanup.Changes) > 0 {
-			// Persist a conservative in-flight fence before any DELETE. A
-			// restarted attempt must read back, never redispatch the cleanup.
-			_, owned, err := s.mutateOwned(ctx, op.ID, attempt, func(tx *entities.StoreTx, current *contract.Operation) error {
-				if current.State != contract.Running {
-					return errPlatformCancelled
-				}
-				rows, err := tx.Platform().DomainDNS().SetCleanupError(ctx, ledger.DomainID, op.ID, ledger.Generation, definitionCleanupUnknown)
-				if err != nil {
-					return unavailable(err)
-				}
-				if rows != 1 {
-					return definitionDNSConflict()
-				}
-				return nil
-			})
-			if err != nil {
-				return err
-			}
-			if !owned {
-				return errNotOwned
-			}
 		}
 	}
 	plan, err := s.domainDNS.RemoveWithGuard(ctx, op.Actor, op.ID, request, guard)
@@ -510,6 +483,58 @@ func (s *Service) cleanupDomainDNSLedger(ctx context.Context, op contract.Operat
 		}
 		return err
 	}
+	return s.finishDomainDNSCleanup(ctx, op, attempt, ledger, step, plan, guard)
+}
+
+func (s *Service) cleanupInvalidDomainDNSIntent(ctx context.Context, op contract.Operation, attempt uint32, ledger domainDNSLedger, step *definitionDNSChild) error {
+	if step != nil {
+		return definitionDNSConflict()
+	}
+	// A pending/failed intent that never applied cannot own a provider record
+	// in this zone. Record verification without touching Cloudflare.
+	marked, err := s.markDomainDNSCleanupVerified(ctx, ledger, op.ID)
+	if err != nil {
+		return err
+	}
+	if !marked {
+		return contract.NewFault(contract.Conflict, "managed DNS cleanup ledger changed before recovery was recorded", "A newer operation owns the binding; retry the current intent.")
+	}
+	s.appendWorkerEvent(ctx, op.ID, attempt, "dns", "Discarded invalid pending managed-DNS intent for "+ledger.Domain+" without provider access; the zone does not contain the hostname.")
+	return nil
+}
+
+func (s *Service) fenceDefinitionDNSCleanup(ctx context.Context, op contract.Operation, attempt uint32, ledger domainDNSLedger, step *definitionDNSChild, guard func(context.Context) error) error {
+	if err := guard(ctx); err != nil {
+		return err
+	}
+	if len(step.Cleanup.Changes) == 0 {
+		return nil
+	}
+	// Persist a conservative in-flight fence before any DELETE. A restarted
+	// attempt must read back, never redispatch the cleanup.
+	_, owned, err := s.mutateOwned(ctx, op.ID, attempt, func(tx *entities.StoreTx, current *contract.Operation) error {
+		if current.State != contract.Running {
+			return errPlatformCancelled
+		}
+		rows, err := tx.Platform().DomainDNS().SetCleanupError(ctx, ledger.DomainID, op.ID, ledger.Generation, definitionCleanupUnknown)
+		if err != nil {
+			return unavailable(err)
+		}
+		if rows != 1 {
+			return definitionDNSConflict()
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if !owned {
+		return errNotOwned
+	}
+	return nil
+}
+
+func (s *Service) finishDomainDNSCleanup(ctx context.Context, op contract.Operation, attempt uint32, ledger domainDNSLedger, step *definitionDNSChild, plan integrations.DomainDNSPlan, guard func(context.Context) error) error {
 	if err := s.checkDomainDNSBoundary(ctx, op.ID, attempt); err != nil {
 		return err
 	}
@@ -518,9 +543,11 @@ func (s *Service) cleanupDomainDNSLedger(ctx context.Context, op contract.Operat
 			return err
 		}
 	}
-	if marked, err := s.markDomainDNSCleanupVerified(ctx, ledger, op.ID); err != nil {
+	marked, err := s.markDomainDNSCleanupVerified(ctx, ledger, op.ID)
+	if err != nil {
 		return err
-	} else if !marked {
+	}
+	if !marked {
 		return contract.NewFault(contract.Conflict, "managed DNS cleanup ledger changed before verification was recorded", "A newer operation owns the binding; reconcile the current intent before deleting it.")
 	}
 	s.appendWorkerEvent(ctx, op.ID, attempt, "dns", "Verified Cloudflare cleanup for "+ledger.Domain+" ("+fmt.Sprint(plan.Applied)+" records removed, "+fmt.Sprint(plan.Unchanged)+" already absent); unrelated records were preserved.")

@@ -157,87 +157,105 @@ func TestIntegrationEntitiesDomainPrerequisitesOperationTxProjections(t *testing
 	store := newTestEntities(t, prerequisitePool(t))
 	ctx := context.Background()
 	op := prerequisiteOperation(t, store, "diagnostic.test", "control-plane", "tx-projections", json.RawMessage(`{"steps":1}`))
-	through := uint64(0)
 	if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
-		current, found, err := tx.Operations().Lock(ctx, op)
-		if err != nil || !found {
-			t.Fatalf("operation lock found=%v err=%v", found, err)
-		}
-		if err := tx.Operations().SetAttempt(ctx, op, 1); err != nil {
+		through, err := appendProjectionEvents(t, ctx, tx, op)
+		if err != nil {
 			return err
 		}
-		current.Attempt = 1
-		append := func(event contract.Event) error {
-			return tx.Operations().AppendEvent(ctx, &current, event)
-		}
-		if err := append(contract.Event{Kind: "log", Stage: "projection", Message: "older projection message"}); err != nil {
-			return err
-		}
-		if err := append(contract.Event{Kind: "warning", Stage: "projection", Message: "newest projection message"}); err != nil {
-			return err
-		}
-		if err := append(contract.Event{Kind: "step", Stage: "projection-result", Result: &contract.ActionResult{
-			OperationID: op, Action: "diagnostic.test", Target: "control-plane", Attempt: 1,
-			Status: contract.Failed, Final: true, History: contract.Cursor{OperationID: op},
-		}}); err != nil {
-			return err
-		}
-		if err := append(contract.Event{Kind: "step", Stage: "action-output", ActionOutputStatus: "available", ActionOutput: json.RawMessage(`{"ok":true}`)}); err != nil {
-			return err
-		}
-		if err := append(contract.Event{Kind: "step", Stage: "deploy-step", Step: "deploy-step", NodeEvidence: &contract.NodeExecutionEvidence{
-			ExecutionID: "exec-failed-prerequisite", Attempt: 1, Outcome: "failed", Stage: "deploy-step", OutputAvailability: "partial",
-		}}); err != nil {
-			return err
-		}
-		if err := append(contract.Event{Kind: "warning", Stage: "evidence", Message: "Node execution evidence could not be retained.", EvidenceLoss: &contract.NodeEvidenceLoss{
-			ExecutionID: "exec-lost-prerequisite", Attempt: 1,
-		}}); err != nil {
-			return err
-		}
-		through = current.LastSequence
-
-		started, found, err := tx.Operations().AttemptStartedAt(ctx, op, 1)
-		if err != nil || !found || started.IsZero() {
-			t.Fatalf("tx attempt started=%v found=%v err=%v", started, found, err)
-		}
-		sequence, found, err := tx.Operations().LastSequence(ctx, op)
-		if err != nil || !found || sequence != through {
-			t.Fatalf("tx last sequence=%d found=%v err=%v, want %d", sequence, found, err, through)
-		}
-		exists, err := tx.Operations().ResultExists(ctx, op, 1, contract.Failed, true)
-		if err != nil || !exists {
-			t.Fatalf("tx result exists=%v err=%v", exists, err)
-		}
-		if exists, err := tx.Operations().ResultExists(ctx, op, 1, contract.Succeeded, true); err != nil || exists {
-			t.Fatalf("tx mismatched result exists=%v err=%v", exists, err)
-		}
-		output, status, found, err := tx.Operations().LatestActionOutput(ctx, op)
-		if err != nil || !found || status != "available" || !json.Valid(output) {
-			t.Fatalf("tx action output=%q status=%q found=%v err=%v", output, status, found, err)
-		}
-		if exists, err := tx.Operations().ActionOutputExists(ctx, op); err != nil || !exists {
-			t.Fatalf("tx action output exists=%v err=%v", exists, err)
-		}
-		evidenceSequence, rawEvidence, found, err := tx.Operations().FailedNodeEvidence(ctx, op, through, 1, "deploy-step")
-		if err != nil || !found || evidenceSequence == 0 || !strings.Contains(string(rawEvidence), "exec-failed-prerequisite") {
-			t.Fatalf("tx failed node evidence sequence=%d raw=%s found=%v err=%v", evidenceSequence, rawEvidence, found, err)
-		}
-		if exists, err := tx.Operations().NodeEvidenceExists(ctx, op, "exec-failed-prerequisite", "failed"); err != nil || !exists {
-			t.Fatalf("tx node evidence exists=%v err=%v", exists, err)
-		}
-		if lost, err := tx.Operations().EvidenceLost(ctx, op, through, 1); err != nil || !lost {
-			t.Fatalf("tx evidence lost=%v err=%v", lost, err)
-		}
-		if message, err := tx.Operations().LatestEventMessageForStage(ctx, op, "projection"); err != nil || message != "newest projection message" {
-			t.Fatalf("tx latest message=%q err=%v", message, err)
-		}
-		if exists, err := tx.Operations().EventStageExists(ctx, op, "projection"); err != nil || !exists {
-			t.Fatalf("tx stage exists=%v err=%v", exists, err)
-		}
+		checkProjectionTransactionReads(t, ctx, tx, op, through)
 		return nil
 	}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func appendProjectionEvents(t *testing.T, ctx context.Context, tx *entities.StoreTx, op contract.OperationID) (uint64, error) {
+	t.Helper()
+	current, found, err := tx.Operations().Lock(ctx, op)
+	if err != nil || !found {
+		t.Fatalf("operation lock found=%v err=%v", found, err)
+	}
+	if err := tx.Operations().SetAttempt(ctx, op, 1); err != nil {
+		return 0, err
+	}
+	current.Attempt = 1
+	events := []contract.Event{
+		{Kind: "log", Stage: "projection", Message: "older projection message"},
+		{Kind: "warning", Stage: "projection", Message: "newest projection message"},
+		{Kind: "step", Stage: "projection-result", Result: &contract.ActionResult{
+			OperationID: op, Action: "diagnostic.test", Target: "control-plane", Attempt: 1,
+			Status: contract.Failed, Final: true, History: contract.Cursor{OperationID: op},
+		}},
+		{Kind: "step", Stage: "action-output", ActionOutputStatus: "available", ActionOutput: json.RawMessage(`{"ok":true}`)},
+		{Kind: "step", Stage: "deploy-step", Step: "deploy-step", NodeEvidence: &contract.NodeExecutionEvidence{
+			ExecutionID: "exec-failed-prerequisite", Attempt: 1, Outcome: "failed", Stage: "deploy-step", OutputAvailability: "partial",
+		}},
+		{Kind: "warning", Stage: "evidence", Message: "Node execution evidence could not be retained.", EvidenceLoss: &contract.NodeEvidenceLoss{
+			ExecutionID: "exec-lost-prerequisite", Attempt: 1,
+		}},
+	}
+	for _, event := range events {
+		if err := tx.Operations().AppendEvent(ctx, &current, event); err != nil {
+			return 0, err
+		}
+	}
+	return current.LastSequence, nil
+}
+
+func checkProjectionTransactionReads(t *testing.T, ctx context.Context, tx *entities.StoreTx, op contract.OperationID, through uint64) {
+	t.Helper()
+	checkProjectionOperationReads(t, ctx, tx, op, through)
+	checkProjectionEvidenceReads(t, ctx, tx, op, through)
+	checkProjectionEventReads(t, ctx, tx, op)
+}
+
+func checkProjectionOperationReads(t *testing.T, ctx context.Context, tx *entities.StoreTx, op contract.OperationID, through uint64) {
+	t.Helper()
+	started, found, err := tx.Operations().AttemptStartedAt(ctx, op, 1)
+	if err != nil || !found || started.IsZero() {
+		t.Fatalf("tx attempt started=%v found=%v err=%v", started, found, err)
+	}
+	sequence, found, err := tx.Operations().LastSequence(ctx, op)
+	if err != nil || !found || sequence != through {
+		t.Fatalf("tx last sequence=%d found=%v err=%v, want %d", sequence, found, err, through)
+	}
+	exists, err := tx.Operations().ResultExists(ctx, op, 1, contract.Failed, true)
+	if err != nil || !exists {
+		t.Fatalf("tx result exists=%v err=%v", exists, err)
+	}
+	if exists, err := tx.Operations().ResultExists(ctx, op, 1, contract.Succeeded, true); err != nil || exists {
+		t.Fatalf("tx mismatched result exists=%v err=%v", exists, err)
+	}
+}
+
+func checkProjectionEvidenceReads(t *testing.T, ctx context.Context, tx *entities.StoreTx, op contract.OperationID, through uint64) {
+	t.Helper()
+	output, status, found, err := tx.Operations().LatestActionOutput(ctx, op)
+	if err != nil || !found || status != "available" || !json.Valid(output) {
+		t.Fatalf("tx action output=%q status=%q found=%v err=%v", output, status, found, err)
+	}
+	if exists, err := tx.Operations().ActionOutputExists(ctx, op); err != nil || !exists {
+		t.Fatalf("tx action output exists=%v err=%v", exists, err)
+	}
+	evidenceSequence, rawEvidence, found, err := tx.Operations().FailedNodeEvidence(ctx, op, through, 1, "deploy-step")
+	if err != nil || !found || evidenceSequence == 0 || !strings.Contains(string(rawEvidence), "exec-failed-prerequisite") {
+		t.Fatalf("tx failed node evidence sequence=%d raw=%s found=%v err=%v", evidenceSequence, rawEvidence, found, err)
+	}
+	if exists, err := tx.Operations().NodeEvidenceExists(ctx, op, "exec-failed-prerequisite", "failed"); err != nil || !exists {
+		t.Fatalf("tx node evidence exists=%v err=%v", exists, err)
+	}
+	if lost, err := tx.Operations().EvidenceLost(ctx, op, through, 1); err != nil || !lost {
+		t.Fatalf("tx evidence lost=%v err=%v", lost, err)
+	}
+}
+
+func checkProjectionEventReads(t *testing.T, ctx context.Context, tx *entities.StoreTx, op contract.OperationID) {
+	t.Helper()
+	if message, err := tx.Operations().LatestEventMessageForStage(ctx, op, "projection"); err != nil || message != "newest projection message" {
+		t.Fatalf("tx latest message=%q err=%v", message, err)
+	}
+	if exists, err := tx.Operations().EventStageExists(ctx, op, "projection"); err != nil || !exists {
+		t.Fatalf("tx stage exists=%v err=%v", exists, err)
 	}
 }
 
@@ -246,60 +264,77 @@ func TestIntegrationEntitiesDomainPrerequisitesOperationSavepointProjection(t *t
 	ctx := context.Background()
 	op := prerequisiteOperation(t, store, "diagnostic.test", "control-plane", "tx-savepoint-projections", json.RawMessage(`{"steps":1}`))
 	if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
-		current, found, err := tx.Operations().Lock(ctx, op)
-		if err != nil || !found {
-			t.Fatalf("operation lock found=%v err=%v", found, err)
-		}
-		if err := tx.Operations().AppendEvent(ctx, &current, contract.Event{
-			Kind: "warning", Stage: "outer-step", Message: "Node step failed: outer",
-		}); err != nil {
+		if err := seedSavepointProjection(t, ctx, tx, op); err != nil {
 			return err
 		}
-		if err := tx.Retention().InsertRun(ctx, entities.RetentionRunInsert{
-			ID: "run_projection_outer", OperationID: op, Status: string(retention.RunRunning),
-			PlannedItems: json.RawMessage(`[]`), RemovedItems: json.RawMessage(`[]`), Errors: json.RawMessage(`[]`),
-			StartedAt: time.Now().UTC().Add(-time.Second), GCGeneration: 1,
-		}); err != nil {
+		if err := runNestedProjectionSavepoint(t, ctx, tx, op); err != nil {
 			return err
 		}
-		scopeErr := tx.WithinSavepoint(ctx, func(nested *entities.StoreTx) error {
-			var nestedOp contract.Operation
-			nestedOp, found, err := nested.Operations().Lock(ctx, op)
-			if err != nil || !found {
-				t.Fatalf("nested lock found=%v err=%v", found, err)
-			}
-			if err := nested.Operations().AppendEvent(ctx, &nestedOp, contract.Event{
-				Kind: "warning", Stage: "nested-step", Message: "Node step failed: nested",
-			}); err != nil {
-				return err
-			}
-			if err := nested.Retention().InsertRun(ctx, entities.RetentionRunInsert{
-				ID: "run_projection_nested", OperationID: op, Status: string(retention.RunRunning),
-				PlannedItems: json.RawMessage(`[]`), RemovedItems: json.RawMessage(`[]`), Errors: json.RawMessage(`[]`),
-				StartedAt: time.Now().UTC(), GCGeneration: 1,
-			}); err != nil {
-				return err
-			}
-			if stage, err := nested.Results().FailedStage(ctx, op, 0); err != nil || stage != "outer-step" {
-				t.Fatalf("nested failed stage=%q err=%v", stage, err)
-			}
-			if run, found, err := nested.Retention().LatestRunForOperation(ctx, op); err != nil || !found || run.ID != "run_projection_nested" {
-				t.Fatalf("nested retention run=%+v found=%v err=%v", run, found, err)
-			}
-			return errProjectionRollback
-		})
-		if scopeErr != errProjectionRollback {
-			return scopeErr
-		}
-		if stage, err := tx.Results().FailedStage(ctx, op, 0); err != nil || stage != "outer-step" {
-			t.Fatalf("post-savepoint stage=%q err=%v", stage, err)
-		}
-		if run, found, err := tx.Retention().LatestRunForOperation(ctx, op); err != nil || !found || run.ID != "run_projection_outer" {
-			t.Fatalf("post-savepoint run=%+v found=%v err=%v", run, found, err)
-		}
+		checkSavepointProjectionRollback(t, ctx, tx, op)
 		return nil
 	}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func seedSavepointProjection(t *testing.T, ctx context.Context, tx *entities.StoreTx, op contract.OperationID) error {
+	t.Helper()
+	current, found, err := tx.Operations().Lock(ctx, op)
+	if err != nil || !found {
+		t.Fatalf("operation lock found=%v err=%v", found, err)
+	}
+	if err := tx.Operations().AppendEvent(ctx, &current, contract.Event{
+		Kind: "warning", Stage: "outer-step", Message: "Node step failed: outer",
+	}); err != nil {
+		return err
+	}
+	return tx.Retention().InsertRun(ctx, entities.RetentionRunInsert{
+		ID: "run_projection_outer", OperationID: op, Status: string(retention.RunRunning),
+		PlannedItems: json.RawMessage(`[]`), RemovedItems: json.RawMessage(`[]`), Errors: json.RawMessage(`[]`),
+		StartedAt: time.Now().UTC().Add(-time.Second), GCGeneration: 1,
+	})
+}
+
+func runNestedProjectionSavepoint(t *testing.T, ctx context.Context, tx *entities.StoreTx, op contract.OperationID) error {
+	t.Helper()
+	scopeErr := tx.WithinSavepoint(ctx, func(nested *entities.StoreTx) error {
+		nestedOp, found, err := nested.Operations().Lock(ctx, op)
+		if err != nil || !found {
+			t.Fatalf("nested lock found=%v err=%v", found, err)
+		}
+		if err := nested.Operations().AppendEvent(ctx, &nestedOp, contract.Event{
+			Kind: "warning", Stage: "nested-step", Message: "Node step failed: nested",
+		}); err != nil {
+			return err
+		}
+		if err := nested.Retention().InsertRun(ctx, entities.RetentionRunInsert{
+			ID: "run_projection_nested", OperationID: op, Status: string(retention.RunRunning),
+			PlannedItems: json.RawMessage(`[]`), RemovedItems: json.RawMessage(`[]`), Errors: json.RawMessage(`[]`),
+			StartedAt: time.Now().UTC(), GCGeneration: 1,
+		}); err != nil {
+			return err
+		}
+		if stage, err := nested.Results().FailedStage(ctx, op, 0); err != nil || stage != "outer-step" {
+			t.Fatalf("nested failed stage=%q err=%v", stage, err)
+		}
+		if run, found, err := nested.Retention().LatestRunForOperation(ctx, op); err != nil || !found || run.ID != "run_projection_nested" {
+			t.Fatalf("nested retention run=%+v found=%v err=%v", run, found, err)
+		}
+		return errProjectionRollback
+	})
+	if !errors.Is(scopeErr, errProjectionRollback) {
+		return scopeErr
+	}
+	return nil
+}
+
+func checkSavepointProjectionRollback(t *testing.T, ctx context.Context, tx *entities.StoreTx, op contract.OperationID) {
+	t.Helper()
+	if stage, err := tx.Results().FailedStage(ctx, op, 0); err != nil || stage != "outer-step" {
+		t.Fatalf("post-savepoint stage=%q err=%v", stage, err)
+	}
+	if run, found, err := tx.Retention().LatestRunForOperation(ctx, op); err != nil || !found || run.ID != "run_projection_outer" {
+		t.Fatalf("post-savepoint run=%+v found=%v err=%v", run, found, err)
 	}
 }
 
@@ -324,26 +359,39 @@ func TestIntegrationEntitiesDomainPrerequisitesDefinitionJournal(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.WithinTx(context.Background(), func(tx *entities.StoreTx) error {
-		ready, err := tx.DefinitionSteps().JournalReady(context.Background(), parent, 0, string(envID), stepKind, target, input)
+	checkDefinitionJournal(t, store, parent, child, envID, appName, envName, stepKind, target, input)
+}
+
+func checkDefinitionJournal(
+	t *testing.T,
+	store *entities.Store,
+	parent, child contract.OperationID,
+	envID platform.EnvironmentID,
+	appName, envName, stepKind, target string,
+	input json.RawMessage,
+) {
+	t.Helper()
+	ctx := context.Background()
+	if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		ready, err := tx.DefinitionSteps().JournalReady(ctx, parent, 0, string(envID), stepKind, target, input)
 		if err != nil || !ready {
 			t.Fatalf("journal ready before link=%v err=%v", ready, err)
 		}
-		if linked, err := tx.DefinitionSteps().SetChild(context.Background(), parent, 0, child); err != nil || !linked {
+		if linked, err := tx.DefinitionSteps().SetChild(ctx, parent, 0, child); err != nil || !linked {
 			t.Fatalf("set child=%v err=%v", linked, err)
 		}
-		ready, err = tx.DefinitionSteps().JournalReady(context.Background(), parent, 0, string(envID), stepKind, target, input)
+		ready, err = tx.DefinitionSteps().JournalReady(ctx, parent, 0, string(envID), stepKind, target, input)
 		if err != nil || ready {
 			t.Fatalf("journal ready after link=%v err=%v", ready, err)
 		}
-		linked, found, err := tx.DefinitionSteps().LinkedChild(context.Background(), child, stepKind, target, json.RawMessage(`{"b":2,"a":1}`), testActor)
+		linked, found, err := tx.DefinitionSteps().LinkedChild(ctx, child, stepKind, target, json.RawMessage(`{"b":2,"a":1}`), testActor)
 		if err != nil || !found || !linked.Matches || linked.State != contract.Queued || linked.ErrorCode != "" {
 			t.Fatalf("linked child=%+v found=%v err=%v", linked, found, err)
 		}
-		if linked, found, err := tx.DefinitionSteps().LinkedChild(context.Background(), child, stepKind, target, input, contract.Actor{Kind: "ci", Subject: "wrong"}); err != nil || !found || linked.Matches {
+		if linked, found, err := tx.DefinitionSteps().LinkedChild(ctx, child, stepKind, target, input, contract.Actor{Kind: "ci", Subject: "wrong"}); err != nil || !found || linked.Matches {
 			t.Fatalf("wrong actor linked child=%+v found=%v err=%v", linked, found, err)
 		}
-		dnsTarget, found, err := tx.DefinitionDNS().ChildTarget(context.Background(), child)
+		dnsTarget, found, err := tx.DefinitionDNS().ChildTarget(ctx, child)
 		if err != nil || !found || dnsTarget.App != appName || dnsTarget.Environment != envName ||
 			dnsTarget.EnvironmentID != envID || dnsTarget.ParentID != parent || dnsTarget.Ordinal != 0 {
 			t.Fatalf("dns child target=%+v found=%v err=%v", dnsTarget, found, err)

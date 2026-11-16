@@ -37,24 +37,8 @@ type operatorIdentity struct {
 	sudoPassword string
 }
 
-func identityDir(name string) (string, error) {
-	workspacePath, err := host.DefaultWorkspacePath()
-	if err != nil {
-		return "", err
-	}
-	return identityDirAt(workspacePath, name), nil
-}
-
 func identityDirAt(storePath, name string) string {
 	return filepath.Join(filepath.Dir(storePath), "servers", name)
-}
-
-func loadOrCreateIdentity(name string) (*operatorIdentity, error) {
-	workspacePath, err := host.DefaultWorkspacePath()
-	if err != nil {
-		return nil, err
-	}
-	return loadOrCreateIdentityAt(workspacePath, name)
 }
 
 func loadOrCreateIdentityAt(storePath, name string) (*operatorIdentity, error) {
@@ -63,20 +47,10 @@ func loadOrCreateIdentityAt(storePath, name string) (*operatorIdentity, error) {
 		return nil, err
 	}
 	id := &operatorIdentity{dir: dir, sshKeyPath: filepath.Join(dir, "ssh_ed25519"), wgKeyPath: filepath.Join(dir, "wireguard.key")}
-	if _, err := os.Stat(id.sshKeyPath); errors.Is(err, os.ErrNotExist) {
-		_, priv, err := ed25519.GenerateKey(rand.Reader)
-		if err != nil {
-			return nil, err
-		}
-		block, err := ssh.MarshalPrivateKey(priv, "eregion operator "+name)
-		if err != nil {
-			return nil, err
-		}
-		if err := writePrivate(id.sshKeyPath, pem.EncodeToMemory(block)); err != nil {
-			return nil, err
-		}
+	if err := ensureOperatorSSHKey(id, name); err != nil {
+		return nil, err
 	}
-	raw, err := os.ReadFile(id.sshKeyPath) //nolint:gosec // G304: eregion's own key.
+	raw, err := os.ReadFile(id.sshKeyPath)
 	if err != nil {
 		return nil, err
 	}
@@ -84,29 +58,16 @@ func loadOrCreateIdentityAt(storePath, name string) (*operatorIdentity, error) {
 	if id.signer, err = ssh.ParsePrivateKey(raw); err != nil {
 		return nil, err
 	}
-	if _, err := os.Stat(id.wgKeyPath); errors.Is(err, os.ErrNotExist) {
-		key, err := transport.GenerateWireGuardKey()
-		if err != nil {
-			return nil, err
-		}
-		if err := writePrivate(id.wgKeyPath, []byte(key.Encode()+"\n")); err != nil {
-			return nil, err
-		}
+	if err := ensureWireGuardKey(id); err != nil {
+		return nil, err
 	}
 	if id.wg, err = transport.ReadWireGuardKey(id.wgKeyPath); err != nil {
 		return nil, err
 	}
-	passPath := filepath.Join(dir, "sudo-password")
-	if _, err := os.Stat(passPath); errors.Is(err, os.ErrNotExist) {
-		secret := make([]byte, 16)
-		if _, err := rand.Read(secret); err != nil {
-			return nil, err
-		}
-		if err := writePrivate(passPath, []byte(hex.EncodeToString(secret)+"\n")); err != nil {
-			return nil, err
-		}
+	if err := ensureSudoPassword(id); err != nil {
+		return nil, err
 	}
-	pass, err := os.ReadFile(passPath) //nolint:gosec // G304: eregion's own file.
+	pass, err := os.ReadFile(filepath.Join(dir, "sudo-password"))
 	if err != nil {
 		return nil, err
 	}
@@ -114,8 +75,46 @@ func loadOrCreateIdentityAt(storePath, name string) (*operatorIdentity, error) {
 	return id, nil
 }
 
+func ensureOperatorSSHKey(id *operatorIdentity, name string) error {
+	if _, err := os.Stat(id.sshKeyPath); !errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return err
+	}
+	block, err := ssh.MarshalPrivateKey(priv, "eregion operator "+name)
+	if err != nil {
+		return err
+	}
+	return writePrivate(id.sshKeyPath, pem.EncodeToMemory(block))
+}
+
+func ensureWireGuardKey(id *operatorIdentity) error {
+	if _, err := os.Stat(id.wgKeyPath); !errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	key, err := transport.GenerateWireGuardKey()
+	if err != nil {
+		return err
+	}
+	return writePrivate(id.wgKeyPath, []byte(key.Encode()+"\n"))
+}
+
+func ensureSudoPassword(id *operatorIdentity) error {
+	passPath := filepath.Join(id.dir, "sudo-password")
+	if _, err := os.Stat(passPath); !errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	secret := make([]byte, 16)
+	if _, err := rand.Read(secret); err != nil {
+		return err
+	}
+	return writePrivate(passPath, []byte(hex.EncodeToString(secret)+"\n"))
+}
+
 func writePrivate(path string, data []byte) error {
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600) //nolint:gosec // G304: eregion's own file.
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}
@@ -174,14 +173,14 @@ func pinWorkspaceKnownHosts(pending, scoped, publicAddress, wireGuardAddress str
 }
 
 // routeRemote opens a host.Remote for a workspace access route.
-func routeRemote(route *host.WorkspaceSSH, prompt bool) (*host.Remote, error) {
-	auth, err := sshAuth(route.Identity, prompt)
+func routeRemote(ctx context.Context, route *host.WorkspaceSSH, prompt bool) (*host.Remote, error) {
+	auth, err := sshAuth(ctx, route.Identity, prompt)
 	if err != nil {
 		return nil, err
 	}
 	cfg := host.RemoteConfig{Address: route.Address, User: route.User, KnownHosts: route.KnownHosts, Auth: auth, Timeout: 20 * time.Second}
 	if route.WireGuard != nil {
-		if cfg.Dial, err = wireGuardDial(route.WireGuard); err != nil {
+		if cfg.Dial, err = wireGuardDial(ctx, route.WireGuard); err != nil {
 			return nil, contract.NewFault(contract.ValidationFailed, "the workspace SSH route is not usable", err.Error())
 		}
 	}
@@ -194,39 +193,11 @@ func routeRemote(route *host.WorkspaceSSH, prompt bool) (*host.Remote, error) {
 func (r *serverInit) secureAccess(ctx context.Context, id *operatorIdentity, publicHost string) (*host.WorkspaceSSH, error) {
 	nodeKey := r.pending.NodePublicKey
 	if !r.pending.Done(phaseAccessSetup) {
-		root := r.remote
-		if root == nil {
-			return nil, contract.NewFault(contract.InputRequired, "the access setup needs the root first-contact connection", "Run server init --resume with the first-contact credential; root SSH is still open before the access setup runs.")
-		}
-		port, _ := strconv.Atoi(r.answers.Port)
-		cfg := host.DefaultConfig(host.RoleMain, r.answers.Node)
-		_, apiPortText, _ := net.SplitHostPort(cfg.APIListen)
-		apiPort, _ := strconv.Atoi(apiPortText)
-		task := r.start("harden", "Hardening the server and bringing up WireGuard")
-		setup := access.Setup{AdminUser: r.answers.AdminUser, OperatorSSHKey: id.authorizedKey(), SudoPassword: id.sudoPassword, OperatorPublicKey: id.wg.PublicKey().String(), SSHPort: port, APIPort: apiPort}
-		var out, stderr strings.Builder
-		if err := root.Run(ctx, "bash -s", strings.NewReader(access.Program("setup", setup.Env())), &out, &stderr); err != nil {
-			task.end(ui.EndFail, "")
-			return nil, contract.NewFault(contract.Unavailable, "hardening the server failed", lastLine(stderr.String(), err))
-		}
-		got, keyErr := access.PublicKey(out.String())
-		if keyErr == nil {
-			nodeKey = got
-			r.pending.NodePublicKey = nodeKey
-		}
-		// setup.sh installs the sshd drop-in last, so root SSH is already gone
-		// when it returns. Record the phase before any remaining step can fail;
-		// a resume then reconnects as the admin user over WireGuard.
-		r.pending.Mark(phaseAccessSetup)
-		if err := r.savePendingRecord(r.pending); err != nil {
-			task.end(ui.EndFail, "")
+		var err error
+		nodeKey, err = r.setupAccess(ctx, id)
+		if err != nil {
 			return nil, err
 		}
-		if keyErr != nil {
-			task.end(ui.EndFail, "")
-			return nil, contract.NewFault(contract.Unavailable, keyErr.Error(), "")
-		}
-		task.end(ui.EndOK, "admin user "+r.answers.AdminUser+", wg0 "+access.NodeAddress+", ufw, sshd")
 	}
 	if nodeKey == "" {
 		return nil, contract.NewFault(contract.PreconditionFailed, "the pending init has no node WireGuard key", "Run server init --discard and start again; the access setup did not finish.")
@@ -270,6 +241,44 @@ func (r *serverInit) secureAccess(ctx context.Context, id *operatorIdentity, pub
 	return route, nil
 }
 
+// setupAccess hardens the server and records the phase before any remaining
+// step can fail, so a resume reconnects as the admin user over WireGuard.
+func (r *serverInit) setupAccess(ctx context.Context, id *operatorIdentity) (string, error) {
+	root := r.remote
+	if root == nil {
+		return "", contract.NewFault(contract.InputRequired, "the access setup needs the root first-contact connection", "Run server init --resume with the first-contact credential; root SSH is still open before the access setup runs.")
+	}
+	port, _ := strconv.Atoi(r.answers.Port)
+	cfg := host.DefaultConfig(host.RoleMain, r.answers.Node)
+	_, apiPortText, _ := net.SplitHostPort(cfg.APIListen)
+	apiPort, _ := strconv.Atoi(apiPortText)
+	task := r.start("harden", "Hardening the server and bringing up WireGuard")
+	setup := access.Setup{AdminUser: r.answers.AdminUser, OperatorSSHKey: id.authorizedKey(), SudoPassword: id.sudoPassword, OperatorPublicKey: id.wg.PublicKey().String(), SSHPort: port, APIPort: apiPort}
+	var out, stderr strings.Builder
+	if err := root.Run(ctx, "bash -s", strings.NewReader(access.Program("setup", setup.Env())), &out, &stderr); err != nil {
+		task.end(ui.EndFail, "")
+		return "", contract.NewFault(contract.Unavailable, "hardening the server failed", lastLine(stderr.String(), err))
+	}
+	got, keyErr := access.PublicKey(out.String())
+	if keyErr == nil {
+		r.pending.NodePublicKey = got
+	}
+	// setup.sh installs the sshd drop-in last, so root SSH is already gone
+	// when it returns. Record the phase before any remaining step can fail;
+	// a resume then reconnects as the admin user over WireGuard.
+	r.pending.Mark(phaseAccessSetup)
+	if err := r.savePendingRecord(r.pending); err != nil {
+		task.end(ui.EndFail, "")
+		return "", err
+	}
+	if keyErr != nil {
+		task.end(ui.EndFail, "")
+		return "", contract.NewFault(contract.Unavailable, keyErr.Error(), "")
+	}
+	task.end(ui.EndOK, "admin user "+r.answers.AdminUser+", wg0 "+access.NodeAddress+", ufw, sshd")
+	return r.pending.NodePublicKey, nil
+}
+
 // planRows adds the access changes to the host steps. The admin user, wg0,
 // firewall and SSH lockdown switchover are applied by setup.sh, not by a host
 // bootstrap step, so the plan names them explicitly. The exporter and endpoint
@@ -305,7 +314,7 @@ func runWithRetry(ctx context.Context, route *host.WorkspaceSSH, command string,
 	deadline := time.Now().Add(within)
 	var last error
 	for time.Now().Before(deadline) {
-		remote, err := routeRemote(route, false)
+		remote, err := routeRemote(ctx, route, false)
 		if err != nil {
 			return err
 		}

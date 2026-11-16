@@ -26,6 +26,18 @@ import (
 // start a database or use an ambient DSN.
 
 func TestIntegrationPlatformWebhookAdmissionReplayAndRotation(t *testing.T) {
+	pool, s, ctx := newPlatformWebhookFixture(t)
+	first, operationID := enablePlatformWebhook(t, ctx, pool, s)
+	assertWebhookSecretNotLeaked(t, ctx, pool, operationID, "webhook-secret-value-1")
+	assertWebhookDesiredRevision(t, ctx, pool)
+	assertPlatformWebhookReplay(t, ctx, pool, s, first)
+	rotation := rotatePlatformWebhook(t, ctx, pool, s)
+	assertPlatformWebhookRotationReplay(t, ctx, pool, s, rotation)
+	assertPlatformWebhookRotationRequiresSecret(t, ctx, pool, s, rotation)
+}
+
+func newPlatformWebhookFixture(t *testing.T) (*pgxpool.Pool, *Service, context.Context) {
+	t.Helper()
 	pool, _ := testPool(t, true)
 	ring, err := vault.GenerateKeyRing()
 	if err != nil {
@@ -45,7 +57,6 @@ func TestIntegrationPlatformWebhookAdmissionReplayAndRotation(t *testing.T) {
 	t.Cleanup(run.Close)
 	s := run.Service
 	ctx := context.Background()
-
 	platformSubmit(t, s, platform.KindNodeRegister, "platform", "webhook-node", map[string]any{
 		"name": "local", "roles": []string{platform.RoleApplication}, "capabilities": []string{platform.CapabilityDocker},
 	})
@@ -56,7 +67,11 @@ func TestIntegrationPlatformWebhookAdmissionReplayAndRotation(t *testing.T) {
 			"source": map[string]any{"url": "https://github.com/acme/api", "ref": "main"},
 		}},
 	})
+	return pool, s, ctx
+}
 
+func enablePlatformWebhook(t *testing.T, ctx context.Context, pool *pgxpool.Pool, s *Service) (operations.Submission, contract.OperationID) {
+	t.Helper()
 	first := operations.Submission{
 		Kind: platform.KindEnvironmentUpdate, Target: "env/webhook/production", Actor: testActor,
 		IdempotencyKey: "webhook-enable-1",
@@ -70,27 +85,39 @@ func TestIntegrationPlatformWebhookAdmissionReplayAndRotation(t *testing.T) {
 	if result.Replay || !result.WebhookSecretActivated {
 		t.Fatalf("first receipt = %+v", result)
 	}
+	if got := webhookSecretRevisionCount(ctx, t, pool, "webhook"); got != 1 {
+		t.Fatalf("secret revisions after enable = %d", got)
+	}
+	return first, result.Operation.ID
+}
+
+func assertWebhookSecretNotLeaked(t *testing.T, ctx context.Context, pool *pgxpool.Pool, operationID contract.OperationID, secret string) {
+	t.Helper()
 	var storedInput []byte
-	if err := pool.QueryRow(ctx, `SELECT input FROM eregion_operations WHERE id=$1`, result.Operation.ID).Scan(&storedInput); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT input FROM eregion_operations WHERE id=$1`, operationID).Scan(&storedInput); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(storedInput), "webhook-secret-value-1") {
+	if strings.Contains(string(storedInput), secret) {
 		t.Fatal("the transient webhook secret entered the operation input")
 	}
 	var eventText string
-	if err := pool.QueryRow(ctx, `SELECT coalesce(string_agg(event::text,' '),'') FROM eregion_operation_events WHERE operation_id=$1`, result.Operation.ID).Scan(&eventText); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT coalesce(string_agg(event::text,' '),'') FROM eregion_operation_events WHERE operation_id=$1`, operationID).Scan(&eventText); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(eventText, "webhook-secret-value-1") {
+	if strings.Contains(eventText, secret) {
 		t.Fatal("the transient webhook secret entered an operation event")
 	}
 	var riverArgs string
-	if err := pool.QueryRow(ctx, `SELECT coalesce(string_agg(args::text,' '),'') FROM river_job WHERE args->>'operation_id'=$1`, result.Operation.ID).Scan(&riverArgs); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT coalesce(string_agg(args::text,' '),'') FROM river_job WHERE args->>'operation_id'=$1`, operationID).Scan(&riverArgs); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(riverArgs, "webhook-secret-value-1") {
+	if strings.Contains(riverArgs, secret) {
 		t.Fatal("the transient webhook secret entered River arguments")
 	}
+}
+
+func assertWebhookDesiredRevision(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
+	t.Helper()
 	var autoDeploy bool
 	var webhookName string
 	if err := pool.QueryRow(ctx, `SELECT r.auto_deploy,r.webhook_secret_name
@@ -103,46 +130,52 @@ func TestIntegrationPlatformWebhookAdmissionReplayAndRotation(t *testing.T) {
 	if !autoDeploy || webhookName != platform.DefaultWebhookSecretName {
 		t.Fatalf("desired webhook state = auto_deploy %v name %q", autoDeploy, webhookName)
 	}
+}
+
+func currentWebhookRevision(t *testing.T, ctx context.Context, pool *pgxpool.Pool) string {
+	t.Helper()
 	var revisionID string
 	if err := pool.QueryRow(ctx, `SELECT current_revision_id FROM eregion_platform_environments e
         JOIN eregion_platform_apps a ON a.id=e.app_id WHERE a.name='webhook' AND e.name='production'`).Scan(&revisionID); err != nil {
 		t.Fatal(err)
 	}
-	if got := webhookSecretRevisionCount(t, pool, "webhook", "production", platform.DefaultWebhookSecretName); got != 1 {
-		t.Fatalf("secret revisions after enable = %d", got)
-	}
+	return revisionID
+}
 
+func assertPlatformWebhookReplay(t *testing.T, ctx context.Context, pool *pgxpool.Pool, s *Service, first operations.Submission) {
+	t.Helper()
 	// Change the current desired state while keeping the same idempotency key.
-	platformSubmit(t, s, platform.KindConfigSet, "env/webhook/production", "webhook-current-change", map[string]any{
+	platformSubmitContext(ctx, t, s, platform.KindConfigSet, "env/webhook/production", "webhook-current-change", map[string]any{
 		"config": map[string]string{"AFTER": "enable"},
 	})
-	result, err = s.SubmitWithReceipt(ctx, first)
+	result, err := s.SubmitWithReceipt(ctx, first)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !result.Replay || result.WebhookSecretActivated {
 		t.Fatalf("replay receipt = %+v", result)
 	}
-	if got := webhookSecretRevisionCount(t, pool, "webhook", "production", platform.DefaultWebhookSecretName); got != 1 {
+	if got := webhookSecretRevisionCount(ctx, t, pool, "webhook"); got != 1 {
 		t.Fatalf("replay added a secret revision: %d", got)
 	}
-
 	conflict := first
 	conflict.Input = json.RawMessage(`{"auto_deploy":true,"config":{"OTHER":"value"}}`)
 	if _, err := s.SubmitWithReceipt(ctx, conflict); err == nil || contract.Classify(err).Code != contract.Conflict {
 		t.Fatalf("changed input error = %v", err)
 	}
-	if got := webhookSecretRevisionCount(t, pool, "webhook", "production", platform.DefaultWebhookSecretName); got != 1 {
+	if got := webhookSecretRevisionCount(ctx, t, pool, "webhook"); got != 1 {
 		t.Fatalf("conflict added a secret revision: %d", got)
 	}
+}
 
-	// Rotation-only is a real admitted operation but must not fabricate an
-	// unchanged desired-state revision.
-	var beforeRevision string
-	if err := pool.QueryRow(ctx, `SELECT current_revision_id FROM eregion_platform_environments e
-        JOIN eregion_platform_apps a ON a.id=e.app_id WHERE a.name='webhook' AND e.name='production'`).Scan(&beforeRevision); err != nil {
-		t.Fatal(err)
-	}
+func rotatePlatformWebhook(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	s *Service,
+) operations.Submission {
+	t.Helper()
+	beforeRevision := currentWebhookRevision(t, ctx, pool)
 	rotation := operations.Submission{
 		Kind: platform.KindEnvironmentUpdate, Target: "env/webhook/production", Actor: testActor,
 		IdempotencyKey: "webhook-rotate-1",
@@ -156,23 +189,24 @@ func TestIntegrationPlatformWebhookAdmissionReplayAndRotation(t *testing.T) {
 	if rotated.Replay || !rotated.WebhookSecretActivated {
 		t.Fatalf("rotation receipt = %+v", rotated)
 	}
-	var rotatedInput []byte
-	if err := pool.QueryRow(ctx, `SELECT input FROM eregion_operations WHERE id=$1`, rotated.Operation.ID).Scan(&rotatedInput); err != nil {
-		t.Fatal(err)
+	assertWebhookSecretNotLeaked(t, ctx, pool, rotated.Operation.ID, "webhook-secret-value-2")
+	if current := currentWebhookRevision(t, ctx, pool); current != beforeRevision {
+		t.Fatalf("rotation changed the current revision %q -> %q", beforeRevision, current)
 	}
-	if strings.Contains(string(rotatedInput), "webhook-secret-value-2") {
-		t.Fatal("the rotated transient webhook secret entered the operation input")
-	}
-	if err := pool.QueryRow(ctx, `SELECT current_revision_id FROM eregion_platform_environments e
-        JOIN eregion_platform_apps a ON a.id=e.app_id WHERE a.name='webhook' AND e.name='production'`).Scan(&revisionID); err != nil {
-		t.Fatal(err)
-	}
-	if revisionID != beforeRevision {
-		t.Fatalf("rotation changed the current revision %q -> %q", beforeRevision, revisionID)
-	}
-	if got := webhookSecretRevisionCount(t, pool, "webhook", "production", platform.DefaultWebhookSecretName); got != 2 {
+	if got := webhookSecretRevisionCount(ctx, t, pool, "webhook"); got != 2 {
 		t.Fatalf("secret revisions after rotation = %d", got)
 	}
+	return rotation
+}
+
+func assertPlatformWebhookRotationReplay(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	s *Service,
+	rotation operations.Submission,
+) {
+	t.Helper()
 	rotateReplay, err := s.SubmitWithReceipt(ctx, rotation)
 	if err != nil {
 		t.Fatal(err)
@@ -180,16 +214,26 @@ func TestIntegrationPlatformWebhookAdmissionReplayAndRotation(t *testing.T) {
 	if !rotateReplay.Replay || rotateReplay.WebhookSecretActivated {
 		t.Fatalf("rotation replay = %+v", rotateReplay)
 	}
-	if got := webhookSecretRevisionCount(t, pool, "webhook", "production", platform.DefaultWebhookSecretName); got != 2 {
+	if got := webhookSecretRevisionCount(ctx, t, pool, "webhook"); got != 2 {
 		t.Fatalf("rotation replay added a secret revision: %d", got)
 	}
+}
+
+func assertPlatformWebhookRotationRequiresSecret(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	s *Service,
+	rotation operations.Submission,
+) {
+	t.Helper()
 	withoutSecret := rotation
 	withoutSecret.IdempotencyKey = "webhook-rotate-no-secret"
 	withoutSecret.WebhookSecret = nil
 	if _, err := s.SubmitWithReceipt(ctx, withoutSecret); err == nil || contract.Classify(err).Code != contract.InputRequired {
 		t.Fatalf("rotation without a transient secret error = %v", err)
 	}
-	if got := webhookSecretRevisionCount(t, pool, "webhook", "production", platform.DefaultWebhookSecretName); got != 2 {
+	if got := webhookSecretRevisionCount(ctx, t, pool, "webhook"); got != 2 {
 		t.Fatalf("rejected rotation added a secret revision: %d", got)
 	}
 }
@@ -264,23 +308,7 @@ func TestIntegrationPlatformWebhookConcurrentAdmissionLoser(t *testing.T) {
 	}
 	lockReleased = true
 	wg.Wait()
-	fresh, replay := 0, 0
-	for index := range results {
-		if errs[index] != nil {
-			t.Fatalf("concurrent submit %d: %v", index, errs[index])
-		}
-		if results[index].Replay {
-			replay++
-			if results[index].WebhookSecretActivated {
-				t.Fatalf("loser receipt = %+v", results[index])
-			}
-		} else {
-			fresh++
-			if !results[index].WebhookSecretActivated {
-				t.Fatalf("winner receipt = %+v", results[index])
-			}
-		}
-	}
+	fresh, replay := assertConcurrentWebhookReceipts(t, results, errs)
 	if fresh != 1 || replay != 1 {
 		t.Fatalf("receipts fresh=%d replay=%d", fresh, replay)
 	}
@@ -292,9 +320,34 @@ func TestIntegrationPlatformWebhookConcurrentAdmissionLoser(t *testing.T) {
 	if operationsCount != 1 {
 		t.Fatalf("operations = %d", operationsCount)
 	}
-	if got := webhookSecretRevisionCount(t, pool, "concurrent", "production", platform.DefaultWebhookSecretName); got != 1 {
+	if got := webhookSecretRevisionCount(ctx, t, pool, "concurrent"); got != 1 {
 		t.Fatalf("secret revisions = %d, want exactly the winner", got)
 	}
+}
+
+func assertConcurrentWebhookReceipts(
+	t *testing.T,
+	results []operations.SubmissionResult,
+	errs []error,
+) (fresh, replay int) {
+	t.Helper()
+	for index := range results {
+		if errs[index] != nil {
+			t.Fatalf("concurrent submit %d: %v", index, errs[index])
+		}
+		if results[index].Replay {
+			replay++
+			if results[index].WebhookSecretActivated {
+				t.Fatalf("loser receipt = %+v", results[index])
+			}
+			continue
+		}
+		fresh++
+		if !results[index].WebhookSecretActivated {
+			t.Fatalf("winner receipt = %+v", results[index])
+		}
+	}
+	return fresh, replay
 }
 
 func TestIntegrationPlatformWebhookAdmissionRollback(t *testing.T) {
@@ -347,7 +400,7 @@ func TestIntegrationPlatformWebhookAdmissionRollback(t *testing.T) {
 	if operationsCount != 0 {
 		t.Fatalf("rolled-back admission left %d operations", operationsCount)
 	}
-	if got := webhookSecretRevisionCount(t, pool, "rollback", "production", platform.DefaultWebhookSecretName); got != 0 {
+	if got := webhookSecretRevisionCount(ctx, t, pool, "rollback"); got != 0 {
 		t.Fatalf("rolled-back admission left %d secret revisions", got)
 	}
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_platform_environment_revisions r
@@ -409,7 +462,7 @@ func TestIntegrationPlatformWebhookAdmissionAndDeletionLockOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rollback(deleteTx)
+	defer rollback(ctx, deleteTx)
 	if _, err := deleteTx.Exec(ctx, `UPDATE eregion_platform_environments SET updated_at=clock_timestamp() WHERE id=$1`, environmentID); err != nil {
 		t.Fatal(err)
 	}
@@ -444,7 +497,7 @@ func TestIntegrationPlatformWebhookAdmissionAndDeletionLockOrder(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("platform webhook rotation did not finish after simulated delete released its locks")
 	}
-	if got := webhookSecretRevisionCount(t, pool, "order", "production", platform.DefaultWebhookSecretName); got != 2 {
+	if got := webhookSecretRevisionCount(ctx, t, pool, "order"); got != 2 {
 		t.Fatalf("secret revisions = %d", got)
 	}
 }
@@ -508,7 +561,7 @@ func TestIntegrationPlatformWebhookCredentialCollisionRollsBackActivation(t *tes
 	if _, err := s.SubmitWithReceipt(ctx, collision); err == nil || contract.Classify(err).Code != contract.ValidationFailed {
 		t.Fatalf("credential/webhook-name collision error = %v", err)
 	}
-	if got := webhookSecretRevisionCount(t, pool, "collision", "production", platform.DefaultWebhookSecretName); got != 1 {
+	if got := webhookSecretRevisionCount(ctx, t, pool, "collision"); got != 1 {
 		t.Fatalf("collision left %d webhook secret revisions, want the original", got)
 	}
 	var operationCount int
@@ -596,7 +649,7 @@ func TestIntegrationPlatformWebhookHTTPRotationWithoutTransientRejected(t *testi
 		contract.Classify(err).Code != contract.InputRequired {
 		t.Fatalf("HTTP rotation without transient secret error = %v", err)
 	}
-	if got := webhookSecretRevisionCount(t, pool, "httpwebhook", "production", platform.DefaultWebhookSecretName); got != 1 {
+	if got := webhookSecretRevisionCount(ctx, t, pool, "httpwebhook"); got != 1 {
 		t.Fatalf("HTTP rejection changed webhook secret revisions: %d", got)
 	}
 	var currentAfter string
@@ -752,10 +805,27 @@ func TestIntegrationWebhookNameOnlyAdmissionAndReplay(t *testing.T) {
 	pool, run, secrets := newWebhookIntegrationRuntime(t, 0)
 	s := run.Service
 	ctx := context.Background()
-	platformSubmit(t, s, platform.KindNodeRegister, "platform", "name-node", map[string]any{
+	seedWebhookNameFixture(t, ctx, s, secrets)
+	request := func(key, input string) operations.Submission {
+		return operations.Submission{Kind: platform.KindEnvironmentUpdate, Target: "env/nametest/production", Actor: testActor, IdempotencyKey: key, Input: json.RawMessage(input)}
+	}
+	if _, err := s.SubmitWithReceipt(ctx, request("name-enable", `{"auto_deploy":true,"webhook_secret_name":"ACTIVE"}`)); err != nil {
+		t.Fatal(err)
+	}
+	assertWebhookNameRejections(t, ctx, pool, s, request, true)
+	if _, err := s.SubmitWithReceipt(ctx, request("name-disable", `{"auto_deploy":false}`)); err != nil {
+		t.Fatal(err)
+	}
+	assertWebhookNameRejections(t, ctx, pool, s, request, false)
+	assertWebhookNameOnlyReplay(t, ctx, pool, s, secrets, request)
+}
+
+func seedWebhookNameFixture(t *testing.T, ctx context.Context, s *Service, secrets *vault.Service) {
+	t.Helper()
+	platformSubmitContext(ctx, t, s, platform.KindNodeRegister, "platform", "name-node", map[string]any{
 		"name": "local", "roles": []string{platform.RoleApplication}, "capabilities": []string{platform.CapabilityDocker},
 	})
-	platformSubmit(t, s, platform.KindAppCreate, "platform", "name-app", map[string]any{
+	platformSubmitContext(ctx, t, s, platform.KindAppCreate, "platform", "name-app", map[string]any{
 		"name": "nametest", "environments": []map[string]any{{"name": "production", "node": "local",
 			"source": map[string]any{"url": "https://github.com/acme/api", "ref": "main"}}},
 	})
@@ -779,48 +849,59 @@ func TestIntegrationWebhookNameOnlyAdmissionAndReplay(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	request := func(key, input string) operations.Submission {
-		return operations.Submission{Kind: platform.KindEnvironmentUpdate, Target: "env/nametest/production", Actor: testActor, IdempotencyKey: key, Input: json.RawMessage(input)}
-	}
-	if _, err := s.SubmitWithReceipt(ctx, request("name-enable", `{"auto_deploy":true,"webhook_secret_name":"ACTIVE"}`)); err != nil {
+}
+
+type webhookNameCounts struct {
+	revision                                     string
+	revisions, operations, jobs, secretRevisions int
+}
+
+func readWebhookNameCounts(t *testing.T, ctx context.Context, pool *pgxpool.Pool) webhookNameCounts {
+	t.Helper()
+	var c webhookNameCounts
+	err := pool.QueryRow(ctx, `SELECT e.current_revision_id,
+		(SELECT count(*) FROM eregion_platform_environment_revisions r WHERE r.environment_id=e.id),
+		(SELECT count(*) FROM eregion_operations), (SELECT count(*) FROM river_job),
+		(SELECT count(*) FROM eregion_secret_revisions WHERE app='nametest' AND environment='production')
+		FROM eregion_platform_environments e JOIN eregion_platform_apps a ON a.id=e.app_id
+		WHERE a.name='nametest' AND e.name='production'`).Scan(&c.revision, &c.revisions, &c.operations, &c.jobs, &c.secretRevisions)
+	if err != nil {
 		t.Fatal(err)
 	}
-	type counts struct {
-		revision                                     string
-		revisions, operations, jobs, secretRevisions int
-	}
-	readCounts := func() counts {
-		t.Helper()
-		var c counts
-		err := pool.QueryRow(ctx, `SELECT e.current_revision_id,
-			(SELECT count(*) FROM eregion_platform_environment_revisions r WHERE r.environment_id=e.id),
-			(SELECT count(*) FROM eregion_operations), (SELECT count(*) FROM river_job),
-			(SELECT count(*) FROM eregion_secret_revisions WHERE app='nametest' AND environment='production')
-			FROM eregion_platform_environments e JOIN eregion_platform_apps a ON a.id=e.app_id
-			WHERE a.name='nametest' AND e.name='production'`).Scan(&c.revision, &c.revisions, &c.operations, &c.jobs, &c.secretRevisions)
-		if err != nil {
-			t.Fatal(err)
+	return c
+}
+
+func assertWebhookNameRejections(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	s *Service,
+	request func(key, input string) operations.Submission,
+	enabled bool,
+) {
+	t.Helper()
+	for _, name := range []string{"MISSING", "ARCHIVED"} {
+		before := readWebhookNameCounts(t, ctx, pool)
+		key := fmt.Sprintf("name-reject-%t-%s", enabled, name)
+		_, err := s.SubmitWithReceipt(ctx, request(key, fmt.Sprintf(`{"webhook_secret_name":%q}`, name)))
+		if err == nil || contract.Classify(err).Code != contract.PreconditionFailed {
+			t.Fatalf("enabled=%t name=%s error=%v", enabled, name, err)
 		}
-		return c
-	}
-	for _, enabled := range []bool{true, false} {
-		if !enabled {
-			if _, err := s.SubmitWithReceipt(ctx, request("name-disable", `{"auto_deploy":false}`)); err != nil {
-				t.Fatal(err)
-			}
-		}
-		for _, name := range []string{"MISSING", "ARCHIVED"} {
-			before := readCounts()
-			key := fmt.Sprintf("name-reject-%t-%s", enabled, name)
-			_, err := s.SubmitWithReceipt(ctx, request(key, fmt.Sprintf(`{"webhook_secret_name":%q}`, name)))
-			if err == nil || contract.Classify(err).Code != contract.PreconditionFailed {
-				t.Fatalf("enabled=%t name=%s error=%v", enabled, name, err)
-			}
-			if after := readCounts(); after != before {
-				t.Fatalf("rejected name changed rows: before=%+v after=%+v", before, after)
-			}
+		if after := readWebhookNameCounts(t, ctx, pool); after != before {
+			t.Fatalf("rejected name changed rows: before=%+v after=%+v", before, after)
 		}
 	}
+}
+
+func assertWebhookNameOnlyReplay(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	s *Service,
+	secrets *vault.Service,
+	request func(key, input string) operations.Submission,
+) {
+	t.Helper()
 	// Commit a name-only update while disabled, then archive the name. An
 	// idempotent replay must be returned before validating current vault state.
 	ns, _ := vault.NewNamespace("nametest", "production", "ACTIVE")
@@ -844,12 +925,12 @@ func TestIntegrationWebhookNameOnlyAdmissionAndReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	before := readCounts()
+	before := readWebhookNameCounts(t, ctx, pool)
 	again, err := s.SubmitWithReceipt(ctx, replay)
 	if err != nil || !again.Replay || again.Operation.ID != first.Operation.ID || again.WebhookSecretActivated {
 		t.Fatalf("replay=%+v err=%v", again, err)
 	}
-	if after := readCounts(); after != before {
+	if after := readWebhookNameCounts(t, ctx, pool); after != before {
 		t.Fatalf("replay changed rows: before=%+v after=%+v", before, after)
 	}
 	metadata, err := secrets.Store().Get(ctx, other)
@@ -866,10 +947,22 @@ func TestIntegrationWebhookAdmissionSerializesArchive(t *testing.T) {
 	pool, run, secrets := newWebhookIntegrationRuntime(t, 0)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	platformSubmit(t, run.Service, platform.KindNodeRegister, "platform", "archive-node", map[string]any{
+	ns := seedArchiveWebhookFixture(t, ctx, run, secrets)
+	assertAdmissionBeforeArchive(t, ctx, pool, run, secrets, ns)
+	assertArchiveBeforeAdmission(t, ctx, pool, run, secrets, ns)
+}
+
+func seedArchiveWebhookFixture(
+	t *testing.T,
+	ctx context.Context,
+	run *Runtime,
+	secrets *vault.Service,
+) vault.Namespace {
+	t.Helper()
+	platformSubmitContext(ctx, t, run.Service, platform.KindNodeRegister, "platform", "archive-node", map[string]any{
 		"name": "local", "roles": []string{platform.RoleApplication}, "capabilities": []string{platform.CapabilityDocker},
 	})
-	platformSubmit(t, run.Service, platform.KindAppCreate, "platform", "archive-app", map[string]any{
+	platformSubmitContext(ctx, t, run.Service, platform.KindAppCreate, "platform", "archive-app", map[string]any{
 		"name": "archivetest", "environments": []map[string]any{{"name": "production", "node": "local",
 			"source": map[string]any{"url": "https://github.com/acme/api", "ref": "main"}}},
 	})
@@ -884,24 +977,37 @@ func TestIntegrationWebhookAdmissionSerializesArchive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	awaitLock := func(fragment string) {
-		t.Helper()
-		deadline := time.Now().Add(5 * time.Second)
-		for {
-			var count int
-			if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity WHERE datname=current_database()
-				AND state='active' AND wait_event_type='Lock' AND query ILIKE '%' || $1 || '%'`, fragment).Scan(&count); err != nil {
-				t.Fatal(err)
-			}
-			if count > 0 {
-				return
-			}
-			if time.Now().After(deadline) {
-				t.Fatalf("no lock waiter for %q", fragment)
-			}
-			time.Sleep(20 * time.Millisecond)
+	return ns
+}
+
+func awaitWebhookLock(t *testing.T, ctx context.Context, pool *pgxpool.Pool, fragment string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var count int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity WHERE datname=current_database()
+			AND state='active' AND wait_event_type='Lock' AND query ILIKE '%' || $1 || '%'`, fragment).Scan(&count); err != nil {
+			t.Fatal(err)
 		}
+		if count > 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no lock waiter for %q", fragment)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
+}
+
+func assertAdmissionBeforeArchive(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	run *Runtime,
+	secrets *vault.Service,
+	ns vault.Namespace,
+) {
+	t.Helper()
 	// Admission's namespace lock remains held until its caller commits.
 	admissionLocked := make(chan struct{})
 	admissionRelease := make(chan struct{})
@@ -927,7 +1033,7 @@ func TestIntegrationWebhookAdmissionSerializesArchive(t *testing.T) {
 			return err
 		})
 	}()
-	awaitLock("FROM eregion_secrets")
+	awaitWebhookLock(t, ctx, pool, "FROM eregion_secrets")
 	close(admissionRelease)
 	if err := <-admissionDone; err != nil {
 		t.Fatalf("admission validation: %v", err)
@@ -935,9 +1041,38 @@ func TestIntegrationWebhookAdmissionSerializesArchive(t *testing.T) {
 	if err := <-archiveDone; err != nil {
 		t.Fatalf("archive after admission commit: %v", err)
 	}
+}
+
+type archiveWebhookCounts struct {
+	revision                    string
+	revisions, operations, jobs int
+}
+
+func readArchiveWebhookCounts(t *testing.T, ctx context.Context, pool *pgxpool.Pool) archiveWebhookCounts {
+	t.Helper()
+	var c archiveWebhookCounts
+	if err := pool.QueryRow(ctx, `SELECT e.current_revision_id,
+		(SELECT count(*) FROM eregion_platform_environment_revisions r WHERE r.environment_id=e.id),
+		(SELECT count(*) FROM eregion_operations), (SELECT count(*) FROM river_job)
+		FROM eregion_platform_environments e JOIN eregion_platform_apps a ON a.id=e.app_id
+		WHERE a.name='archivetest' AND e.name='production'`).Scan(&c.revision, &c.revisions, &c.operations, &c.jobs); err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+func assertArchiveBeforeAdmission(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	run *Runtime,
+	secrets *vault.Service,
+	ns vault.Namespace,
+) {
+	t.Helper()
 	// Restore, then archive first inside an uncommitted transaction. The real
 	// submission must wait, observe archived state, and roll back completely.
-	err = run.Service.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+	err := run.Service.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
 		_, err := secrets.Store().Set(ctx, tx.Secrets(), ns, []byte("secret-value-2"), 1, testActor)
 		return err
 	})
@@ -958,15 +1093,7 @@ func TestIntegrationWebhookAdmissionSerializesArchive(t *testing.T) {
 		})
 	}()
 	<-archiveLocked
-	var beforeRevision string
-	var beforeRevisions, beforeOps, beforeJobs int
-	if err := pool.QueryRow(ctx, `SELECT e.current_revision_id,
-		(SELECT count(*) FROM eregion_platform_environment_revisions r WHERE r.environment_id=e.id),
-		(SELECT count(*) FROM eregion_operations), (SELECT count(*) FROM river_job)
-		FROM eregion_platform_environments e JOIN eregion_platform_apps a ON a.id=e.app_id
-		WHERE a.name='archivetest' AND e.name='production'`).Scan(&beforeRevision, &beforeRevisions, &beforeOps, &beforeJobs); err != nil {
-		t.Fatal(err)
-	}
+	before := readArchiveWebhookCounts(t, ctx, pool)
 	submitted := make(chan error, 1)
 	go func() {
 		_, err := run.Service.SubmitWithReceipt(ctx, operations.Submission{
@@ -975,7 +1102,7 @@ func TestIntegrationWebhookAdmissionSerializesArchive(t *testing.T) {
 		})
 		submitted <- err
 	}()
-	awaitLock("FROM eregion_secrets")
+	awaitWebhookLock(t, ctx, pool, "FROM eregion_secrets")
 	close(archiveRelease)
 	if err := <-archive; err != nil {
 		t.Fatal(err)
@@ -983,17 +1110,8 @@ func TestIntegrationWebhookAdmissionSerializesArchive(t *testing.T) {
 	if err := <-submitted; err == nil || contract.Classify(err).Code != contract.PreconditionFailed {
 		t.Fatalf("archived name admission error: %v", err)
 	}
-	var afterRevision string
-	var afterRevisions, afterOps, afterJobs int
-	if err := pool.QueryRow(ctx, `SELECT e.current_revision_id,
-		(SELECT count(*) FROM eregion_platform_environment_revisions r WHERE r.environment_id=e.id),
-		(SELECT count(*) FROM eregion_operations), (SELECT count(*) FROM river_job)
-		FROM eregion_platform_environments e JOIN eregion_platform_apps a ON a.id=e.app_id
-		WHERE a.name='archivetest' AND e.name='production'`).Scan(&afterRevision, &afterRevisions, &afterOps, &afterJobs); err != nil {
-		t.Fatal(err)
-	}
-	if beforeRevision != afterRevision || beforeRevisions != afterRevisions || beforeOps != afterOps || beforeJobs != afterJobs {
-		t.Fatalf("rejected admission left rows: revision %s->%s revisions %d->%d operations %d->%d jobs %d->%d", beforeRevision, afterRevision, beforeRevisions, afterRevisions, beforeOps, afterOps, beforeJobs, afterJobs)
+	if after := readArchiveWebhookCounts(t, ctx, pool); after != before {
+		t.Fatalf("rejected admission left rows: before=%+v after=%+v", before, after)
 	}
 }
 
@@ -1018,10 +1136,12 @@ func awaitBlockedWebhookInserts(t *testing.T, pool *pgxpool.Pool, want int) {
 	}
 }
 
-func webhookSecretRevisionCount(t *testing.T, pool *pgxpool.Pool, app, environment, name string) int {
+func webhookSecretRevisionCount(ctx context.Context, t *testing.T, pool *pgxpool.Pool, app string) int {
 	t.Helper()
+	const environment = "production"
+	const name = platform.DefaultWebhookSecretName
 	var count int
-	if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM eregion_secret_revisions
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_secret_revisions
         WHERE app=$1 AND environment=$2 AND name=$3`, app, environment, name).Scan(&count); err != nil {
 		t.Fatal(err)
 	}

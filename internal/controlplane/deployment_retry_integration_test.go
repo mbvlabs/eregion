@@ -101,7 +101,7 @@ func newDeploymentRetryFixtureWithTransport(t *testing.T, transport node.Transpo
 		if err := runPlatformAttempt(ctx, s, op.ID, 1); err != nil {
 			t.Fatalf("%s attempt: %v", op.Kind, err)
 		}
-		platformAwait(t, s, op, contract.Succeeded)
+		platformAwait(t, s, op, contract.Succeeded) //nolint:contextcheck // The assertion helper owns its bounded test wait, independently of this setup context.
 	}
 	runOperation(platformSubmit(t, s, platform.KindNodeRegister, "platform", "retry-node", map[string]any{
 		"name": "local", "roles": []string{platform.RoleApplication, platform.RoleBuilder, platform.RoleControlPlane},
@@ -136,11 +136,10 @@ func (f *deploymentRetryFixture) serving(t *testing.T) (platform.ReleaseID, plat
 	return env.ServingRelease, env.ServingDeploymentID
 }
 
-func (f *deploymentRetryFixture) deploy(t *testing.T) platform.ReleaseID {
+func (f *deploymentRetryFixture) deploy(t *testing.T) {
 	t.Helper()
 	release := f.createRelease("deploy-"+fmt.Sprint(time.Now().UnixNano()), "registry.example/live:base")
 	f.run(platformSubmit(t, f.service, platform.KindDeploy, "env/live/production", "deploy-"+string(release), map[string]any{"release_id": release}))
-	return release
 }
 
 func insertDeploymentOwner(t *testing.T, pool *pgxpool.Pool, env platform.Environment, owner deploymentOwner) {
@@ -211,6 +210,74 @@ func ownerForFixture(t *testing.T, fixture *deploymentRetryFixture, env platform
 		t.Fatal(err)
 	}
 	return owner, has
+}
+
+func newDeployedRecordingFixture(t *testing.T) (*deploymentRetryFixture, *recordingDeployTransport, platform.Environment) {
+	t.Helper()
+	transport := &recordingDeployTransport{scriptedDeployTransport: newScriptedDeployTransport()}
+	fixture := newDeploymentRetryFixtureWithTransport(t, transport)
+	fixture.deploy(t)
+	return fixture, transport, fixture.environment(t)
+}
+
+func previousDeploymentFor(t *testing.T, fixture *deploymentRetryFixture, env platform.Environment) platform.Deployment {
+	t.Helper()
+	previous, err := fixture.service.deploymentByID(fixture.ctx, env.ServingDeploymentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return previous
+}
+
+func assertOperationNotTerminal(t *testing.T, fixture *deploymentRetryFixture, opID contract.OperationID, context string) {
+	t.Helper()
+	current, err := fixture.service.Get(fixture.ctx, testActor, opID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.State.Terminal() {
+		t.Fatalf("%s: operation became terminal: %+v", context, current)
+	}
+}
+
+func assertOperationState(t *testing.T, fixture *deploymentRetryFixture, opID contract.OperationID, want contract.State, context string) {
+	t.Helper()
+	current, err := fixture.service.Get(fixture.ctx, testActor, opID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.State != want {
+		t.Fatalf("%s: operation = %+v, want %s", context, current, want)
+	}
+}
+
+func assertOwnerPhase(t *testing.T, fixture *deploymentRetryFixture, env platform.Environment, want deploymentOwnerPhase, context string) {
+	t.Helper()
+	owner, has := ownerForFixture(t, fixture, env)
+	if !has || owner.Phase != want {
+		t.Fatalf("%s: owner = %+v, has=%t, want phase %s", context, owner, has, want)
+	}
+}
+
+func assertOwnerRetained(t *testing.T, fixture *deploymentRetryFixture, env platform.Environment, context string) {
+	t.Helper()
+	if owner, has := ownerForFixture(t, fixture, env); !has {
+		t.Fatalf("%s: owner was released: %+v", context, owner)
+	}
+}
+
+func assertOwnerReleased(t *testing.T, fixture *deploymentRetryFixture, env platform.Environment, context string) {
+	t.Helper()
+	if owner, has := ownerForFixture(t, fixture, env); has {
+		t.Fatalf("%s: owner remained: %+v", context, owner)
+	}
+}
+
+func assertServingDeployment(t *testing.T, fixture *deploymentRetryFixture, release platform.ReleaseID, deployment platform.DeploymentID, context string) {
+	t.Helper()
+	if gotRelease, gotDeployment := fixture.serving(t); gotRelease != release || gotDeployment != deployment {
+		t.Fatalf("%s: serving = %s/%s, want %s/%s", context, gotRelease, gotDeployment, release, deployment)
+	}
 }
 
 type recordingDeployTransport struct {
@@ -566,7 +633,7 @@ func TestIntegrationDeploymentLegacyAmbiguousOwnerRecoversConservatively(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	var ops []contract.Operation
+	ops := make([]contract.Operation, 0, 2)
 	for _, key := range []string{"legacy-c", "legacy-d"} {
 		release := fixture.createRelease(key, "registry.example/live:"+key)
 		op := platformSubmit(t, fixture.service, platform.KindDeploy, "env/live/production", key, map[string]any{"release_id": release})
@@ -909,56 +976,65 @@ func TestIntegrationDeploymentServingCleanupIsDurable(t *testing.T) {
 func TestIntegrationDeploymentCleanupRecordFailureRetainsOwnership(t *testing.T) {
 	for name, ambiguous := range map[string]bool{"terminal": false, "ambiguous": true} {
 		t.Run(name, func(t *testing.T) {
-			transport := &recordingDeployTransport{scriptedDeployTransport: newScriptedDeployTransport()}
-			fixture := newDeploymentRetryFixtureWithTransport(t, transport)
-			fixture.deploy(t)
-			env := fixture.environment(t)
+			fixture, transport, env := newDeployedRecordingFixture(t)
 			fixture.service.routeSync = func(context.Context) error {
 				transport.events = append(transport.events, "restore:ok")
 				return nil
 			}
-			if !ambiguous {
-				op, _, _, _ := fixture.prepareOwnedCandidate(t, "record-failure", "registry.example/live:record-failure", "running")
-				if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_operations SET state='failed' WHERE id=$1`, op.ID); err != nil {
-					t.Fatal(err)
-				}
-			} else {
-				var ops []contract.Operation
-				for _, key := range []string{"ambiguous-a", "ambiguous-b"} {
-					release := fixture.createRelease(key, "registry.example/live:"+key)
-					op := platformSubmit(t, fixture.service, platform.KindDeploy, "env/live/production", key, map[string]any{"release_id": release})
-					dep := deploymentForOperation(t, fixture.pool, op.ID)
-					if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_platform_deployments
-                        SET state='running',instances=$2 WHERE id=$1`,
-						dep, fmt.Sprintf(`[{"name":%q,"process":"web","kind":"web","replica":"1","state":"running"}]`, key+"-candidate")); err != nil {
-						t.Fatal(err)
-					}
-					ops = append(ops, op)
-				}
-				if _, err := fixture.pool.Exec(fixture.ctx, `INSERT INTO eregion_platform_deployment_owners
-                    (environment_id,phase,route_target_deployment_id,restore_release_id,restore_deployment_id,created_at,updated_at)
-                    VALUES($1,'ambiguous',$2,$3,$4,clock_timestamp(),clock_timestamp())`, env.ID, env.ServingDeploymentID, env.ServingRelease, env.ServingDeploymentID); err != nil {
-					t.Fatal(err)
-				}
-				defer func() {
-					for _, op := range ops {
-						current, _ := fixture.service.Get(fixture.ctx, testActor, op.ID)
-						if current.State.Terminal() {
-							t.Fatalf("ambiguous operation %s became terminal before cleanup was durable", op.ID)
-						}
-					}
-				}()
-			}
+			ops := seedCleanupRecordFailure(t, fixture, env, ambiguous)
 			if _, err := fixture.pool.Exec(fixture.ctx, `DROP TABLE eregion_platform_container_cleanup`); err != nil {
 				t.Fatal(err)
 			}
 			if err := fixture.service.reconcileDeploymentOwners(fixture.ctx); err == nil {
 				t.Fatal("owner reconciliation succeeded while cleanup rows could not be recorded")
 			}
-			if owner, has := ownerForFixture(t, fixture, env); !has {
-				t.Fatalf("ownership was released despite cleanup record failure: %+v", owner)
-			}
+			assertCleanupRecordFailureRetained(t, fixture, env, ops)
 		})
+	}
+}
+
+// seedCleanupRecordFailure records the terminal or ambiguous owner state whose
+// cleanup row insertion is about to fail.
+func seedCleanupRecordFailure(t *testing.T, fixture *deploymentRetryFixture, env platform.Environment, ambiguous bool) []contract.Operation {
+	t.Helper()
+	if !ambiguous {
+		op, _, _, _ := fixture.prepareOwnedCandidate(t, "record-failure", "registry.example/live:record-failure", "running")
+		if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_operations SET state='failed' WHERE id=$1`, op.ID); err != nil {
+			t.Fatal(err)
+		}
+		return nil
+	}
+	ops := make([]contract.Operation, 0, 2)
+	for _, key := range []string{"ambiguous-a", "ambiguous-b"} {
+		release := fixture.createRelease(key, "registry.example/live:"+key)
+		op := platformSubmit(t, fixture.service, platform.KindDeploy, "env/live/production", key, map[string]any{"release_id": release})
+		dep := deploymentForOperation(t, fixture.pool, op.ID)
+		if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_platform_deployments
+            SET state='running',instances=$2 WHERE id=$1`,
+			dep, fmt.Sprintf(`[{"name":%q,"process":"web","kind":"web","replica":"1","state":"running"}]`, key+"-candidate")); err != nil {
+			t.Fatal(err)
+		}
+		ops = append(ops, op)
+	}
+	if _, err := fixture.pool.Exec(fixture.ctx, `INSERT INTO eregion_platform_deployment_owners
+        (environment_id,phase,route_target_deployment_id,restore_release_id,restore_deployment_id,created_at,updated_at)
+        VALUES($1,'ambiguous',$2,$3,$4,clock_timestamp(),clock_timestamp())`, env.ID, env.ServingDeploymentID, env.ServingRelease, env.ServingDeploymentID); err != nil {
+		t.Fatal(err)
+	}
+	return ops
+}
+
+func assertCleanupRecordFailureRetained(t *testing.T, fixture *deploymentRetryFixture, env platform.Environment, ops []contract.Operation) {
+	t.Helper()
+	assertOwnerRetained(t, fixture, env, "cleanup record failure")
+	for _, op := range ops {
+		current, err := fixture.service.Get(fixture.ctx, testActor, op.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if current.State.Terminal() {
+			t.Fatalf("ambiguous operation %s became terminal before cleanup was durable", op.ID)
+		}
 	}
 }
 
@@ -1017,7 +1093,7 @@ func TestIntegrationScaleAdmissionContentionIsNonblocking(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close(context.Background())
+	defer func() { _ = conn.Close(context.Background()) }()
 	key := targetLockKey("env/live/production")
 	if _, err := conn.Exec(fixture.ctx, `SELECT pg_advisory_lock($1)`, key); err != nil {
 		t.Fatal(err)
@@ -1071,7 +1147,7 @@ func TestIntegrationDeployWorkerLockContentionSnoozes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close(context.Background())
+	defer func() { _ = conn.Close(context.Background()) }()
 	key := targetLockKey("env/live/production")
 	if _, err := conn.Exec(fixture.ctx, `SELECT pg_advisory_lock($1)`, key); err != nil {
 		t.Fatal(err)
@@ -1177,71 +1253,56 @@ func TestIntegrationDeploymentCleanupProtectsFrozenRestoreTarget(t *testing.T) {
 func TestIntegrationDeploymentPreRecordFailureRetainsOwner(t *testing.T) {
 	for name, failLookup := range map[string]bool{"insert": false, "lookup": true} {
 		t.Run(name, func(t *testing.T) {
-			transport := &recordingDeployTransport{scriptedDeployTransport: newScriptedDeployTransport()}
-			fixture := newDeploymentRetryFixtureWithTransport(t, transport)
-			fixture.deploy(t)
-			env := fixture.environment(t)
-			previous, err := fixture.service.deploymentByID(fixture.ctx, env.ServingDeploymentID)
-			if err != nil {
-				t.Fatal(err)
-			}
-			var previousInstances []byte
-			if err := fixture.pool.QueryRow(fixture.ctx, `SELECT instances FROM eregion_platform_deployments WHERE id=$1`, previous.ID).Scan(&previousInstances); err != nil {
-				t.Fatal(err)
-			}
-			release := fixture.createRelease("pre-record", "registry.example/live:pre-record")
-			op := platformSubmit(t, fixture.service, platform.KindDeploy, "env/live/production", "pre-record", map[string]any{"release_id": release})
-			if failLookup {
-				if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_platform_deployments SET instances='{"invalid":true}'::jsonb WHERE id=$1`, previous.ID); err != nil {
-					t.Fatal(err)
-				}
-			} else {
-				if _, err := fixture.pool.Exec(fixture.ctx, fmt.Sprintf(`ALTER TABLE eregion_platform_container_cleanup
-                    ADD CONSTRAINT pre_record_failure CHECK (container_name <> '%s')`, previous.Instances[0].Name)); err != nil {
-					t.Fatal(err)
-				}
-			}
+			fixture, _, env := newDeployedRecordingFixture(t)
+			previous := previousDeploymentFor(t, fixture, env)
+			previousInstances, op := seedPreRecordFailure(t, fixture, previous, failLookup)
 			if err := runPlatformAttempt(fixture.ctx, fixture.service, op.ID, 1); err == nil {
 				t.Fatal("deployment succeeded without durable previous cleanup")
 			}
-			current, err := fixture.service.Get(fixture.ctx, testActor, op.ID)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if current.State.Terminal() {
-				t.Fatalf("operation terminalized without durable cleanup: %+v", current)
-			}
-			owner, has := ownerForFixture(t, fixture, env)
-			if !has {
-				t.Fatal("owner was released without durable cleanup")
-			}
-			if owner.Phase != deploymentOwnerServing {
-				t.Fatalf("owner phase = %s, want serving", owner.Phase)
-			}
-			if failLookup {
-				if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_platform_deployments SET instances=$2 WHERE id=$1`, previous.ID, previousInstances); err != nil {
-					t.Fatal(err)
-				}
-			} else {
-				if _, err := fixture.pool.Exec(fixture.ctx, `ALTER TABLE eregion_platform_container_cleanup
-                    DROP CONSTRAINT pre_record_failure`); err != nil {
-					t.Fatal(err)
-				}
-			}
+			assertOperationNotTerminal(t, fixture, op.ID, "pre-record failure")
+			assertOwnerPhase(t, fixture, env, deploymentOwnerServing, "pre-record failure")
+			repairPreRecordFailure(t, fixture, previous, previousInstances, failLookup)
 			if err := runPlatformAttempt(fixture.ctx, fixture.service, op.ID, 1); err != nil {
 				t.Fatalf("retry after pre-record repair: %v", err)
 			}
-			current, err = fixture.service.Get(fixture.ctx, testActor, op.ID)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if current.State != contract.Succeeded {
-				t.Fatalf("repaired deployment = %+v, want succeeded", current)
-			}
-			if _, has := ownerForFixture(t, fixture, env); has {
-				t.Fatal("owner remained after successful finalization")
-			}
+			assertOperationState(t, fixture, op.ID, contract.Succeeded, "pre-record retry")
+			assertOwnerReleased(t, fixture, env, "pre-record retry")
 		})
+	}
+}
+
+func seedPreRecordFailure(t *testing.T, fixture *deploymentRetryFixture, previous platform.Deployment, failLookup bool) ([]byte, contract.Operation) {
+	t.Helper()
+	var previousInstances []byte
+	if err := fixture.pool.QueryRow(fixture.ctx, `SELECT instances FROM eregion_platform_deployments WHERE id=$1`, previous.ID).Scan(&previousInstances); err != nil {
+		t.Fatal(err)
+	}
+	release := fixture.createRelease("pre-record", "registry.example/live:pre-record")
+	op := platformSubmit(t, fixture.service, platform.KindDeploy, "env/live/production", "pre-record", map[string]any{"release_id": release})
+	if failLookup {
+		if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_platform_deployments SET instances='{"invalid":true}'::jsonb WHERE id=$1`, previous.ID); err != nil {
+			t.Fatal(err)
+		}
+		return previousInstances, op
+	}
+	if _, err := fixture.pool.Exec(fixture.ctx, fmt.Sprintf(`ALTER TABLE eregion_platform_container_cleanup
+        ADD CONSTRAINT pre_record_failure CHECK (container_name <> '%s')`, previous.Instances[0].Name)); err != nil {
+		t.Fatal(err)
+	}
+	return previousInstances, op
+}
+
+func repairPreRecordFailure(t *testing.T, fixture *deploymentRetryFixture, previous platform.Deployment, previousInstances []byte, failLookup bool) {
+	t.Helper()
+	if failLookup {
+		if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_platform_deployments SET instances=$2 WHERE id=$1`, previous.ID, previousInstances); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	if _, err := fixture.pool.Exec(fixture.ctx, `ALTER TABLE eregion_platform_container_cleanup
+        DROP CONSTRAINT pre_record_failure`); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -1511,233 +1572,219 @@ func TestIntegrationDeploymentRestorePhaseAuthoritative(t *testing.T) {
 func TestIntegrationRecoveryPostSwitchSyncFailureUsesRestoration(t *testing.T) {
 	for name, restoreFails := range map[string]bool{"restore succeeds": false, "restore fails": true} {
 		t.Run(name, func(t *testing.T) {
-			transport := &recordingDeployTransport{scriptedDeployTransport: newScriptedDeployTransport()}
-			fixture := newDeploymentRetryFixtureWithTransport(t, transport)
-			fixture.deploy(t)
-			env := fixture.environment(t)
-			previousRelease, previousDeployment := env.ServingRelease, env.ServingDeploymentID
-			op, _, _, _ := fixture.prepareOwnedCandidate(t, "recovery-sync", "registry.example/live:recovery-sync", "completed")
-			insertCompletedStep(t, fixture.pool, op.ID, deploymentPublicStep, strings.Repeat("b", 64))
-			if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_platform_deployment_owners
-                SET phase='serving',route_target_deployment_id=$2 WHERE environment_id=$1`, env.ID, deploymentForOperation(t, fixture.pool, op.ID)); err != nil {
-				t.Fatal(err)
-			}
-			calls := 0
-			fixture.service.routeSync = func(context.Context) error {
-				calls++
-				if calls == 1 {
-					return contract.NewFault(contract.PreconditionFailed, "recovery resync failed", "test")
-				}
-				if restoreFails {
-					return contract.NewFault(contract.Unavailable, "restore writer unavailable", "test")
-				}
-				transport.events = append(transport.events, "restore:ok")
-				return nil
-			}
+			fixture, transport, env, op, previousRelease, previousDeployment := setupRecoverySyncFailure(t, "recovery-sync")
+			installRecoverySyncRoute(t, fixture, transport, restoreFails)
 			current, err := fixture.service.Get(fixture.ctx, testActor, op.ID)
 			if err != nil {
 				t.Fatal(err)
 			}
 			err = fixture.service.reconcileDeployment(fixture.ctx, current)
 			if restoreFails {
-				if err == nil {
-					t.Fatal("reconciliation succeeded while recovery restoration failed")
-				}
-				current, err = fixture.service.Get(fixture.ctx, testActor, op.ID)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if current.State.Terminal() {
-					t.Fatalf("operation terminalized before recovery restoration: %+v", current)
-				}
-				owner, has := ownerForFixture(t, fixture, env)
-				if !has || owner.Phase != deploymentOwnerRestoring {
-					t.Fatalf("owner after failed recovery restore = %+v, has=%t", owner, has)
-				}
+				assertRecoveryRestoreFailureRetained(t, fixture, env, op, err)
 				return
 			}
 			if err != nil {
 				t.Fatal(err)
 			}
-			final, err := fixture.service.Get(fixture.ctx, testActor, op.ID)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if final.State != contract.Failed {
-				t.Fatalf("recovery sync failure = %+v, want failed", final)
-			}
-			if release, deployment := fixture.serving(t); release != previousRelease || deployment != previousDeployment {
-				t.Fatalf("serving after recovery sync failure = %s/%s, want %s/%s", release, deployment, previousRelease, previousDeployment)
-			}
-			if owner, has := ownerForFixture(t, fixture, env); has {
-				t.Fatalf("owner remained after restored recovery failure: %+v", owner)
-			}
+			assertOperationState(t, fixture, op.ID, contract.Failed, "recovery sync failure")
+			assertServingDeployment(t, fixture, previousRelease, previousDeployment, "recovery sync failure")
+			assertOwnerReleased(t, fixture, env, "recovery sync failure")
 		})
 	}
+}
+
+func setupRecoverySyncFailure(t *testing.T, key string) (*deploymentRetryFixture, *recordingDeployTransport, platform.Environment, contract.Operation, platform.ReleaseID, platform.DeploymentID) {
+	t.Helper()
+	fixture, transport, env := newDeployedRecordingFixture(t)
+	previousRelease, previousDeployment := env.ServingRelease, env.ServingDeploymentID
+	op, depID, _, _ := fixture.prepareOwnedCandidate(t, key, "registry.example/live:"+key, "completed")
+	insertCompletedStep(t, fixture.pool, op.ID, deploymentPublicStep, strings.Repeat("b", 64))
+	if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_platform_deployment_owners
+        SET phase='serving',route_target_deployment_id=$2 WHERE environment_id=$1`, env.ID, depID); err != nil {
+		t.Fatal(err)
+	}
+	return fixture, transport, env, op, previousRelease, previousDeployment
+}
+
+func installRecoverySyncRoute(t *testing.T, fixture *deploymentRetryFixture, transport *recordingDeployTransport, restoreFails bool) {
+	t.Helper()
+	calls := 0
+	fixture.service.routeSync = func(context.Context) error {
+		calls++
+		if calls == 1 {
+			return contract.NewFault(contract.PreconditionFailed, "recovery resync failed", "test")
+		}
+		if restoreFails {
+			return contract.NewFault(contract.Unavailable, "restore writer unavailable", "test")
+		}
+		transport.events = append(transport.events, "restore:ok")
+		return nil
+	}
+}
+
+func assertRecoveryRestoreFailureRetained(t *testing.T, fixture *deploymentRetryFixture, env platform.Environment, op contract.Operation, err error) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("reconciliation succeeded while recovery restoration failed")
+	}
+	assertOperationNotTerminal(t, fixture, op.ID, "recovery restore failure")
+	assertOwnerPhase(t, fixture, env, deploymentOwnerRestoring, "recovery restore failure")
 }
 
 func TestIntegrationCancellationCleanupIntentIsDurable(t *testing.T) {
 	for name, blockInsert := range map[string]bool{"insert failure": true, "resolver unavailable": false} {
 		t.Run(name, func(t *testing.T) {
-			transport := &recordingDeployTransport{scriptedDeployTransport: newScriptedDeployTransport()}
-			fixture := newDeploymentRetryFixtureWithTransport(t, transport)
-			fixture.deploy(t)
-			env := fixture.environment(t)
-			op, dep, _, _ := fixture.prepareOwnedCandidate(t, "cancel-durable", "registry.example/live:cancel-durable", "running")
-			if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_operations SET state='cancelling' WHERE id=$1`, op.ID); err != nil {
-				t.Fatal(err)
-			}
-			candidateName := dep + "-candidate"
-			_ = candidateName
-			if blockInsert {
-				if _, err := fixture.pool.Exec(fixture.ctx, fmt.Sprintf(`ALTER TABLE eregion_platform_container_cleanup
-                    ADD CONSTRAINT cancel_cleanup_failure CHECK (container_name <> '%s')`, "cancel-durable-candidate")); err != nil {
-					t.Fatal(err)
-				}
-			} else {
-				fixture.service.resolver = nil
-			}
-			fixture.service.routeSync = func(context.Context) error { return nil }
+			fixture, _, env, op, dep := setupCancellationCleanupIntent(t, "cancel-durable", blockInsert)
 			current, err := fixture.service.Get(fixture.ctx, testActor, op.ID)
 			if err != nil {
 				t.Fatal(err)
 			}
 			if blockInsert {
-				if err := fixture.service.reconcileDeployment(fixture.ctx, current); err == nil {
-					t.Fatal("cancellation terminalized without durable cleanup intent")
-				}
-				current, err = fixture.service.Get(fixture.ctx, testActor, op.ID)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if current.State.Terminal() {
-					t.Fatalf("cancellation terminalized on cleanup insert failure: %+v", current)
-				}
-				if owner, has := ownerForFixture(t, fixture, env); !has {
-					t.Fatalf("owner released on cleanup insert failure: %+v", owner)
-				}
-				if _, err := fixture.pool.Exec(fixture.ctx, `ALTER TABLE eregion_platform_container_cleanup DROP CONSTRAINT cancel_cleanup_failure`); err != nil {
-					t.Fatal(err)
-				}
-				current, err = fixture.service.Get(fixture.ctx, testActor, op.ID)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if err := fixture.service.reconcileDeployment(fixture.ctx, current); err != nil {
-					t.Fatal(err)
-				}
-			} else {
-				if err := fixture.service.reconcileDeployment(fixture.ctx, current); err != nil {
-					t.Fatal(err)
-				}
-				var rows int
-				if err := fixture.pool.QueryRow(fixture.ctx, `SELECT count(*) FROM eregion_platform_container_cleanup
-                    WHERE deployment_id=$1`, dep).Scan(&rows); err != nil {
-					t.Fatal(err)
-				}
-				if rows == 0 {
-					t.Fatal("cancellation cleanup intent was not durable when the resolver was unavailable")
-				}
+				assertBlockedCancellationCleanupIntent(t, fixture, env, op, current)
+				return
 			}
-			final, err := fixture.service.Get(fixture.ctx, testActor, op.ID)
-			if err != nil {
+			if err := fixture.service.reconcileDeployment(fixture.ctx, current); err != nil {
 				t.Fatal(err)
 			}
-			if final.State != contract.Canceled {
-				t.Fatalf("cancellation = %+v, want cancelled", final)
-			}
+			assertResolverUnavailableCleanupIntent(t, fixture, op, dep)
 		})
 	}
 }
 
+func setupCancellationCleanupIntent(t *testing.T, key string, blockInsert bool) (*deploymentRetryFixture, *recordingDeployTransport, platform.Environment, contract.Operation, platform.DeploymentID) {
+	t.Helper()
+	fixture, transport, env := newDeployedRecordingFixture(t)
+	op, dep, _, _ := fixture.prepareOwnedCandidate(t, key, "registry.example/live:"+key, "running")
+	if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_operations SET state='cancelling' WHERE id=$1`, op.ID); err != nil {
+		t.Fatal(err)
+	}
+	if blockInsert {
+		if _, err := fixture.pool.Exec(fixture.ctx, fmt.Sprintf(`ALTER TABLE eregion_platform_container_cleanup
+            ADD CONSTRAINT cancel_cleanup_failure CHECK (container_name <> '%s')`, key+"-candidate")); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		fixture.service.resolver = nil
+	}
+	fixture.service.routeSync = func(context.Context) error { return nil }
+	return fixture, transport, env, op, dep
+}
+
+func assertBlockedCancellationCleanupIntent(t *testing.T, fixture *deploymentRetryFixture, env platform.Environment, op contract.Operation, current contract.Operation) {
+	t.Helper()
+	if err := fixture.service.reconcileDeployment(fixture.ctx, current); err == nil {
+		t.Fatal("cancellation terminalized without durable cleanup intent")
+	}
+	assertOperationNotTerminal(t, fixture, op.ID, "cancellation cleanup insert failure")
+	assertOwnerRetained(t, fixture, env, "cancellation cleanup insert failure")
+	if _, err := fixture.pool.Exec(fixture.ctx, `ALTER TABLE eregion_platform_container_cleanup DROP CONSTRAINT cancel_cleanup_failure`); err != nil {
+		t.Fatal(err)
+	}
+	current, err := fixture.service.Get(fixture.ctx, testActor, op.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.service.reconcileDeployment(fixture.ctx, current); err != nil {
+		t.Fatal(err)
+	}
+	assertOperationState(t, fixture, op.ID, contract.Canceled, "cancellation after cleanup repair")
+}
+
+func assertResolverUnavailableCleanupIntent(t *testing.T, fixture *deploymentRetryFixture, op contract.Operation, dep platform.DeploymentID) {
+	t.Helper()
+	var rows int
+	if err := fixture.pool.QueryRow(fixture.ctx, `SELECT count(*) FROM eregion_platform_container_cleanup
+        WHERE deployment_id=$1`, dep).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows == 0 {
+		t.Fatal("cancellation cleanup intent was not durable when the resolver was unavailable")
+	}
+	assertOperationState(t, fixture, op.ID, contract.Canceled, "cancellation with unavailable resolver")
+}
+
 func TestIntegrationPreviousCleanupPinnedRevisionNode(t *testing.T) {
 	t.Run("uses pinned node after environment move", func(t *testing.T) {
-		transport := &recordingDeployTransport{scriptedDeployTransport: newScriptedDeployTransport()}
-		fixture := newDeploymentRetryFixtureWithTransport(t, transport)
-		fixture.deploy(t)
-		env := fixture.environment(t)
-		previous, err := fixture.service.deploymentByID(fixture.ctx, env.ServingDeploymentID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if previous.RevisionID == "" {
-			t.Fatal("previous deployment has no pinned revision")
-		}
-		if _, err := fixture.pool.Exec(fixture.ctx, `ALTER TABLE eregion_platform_environment_revisions DISABLE TRIGGER USER`); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_platform_environment_revisions
-            SET runtime=jsonb_set(runtime,'{node}','"old-node"') WHERE id=$1`, previous.RevisionID); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := fixture.pool.Exec(fixture.ctx, `ALTER TABLE eregion_platform_environment_revisions ENABLE TRIGGER USER`); err != nil {
-			t.Fatal(err)
-		}
-		release := fixture.createRelease("pinned-node", "registry.example/live:pinned-node")
-		op := platformSubmit(t, fixture.service, platform.KindDeploy, "env/live/production", "pinned-node", map[string]any{"release_id": release})
-		runPlatformAttempt(fixture.ctx, fixture.service, op.ID, 1)
-		var node string
-		if err := fixture.pool.QueryRow(fixture.ctx, `SELECT node FROM eregion_platform_container_cleanup
-            WHERE deployment_id=$1 LIMIT 1`, previous.ID).Scan(&node); err != nil {
-			t.Fatal(err)
-		}
-		if node != "old-node" {
-			t.Fatalf("cleanup node = %q, want pinned old-node", node)
-		}
+		assertPinnedRevisionCleanupUsesPinnedNode(t)
 	})
 	t.Run("lookup failure retains owner", func(t *testing.T) {
-		transport := &recordingDeployTransport{scriptedDeployTransport: newScriptedDeployTransport()}
-		fixture := newDeploymentRetryFixtureWithTransport(t, transport)
-		fixture.deploy(t)
-		env := fixture.environment(t)
-		previous, err := fixture.service.deploymentByID(fixture.ctx, env.ServingDeploymentID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		fixture.run(platformSubmit(t, fixture.service, platform.KindConfigSet, "env/live/production",
-			"pinned-fail-config", map[string]any{"config": map[string]string{"PIN": "1"}}))
-		release := fixture.createRelease("pinned-fail", "registry.example/live:pinned-fail")
-		op := platformSubmit(t, fixture.service, platform.KindDeploy, "env/live/production", "pinned-fail", map[string]any{"release_id": release})
-		var runtime []byte
-		if err := fixture.pool.QueryRow(fixture.ctx, `SELECT runtime FROM eregion_platform_environment_revisions WHERE id=$1`, previous.RevisionID).Scan(&runtime); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := fixture.pool.Exec(fixture.ctx, `ALTER TABLE eregion_platform_environment_revisions DISABLE TRIGGER USER`); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_platform_environment_revisions
-            SET runtime='[]'::jsonb WHERE id=$1`, previous.RevisionID); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := fixture.pool.Exec(fixture.ctx, `ALTER TABLE eregion_platform_environment_revisions ENABLE TRIGGER USER`); err != nil {
-			t.Fatal(err)
-		}
-		if err := runPlatformAttempt(fixture.ctx, fixture.service, op.ID, 1); err == nil {
-			t.Fatal("deployment succeeded with unreadable pinned previous revision")
-		}
-		current, err := fixture.service.Get(fixture.ctx, testActor, op.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if current.State.Terminal() {
-			t.Fatalf("operation terminalized on pinned revision lookup failure: %+v", current)
-		}
-		if owner, has := ownerForFixture(t, fixture, env); !has {
-			t.Fatalf("owner released on pinned revision lookup failure: %+v", owner)
-		}
-		if _, err := fixture.pool.Exec(fixture.ctx, `ALTER TABLE eregion_platform_environment_revisions DISABLE TRIGGER USER`); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_platform_environment_revisions SET runtime=$2 WHERE id=$1`, previous.RevisionID, runtime); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := fixture.pool.Exec(fixture.ctx, `ALTER TABLE eregion_platform_environment_revisions ENABLE TRIGGER USER`); err != nil {
-			t.Fatal(err)
-		}
-		if err := runPlatformAttempt(fixture.ctx, fixture.service, op.ID, 1); err != nil {
-			t.Fatalf("retry after pinned revision repair: %v", err)
-		}
+		assertPinnedRevisionLookupFailureRetainsOwner(t)
 	})
+}
+
+func disableRevisionTriggers(t *testing.T, fixture *deploymentRetryFixture) {
+	t.Helper()
+	if _, err := fixture.pool.Exec(fixture.ctx, `ALTER TABLE eregion_platform_environment_revisions DISABLE TRIGGER USER`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func enableRevisionTriggers(t *testing.T, fixture *deploymentRetryFixture) {
+	t.Helper()
+	if _, err := fixture.pool.Exec(fixture.ctx, `ALTER TABLE eregion_platform_environment_revisions ENABLE TRIGGER USER`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertPinnedRevisionCleanupUsesPinnedNode(t *testing.T) {
+	t.Helper()
+	fixture, _, env := newDeployedRecordingFixture(t)
+	previous := previousDeploymentFor(t, fixture, env)
+	if previous.RevisionID == "" {
+		t.Fatal("previous deployment has no pinned revision")
+	}
+	disableRevisionTriggers(t, fixture)
+	if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_platform_environment_revisions
+        SET runtime=jsonb_set(runtime,'{node}','"old-node"') WHERE id=$1`, previous.RevisionID); err != nil {
+		t.Fatal(err)
+	}
+	enableRevisionTriggers(t, fixture)
+	release := fixture.createRelease("pinned-node", "registry.example/live:pinned-node")
+	op := platformSubmit(t, fixture.service, platform.KindDeploy, "env/live/production", "pinned-node", map[string]any{"release_id": release})
+	if err := runPlatformAttempt(fixture.ctx, fixture.service, op.ID, 1); err != nil {
+		t.Fatalf("deploy with pinned cleanup node: %v", err)
+	}
+	var node string
+	if err := fixture.pool.QueryRow(fixture.ctx, `SELECT node FROM eregion_platform_container_cleanup
+        WHERE deployment_id=$1 LIMIT 1`, previous.ID).Scan(&node); err != nil {
+		t.Fatal(err)
+	}
+	if node != "old-node" {
+		t.Fatalf("cleanup node = %q, want pinned old-node", node)
+	}
+}
+
+func assertPinnedRevisionLookupFailureRetainsOwner(t *testing.T) {
+	t.Helper()
+	fixture, _, env := newDeployedRecordingFixture(t)
+	previous := previousDeploymentFor(t, fixture, env)
+	fixture.run(platformSubmit(t, fixture.service, platform.KindConfigSet, "env/live/production",
+		"pinned-fail-config", map[string]any{"config": map[string]string{"PIN": "1"}}))
+	release := fixture.createRelease("pinned-fail", "registry.example/live:pinned-fail")
+	op := platformSubmit(t, fixture.service, platform.KindDeploy, "env/live/production", "pinned-fail", map[string]any{"release_id": release})
+	var runtime []byte
+	if err := fixture.pool.QueryRow(fixture.ctx, `SELECT runtime FROM eregion_platform_environment_revisions WHERE id=$1`, previous.RevisionID).Scan(&runtime); err != nil {
+		t.Fatal(err)
+	}
+	disableRevisionTriggers(t, fixture)
+	if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_platform_environment_revisions
+        SET runtime='[]'::jsonb WHERE id=$1`, previous.RevisionID); err != nil {
+		t.Fatal(err)
+	}
+	enableRevisionTriggers(t, fixture)
+	if err := runPlatformAttempt(fixture.ctx, fixture.service, op.ID, 1); err == nil {
+		t.Fatal("deployment succeeded with unreadable pinned previous revision")
+	}
+	assertOperationNotTerminal(t, fixture, op.ID, "pinned revision lookup failure")
+	assertOwnerRetained(t, fixture, env, "pinned revision lookup failure")
+	disableRevisionTriggers(t, fixture)
+	if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_platform_environment_revisions SET runtime=$2 WHERE id=$1`, previous.RevisionID, runtime); err != nil {
+		t.Fatal(err)
+	}
+	enableRevisionTriggers(t, fixture)
+	if err := runPlatformAttempt(fixture.ctx, fixture.service, op.ID, 1); err != nil {
+		t.Fatalf("retry after pinned revision repair: %v", err)
+	}
 }
 
 func TestIntegrationAmbiguousDeploymentLookupFailureRetainsOwner(t *testing.T) {
@@ -1809,150 +1856,139 @@ func blockContainerCleanupInserts(t *testing.T, pool *pgxpool.Pool) func() {
 // before cancellation or terminal failure settles ownership.
 func TestIntegrationDeploymentPreSaveCleanupReconstruction(t *testing.T) {
 	t.Run("cancellation uses planned names without a resolver", func(t *testing.T) {
-		transport := &recordingDeployTransport{scriptedDeployTransport: newScriptedDeployTransport()}
-		fixture := newDeploymentRetryFixtureWithTransport(t, transport)
-		fixture.deploy(t)
-		env := fixture.environment(t)
-		if env.Revision == nil {
-			t.Fatal("environment has no current revision")
-		}
-		release := fixture.createRelease("pre-save-cancel", "registry.example/live:pre-save-cancel")
-		op := platformSubmit(t, fixture.service, platform.KindDeploy, "env/live/production", "pre-save-cancel",
-			map[string]any{"release_id": release})
-		depID := platform.DeploymentID(deploymentForOperation(t, fixture.pool, op.ID))
-		plan, err := platform.PlanDeployment(env.App, env.Name, env.Revision.RevisionState, release, depID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(plan) == 0 {
-			t.Fatal("candidate plan is empty")
-		}
-		if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_platform_deployments
-            SET state='running',instances='[]'::jsonb,revision_id=$2 WHERE id=$1`, depID, env.RevisionID); err != nil {
-			t.Fatal(err)
-		}
-		for _, planned := range plan {
-			insertCompletedStep(t, fixture.pool, op.ID, containerStepID(planned.Process.Name, planned.Replica), strings.Repeat("c", 64))
-		}
-		if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_operations
-            SET state='cancelling',attempt=1 WHERE id=$1`, op.ID); err != nil {
-			t.Fatal(err)
-		}
-		insertDeploymentOwner(t, fixture.pool, env, deploymentOwner{
-			EnvironmentID: env.ID, OperationID: op.ID, DeploymentID: depID, Attempt: 1,
-			Phase: deploymentOwnerSwitching, RouteTarget: depID,
-			RestoreReleaseID: env.ServingRelease, RestoreDeploymentID: env.ServingDeploymentID,
-		})
-		fixture.service.resolver = nil
-		current, err := fixture.service.Get(fixture.ctx, testActor, op.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := fixture.service.reconcileDeployment(fixture.ctx, current); err != nil {
-			t.Fatal(err)
-		}
-		final, err := fixture.service.Get(fixture.ctx, testActor, op.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if final.State != contract.Canceled {
-			t.Fatalf("cancellation = %+v, want cancelled", final)
-		}
-		if owner, has := ownerForFixture(t, fixture, env); has {
-			t.Fatalf("owner remained after pre-save cancellation: %+v", owner)
-		}
-		for _, planned := range plan {
-			var count int
-			var nodeName string
-			if err := fixture.pool.QueryRow(fixture.ctx, `SELECT count(*),coalesce(min(node),'')
-                FROM eregion_platform_container_cleanup
-                WHERE deployment_id=$1 AND container_name=$2`, depID, planned.Name).Scan(&count, &nodeName); err != nil {
-				t.Fatal(err)
-			}
-			if count != 1 {
-				t.Fatalf("cleanup rows for pre-save container %s = %d, want 1", planned.Name, count)
-			}
-			if nodeName != env.Node {
-				t.Fatalf("cleanup node for %s = %q, want %q", planned.Name, nodeName, env.Node)
-			}
-		}
+		scenario := newPreSaveScenario(t, "pre-save-cancel", "c")
+		assertPreSaveCancellationCleanup(t, scenario)
 	})
 
 	t.Run("unresolvable pinned node retains ownership", func(t *testing.T) {
-		transport := &recordingDeployTransport{scriptedDeployTransport: newScriptedDeployTransport()}
-		fixture := newDeploymentRetryFixtureWithTransport(t, transport)
-		fixture.deploy(t)
-		env := fixture.environment(t)
-		if env.Revision == nil {
-			t.Fatal("environment has no current revision")
-		}
-		release := fixture.createRelease("pre-save-node", "registry.example/live:pre-save-node")
-		op := platformSubmit(t, fixture.service, platform.KindDeploy, "env/live/production", "pre-save-node",
-			map[string]any{"release_id": release})
-		depID := platform.DeploymentID(deploymentForOperation(t, fixture.pool, op.ID))
-		plan, err := platform.PlanDeployment(env.App, env.Name, env.Revision.RevisionState, release, depID)
-		if err != nil {
+		scenario := newPreSaveScenario(t, "pre-save-node", "d")
+		disableRevisionTriggers(t, scenario.fixture)
+		if _, err := scenario.fixture.pool.Exec(scenario.fixture.ctx, `UPDATE eregion_platform_environment_revisions
+            SET runtime='{}'::jsonb WHERE id=$1`, scenario.env.RevisionID); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_platform_deployments
-            SET state='running',instances='[]'::jsonb,revision_id=$2 WHERE id=$1`, depID, env.RevisionID); err != nil {
-			t.Fatal(err)
-		}
-		for _, planned := range plan {
-			insertCompletedStep(t, fixture.pool, op.ID, containerStepID(planned.Process.Name, planned.Replica), strings.Repeat("d", 64))
-		}
-		if _, err := fixture.pool.Exec(fixture.ctx, `ALTER TABLE eregion_platform_environment_revisions DISABLE TRIGGER USER`); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_platform_environment_revisions
-            SET runtime='{}'::jsonb WHERE id=$1`, env.RevisionID); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := fixture.pool.Exec(fixture.ctx, `ALTER TABLE eregion_platform_environment_revisions ENABLE TRIGGER USER`); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_operations
-            SET state='cancelling',attempt=1 WHERE id=$1`, op.ID); err != nil {
-			t.Fatal(err)
-		}
-		insertDeploymentOwner(t, fixture.pool, env, deploymentOwner{
-			EnvironmentID: env.ID, OperationID: op.ID, DeploymentID: depID, Attempt: 1,
-			Phase: deploymentOwnerSwitching, RouteTarget: depID,
-			RestoreReleaseID: env.ServingRelease, RestoreDeploymentID: env.ServingDeploymentID,
-		})
-		fixture.service.resolver = nil
-		current, err := fixture.service.Get(fixture.ctx, testActor, op.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := fixture.service.reconcileDeployment(fixture.ctx, current); err == nil {
-			t.Fatal("cancellation settled with an unresolvable pinned cleanup node")
-		}
-		current, err = fixture.service.Get(fixture.ctx, testActor, op.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if current.State.Terminal() {
-			t.Fatalf("cancellation terminalized with an unresolvable pinned cleanup node: %+v", current)
-		}
-		if owner, has := ownerForFixture(t, fixture, env); !has {
-			t.Fatalf("owner released with an unresolvable pinned cleanup node: %+v", owner)
-		}
-		var count int
-		if err := fixture.pool.QueryRow(fixture.ctx, `SELECT count(*) FROM eregion_platform_container_cleanup
-            WHERE deployment_id=$1`, depID).Scan(&count); err != nil {
-			t.Fatal(err)
-		}
-		if count != 0 {
-			t.Fatalf("cleanup rows were invented for an unresolvable pinned node: %d", count)
-		}
+		enableRevisionTriggers(t, scenario.fixture)
+		assertUnresolvablePinnedCleanupNodeRetainsOwnership(t, scenario)
 	})
+}
+
+type preSaveScenario struct {
+	fixture *deploymentRetryFixture
+	env     platform.Environment
+	op      contract.Operation
+	depID   platform.DeploymentID
+	plan    []platform.PlannedContainer
+}
+
+func newPreSaveScenario(t *testing.T, key, hashChar string) *preSaveScenario {
+	t.Helper()
+	fixture, _, env := newDeployedRecordingFixture(t)
+	if env.Revision == nil {
+		t.Fatal("environment has no current revision")
+	}
+	release := fixture.createRelease(key, "registry.example/live:"+key)
+	op := platformSubmit(t, fixture.service, platform.KindDeploy, "env/live/production", key,
+		map[string]any{"release_id": release})
+	depID := platform.DeploymentID(deploymentForOperation(t, fixture.pool, op.ID))
+	plan, err := platform.PlanDeployment(env.App, env.Name, env.Revision.RevisionState, release, depID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan) == 0 {
+		t.Fatal("candidate plan is empty")
+	}
+	if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_platform_deployments
+        SET state='running',instances='[]'::jsonb,revision_id=$2 WHERE id=$1`, depID, env.RevisionID); err != nil {
+		t.Fatal(err)
+	}
+	for _, planned := range plan {
+		insertCompletedStep(t, fixture.pool, op.ID, containerStepID(planned.Process.Name, planned.Replica), strings.Repeat(hashChar, 64))
+	}
+	if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_operations
+        SET state='cancelling',attempt=1 WHERE id=$1`, op.ID); err != nil {
+		t.Fatal(err)
+	}
+	insertDeploymentOwner(t, fixture.pool, env, deploymentOwner{
+		EnvironmentID: env.ID, OperationID: op.ID, DeploymentID: depID, Attempt: 1,
+		Phase: deploymentOwnerSwitching, RouteTarget: depID,
+		RestoreReleaseID: env.ServingRelease, RestoreDeploymentID: env.ServingDeploymentID,
+	})
+	fixture.service.resolver = nil
+	return &preSaveScenario{fixture: fixture, env: env, op: op, depID: depID, plan: plan}
+}
+
+func assertPreSaveCancellationCleanup(t *testing.T, scenario *preSaveScenario) {
+	t.Helper()
+	current, err := scenario.fixture.service.Get(scenario.fixture.ctx, testActor, scenario.op.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := scenario.fixture.service.reconcileDeployment(scenario.fixture.ctx, current); err != nil {
+		t.Fatal(err)
+	}
+	assertOperationState(t, scenario.fixture, scenario.op.ID, contract.Canceled, "pre-save cancellation")
+	assertOwnerReleased(t, scenario.fixture, scenario.env, "pre-save cancellation")
+	for _, planned := range scenario.plan {
+		var count int
+		var nodeName string
+		if err := scenario.fixture.pool.QueryRow(scenario.fixture.ctx, `SELECT count(*),coalesce(min(node),'')
+            FROM eregion_platform_container_cleanup
+            WHERE deployment_id=$1 AND container_name=$2`, scenario.depID, planned.Name).Scan(&count, &nodeName); err != nil {
+			t.Fatal(err)
+		}
+		if count != 1 {
+			t.Fatalf("cleanup rows for pre-save container %s = %d, want 1", planned.Name, count)
+		}
+		if nodeName != scenario.env.Node {
+			t.Fatalf("cleanup node for %s = %q, want %q", planned.Name, nodeName, scenario.env.Node)
+		}
+	}
+}
+
+func assertUnresolvablePinnedCleanupNodeRetainsOwnership(t *testing.T, scenario *preSaveScenario) {
+	t.Helper()
+	current, err := scenario.fixture.service.Get(scenario.fixture.ctx, testActor, scenario.op.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := scenario.fixture.service.reconcileDeployment(scenario.fixture.ctx, current); err == nil {
+		t.Fatal("cancellation settled with an unresolvable pinned cleanup node")
+	}
+	assertOperationNotTerminal(t, scenario.fixture, scenario.op.ID, "unresolvable pinned cleanup node")
+	assertOwnerRetained(t, scenario.fixture, scenario.env, "unresolvable pinned cleanup node")
+	var count int
+	if err := scenario.fixture.pool.QueryRow(scenario.fixture.ctx, `SELECT count(*) FROM eregion_platform_container_cleanup
+        WHERE deployment_id=$1`, scenario.depID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("cleanup rows were invented for an unresolvable pinned node: %d", count)
+	}
 }
 
 // TestIntegrationDeploymentRetryableFailureRetainsCandidates proves a retryable
 // pre-switch failure does not remove containers whose completed step rows make
 // the retry skip recreation.
 func TestIntegrationDeploymentRetryableFailureRetainsCandidates(t *testing.T) {
+	state := newRetryableCandidateTest(t)
+	assertRetryableFailureRetained(t, state)
+	assertRetryableRetrySucceeded(t, state)
+}
+
+type retryableCandidateTest struct {
+	fixture          *deploymentRetryFixture
+	transport        *healthFaultTransport
+	env              platform.Environment
+	release          platform.ReleaseID
+	previousRelease  platform.ReleaseID
+	previousDeployID platform.DeploymentID
+	op               contract.Operation
+	depID            platform.DeploymentID
+	plan             []platform.PlannedContainer
+}
+
+func newRetryableCandidateTest(t *testing.T) *retryableCandidateTest {
+	t.Helper()
 	transport := &healthFaultTransport{
 		recordingDeployTransport: &recordingDeployTransport{scriptedDeployTransport: newScriptedDeployTransport()},
 	}
@@ -1963,83 +1999,75 @@ func TestIntegrationDeploymentRetryableFailureRetainsCandidates(t *testing.T) {
 	if env.Revision == nil {
 		t.Fatal("environment has no current revision")
 	}
-	previousRelease, previousDeployment := env.ServingRelease, env.ServingDeploymentID
-	release := fixture.createRelease("retry-retain", "registry.example/live:retry-retain")
-	op := platformSubmit(t, fixture.service, platform.KindDeploy, "env/live/production", "retry-retain",
-		map[string]any{"release_id": release})
-	depID := platform.DeploymentID(deploymentForOperation(t, fixture.pool, op.ID))
-	plan, err := platform.PlanDeployment(env.App, env.Name, env.Revision.RevisionState, release, depID)
+	state := &retryableCandidateTest{
+		fixture: fixture, transport: transport, env: env,
+		previousRelease: env.ServingRelease, previousDeployID: env.ServingDeploymentID,
+	}
+	state.release = fixture.createRelease("retry-retain", "registry.example/live:retry-retain")
+	state.op = platformSubmit(t, fixture.service, platform.KindDeploy, "env/live/production", "retry-retain",
+		map[string]any{"release_id": state.release})
+	state.depID = platform.DeploymentID(deploymentForOperation(t, fixture.pool, state.op.ID))
+	plan, err := platform.PlanDeployment(env.App, env.Name, env.Revision.RevisionState, state.release, state.depID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(plan) == 0 {
 		t.Fatal("candidate plan is empty")
 	}
-	if err := runPlatformAttempt(fixture.ctx, fixture.service, op.ID, 1); err == nil {
+	state.plan = plan
+	if err := runPlatformAttempt(fixture.ctx, fixture.service, state.op.ID, 1); err == nil {
 		t.Fatal("retryable pre-switch failure was not returned")
 	}
-	current, err := fixture.service.Get(fixture.ctx, testActor, op.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if current.State.Terminal() {
-		t.Fatalf("retryable pre-switch failure terminalized: %+v", current)
-	}
-	if owner, has := ownerForFixture(t, fixture, env); !has || owner.Phase != deploymentOwnerPrepared {
-		t.Fatalf("owner after retryable pre-switch failure = %+v, has=%t", owner, has)
-	}
-	for _, planned := range plan {
+	assertOperationNotTerminal(t, fixture, state.op.ID, "retryable pre-switch failure")
+	assertOwnerPhase(t, fixture, env, deploymentOwnerPrepared, "retryable pre-switch failure")
+	return state
+}
+
+func assertRetryableFailureRetained(t *testing.T, state *retryableCandidateTest) {
+	t.Helper()
+	for _, planned := range state.plan {
 		step := containerStepID(planned.Process.Name, planned.Replica)
-		if runs := transport.runCount(op.ID, step); runs != 1 {
+		if runs := state.transport.runCount(state.op.ID, step); runs != 1 {
 			t.Fatalf("container step %s ran %d times before retry, want 1", step, runs)
 		}
-		var state string
-		if err := fixture.pool.QueryRow(fixture.ctx, `SELECT state FROM eregion_operation_steps
-            WHERE operation_id=$1 AND step=$2`, op.ID, step).Scan(&state); err != nil {
+		var stepState string
+		if err := state.fixture.pool.QueryRow(state.fixture.ctx, `SELECT state FROM eregion_operation_steps
+            WHERE operation_id=$1 AND step=$2`, state.op.ID, step).Scan(&stepState); err != nil {
 			t.Fatal(err)
 		}
-		if state != "completed" {
-			t.Fatalf("container step %s after retryable failure = %q, want completed", step, state)
+		if stepState != "completed" {
+			t.Fatalf("container step %s after retryable failure = %q, want completed", step, stepState)
 		}
 	}
-	if index := transport.eventIndex("run:platform-cleanup-"); index >= 0 {
-		t.Fatalf("retryable pre-switch failure attempted cleanup: %v", transport.events)
+	if index := state.transport.eventIndex("run:platform-cleanup-"); index >= 0 {
+		t.Fatalf("retryable pre-switch failure attempted cleanup: %v", state.transport.events)
 	}
 	var cleanupRows int
-	if err := fixture.pool.QueryRow(fixture.ctx, `SELECT count(*) FROM eregion_platform_container_cleanup
-        WHERE deployment_id=$1`, depID).Scan(&cleanupRows); err != nil {
+	if err := state.fixture.pool.QueryRow(state.fixture.ctx, `SELECT count(*) FROM eregion_platform_container_cleanup
+        WHERE deployment_id=$1`, state.depID).Scan(&cleanupRows); err != nil {
 		t.Fatal(err)
 	}
 	if cleanupRows != 0 {
 		t.Fatalf("retryable pre-switch failure recorded %d cleanup rows, want 0", cleanupRows)
 	}
-	if releaseID, deploymentID := fixture.serving(t); releaseID != previousRelease || deploymentID != previousDeployment {
-		t.Fatalf("serving changed on retryable failure = %s/%s, want %s/%s", releaseID, deploymentID, previousRelease, previousDeployment)
-	}
+	assertServingDeployment(t, state.fixture, state.previousRelease, state.previousDeployID, "retryable pre-switch failure")
+}
 
-	transport.failure = nil
-	if err := runPlatformAttempt(fixture.ctx, fixture.service, op.ID, 1); err != nil {
+func assertRetryableRetrySucceeded(t *testing.T, state *retryableCandidateTest) {
+	t.Helper()
+	state.transport.failure = nil
+	if err := runPlatformAttempt(state.fixture.ctx, state.fixture.service, state.op.ID, 1); err != nil {
 		t.Fatalf("retry after retryable failure: %v", err)
 	}
-	final, err := fixture.service.Get(fixture.ctx, testActor, op.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if final.State != contract.Succeeded {
-		t.Fatalf("retried deployment = %+v, want succeeded", final)
-	}
-	for _, planned := range plan {
+	assertOperationState(t, state.fixture, state.op.ID, contract.Succeeded, "retryable failure retry")
+	for _, planned := range state.plan {
 		step := containerStepID(planned.Process.Name, planned.Replica)
-		if runs := transport.runCount(op.ID, step); runs != 1 {
+		if runs := state.transport.runCount(state.op.ID, step); runs != 1 {
 			t.Fatalf("container step %s ran %d times across retry, want 1", step, runs)
 		}
 	}
-	if releaseID, deploymentID := fixture.serving(t); releaseID != release || deploymentID != depID {
-		t.Fatalf("serving after retry = %s/%s, want %s/%s", releaseID, deploymentID, release, depID)
-	}
-	if owner, has := ownerForFixture(t, fixture, env); has {
-		t.Fatalf("owner remained after successful retry: %+v", owner)
-	}
+	assertServingDeployment(t, state.fixture, state.release, state.depID, "retryable failure retry")
+	assertOwnerReleased(t, state.fixture, state.env, "retryable failure retry")
 }
 
 // TestIntegrationLiveCleanupIntentFailureRetainsOwner covers both live terminal
@@ -2048,95 +2076,67 @@ func TestIntegrationDeploymentRetryableFailureRetainsCandidates(t *testing.T) {
 // nonterminal operation and its owner.
 func TestIntegrationLiveCleanupIntentFailureRetainsOwner(t *testing.T) {
 	t.Run("pre-switch terminal failure", func(t *testing.T) {
-		transport := &healthFaultTransport{
-			recordingDeployTransport: &recordingDeployTransport{scriptedDeployTransport: newScriptedDeployTransport()},
-		}
-		fixture := newDeploymentRetryFixtureWithTransport(t, transport)
-		fixture.deploy(t)
-		transport.failure = contract.NewFault(contract.PreconditionFailed, "health rejected", "test")
-		env := fixture.environment(t)
-		release := fixture.createRelease("live-cleanup-health", "registry.example/live:live-cleanup-health")
-		op := platformSubmit(t, fixture.service, platform.KindDeploy, "env/live/production", "live-cleanup-health",
-			map[string]any{"release_id": release})
-		dropBlock := blockContainerCleanupInserts(t, fixture.pool)
-		if err := runPlatformAttempt(fixture.ctx, fixture.service, op.ID, 1); err == nil {
-			t.Fatal("terminal failure settled without durable cleanup intent")
-		}
-		current, err := fixture.service.Get(fixture.ctx, testActor, op.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if current.State.Terminal() {
-			t.Fatalf("terminal failure settled without durable cleanup intent: %+v", current)
-		}
-		if owner, has := ownerForFixture(t, fixture, env); !has {
-			t.Fatalf("owner released without durable cleanup intent: %+v", owner)
-		}
-		if index := transport.eventIndex("run:platform-cleanup-"); index >= 0 {
-			t.Fatalf("cleanup ran before intent was durable: %v", transport.events)
-		}
-		dropBlock()
-		transport.failure = nil
-		if err := runPlatformAttempt(fixture.ctx, fixture.service, op.ID, 1); err != nil {
-			t.Fatalf("retry after cleanup intent repair: %v", err)
-		}
-		final, err := fixture.service.Get(fixture.ctx, testActor, op.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if final.State != contract.Succeeded {
-			t.Fatalf("retried deployment = %+v, want succeeded", final)
-		}
+		assertPreSwitchTerminalCleanupIntent(t)
 	})
-
 	t.Run("post-switch public failure", func(t *testing.T) {
-		transport := &recordingDeployTransport{scriptedDeployTransport: newScriptedDeployTransport()}
-		fixture := newDeploymentRetryFixtureWithTransport(t, transport)
-		fixture.deploy(t)
-		env := fixture.environment(t)
-		previousRelease, previousDeployment := env.ServingRelease, env.ServingDeploymentID
-		fixture.service.publicVerify = func(context.Context, platform.Environment, string) error {
-			return contract.NewFault(contract.PreconditionFailed, "public verification rejected", "test")
-		}
-		release := fixture.createRelease("live-cleanup-public", "registry.example/live:live-cleanup-public")
-		op := platformSubmit(t, fixture.service, platform.KindDeploy, "env/live/production", "live-cleanup-public",
-			map[string]any{"release_id": release})
-		dropBlock := blockContainerCleanupInserts(t, fixture.pool)
-		if err := runPlatformAttempt(fixture.ctx, fixture.service, op.ID, 1); err == nil {
-			t.Fatal("public failure settled without durable cleanup intent")
-		}
-		current, err := fixture.service.Get(fixture.ctx, testActor, op.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if current.State.Terminal() {
-			t.Fatalf("public failure settled without durable cleanup intent: %+v", current)
-		}
-		if owner, has := ownerForFixture(t, fixture, env); !has || owner.Phase != deploymentOwnerRestored {
-			t.Fatalf("owner after blocked public cleanup intent = %+v, has=%t", owner, has)
-		}
-		if releaseID, deploymentID := fixture.serving(t); releaseID != previousRelease || deploymentID != previousDeployment {
-			t.Fatalf("serving after blocked public cleanup intent = %s/%s, want %s/%s", releaseID, deploymentID, previousRelease, previousDeployment)
-		}
-		dropBlock()
-		fixture.service.publicVerify = func(context.Context, platform.Environment, string) error { return nil }
-		if err := runPlatformAttempt(fixture.ctx, fixture.service, op.ID, 1); err != nil {
-			t.Fatalf("recovery after cleanup intent repair: %v", err)
-		}
-		final, err := fixture.service.Get(fixture.ctx, testActor, op.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if final.State != contract.Failed {
-			t.Fatalf("recovered public failure = %+v, want failed", final)
-		}
-		if owner, has := ownerForFixture(t, fixture, env); has {
-			t.Fatalf("owner remained after recovered public failure: %+v", owner)
-		}
-		if releaseID, deploymentID := fixture.serving(t); releaseID != previousRelease || deploymentID != previousDeployment {
-			t.Fatalf("serving after recovered public failure = %s/%s, want %s/%s", releaseID, deploymentID, previousRelease, previousDeployment)
-		}
+		assertPostSwitchPublicCleanupIntent(t)
 	})
+}
+
+func assertPreSwitchTerminalCleanupIntent(t *testing.T) {
+	t.Helper()
+	transport := &healthFaultTransport{
+		recordingDeployTransport: &recordingDeployTransport{scriptedDeployTransport: newScriptedDeployTransport()},
+	}
+	fixture := newDeploymentRetryFixtureWithTransport(t, transport)
+	fixture.deploy(t)
+	transport.failure = contract.NewFault(contract.PreconditionFailed, "health rejected", "test")
+	env := fixture.environment(t)
+	release := fixture.createRelease("live-cleanup-health", "registry.example/live:live-cleanup-health")
+	op := platformSubmit(t, fixture.service, platform.KindDeploy, "env/live/production", "live-cleanup-health",
+		map[string]any{"release_id": release})
+	dropBlock := blockContainerCleanupInserts(t, fixture.pool)
+	if err := runPlatformAttempt(fixture.ctx, fixture.service, op.ID, 1); err == nil {
+		t.Fatal("terminal failure settled without durable cleanup intent")
+	}
+	assertOperationNotTerminal(t, fixture, op.ID, "terminal cleanup intent failure")
+	assertOwnerRetained(t, fixture, env, "terminal cleanup intent failure")
+	if index := transport.eventIndex("run:platform-cleanup-"); index >= 0 {
+		t.Fatalf("cleanup ran before intent was durable: %v", transport.events)
+	}
+	dropBlock()
+	transport.failure = nil
+	if err := runPlatformAttempt(fixture.ctx, fixture.service, op.ID, 1); err != nil {
+		t.Fatalf("retry after cleanup intent repair: %v", err)
+	}
+	assertOperationState(t, fixture, op.ID, contract.Succeeded, "terminal cleanup intent retry")
+}
+
+func assertPostSwitchPublicCleanupIntent(t *testing.T) {
+	t.Helper()
+	fixture, _, env := newDeployedRecordingFixture(t)
+	previousRelease, previousDeployment := env.ServingRelease, env.ServingDeploymentID
+	fixture.service.publicVerify = func(context.Context, platform.Environment, string) error {
+		return contract.NewFault(contract.PreconditionFailed, "public verification rejected", "test")
+	}
+	release := fixture.createRelease("live-cleanup-public", "registry.example/live:live-cleanup-public")
+	op := platformSubmit(t, fixture.service, platform.KindDeploy, "env/live/production", "live-cleanup-public",
+		map[string]any{"release_id": release})
+	dropBlock := blockContainerCleanupInserts(t, fixture.pool)
+	if err := runPlatformAttempt(fixture.ctx, fixture.service, op.ID, 1); err == nil {
+		t.Fatal("public failure settled without durable cleanup intent")
+	}
+	assertOperationNotTerminal(t, fixture, op.ID, "public cleanup intent failure")
+	assertOwnerPhase(t, fixture, env, deploymentOwnerRestored, "public cleanup intent failure")
+	assertServingDeployment(t, fixture, previousRelease, previousDeployment, "public cleanup intent failure")
+	dropBlock()
+	fixture.service.publicVerify = func(context.Context, platform.Environment, string) error { return nil }
+	if err := runPlatformAttempt(fixture.ctx, fixture.service, op.ID, 1); err != nil {
+		t.Fatalf("recovery after cleanup intent repair: %v", err)
+	}
+	assertOperationState(t, fixture, op.ID, contract.Failed, "public cleanup intent recovery")
+	assertOwnerReleased(t, fixture, env, "public cleanup intent recovery")
+	assertServingDeployment(t, fixture, previousRelease, previousDeployment, "public cleanup intent recovery")
 }
 
 // TestIntegrationMaintenanceCleanupProtectsOwnerCandidate covers a crash after
@@ -2158,7 +2158,7 @@ func TestIntegrationMaintenanceCleanupProtectsOwnerCandidate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := fixture.service.persistDeploymentCleanupInstances(fixture.ctx, env, dep, dep.Instances, "candidate", owner.Attempt); err != nil {
+	if err := fixture.service.persistDeploymentCleanupInstances(fixture.ctx, env, dep, dep.Instances, owner.Attempt); err != nil {
 		t.Fatal(err)
 	}
 	name := key + "-candidate"
@@ -2208,6 +2208,23 @@ func TestIntegrationMaintenanceCleanupProtectsOwnerCandidate(t *testing.T) {
 // cancellation from a durable cancel request: shutdown must not remove
 // candidates a retry still needs.
 func TestIntegrationWorkerShutdownRetainsCandidates(t *testing.T) {
+	state := newShutdownCandidateTest(t)
+	assertShutdownRetained(t, state)
+	assertShutdownRetrySucceeded(t, state)
+}
+
+type shutdownCandidateTest struct {
+	fixture   *deploymentRetryFixture
+	transport *healthFaultTransport
+	env       platform.Environment
+	release   platform.ReleaseID
+	op        contract.Operation
+	depID     platform.DeploymentID
+	plan      []platform.PlannedContainer
+}
+
+func newShutdownCandidateTest(t *testing.T) *shutdownCandidateTest {
+	t.Helper()
 	transport := &healthFaultTransport{
 		recordingDeployTransport: &recordingDeployTransport{scriptedDeployTransport: newScriptedDeployTransport()},
 	}
@@ -2217,82 +2234,113 @@ func TestIntegrationWorkerShutdownRetainsCandidates(t *testing.T) {
 	if env.Revision == nil {
 		t.Fatal("environment has no current revision")
 	}
-	release := fixture.createRelease("shutdown-retain", "registry.example/live:shutdown-retain")
-	op := platformSubmit(t, fixture.service, platform.KindDeploy, "env/live/production", "shutdown-retain",
-		map[string]any{"release_id": release})
-	depID := platform.DeploymentID(deploymentForOperation(t, fixture.pool, op.ID))
-	plan, err := platform.PlanDeployment(env.App, env.Name, env.Revision.RevisionState, release, depID)
+	state := &shutdownCandidateTest{fixture: fixture, transport: transport, env: env}
+	state.release = fixture.createRelease("shutdown-retain", "registry.example/live:shutdown-retain")
+	state.op = platformSubmit(t, fixture.service, platform.KindDeploy, "env/live/production", "shutdown-retain",
+		map[string]any{"release_id": state.release})
+	state.depID = platform.DeploymentID(deploymentForOperation(t, fixture.pool, state.op.ID))
+	plan, err := platform.PlanDeployment(env.App, env.Name, env.Revision.RevisionState, state.release, state.depID)
 	if err != nil {
 		t.Fatal(err)
 	}
+	state.plan = plan
 	transport.failure = context.Canceled
-	if err := runPlatformAttempt(fixture.ctx, fixture.service, op.ID, 1); err == nil {
+	if err := runPlatformAttempt(fixture.ctx, fixture.service, state.op.ID, 1); err == nil {
 		t.Fatal("worker shutdown did not return an error")
 	}
-	current, err := fixture.service.Get(fixture.ctx, testActor, op.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if current.State.Terminal() {
-		t.Fatalf("worker shutdown terminalized the operation: %+v", current)
-	}
-	if owner, has := ownerForFixture(t, fixture, env); !has || owner.Phase != deploymentOwnerPrepared {
-		t.Fatalf("owner after worker shutdown = %+v, has=%t", owner, has)
-	}
-	for _, planned := range plan {
+	assertOperationNotTerminal(t, fixture, state.op.ID, "worker shutdown")
+	assertOwnerPhase(t, fixture, env, deploymentOwnerPrepared, "worker shutdown")
+	return state
+}
+
+func assertShutdownRetained(t *testing.T, state *shutdownCandidateTest) {
+	t.Helper()
+	for _, planned := range state.plan {
 		step := containerStepID(planned.Process.Name, planned.Replica)
-		if runs := transport.runCount(op.ID, step); runs != 1 {
+		if runs := state.transport.runCount(state.op.ID, step); runs != 1 {
 			t.Fatalf("container step %s ran %d times before retry, want 1", step, runs)
 		}
-		var state string
-		if err := fixture.pool.QueryRow(fixture.ctx, `SELECT state FROM eregion_operation_steps
-            WHERE operation_id=$1 AND step=$2`, op.ID, step).Scan(&state); err != nil {
+		var stepState string
+		if err := state.fixture.pool.QueryRow(state.fixture.ctx, `SELECT state FROM eregion_operation_steps
+            WHERE operation_id=$1 AND step=$2`, state.op.ID, step).Scan(&stepState); err != nil {
 			t.Fatal(err)
 		}
-		if state != "completed" {
-			t.Fatalf("container step %s after worker shutdown = %q, want completed", step, state)
+		if stepState != "completed" {
+			t.Fatalf("container step %s after worker shutdown = %q, want completed", step, stepState)
 		}
 	}
-	if index := transport.eventIndex("run:platform-cleanup-"); index >= 0 {
-		t.Fatalf("worker shutdown ran candidate cleanup: %v", transport.events)
+	if index := state.transport.eventIndex("run:platform-cleanup-"); index >= 0 {
+		t.Fatalf("worker shutdown ran candidate cleanup: %v", state.transport.events)
 	}
 	var cleanupRows int
-	if err := fixture.pool.QueryRow(fixture.ctx, `SELECT count(*) FROM eregion_platform_container_cleanup
-        WHERE deployment_id=$1`, depID).Scan(&cleanupRows); err != nil {
+	if err := state.fixture.pool.QueryRow(state.fixture.ctx, `SELECT count(*) FROM eregion_platform_container_cleanup
+        WHERE deployment_id=$1`, state.depID).Scan(&cleanupRows); err != nil {
 		t.Fatal(err)
 	}
 	if cleanupRows != 0 {
 		t.Fatalf("worker shutdown recorded %d cleanup rows, want 0", cleanupRows)
 	}
-	transport.failure = nil
-	if err := runPlatformAttempt(fixture.ctx, fixture.service, op.ID, 1); err != nil {
+}
+
+func assertShutdownRetrySucceeded(t *testing.T, state *shutdownCandidateTest) {
+	t.Helper()
+	state.transport.failure = nil
+	if err := runPlatformAttempt(state.fixture.ctx, state.fixture.service, state.op.ID, 1); err != nil {
 		t.Fatalf("retry after worker shutdown: %v", err)
 	}
-	final, err := fixture.service.Get(fixture.ctx, testActor, op.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if final.State != contract.Succeeded {
-		t.Fatalf("retried deployment after shutdown = %+v, want succeeded", final)
-	}
-	for _, planned := range plan {
+	assertOperationState(t, state.fixture, state.op.ID, contract.Succeeded, "retry after worker shutdown")
+	for _, planned := range state.plan {
 		step := containerStepID(planned.Process.Name, planned.Replica)
-		if runs := transport.runCount(op.ID, step); runs != 1 {
+		if runs := state.transport.runCount(state.op.ID, step); runs != 1 {
 			t.Fatalf("container step %s ran %d times across shutdown retry, want 1", step, runs)
 		}
 	}
-	if releaseID, deploymentID := fixture.serving(t); releaseID != release || deploymentID != depID {
-		t.Fatalf("serving after shutdown retry = %s/%s, want %s/%s", releaseID, deploymentID, release, depID)
-	}
+	assertServingDeployment(t, state.fixture, state.release, state.depID, "retry after worker shutdown")
 }
 
 // TestIntegrationCleanupEvidenceReadFailureRetainsOwner covers a disappearing
 // container-step evidence read before a pre-save cancellation settles.
 func TestIntegrationCleanupEvidenceReadFailureRetainsOwner(t *testing.T) {
-	transport := &recordingDeployTransport{scriptedDeployTransport: newScriptedDeployTransport()}
-	fixture := newDeploymentRetryFixtureWithTransport(t, transport)
-	fixture.deploy(t)
-	env := fixture.environment(t)
+	scenario := newCleanupEvidenceReadScenario(t)
+	current, err := scenario.fixture.service.Get(scenario.fixture.ctx, testActor, scenario.op.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := scenario.fixture.service.reconcileDeployment(scenario.fixture.ctx, current); err == nil {
+		t.Fatal("cancellation settled without a readable cleanup evidence set")
+	}
+	assertOperationNotTerminal(t, scenario.fixture, scenario.op.ID, "cleanup evidence read failure")
+	assertOwnerRetained(t, scenario.fixture, scenario.env, "cleanup evidence read failure")
+	assertCleanupRowCount(t, scenario.fixture, scenario.depID, 0, "cleanup evidence read failure")
+
+	scenario.fixture.service.deploymentCleanupEvidence = nil
+	current, err = scenario.fixture.service.Get(scenario.fixture.ctx, testActor, scenario.op.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := scenario.fixture.service.reconcileDeployment(scenario.fixture.ctx, current); err != nil {
+		t.Fatalf("cancellation retry after evidence repair: %v", err)
+	}
+	assertOperationState(t, scenario.fixture, scenario.op.ID, contract.Canceled, "cleanup evidence repaired")
+	assertOwnerReleased(t, scenario.fixture, scenario.env, "cleanup evidence repaired")
+	assertCleanupRowCount(t, scenario.fixture, scenario.depID, 0, "post-settlement cleanup removal")
+	if index := scenario.transport.eventIndex("run:" + cleanupStepID(scenario.plan[0].Name)); index < 0 {
+		t.Fatalf("post-settlement cleanup did not run: %v", scenario.transport.events)
+	}
+}
+
+type cleanupEvidenceReadScenario struct {
+	fixture   *deploymentRetryFixture
+	transport *recordingDeployTransport
+	env       platform.Environment
+	op        contract.Operation
+	depID     platform.DeploymentID
+	plan      []platform.PlannedContainer
+}
+
+func newCleanupEvidenceReadScenario(t *testing.T) *cleanupEvidenceReadScenario {
+	t.Helper()
+	fixture, transport, env := newDeployedRecordingFixture(t)
 	if env.Revision == nil {
 		t.Fatal("environment has no current revision")
 	}
@@ -2326,58 +2374,18 @@ func TestIntegrationCleanupEvidenceReadFailureRetainsOwner(t *testing.T) {
 	fixture.service.deploymentCleanupEvidence = func(context.Context, contract.OperationID, string) (bool, error) {
 		return false, errors.New("step evidence read failed")
 	}
-	current, err := fixture.service.Get(fixture.ctx, testActor, op.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := fixture.service.reconcileDeployment(fixture.ctx, current); err == nil {
-		t.Fatal("cancellation settled without a readable cleanup evidence set")
-	}
-	current, err = fixture.service.Get(fixture.ctx, testActor, op.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if current.State.Terminal() {
-		t.Fatalf("cancellation terminalized on cleanup evidence read failure: %+v", current)
-	}
-	if owner, has := ownerForFixture(t, fixture, env); !has {
-		t.Fatalf("owner released on cleanup evidence read failure: %+v", owner)
-	}
+	return &cleanupEvidenceReadScenario{fixture: fixture, transport: transport, env: env, op: op, depID: depID, plan: plan}
+}
+
+func assertCleanupRowCount(t *testing.T, fixture *deploymentRetryFixture, depID platform.DeploymentID, want int, context string) {
+	t.Helper()
 	var rows int
 	if err := fixture.pool.QueryRow(fixture.ctx, `SELECT count(*) FROM eregion_platform_container_cleanup
         WHERE deployment_id=$1`, depID).Scan(&rows); err != nil {
 		t.Fatal(err)
 	}
-	if rows != 0 {
-		t.Fatalf("cleanup rows recorded despite evidence read failure = %d", rows)
-	}
-	fixture.service.deploymentCleanupEvidence = nil
-	current, err = fixture.service.Get(fixture.ctx, testActor, op.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := fixture.service.reconcileDeployment(fixture.ctx, current); err != nil {
-		t.Fatalf("cancellation retry after evidence repair: %v", err)
-	}
-	final, err := fixture.service.Get(fixture.ctx, testActor, op.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if final.State != contract.Canceled {
-		t.Fatalf("cancellation after evidence repair = %+v, want cancelled", final)
-	}
-	if owner, has := ownerForFixture(t, fixture, env); has {
-		t.Fatalf("owner remained after cancellation: %+v", owner)
-	}
-	if err := fixture.pool.QueryRow(fixture.ctx, `SELECT count(*) FROM eregion_platform_container_cleanup
-        WHERE deployment_id=$1`, depID).Scan(&rows); err != nil {
-		t.Fatal(err)
-	}
-	if rows != 0 {
-		t.Fatalf("durable cleanup rows after successful post-settlement removal = %d, want 0", rows)
-	}
-	if index := transport.eventIndex("run:" + cleanupStepID(plan[0].Name)); index < 0 {
-		t.Fatalf("post-settlement cleanup did not run: %v", transport.events)
+	if rows != want {
+		t.Fatalf("%s: cleanup rows = %d, want %d", context, rows, want)
 	}
 }
 
@@ -2387,125 +2395,109 @@ func TestIntegrationCleanupEvidenceReadFailureRetainsOwner(t *testing.T) {
 // durable cleanup-intent failpoint must be reached before the prepared owner is
 // released.
 func TestIntegrationDeploymentTerminalRetryWithRetainedCandidates(t *testing.T) {
-	run := func(t *testing.T) (contract.Operation, []platform.PlannedContainer, *deploymentRetryFixture, *healthFaultTransport) {
-		t.Helper()
-		transport := &healthFaultTransport{
-			recordingDeployTransport: &recordingDeployTransport{scriptedDeployTransport: newScriptedDeployTransport()},
-		}
-		fixture := newDeploymentRetryFixtureWithTransport(t, transport)
-		fixture.deploy(t)
-		env := fixture.environment(t)
-		if env.Revision == nil {
-			t.Fatal("environment has no current revision")
-		}
-		release := fixture.createRelease("terminal-retry", "registry.example/live:terminal-retry")
-		op := platformSubmit(t, fixture.service, platform.KindDeploy, "env/live/production", "terminal-retry",
-			map[string]any{"release_id": release})
-		depID := platform.DeploymentID(deploymentForOperation(t, fixture.pool, op.ID))
-		plan, err := platform.PlanDeployment(env.App, env.Name, env.Revision.RevisionState, release, depID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		transport.failure = errors.New("health probe timed out")
-		if err := runPlatformAttempt(fixture.ctx, fixture.service, op.ID, 1); err == nil {
-			t.Fatal("retryable failure was not returned")
-		}
-		current, err := fixture.service.Get(fixture.ctx, testActor, op.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if current.State.Terminal() {
-			t.Fatalf("retryable failure terminalized: %+v", current)
-		}
-		if owner, has := ownerForFixture(t, fixture, env); !has || owner.Phase != deploymentOwnerPrepared {
-			t.Fatalf("owner after retryable failure = %+v, has=%t", owner, has)
-		}
-		transport.failure = nil
-		if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_platform_nodes
-            SET capabilities=ARRAY['buildpacks'] WHERE name=$1`, env.Node); err != nil {
-			t.Fatal(err)
-		}
-		fixture.service.resolver = nil
-		transport.events = nil
-		return op, plan, fixture, transport
-	}
-
 	t.Run("placement failure retains owner while effect is unknown", func(t *testing.T) {
-		op, plan, fixture, transport := run(t)
-		// The first attempt reported a retryable health transport failure. The
-		// step outcome is unknown, and this retry removes the resolver and the
-		// application capability. A terminal placement refusal must therefore
-		// retain the owner and candidate cleanup intent instead of acting as if
-		// the detached health effect were absent.
-		err := runPlatformAttempt(fixture.ctx, fixture.service, op.ID, 1)
-		if err == nil {
-			t.Fatal("placement retry unexpectedly succeeded while a detached effect was unknown")
-		}
-		if fault := contract.Classify(err); fault.Code != contract.Unavailable {
-			t.Fatalf("placement retry error = %s, %v; want unavailable", fault.Code, err)
-		}
-		final, err := fixture.service.Get(fixture.ctx, testActor, op.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if final.State.Terminal() {
-			t.Fatalf("placement retry terminalized while a detached effect was unknown: %+v", final)
-		}
-		env := fixture.environment(t)
-		if _, has := ownerForFixture(t, fixture, env); !has {
-			t.Fatal("owner released while a detached node effect was unknown")
-		}
-		if index := transport.eventIndex("run:" + cleanupStepID(plan[0].Name)); index >= 0 {
-			t.Fatalf("cleanup ran while a detached effect was unknown: %v", transport.events)
-		}
-		for _, planned := range plan {
-			var count int
-			if err := fixture.pool.QueryRow(fixture.ctx, `SELECT count(*)
-                FROM eregion_platform_container_cleanup WHERE container_name=$1`, planned.Name).
-				Scan(&count); err != nil {
-				t.Fatal(err)
-			}
-			if count != 0 {
-				t.Fatalf("cleanup rows for retained container %s = %d, want 0 while the effect is unknown", planned.Name, count)
-			}
-		}
+		assertPlacementFailureRetainsUnknownEffect(t, setupTerminalRetryCandidates(t))
 	})
-
 	t.Run("cleanup record failure retains owner", func(t *testing.T) {
-		op, _, fixture, _ := run(t)
-		env := fixture.environment(t)
-		// Model the previous health/live effect as quiescent with an observable
-		// terminal-safe status on the pinned node. This exercises the real
-		// terminal cleanup insert failpoint instead of accidentally stopping at
-		// the unknown-effect guard.
-		absent := &fixedStatusTransport{status: engine.StatusAbsent}
-		fixture.service.resolver = newTestNodeResolver(t, fixture.pool, map[string]node.Transport{env.Node: absent})
-		dropBlock := blockContainerCleanupInserts(t, fixture.pool)
-		defer dropBlock()
-		err := runPlatformAttempt(fixture.ctx, fixture.service, op.ID, 1)
-		if err == nil {
-			t.Fatal("terminal placement failure settled without durable cleanup intent")
-		}
-		fault := contract.Classify(err)
-		if fault.Code != contract.Unavailable ||
-			!strings.Contains(fault.Message, "candidate cleanup intent could not be recorded durably") ||
-			!strings.Contains(fault.Hint, "Keep the deployment owner and candidate containers") {
-			t.Fatalf("cleanup failpoint error = %+v, want the durable cleanup-intent fault", fault)
-		}
-		if absent.callCount() == 0 {
-			t.Fatal("cleanup retry did not observe the pinned node before the cleanup insert")
-		}
-		current, err := fixture.service.Get(fixture.ctx, testActor, op.ID)
-		if err != nil {
+		assertTerminalCleanupRecordFailureRetainsOwner(t, setupTerminalRetryCandidates(t))
+	})
+}
+
+type terminalRetryCandidateTest struct {
+	fixture   *deploymentRetryFixture
+	transport *healthFaultTransport
+	op        contract.Operation
+	plan      []platform.PlannedContainer
+}
+
+func setupTerminalRetryCandidates(t *testing.T) *terminalRetryCandidateTest {
+	t.Helper()
+	transport := &healthFaultTransport{
+		recordingDeployTransport: &recordingDeployTransport{scriptedDeployTransport: newScriptedDeployTransport()},
+	}
+	fixture := newDeploymentRetryFixtureWithTransport(t, transport)
+	fixture.deploy(t)
+	env := fixture.environment(t)
+	if env.Revision == nil {
+		t.Fatal("environment has no current revision")
+	}
+	release := fixture.createRelease("terminal-retry", "registry.example/live:terminal-retry")
+	op := platformSubmit(t, fixture.service, platform.KindDeploy, "env/live/production", "terminal-retry",
+		map[string]any{"release_id": release})
+	depID := platform.DeploymentID(deploymentForOperation(t, fixture.pool, op.ID))
+	plan, err := platform.PlanDeployment(env.App, env.Name, env.Revision.RevisionState, release, depID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport.failure = errors.New("health probe timed out")
+	if err := runPlatformAttempt(fixture.ctx, fixture.service, op.ID, 1); err == nil {
+		t.Fatal("retryable failure was not returned")
+	}
+	assertOperationNotTerminal(t, fixture, op.ID, "retryable failure before terminal retry")
+	assertOwnerPhase(t, fixture, env, deploymentOwnerPrepared, "retryable failure before terminal retry")
+	transport.failure = nil
+	if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_platform_nodes
+        SET capabilities=ARRAY['buildpacks'] WHERE name=$1`, env.Node); err != nil {
+		t.Fatal(err)
+	}
+	fixture.service.resolver = nil
+	transport.events = nil
+	return &terminalRetryCandidateTest{fixture: fixture, transport: transport, op: op, plan: plan}
+}
+
+func assertPlacementFailureRetainsUnknownEffect(t *testing.T, state *terminalRetryCandidateTest) {
+	t.Helper()
+	err := runPlatformAttempt(state.fixture.ctx, state.fixture.service, state.op.ID, 1)
+	if err == nil {
+		t.Fatal("placement retry unexpectedly succeeded while a detached effect was unknown")
+	}
+	if fault := contract.Classify(err); fault.Code != contract.Unavailable {
+		t.Fatalf("placement retry error = %s, %v; want unavailable", fault.Code, err)
+	}
+	assertOperationNotTerminal(t, state.fixture, state.op.ID, "placement retry")
+	env := state.fixture.environment(t)
+	assertOwnerRetained(t, state.fixture, env, "placement retry")
+	if index := state.transport.eventIndex("run:" + cleanupStepID(state.plan[0].Name)); index >= 0 {
+		t.Fatalf("cleanup ran while a detached effect was unknown: %v", state.transport.events)
+	}
+	for _, planned := range state.plan {
+		var count int
+		if err := state.fixture.pool.QueryRow(state.fixture.ctx, `SELECT count(*)
+            FROM eregion_platform_container_cleanup WHERE container_name=$1`, planned.Name).
+			Scan(&count); err != nil {
 			t.Fatal(err)
 		}
-		if current.State.Terminal() {
-			t.Fatalf("terminal placement failure settled without durable cleanup intent: %+v", current)
+		if count != 0 {
+			t.Fatalf("cleanup rows for retained container %s = %d, want 0 while the effect is unknown", planned.Name, count)
 		}
-		if owner, has := ownerForFixture(t, fixture, env); !has {
-			t.Fatalf("owner released without durable cleanup intent: %+v", owner)
-		}
-	})
+	}
+}
+
+func assertTerminalCleanupRecordFailureRetainsOwner(t *testing.T, state *terminalRetryCandidateTest) {
+	t.Helper()
+	env := state.fixture.environment(t)
+	// Model the previous health/live effect as quiescent with an observable
+	// terminal-safe status on the pinned node. This exercises the real terminal
+	// cleanup insert failpoint instead of stopping at the unknown-effect guard.
+	absent := &fixedStatusTransport{status: engine.StatusAbsent}
+	state.fixture.service.resolver = newTestNodeResolver(t, state.fixture.pool, map[string]node.Transport{env.Node: absent})
+	dropBlock := blockContainerCleanupInserts(t, state.fixture.pool)
+	defer dropBlock()
+	err := runPlatformAttempt(state.fixture.ctx, state.fixture.service, state.op.ID, 1)
+	if err == nil {
+		t.Fatal("terminal placement failure settled without durable cleanup intent")
+	}
+	fault := contract.Classify(err)
+	if fault.Code != contract.Unavailable ||
+		!strings.Contains(fault.Message, "candidate cleanup intent could not be recorded durably") ||
+		!strings.Contains(fault.Hint, "Keep the deployment owner and candidate containers") {
+		t.Fatalf("cleanup failpoint error = %+v, want the durable cleanup-intent fault", fault)
+	}
+	if absent.callCount() == 0 {
+		t.Fatal("cleanup retry did not observe the pinned node before the cleanup insert")
+	}
+	assertOperationNotTerminal(t, state.fixture, state.op.ID, "terminal cleanup intent failure")
+	assertOwnerRetained(t, state.fixture, env, "terminal cleanup intent failure")
 }
 
 // TestIntegrationOwnerRestoreTargetCandidateFailsClosed keeps the unsafe
@@ -2514,49 +2506,44 @@ func TestIntegrationDeploymentTerminalRetryWithRetainedCandidates(t *testing.T) 
 // predecessor.
 func TestIntegrationOwnerRestoreTargetCandidateFailsClosed(t *testing.T) {
 	for _, phase := range []deploymentOwnerPhase{deploymentOwnerSwitching, deploymentOwnerRestoring} {
-		phase := phase
 		t.Run(string(phase), func(t *testing.T) {
-			transport := &recordingDeployTransport{scriptedDeployTransport: newScriptedDeployTransport()}
-			fixture := newDeploymentRetryFixtureWithTransport(t, transport)
-			fixture.deploy(t)
-			env := fixture.environment(t)
-			previousRelease, previousDeployment := env.ServingRelease, env.ServingDeploymentID
-			op, depID, _, _ := fixture.prepareOwnedCandidate(t, "unsafe-"+string(phase), "registry.example/live:unsafe", "running")
-			if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_platform_deployment_owners
-                SET phase=$2,restore_deployment_id=$3 WHERE environment_id=$1`, env.ID, string(phase), depID); err != nil {
-				t.Fatal(err)
-			}
-			if err := runPlatformAttempt(fixture.ctx, fixture.service, op.ID, 1); err == nil {
-				t.Fatal("unsafe restore target was accepted as a live retry")
-			}
-			current, err := fixture.service.Get(fixture.ctx, testActor, op.ID)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if current.State.Terminal() {
-				t.Fatalf("unsafe live invariant terminalized the operation: %+v", current)
-			}
-			owner, has := ownerForFixture(t, fixture, env)
-			if !has || owner.RestoreDeploymentID != depID {
-				t.Fatalf("owner after unsafe live retry = %+v, has=%t", owner, has)
-			}
-			// The terminal owner sweep must enforce the same invariant instead
-			// of bypassing the live guard.
-			if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_operations
-                SET state='failed',error_code='unavailable' WHERE id=$1`, op.ID); err != nil {
-				t.Fatal(err)
-			}
-			if err := fixture.service.reconcileDeploymentOwners(fixture.ctx); err == nil {
-				t.Fatal("terminal owner sweep settled an unsafe restore target")
-			}
-			owner, has = ownerForFixture(t, fixture, env)
-			if !has || owner.RestoreDeploymentID != depID {
-				t.Fatalf("owner after unsafe terminal sweep = %+v, has=%t", owner, has)
-			}
-			if release, deployment := fixture.serving(t); release != previousRelease || deployment != previousDeployment {
-				t.Fatalf("serving after unsafe owner recovery = %s/%s, want %s/%s", release, deployment, previousRelease, previousDeployment)
-			}
+			assertUnsafeRestoreTargetFailsClosed(t, phase)
 		})
+	}
+}
+
+func assertUnsafeRestoreTargetFailsClosed(t *testing.T, phase deploymentOwnerPhase) {
+	t.Helper()
+	fixture, _, env := newDeployedRecordingFixture(t)
+	previousRelease, previousDeployment := env.ServingRelease, env.ServingDeploymentID
+	op, depID, _, _ := fixture.prepareOwnedCandidate(t, "unsafe-"+string(phase), "registry.example/live:unsafe", "running")
+	if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_platform_deployment_owners
+        SET phase=$2,restore_deployment_id=$3 WHERE environment_id=$1`, env.ID, string(phase), depID); err != nil {
+		t.Fatal(err)
+	}
+	if err := runPlatformAttempt(fixture.ctx, fixture.service, op.ID, 1); err == nil {
+		t.Fatal("unsafe restore target was accepted as a live retry")
+	}
+	assertOperationNotTerminal(t, fixture, op.ID, "unsafe live invariant")
+	assertUnsafeOwnerTarget(t, fixture, env, depID, "unsafe live retry")
+	// The terminal owner sweep must enforce the same invariant instead of
+	// bypassing the live guard.
+	if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_operations
+        SET state='failed',error_code='unavailable' WHERE id=$1`, op.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.service.reconcileDeploymentOwners(fixture.ctx); err == nil {
+		t.Fatal("terminal owner sweep settled an unsafe restore target")
+	}
+	assertUnsafeOwnerTarget(t, fixture, env, depID, "unsafe terminal sweep")
+	assertServingDeployment(t, fixture, previousRelease, previousDeployment, "unsafe owner recovery")
+}
+
+func assertUnsafeOwnerTarget(t *testing.T, fixture *deploymentRetryFixture, env platform.Environment, depID platform.DeploymentID, context string) {
+	t.Helper()
+	owner, has := ownerForFixture(t, fixture, env)
+	if !has || owner.RestoreDeploymentID != depID {
+		t.Fatalf("%s: owner = %+v, has=%t, want restore target %s", context, owner, has, depID)
 	}
 }
 
@@ -2566,93 +2553,103 @@ func TestIntegrationOwnerRestoreTargetCandidateFailsClosed(t *testing.T) {
 // binding from the owner before recovery effects, so cleanup targets the real
 // predecessor.
 func TestIntegrationDeploymentRenewalRepairsCrashGapPredecessor(t *testing.T) {
-	transport := &recordingDeployTransport{scriptedDeployTransport: newScriptedDeployTransport()}
-	fixture := newDeploymentRetryFixtureWithTransport(t, transport)
-	fixture.deploy(t)
-	env := fixture.environment(t)
-	staleRelease, staleDeployment := env.ServingRelease, env.ServingDeploymentID
-	staleDeploymentRow, err := fixture.service.deploymentByID(fixture.ctx, staleDeployment)
-	if err != nil {
-		t.Fatal(err)
-	}
+	state := newCrashGapScenario(t)
+	assertCrashGapRecovered(t, state)
+}
 
+type crashGapScenario struct {
+	fixture             *deploymentRetryFixture
+	transport           *recordingDeployTransport
+	env                 platform.Environment
+	staleRelease        platform.ReleaseID
+	staleDeployment     platform.DeploymentID
+	staleRow            platform.Deployment
+	candidateDeployment platform.DeploymentID
+	predecessorRelease  platform.ReleaseID
+	predecessorDeploy   platform.DeploymentID
+	predecessorRow      platform.Deployment
+	opC                 contract.Operation
+	releaseC            platform.ReleaseID
+}
+
+func newCrashGapScenario(t *testing.T) *crashGapScenario {
+	t.Helper()
+	fixture, transport, env := newDeployedRecordingFixture(t)
+	state := &crashGapScenario{
+		fixture: fixture, transport: transport, env: env,
+		staleRelease: env.ServingRelease, staleDeployment: env.ServingDeploymentID,
+	}
+	state.staleRow = previousDeploymentFor(t, fixture, env)
 	releaseB := fixture.createRelease("gap-b", "registry.example/live:gap-b")
 	opB := platformSubmit(t, fixture.service, platform.KindDeploy, "env/live/production", "gap-b", map[string]any{"release_id": releaseB})
-	releaseC := fixture.createRelease("gap-c", "registry.example/live:gap-c")
-	opC := platformSubmit(t, fixture.service, platform.KindDeploy, "env/live/production", "gap-c", map[string]any{"release_id": releaseC})
+	state.releaseC = fixture.createRelease("gap-c", "registry.example/live:gap-c")
+	state.opC = platformSubmit(t, fixture.service, platform.KindDeploy, "env/live/production", "gap-c", map[string]any{"release_id": state.releaseC})
 
 	// Two queued deploys: B runs first and becomes the true predecessor of C.
 	fixture.run(opB)
 	env = fixture.environment(t)
-	predecessorRelease, predecessorDeployment := env.ServingRelease, env.ServingDeploymentID
-	predecessorRow, err := fixture.service.deploymentByID(fixture.ctx, predecessorDeployment)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if predecessorDeployment == staleDeployment {
+	state.predecessorRelease, state.predecessorDeploy = env.ServingRelease, env.ServingDeploymentID
+	state.predecessorRow = previousDeploymentFor(t, fixture, env)
+	if state.predecessorDeploy == state.staleDeployment {
 		t.Fatal("B did not become serving before C")
 	}
 
 	// Simulate the crash gap for C: its owner froze B, but its deployment row
 	// still names the older A predecessor.
-	candidateDeployment := platform.DeploymentID(deploymentForOperation(t, fixture.pool, opC.ID))
+	state.candidateDeployment = platform.DeploymentID(deploymentForOperation(t, fixture.pool, state.opC.ID))
 	if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_platform_deployments
         SET state='running',previous_release_id=$2,previous_deployment_id=$3 WHERE id=$1`,
-		candidateDeployment, staleRelease, staleDeployment); err != nil {
+		state.candidateDeployment, state.staleRelease, state.staleDeployment); err != nil {
 		t.Fatal(err)
 	}
-	insertCompletedStep(t, fixture.pool, opC.ID, deploymentRouteStep, strings.Repeat("a", 64))
-	insertCompletedStep(t, fixture.pool, opC.ID, deploymentPublicStep, strings.Repeat("b", 64))
+	insertCompletedStep(t, fixture.pool, state.opC.ID, deploymentRouteStep, strings.Repeat("a", 64))
+	insertCompletedStep(t, fixture.pool, state.opC.ID, deploymentPublicStep, strings.Repeat("b", 64))
 	insertDeploymentOwner(t, fixture.pool, env, deploymentOwner{
-		EnvironmentID: env.ID, OperationID: opC.ID, DeploymentID: candidateDeployment, Attempt: 1,
-		Phase: deploymentOwnerServing, RouteTarget: candidateDeployment,
-		RestoreReleaseID: predecessorRelease, RestoreDeploymentID: predecessorDeployment,
+		EnvironmentID: env.ID, OperationID: state.opC.ID, DeploymentID: state.candidateDeployment, Attempt: 1,
+		Phase: deploymentOwnerServing, RouteTarget: state.candidateDeployment,
+		RestoreReleaseID: state.predecessorRelease, RestoreDeploymentID: state.predecessorDeploy,
 	})
 	var beforeRelease, beforeDeployment string
 	if err := fixture.pool.QueryRow(fixture.ctx, `SELECT coalesce(previous_release_id,''),coalesce(previous_deployment_id,'')
-        FROM eregion_platform_deployments WHERE id=$1`, candidateDeployment).Scan(&beforeRelease, &beforeDeployment); err != nil {
+        FROM eregion_platform_deployments WHERE id=$1`, state.candidateDeployment).Scan(&beforeRelease, &beforeDeployment); err != nil {
 		t.Fatal(err)
 	}
-	if beforeRelease != string(staleRelease) || beforeDeployment != string(staleDeployment) {
-		t.Fatalf("crash-gap fixture previous = %s/%s, want stale %s/%s", beforeRelease, beforeDeployment, staleRelease, staleDeployment)
+	if beforeRelease != string(state.staleRelease) || beforeDeployment != string(state.staleDeployment) {
+		t.Fatalf("crash-gap fixture previous = %s/%s, want stale %s/%s", beforeRelease, beforeDeployment, state.staleRelease, state.staleDeployment)
 	}
+	return state
+}
 
-	transport.events = nil
-	if err := runPlatformAttempt(fixture.ctx, fixture.service, opC.ID, 1); err != nil {
+func assertCrashGapRecovered(t *testing.T, state *crashGapScenario) {
+	t.Helper()
+	state.transport.events = nil
+	if err := runPlatformAttempt(state.fixture.ctx, state.fixture.service, state.opC.ID, 1); err != nil {
 		t.Fatalf("C attempt after crash gap: %v", err)
 	}
-	final, err := fixture.service.Get(fixture.ctx, testActor, opC.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if final.State != contract.Succeeded {
-		t.Fatalf("C after crash-gap recovery = %+v, want succeeded", final)
-	}
+	assertOperationState(t, state.fixture, state.opC.ID, contract.Succeeded, "crash-gap recovery")
 	var afterRelease, afterDeployment string
-	if err := fixture.pool.QueryRow(fixture.ctx, `SELECT coalesce(previous_release_id,''),coalesce(previous_deployment_id,'')
-        FROM eregion_platform_deployments WHERE id=$1`, candidateDeployment).Scan(&afterRelease, &afterDeployment); err != nil {
+	if err := state.fixture.pool.QueryRow(state.fixture.ctx, `SELECT coalesce(previous_release_id,''),coalesce(previous_deployment_id,'')
+        FROM eregion_platform_deployments WHERE id=$1`, state.candidateDeployment).Scan(&afterRelease, &afterDeployment); err != nil {
 		t.Fatal(err)
 	}
-	if afterRelease != string(predecessorRelease) || afterDeployment != string(predecessorDeployment) {
-		t.Fatalf("renewal bound C previous = %s/%s, want owner predecessor %s/%s", afterRelease, afterDeployment, predecessorRelease, predecessorDeployment)
+	if afterRelease != string(state.predecessorRelease) || afterDeployment != string(state.predecessorDeploy) {
+		t.Fatalf("renewal bound C previous = %s/%s, want owner predecessor %s/%s", afterRelease, afterDeployment, state.predecessorRelease, state.predecessorDeploy)
 	}
-	if release, deployment := fixture.serving(t); release != releaseC || deployment != candidateDeployment {
-		t.Fatalf("serving after C = %s/%s, want %s/%s", release, deployment, releaseC, candidateDeployment)
-	}
-	for _, instance := range predecessorRow.Instances {
+	assertServingDeployment(t, state.fixture, state.releaseC, state.candidateDeployment, "crash-gap recovery")
+	for _, instance := range state.predecessorRow.Instances {
 		if instance.Name == "" {
 			continue
 		}
-		if transport.eventIndex("run:"+cleanupStepID(instance.Name)) < 0 {
-			t.Fatalf("cleanup did not target true predecessor %s; events=%v", instance.Name, transport.events)
+		if state.transport.eventIndex("run:"+cleanupStepID(instance.Name)) < 0 {
+			t.Fatalf("cleanup did not target true predecessor %s; events=%v", instance.Name, state.transport.events)
 		}
 	}
-	for _, instance := range staleDeploymentRow.Instances {
+	for _, instance := range state.staleRow.Instances {
 		if instance.Name == "" {
 			continue
 		}
-		if transport.eventIndex("run:"+cleanupStepID(instance.Name)) >= 0 {
-			t.Fatalf("cleanup targeted stale predecessor %s; events=%v", instance.Name, transport.events)
+		if state.transport.eventIndex("run:"+cleanupStepID(instance.Name)) >= 0 {
+			t.Fatalf("cleanup targeted stale predecessor %s; events=%v", instance.Name, state.transport.events)
 		}
 	}
 }
@@ -2662,83 +2659,17 @@ func TestIntegrationDeploymentRenewalRepairsCrashGapPredecessor(t *testing.T) {
 // operation loaded an environment snapshot that still names the failed candidate
 // A. Every reacquisition path must reload the environment and freeze O.
 func TestIntegrationWaitingOwnerReloadsAfterStaleSettlement(t *testing.T) {
-	type staleFixture struct {
-		fixture     *deploymentRetryFixture
-		env         platform.Environment
-		op          contract.Operation
-		dep         platform.DeploymentID
-		oRelease    platform.ReleaseID
-		oDeployment platform.DeploymentID
-	}
-	setup := func(t *testing.T, key string) staleFixture {
-		t.Helper()
-		transport := &recordingDeployTransport{scriptedDeployTransport: newScriptedDeployTransport()}
-		fixture := newDeploymentRetryFixtureWithTransport(t, transport)
-		fixture.deploy(t)
-		env := fixture.environment(t)
-		oRelease, oDeployment := env.ServingRelease, env.ServingDeploymentID
-
-		releaseA := fixture.createRelease(key+"-a", "registry.example/live:"+key+"-a")
-		opA := platformSubmit(t, fixture.service, platform.KindDeploy, "env/live/production", key+"-a",
-			map[string]any{"release_id": releaseA})
-		deploymentA := platform.DeploymentID(deploymentForOperation(t, fixture.pool, opA.ID))
-		if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_platform_deployments
-            SET state='failed' WHERE id=$1`, deploymentA); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_operations
-            SET state='failed',attempt=1 WHERE id=$1`, opA.ID); err != nil {
-			t.Fatal(err)
-		}
-		// The database serving pointer still names the failed candidate A while
-		// the terminal owner's frozen restore target is O.
-		if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_platform_environments
-            SET serving_release_id=$2,serving_deployment_id=$3 WHERE id=$1`, env.ID, releaseA, deploymentA); err != nil {
-			t.Fatal(err)
-		}
-		insertDeploymentOwner(t, fixture.pool, env, deploymentOwner{
-			EnvironmentID: env.ID, OperationID: opA.ID, DeploymentID: deploymentA, Attempt: 1,
-			Phase: deploymentOwnerPrepared, RouteTarget: oDeployment,
-			RestoreReleaseID: oRelease, RestoreDeploymentID: oDeployment,
-		})
-		releaseB := fixture.createRelease(key+"-b", "registry.example/live:"+key+"-b")
-		opB := platformSubmit(t, fixture.service, platform.KindDeploy, "env/live/production", key+"-b",
-			map[string]any{"release_id": releaseB})
-		return staleFixture{
-			fixture: fixture, env: env, op: opB,
-			dep:      platform.DeploymentID(deploymentForOperation(t, fixture.pool, opB.ID)),
-			oRelease: oRelease, oDeployment: oDeployment,
-		}
-	}
-	assertPredecessor := func(t *testing.T, fixture *deploymentRetryFixture, dep platform.DeploymentID, release platform.ReleaseID, deployment platform.DeploymentID) {
-		t.Helper()
-		var previousRelease, previousDeployment string
-		if err := fixture.pool.QueryRow(fixture.ctx, `SELECT coalesce(previous_release_id,''),coalesce(previous_deployment_id,'')
-            FROM eregion_platform_deployments WHERE id=$1`, dep).Scan(&previousRelease, &previousDeployment); err != nil {
-			t.Fatal(err)
-		}
-		if previousRelease != string(release) || previousDeployment != string(deployment) {
-			t.Fatalf("%s previous = %s/%s, want reloaded serving predecessor %s/%s", dep, previousRelease, previousDeployment, release, deployment)
-		}
-	}
-
 	t.Run("runDeployment", func(t *testing.T) {
-		state := setup(t, "stale-run")
+		state := setupStaleSettlement(t, "stale-run")
 		if err := runPlatformAttempt(state.fixture.ctx, state.fixture.service, state.op.ID, 1); err != nil {
 			t.Fatalf("B attempt: %v", err)
 		}
-		current, err := state.fixture.service.Get(state.fixture.ctx, testActor, state.op.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if current.State != contract.Succeeded {
-			t.Fatalf("B = %+v, want succeeded", current)
-		}
-		assertPredecessor(t, state.fixture, state.dep, state.oRelease, state.oDeployment)
+		assertOperationState(t, state.fixture, state.op.ID, contract.Succeeded, "B deployment after stale settlement")
+		state.assertPredecessor(t)
 	})
 
 	t.Run("cancellation", func(t *testing.T) {
-		state := setup(t, "stale-cancel")
+		state := setupStaleSettlement(t, "stale-cancel")
 		if _, err := state.fixture.pool.Exec(state.fixture.ctx, `UPDATE eregion_operations
             SET state='cancelling',attempt=1 WHERE id=$1`, state.op.ID); err != nil {
 			t.Fatal(err)
@@ -2746,21 +2677,13 @@ func TestIntegrationWaitingOwnerReloadsAfterStaleSettlement(t *testing.T) {
 		if err := runPlatformAttempt(state.fixture.ctx, state.fixture.service, state.op.ID, 1); err != nil {
 			t.Fatalf("B cancellation: %v", err)
 		}
-		current, err := state.fixture.service.Get(state.fixture.ctx, testActor, state.op.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if current.State != contract.Canceled {
-			t.Fatalf("B cancellation = %+v, want cancelled", current)
-		}
-		assertPredecessor(t, state.fixture, state.dep, state.oRelease, state.oDeployment)
-		if release, deployment := state.fixture.serving(t); release != state.oRelease || deployment != state.oDeployment {
-			t.Fatalf("serving after cancellation = %s/%s, want restored %s/%s", release, deployment, state.oRelease, state.oDeployment)
-		}
+		assertOperationState(t, state.fixture, state.op.ID, contract.Canceled, "B cancellation after stale settlement")
+		state.assertPredecessor(t)
+		assertServingDeployment(t, state.fixture, state.oRelease, state.oDeployment, "B cancellation after stale settlement")
 	})
 
 	t.Run("reconciliation", func(t *testing.T) {
-		state := setup(t, "stale-reconcile")
+		state := setupStaleSettlement(t, "stale-reconcile")
 		if _, err := state.fixture.pool.Exec(state.fixture.ctx, `UPDATE eregion_operations
             SET state='running',attempt=1 WHERE id=$1`, state.op.ID); err != nil {
 			t.Fatal(err)
@@ -2772,16 +2695,67 @@ func TestIntegrationWaitingOwnerReloadsAfterStaleSettlement(t *testing.T) {
 		if err := state.fixture.service.reconcileDeployment(state.fixture.ctx, current); err != nil {
 			t.Fatalf("B reconciliation: %v", err)
 		}
-		current, err = state.fixture.service.Get(state.fixture.ctx, testActor, state.op.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if current.State != contract.Failed {
-			t.Fatalf("B reconciliation = %+v, want failed without a lease", current)
-		}
-		assertPredecessor(t, state.fixture, state.dep, state.oRelease, state.oDeployment)
-		if release, deployment := state.fixture.serving(t); release != state.oRelease || deployment != state.oDeployment {
-			t.Fatalf("serving after reconciliation = %s/%s, want restored %s/%s", release, deployment, state.oRelease, state.oDeployment)
-		}
+		assertOperationState(t, state.fixture, state.op.ID, contract.Failed, "B reconciliation without lease")
+		state.assertPredecessor(t)
+		assertServingDeployment(t, state.fixture, state.oRelease, state.oDeployment, "B reconciliation after stale settlement")
 	})
+}
+
+type staleSettlementFixture struct {
+	fixture     *deploymentRetryFixture
+	env         platform.Environment
+	op          contract.Operation
+	dep         platform.DeploymentID
+	oRelease    platform.ReleaseID
+	oDeployment platform.DeploymentID
+}
+
+func setupStaleSettlement(t *testing.T, key string) *staleSettlementFixture {
+	t.Helper()
+	fixture, _, env := newDeployedRecordingFixture(t)
+	state := &staleSettlementFixture{
+		fixture: fixture, env: env,
+		oRelease: env.ServingRelease, oDeployment: env.ServingDeploymentID,
+	}
+
+	releaseA := fixture.createRelease(key+"-a", "registry.example/live:"+key+"-a")
+	opA := platformSubmit(t, fixture.service, platform.KindDeploy, "env/live/production", key+"-a",
+		map[string]any{"release_id": releaseA})
+	deploymentA := platform.DeploymentID(deploymentForOperation(t, fixture.pool, opA.ID))
+	if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_platform_deployments
+        SET state='failed' WHERE id=$1`, deploymentA); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_operations
+        SET state='failed',attempt=1 WHERE id=$1`, opA.ID); err != nil {
+		t.Fatal(err)
+	}
+	// The database serving pointer still names the failed candidate A while
+	// the terminal owner's frozen restore target is O.
+	if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_platform_environments
+        SET serving_release_id=$2,serving_deployment_id=$3 WHERE id=$1`, env.ID, releaseA, deploymentA); err != nil {
+		t.Fatal(err)
+	}
+	insertDeploymentOwner(t, fixture.pool, env, deploymentOwner{
+		EnvironmentID: env.ID, OperationID: opA.ID, DeploymentID: deploymentA, Attempt: 1,
+		Phase: deploymentOwnerPrepared, RouteTarget: state.oDeployment,
+		RestoreReleaseID: state.oRelease, RestoreDeploymentID: state.oDeployment,
+	})
+	releaseB := fixture.createRelease(key+"-b", "registry.example/live:"+key+"-b")
+	state.op = platformSubmit(t, fixture.service, platform.KindDeploy, "env/live/production", key+"-b",
+		map[string]any{"release_id": releaseB})
+	state.dep = platform.DeploymentID(deploymentForOperation(t, fixture.pool, state.op.ID))
+	return state
+}
+
+func (s *staleSettlementFixture) assertPredecessor(t *testing.T) {
+	t.Helper()
+	var previousRelease, previousDeployment string
+	if err := s.fixture.pool.QueryRow(s.fixture.ctx, `SELECT coalesce(previous_release_id,''),coalesce(previous_deployment_id,'')
+        FROM eregion_platform_deployments WHERE id=$1`, s.dep).Scan(&previousRelease, &previousDeployment); err != nil {
+		t.Fatal(err)
+	}
+	if previousRelease != string(s.oRelease) || previousDeployment != string(s.oDeployment) {
+		t.Fatalf("%s previous = %s/%s, want reloaded serving predecessor %s/%s", s.dep, previousRelease, previousDeployment, s.oRelease, s.oDeployment)
+	}
 }

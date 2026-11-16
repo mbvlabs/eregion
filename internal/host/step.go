@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"regexp"
 	"strings"
 
@@ -65,7 +64,7 @@ func planEntry(ctx context.Context, step Step, runtime engine.Runtime) (entry Pl
 }
 
 func safeHint(err error) string {
-	var fault *contract.Fault
+	var fault *contract.FaultError
 	if errors.As(err, &fault) {
 		return strings.TrimSpace(fault.Hint)
 	}
@@ -87,16 +86,6 @@ func canonicalInput(value any) ([]byte, error) {
 	return json.Marshal(value)
 }
 
-func scriptEnv(extra map[string]string) map[string]string {
-	env := map[string]string{}
-	for key, value := range extra {
-		if value != "" {
-			env[key] = value
-		}
-	}
-	return env
-}
-
 func incomplete(detail string) (engine.CheckResult, error) {
 	return engine.CheckResult{Complete: false, Detail: detail}, nil
 }
@@ -105,19 +94,12 @@ func complete(detail string) (engine.CheckResult, error) {
 	return engine.CheckResult{Complete: true, Detail: detail}, nil
 }
 
-func checkOutput(ctx context.Context, runtime engine.Runtime, exec Exec, script string) (string, error) {
+func checkOutput(ctx context.Context, exec Exec, script string) (string, error) {
 	output, err := exec.Output(ctx, script)
 	if err != nil {
 		return "", err
 	}
 	return strings.TrimSpace(output), nil
-}
-
-func requireValue(name, value string) error {
-	if strings.TrimSpace(value) == "" {
-		return fmt.Errorf("%s is required", name)
-	}
-	return nil
 }
 
 func contractError(message string) error {

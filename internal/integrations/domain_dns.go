@@ -371,24 +371,10 @@ func (d *DomainDNS) applyPlan(ctx context.Context, actor contract.Actor, opID co
 	if len(plan.Changes) == 0 {
 		return plan, nil
 	}
-	for _, change := range plan.Changes {
-		action, target := domainDNSChangeTarget(plan.Host, change)
-		if err := d.authz.Authorize(ctx, actor, action, target); err != nil {
-			_ = d.audit.Record(ctx, AuditEntry{At: d.now().UTC(), Actor: actor.Subject, Action: action, Target: target, Outcome: "denied", Detail: auditDetail(opID, "authorization denied")})
-			return plan, err
-		}
-		if err := d.audit.Record(ctx, AuditEntry{At: d.now().UTC(), Actor: actor.Subject, Action: action, Target: target, Outcome: "intent", Detail: auditDetail(opID, "zone="+zone.ZoneName+" ownership="+plan.Ownership)}); err != nil {
-			return plan, err
-		}
+	if err := d.authorizePlanChanges(ctx, actor, opID, zone, plan); err != nil {
+		return plan, err
 	}
-	var additions, deletions []DomainDNSChange
-	for _, change := range plan.Changes {
-		if change.Action == "delete" {
-			deletions = append(deletions, change)
-		} else {
-			additions = append(additions, change)
-		}
-	}
+	additions, deletions := domainDNSPartitionChanges(plan.Changes)
 	for _, change := range additions {
 		if err := d.applyOneChange(ctx, actor, opID, zone, client, &plan, change, guard); err != nil {
 			return plan, err
@@ -407,6 +393,31 @@ func (d *DomainDNS) applyPlan(ctx context.Context, actor contract.Actor, opID co
 		}
 	}
 	return plan, nil
+}
+
+func (d *DomainDNS) authorizePlanChanges(ctx context.Context, actor contract.Actor, opID contract.OperationID, zone DNSZone, plan DomainDNSPlan) error {
+	for _, change := range plan.Changes {
+		action, target := domainDNSChangeTarget(plan.Host, change)
+		if err := d.authz.Authorize(ctx, actor, action, target); err != nil {
+			_ = d.audit.Record(ctx, AuditEntry{At: d.now().UTC(), Actor: actor.Subject, Action: action, Target: target, Outcome: "denied", Detail: auditDetail(opID, "authorization denied")})
+			return err
+		}
+		if err := d.audit.Record(ctx, AuditEntry{At: d.now().UTC(), Actor: actor.Subject, Action: action, Target: target, Outcome: "intent", Detail: auditDetail(opID, "zone="+zone.ZoneName+" ownership="+plan.Ownership)}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func domainDNSPartitionChanges(changes []DomainDNSChange) (additions, deletions []DomainDNSChange) {
+	for _, change := range changes {
+		if change.Action == "delete" {
+			deletions = append(deletions, change)
+		} else {
+			additions = append(additions, change)
+		}
+	}
+	return additions, deletions
 }
 
 func (d *DomainDNS) applyOneChange(ctx context.Context, actor contract.Actor, opID contract.OperationID, zone DNSZone, client *Cloudflare, plan *DomainDNSPlan, change DomainDNSChange, guard func(context.Context) error) error {
@@ -433,7 +444,7 @@ func (d *DomainDNS) applyOneChange(ctx context.Context, actor contract.Actor, op
 	}
 	if err := client.apply(ctx, domainDNSChangeToDNSChange(change)); err != nil {
 		_ = d.audit.Record(ctx, AuditEntry{At: d.now().UTC(), Actor: actor.Subject, Action: action, Target: target, Outcome: "failed", Detail: auditDetail(opID, "zone="+zone.ZoneName)})
-		var failure *ProviderFailure
+		var failure *ProviderError
 		if change.Action == "delete" && change.Before != nil && errors.As(err, &failure) &&
 			(contract.Classify(err).Code == contract.Forbidden || contract.Classify(err).Code == contract.PreconditionFailed) {
 			copy := *failure
@@ -537,65 +548,77 @@ func (d *DomainDNS) confirmDomainDNSChange(ctx context.Context, zone DNSZone, cl
 	}
 	switch change.Action {
 	case "create":
-		if change.After == nil {
-			return false, contract.NewFault(contract.Internal, "DNS create change has no desired record", "Do not apply this plan.")
-		}
-		for _, record := range owned[change.Type] {
-			if !domainDNSContentEqual(change.Type, record.Content, change.After.Content) {
-				continue
-			}
-			if record.TTL == change.After.TTL && record.Proxied == change.After.Proxied && record.Comment == change.After.Comment {
-				return true, nil
-			}
-			return false, contract.NewFault(contract.PreconditionFailed,
-				"an owned record with the desired content appeared with different fields",
-				"Retry from a fresh plan; no duplicate record was created.")
-		}
-		return false, nil
+		return confirmDomainDNSCreate(owned, change)
 	case "update":
-		if change.After == nil || change.After.ID == "" {
-			return false, contract.NewFault(contract.Internal, "DNS update change has no target ID", "Do not apply this plan.")
+		return confirmDomainDNSUpdate(current.Records, plan, change)
+	default:
+		return confirmDomainDNSDelete(current.Records, plan, change)
+	}
+}
+
+func confirmDomainDNSCreate(owned map[string][]DomainDNSRecord, change DomainDNSChange) (bool, error) {
+	if change.After == nil {
+		return false, contract.NewFault(contract.Internal, "DNS create change has no desired record", "Do not apply this plan.")
+	}
+	for _, record := range owned[change.Type] {
+		if !domainDNSContentEqual(change.Type, record.Content, change.After.Content) {
+			continue
 		}
-		for _, record := range current.Records {
-			if record.ID != change.After.ID {
-				continue
-			}
-			if !strings.EqualFold(record.Type, change.Type) || !hostnameEqual(record.Name, plan.Host) || record.Comment != plan.Ownership {
-				return false, contract.NewFault(contract.PreconditionFailed,
-					"the owned record changed immediately before the update",
-					"No update was made; inspect the hostname and retry from a fresh plan.")
-			}
-			if domainDNSContentEqual(change.Type, record.Content, change.After.Content) &&
-				record.TTL == change.After.TTL && record.Proxied == change.After.Proxied && record.Comment == change.After.Comment {
-				return true, nil
-			}
-			return false, nil
+		if record.TTL == change.After.TTL && record.Proxied == change.After.Proxied && record.Comment == change.After.Comment {
+			return true, nil
 		}
 		return false, contract.NewFault(contract.PreconditionFailed,
-			"the owned record disappeared before the update",
-			"No update was made; retry from a fresh plan.")
-	default:
-		if change.Before == nil || change.Before.ID == "" {
-			return false, contract.NewFault(contract.Internal, "DNS delete change has no target ID", "Do not apply this plan.")
-		}
-		for _, record := range current.Records {
-			if record.ID != change.Before.ID {
-				continue
-			}
-			if !strings.EqualFold(record.Type, change.Type) || !hostnameEqual(record.Name, plan.Host) || record.Comment != plan.Ownership {
-				return false, contract.NewFault(contract.PreconditionFailed,
-					"the owned record changed immediately before deletion",
-					"No deletion was made; inspect the hostname and retry from a fresh plan.")
-			}
-			if !domainDNSContentEqual(change.Type, record.Content, change.Before.Content) || record.TTL != change.Before.TTL || record.Proxied != change.Before.Proxied {
-				return false, contract.NewFault(contract.PreconditionFailed, "the owned record changed immediately before deletion", "No deletion was made; inspect the hostname and retry from a fresh plan.")
-			}
-			return false, nil
-		}
-		// A concurrent writer may already have removed the exact-owned record.
-		// Skipping is safe; a different record is never deleted.
-		return true, nil
+			"an owned record with the desired content appeared with different fields",
+			"Retry from a fresh plan; no duplicate record was created.")
 	}
+	return false, nil
+}
+
+func confirmDomainDNSUpdate(records []DomainDNSRecord, plan DomainDNSPlan, change DomainDNSChange) (bool, error) {
+	if change.After == nil || change.After.ID == "" {
+		return false, contract.NewFault(contract.Internal, "DNS update change has no target ID", "Do not apply this plan.")
+	}
+	for _, record := range records {
+		if record.ID != change.After.ID {
+			continue
+		}
+		if !strings.EqualFold(record.Type, change.Type) || !hostnameEqual(record.Name, plan.Host) || record.Comment != plan.Ownership {
+			return false, contract.NewFault(contract.PreconditionFailed,
+				"the owned record changed immediately before the update",
+				"No update was made; inspect the hostname and retry from a fresh plan.")
+		}
+		if domainDNSContentEqual(change.Type, record.Content, change.After.Content) &&
+			record.TTL == change.After.TTL && record.Proxied == change.After.Proxied && record.Comment == change.After.Comment {
+			return true, nil
+		}
+		return false, nil
+	}
+	return false, contract.NewFault(contract.PreconditionFailed,
+		"the owned record disappeared before the update",
+		"No update was made; retry from a fresh plan.")
+}
+
+func confirmDomainDNSDelete(records []DomainDNSRecord, plan DomainDNSPlan, change DomainDNSChange) (bool, error) {
+	if change.Before == nil || change.Before.ID == "" {
+		return false, contract.NewFault(contract.Internal, "DNS delete change has no target ID", "Do not apply this plan.")
+	}
+	for _, record := range records {
+		if record.ID != change.Before.ID {
+			continue
+		}
+		if !strings.EqualFold(record.Type, change.Type) || !hostnameEqual(record.Name, plan.Host) || record.Comment != plan.Ownership {
+			return false, contract.NewFault(contract.PreconditionFailed,
+				"the owned record changed immediately before deletion",
+				"No deletion was made; inspect the hostname and retry from a fresh plan.")
+		}
+		if !domainDNSContentEqual(change.Type, record.Content, change.Before.Content) || record.TTL != change.Before.TTL || record.Proxied != change.Before.Proxied {
+			return false, contract.NewFault(contract.PreconditionFailed, "the owned record changed immediately before deletion", "No deletion was made; inspect the hostname and retry from a fresh plan.")
+		}
+		return false, nil
+	}
+	// A concurrent writer may already have removed the exact-owned record.
+	// Skipping is safe; a different record is never deleted.
+	return true, nil
 }
 
 func (d *DomainDNS) snapshot(ctx context.Context, zone DNSZone, client *Cloudflare, host, marker string, proxied bool) (DomainDNSPlan, error) {
@@ -750,8 +773,6 @@ func domainDNSClassify(records []DomainDNSRecord, marker string) (map[string][]D
 }
 
 func domainDNSApplyChanges(desired []DNSRecord, owned map[string][]DomainDNSRecord) ([]DomainDNSChange, int) {
-	var changes []DomainDNSChange
-	unchanged := 0
 	desiredByType := map[string][]DNSRecord{}
 	for _, want := range desired {
 		desiredByType[want.Type] = append(desiredByType[want.Type], want)
@@ -763,62 +784,88 @@ func domainDNSApplyChanges(desired []DNSRecord, owned map[string][]DomainDNSReco
 	for recordType := range owned {
 		types[recordType] = true
 	}
+	var changes []DomainDNSChange
+	unchanged := 0
 	for recordType := range types {
-		wanted := desiredByType[recordType]
-		current := owned[recordType]
-		used := make([]bool, len(current))
-		remaining := make([]DNSRecord, 0, len(wanted))
-		for _, want := range wanted {
-			matched := false
-			for index, existing := range current {
-				if used[index] || !domainDNSContentEqual(recordType, existing.Content, want.Content) {
-					continue
-				}
-				used[index] = true
-				matched = true
-				if existing.TTL == want.TTL && existing.Proxied == want.Proxied && existing.Comment == want.Comment {
-					unchanged++
-					break
-				}
-				after := want
-				after.ID = existing.ID
-				before := existing
-				changes = append(changes, DomainDNSChange{Action: "update", Type: recordType, Before: &before, After: &after})
+		typeChanges, typeUnchanged := domainDNSChangesForType(recordType, desiredByType[recordType], owned[recordType])
+		changes = append(changes, typeChanges...)
+		unchanged += typeUnchanged
+	}
+	sortDomainDNSChanges(changes)
+	return changes, unchanged
+}
+
+func domainDNSChangesForType(recordType string, wanted []DNSRecord, current []DomainDNSRecord) ([]DomainDNSChange, int) {
+	used := make([]bool, len(current))
+	changes, unchanged, remaining := matchDesiredDomainDNS(recordType, wanted, current, used)
+	changes = append(changes, matchRemainingDomainDNS(recordType, remaining, current, used)...)
+	changes = append(changes, deleteUnusedDomainDNS(recordType, current, used)...)
+	return changes, unchanged
+}
+
+func matchDesiredDomainDNS(recordType string, wanted []DNSRecord, current []DomainDNSRecord, used []bool) ([]DomainDNSChange, int, []DNSRecord) {
+	var changes []DomainDNSChange
+	unchanged := 0
+	var remaining []DNSRecord
+	for _, want := range wanted {
+		matched := false
+		for index, existing := range current {
+			if used[index] || !domainDNSContentEqual(recordType, existing.Content, want.Content) {
+				continue
+			}
+			used[index] = true
+			matched = true
+			if existing.TTL == want.TTL && existing.Proxied == want.Proxied && existing.Comment == want.Comment {
+				unchanged++
 				break
 			}
-			if !matched {
-				remaining = append(remaining, want)
-			}
+			after := want
+			after.ID = existing.ID
+			before := existing
+			changes = append(changes, DomainDNSChange{Action: "update", Type: recordType, Before: &before, After: &after})
+			break
 		}
-		for _, want := range remaining {
-			matched := false
-			for index, existing := range current {
-				if used[index] {
-					continue
-				}
-				used[index] = true
-				matched = true
-				after := want
-				after.ID = existing.ID
-				before := existing
-				changes = append(changes, DomainDNSChange{Action: "update", Type: recordType, Before: &before, After: &after})
-				break
-			}
-			if !matched {
-				after := want
-				changes = append(changes, DomainDNSChange{Action: "create", Type: recordType, After: &after})
-			}
+		if !matched {
+			remaining = append(remaining, want)
 		}
+	}
+	return changes, unchanged, remaining
+}
+
+func matchRemainingDomainDNS(recordType string, remaining []DNSRecord, current []DomainDNSRecord, used []bool) []DomainDNSChange {
+	var changes []DomainDNSChange
+	for _, want := range remaining {
+		matched := false
 		for index, existing := range current {
 			if used[index] {
 				continue
 			}
+			used[index] = true
+			matched = true
+			after := want
+			after.ID = existing.ID
 			before := existing
-			changes = append(changes, DomainDNSChange{Action: "delete", Type: recordType, Before: &before})
+			changes = append(changes, DomainDNSChange{Action: "update", Type: recordType, Before: &before, After: &after})
+			break
+		}
+		if !matched {
+			after := want
+			changes = append(changes, DomainDNSChange{Action: "create", Type: recordType, After: &after})
 		}
 	}
-	sortDomainDNSChanges(changes)
-	return changes, unchanged
+	return changes
+}
+
+func deleteUnusedDomainDNS(recordType string, current []DomainDNSRecord, used []bool) []DomainDNSChange {
+	var changes []DomainDNSChange
+	for index, existing := range current {
+		if used[index] {
+			continue
+		}
+		before := existing
+		changes = append(changes, DomainDNSChange{Action: "delete", Type: recordType, Before: &before})
+	}
+	return changes
 }
 
 func sortDomainDNSChanges(changes []DomainDNSChange) {

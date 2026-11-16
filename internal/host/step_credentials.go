@@ -151,7 +151,7 @@ func (s *credentialsStep) Check(_ context.Context, _ engine.Runtime) (engine.Che
 	if !owned {
 		return incomplete("the API auth file " + path + " is not owned by the control-plane account")
 	}
-	raw, err := os.ReadFile(path) //nolint:gosec // G304: fixed host configuration path.
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		return engine.CheckResult{}, err
 	}
@@ -179,38 +179,48 @@ func (s *credentialsStep) Check(_ context.Context, _ engine.Runtime) (engine.Che
 
 func (s *credentialsStep) Apply(_ context.Context, _ engine.Runtime, _ engine.Reporter) (engine.ApplyResult, error) {
 	path := s.authPath()
-	raw, mode, exists, err := fileState(path)
+	authNote, err := s.ensureAuthFile(path)
 	if err != nil {
 		return engine.ApplyResult{}, err
-	}
-	authNote := "existing API token store preserved"
-	if exists {
-		// Validate before touching the file: a damaged store must fail closed,
-		// never be replaced by bootstrap's empty list.
-		if _, err := decodeAuthFile(raw); err != nil {
-			return engine.ApplyResult{}, err
-		}
-		if mode != 0o600 {
-			if err := os.Chmod(path, 0o600); err != nil {
-				return engine.ApplyResult{}, err
-			}
-		}
-		if err := chownIfRoot(path, s.cfg.Layout.User, s.cfg.Layout.Group); err != nil {
-			return engine.ApplyResult{}, err
-		}
-	} else {
-		auth, err := s.credentials.AuthFile(s.cfg.Node)
-		if err != nil {
-			return engine.ApplyResult{}, err
-		}
-		if err := writeReplacingSecret(path, auth, s.cfg.Layout.User, s.cfg.Layout.Group); err != nil {
-			return engine.ApplyResult{}, err
-		}
-		authNote = "empty API token store created; setup mints no token"
 	}
 	if err := writeReplacingSecret(s.envPath(), s.env(), s.cfg.Layout.User, s.cfg.Layout.Group); err != nil {
 		return engine.ApplyResult{}, err
 	}
+	return s.finishApply(path, authNote)
+}
+
+func (s *credentialsStep) ensureAuthFile(path string) (string, error) {
+	raw, mode, exists, err := fileState(path)
+	if err != nil {
+		return "", err
+	}
+	if !exists {
+		auth, err := s.credentials.AuthFile(s.cfg.Node)
+		if err != nil {
+			return "", err
+		}
+		if err := writeReplacingSecret(path, auth, s.cfg.Layout.User, s.cfg.Layout.Group); err != nil {
+			return "", err
+		}
+		return "empty API token store created; setup mints no token", nil
+	}
+	// Validate before touching the file: a damaged store must fail closed,
+	// never be replaced by bootstrap's empty list.
+	if _, err := decodeAuthFile(raw); err != nil {
+		return "", err
+	}
+	if mode != 0o600 {
+		if err := os.Chmod(path, 0o600); err != nil {
+			return "", err
+		}
+	}
+	if err := chownIfRoot(path, s.cfg.Layout.User, s.cfg.Layout.Group); err != nil {
+		return "", err
+	}
+	return "existing API token store preserved", nil
+}
+
+func (s *credentialsStep) finishApply(path, authNote string) (engine.ApplyResult, error) {
 	result := map[string]any{
 		"auth_file": path,
 		"env_file":  s.envPath(),

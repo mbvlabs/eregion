@@ -160,7 +160,7 @@ func NewRemote(config RemoteConfig) (*Remote, error) {
 	if info.Mode().Perm()&0o077 != 0 {
 		return nil, fmt.Errorf("the remote identity %s must not be readable by group or others", config.IdentityFile)
 	}
-	raw, err := os.ReadFile(config.IdentityFile) //nolint:gosec // G304: operator-provided identity file.
+	raw, err := os.ReadFile(config.IdentityFile)
 	if err != nil {
 		return nil, fmt.Errorf("read the remote identity: %w", err)
 	}

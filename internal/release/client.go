@@ -79,20 +79,9 @@ func (c *Client) Resolve(ctx context.Context, channel, version string) (Manifest
 	// version and require its bytes to match the observed pointer exactly.
 	identityVersion := version
 	if identityVersion == "" {
-		identityVersion = peekVersion(raw)
-		if err := matchVersion(channel, identityVersion); err != nil {
-			return Manifest{}, verificationFailed("release manifest version is invalid")
-		}
-		immutableURL := versionRoot(identityVersion) + "/manifest.json"
-		immutable, immutableStatus, err := getCapped(ctx, c.httpClient(), immutableURL, maxMetadata)
+		identityVersion, err = c.pinChannelManifest(ctx, channel, raw)
 		if err != nil {
 			return Manifest{}, err
-		}
-		if immutableStatus != http.StatusOK {
-			return Manifest{}, unreachable(immutableURL, fmt.Errorf("status %d", immutableStatus))
-		}
-		if !bytes.Equal(raw, immutable) {
-			return Manifest{}, verificationFailed("channel manifest differs from immutable version manifest")
 		}
 	}
 	bundleURL := versionRoot(identityVersion) + "/manifest.json.sigstore.json"
@@ -120,6 +109,25 @@ func (c *Client) Resolve(ctx context.Context, channel, version string) (Manifest
 		return Manifest{}, err
 	}
 	return m, nil
+}
+
+func (c *Client) pinChannelManifest(ctx context.Context, channel string, raw []byte) (string, error) {
+	version := peekVersion(raw)
+	if err := matchVersion(channel, version); err != nil {
+		return "", verificationFailed("release manifest version is invalid")
+	}
+	immutableURL := versionRoot(version) + "/manifest.json"
+	immutable, status, err := getCapped(ctx, c.httpClient(), immutableURL, maxMetadata)
+	if err != nil {
+		return "", err
+	}
+	if status != http.StatusOK {
+		return "", unreachable(immutableURL, fmt.Errorf("status %d", status))
+	}
+	if !bytes.Equal(raw, immutable) {
+		return "", verificationFailed("channel manifest differs from immutable version manifest")
+	}
+	return version, nil
 }
 
 // Fetch returns a verified local path for os/arch, using the release cache.
@@ -185,13 +193,8 @@ func (c *Client) Fetch(ctx context.Context, m Manifest, goos, goarch string) (st
 	if err := tmp.Close(); err != nil {
 		return "", fmt.Errorf("close release download: %w", err)
 	}
-	want, err := hex.DecodeString(art.SHA256)
-	if err != nil || len(want) != sha256.Size {
-		return "", verificationFailed("release artifact sha256 is invalid")
-	}
-	got := hash.Sum(nil)
-	if subtle.ConstantTimeCompare(got, want) != 1 {
-		return "", verificationFailed("release artifact sha256 mismatch")
+	if err := verifyArtifactHash(hash.Sum(nil), art.SHA256); err != nil {
+		return "", err
 	}
 	if err := persistManifest(dir, m); err != nil {
 		return "", err
@@ -201,6 +204,17 @@ func (c *Client) Fetch(ctx context.Context, m Manifest, goos, goarch string) (st
 	}
 	cleanup = false
 	return dest, nil
+}
+
+func verifyArtifactHash(got []byte, wantHex string) error {
+	want, err := hex.DecodeString(wantHex)
+	if err != nil || len(want) != sha256.Size {
+		return verificationFailed("release artifact sha256 is invalid")
+	}
+	if subtle.ConstantTimeCompare(got, want) != 1 {
+		return verificationFailed("release artifact sha256 mismatch")
+	}
+	return nil
 }
 
 func persistManifest(dir string, m Manifest) error {
@@ -229,7 +243,7 @@ func fileHasSHA256(path, wantHex string) (bool, error) {
 	if !info.Mode().IsRegular() {
 		return false, fmt.Errorf("cached release is not a regular file")
 	}
-	f, err := os.Open(path) //nolint:gosec // G304: path is under the local release cache.
+	f, err := os.Open(path)
 	if err != nil {
 		return false, err
 	}

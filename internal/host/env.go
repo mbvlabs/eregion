@@ -15,7 +15,7 @@ const ServiceEnvPath = "/etc/eregion/control-plane.env"
 // process. It understands the quoted, escaped form bootstrap writes. A missing
 // file is an error: a node RPC must never fall back to an ambient database URL.
 func LoadServiceEnv(path string) error {
-	raw, err := os.ReadFile(path) //nolint:gosec // G304: the fixed control-plane environment path.
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("read the node service environment: %w", err)
 	}

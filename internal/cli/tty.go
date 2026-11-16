@@ -18,8 +18,8 @@ func humanAtTerminal(cmd *cobra.Command) bool {
 	outputMode, _ := cmd.Flags().GetString("output")
 	plain := outputMode == "" || outputMode == string(output.Plain)
 	return !jsonMode && plain &&
-		term.IsTerminal(int(os.Stdin.Fd())) && //nolint:gosec // G115: file descriptors fit in int.
-		term.IsTerminal(int(os.Stderr.Fd())) //nolint:gosec // G115: file descriptors fit in int.
+		term.IsTerminal(int(os.Stdin.Fd())) &&
+		term.IsTerminal(int(os.Stderr.Fd()))
 }
 
 // humanPlainAt reports whether a command may draw loading feedback: human plain

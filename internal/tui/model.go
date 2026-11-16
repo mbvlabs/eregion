@@ -404,6 +404,8 @@ func (m Model) observationStyle(observation viewer.ObservationState) lipgloss.St
 		return m.palette.ok
 	case viewer.Stale, viewer.Reconnecting:
 		return m.palette.warn
+	case viewer.Connecting, viewer.Closed:
+		return m.palette.dim
 	default:
 		return m.palette.dim
 	}
@@ -445,6 +447,8 @@ func stageState(status viewer.StageStatus) contract.State {
 		return contract.Failed
 	case viewer.StageRunning:
 		return contract.Running
+	case viewer.StageStopped:
+		return contract.Canceled
 	default:
 		return contract.Canceled
 	}
@@ -474,10 +478,6 @@ func (m Model) summaryLine() string {
 		return "terminal result observed"
 	}
 	return ""
-}
-
-func (m Model) maxWidth(width int) string {
-	return lipgloss.NewStyle().MaxWidth(max(1, width)).Render("")
 }
 
 func joinNonEmpty(parts ...string) string {

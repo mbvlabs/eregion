@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/retention"
@@ -24,97 +25,137 @@ func TestIntegrationEntitiesTxProjectionVisibility(t *testing.T) {
 	defer cancel()
 
 	op := insertDefinitionOperation(t, store, "platform.deploy", "env/tx-projection/staging", "tx-visibility", json.RawMessage(`{}`))
-	if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
-		locked, found, err := tx.Operations().Lock(ctx, op)
-		if err != nil || !found {
-			t.Fatalf("lock operation found=%v err=%v", found, err)
-		}
-		if err := tx.Operations().AppendEvent(ctx, &locked, contract.Event{
-			Kind: "warning", Stage: "tx-health", Message: "Node step failed: tx-health",
-			CandidateDiagnostic: &contract.CandidateDiagnostic{DeploymentID: "dep-outer", Status: "failed", RedactionContext: "logs"},
-		}); err != nil {
-			return err
-		}
-		if err := tx.Steps().Insert(ctx, op, "tx-step-outer", "hash-outer", 0, "exec-outer"); err != nil {
-			return err
-		}
-		if _, err := tx.Steps().Fail(ctx, op, "tx-step-outer", contract.Unavailable, "outer failure"); err != nil {
-			return err
-		}
-		if err := tx.Retention().InsertRun(ctx, entities.RetentionRunInsert{
-			ID: "run_tx_outer", OperationID: op, Status: string(retention.RunRunning),
-			PlannedItems: json.RawMessage(`[]`), RemovedItems: json.RawMessage(`[]`),
-			Errors: json.RawMessage(`[]`), StartedAt: time.Now().UTC(), GCGeneration: 1,
-		}); err != nil {
-			return err
-		}
-		diagnostics, err := tx.Results().CandidateDiagnostics(ctx, op, 0, 100)
-		if err != nil || len(diagnostics) != 1 || diagnostics[0].DeploymentID != "dep-outer" {
-			t.Fatalf("uncommitted diagnostics=%+v err=%v", diagnostics, err)
-		}
-		if stage, err := tx.Results().FailedStage(ctx, op, 0); err != nil || stage != "tx-health" {
-			t.Fatalf("uncommitted stage=%q err=%v", stage, err)
-		}
-		run, found, err := tx.Retention().LatestRunForOperation(ctx, op)
-		if err != nil || !found || run.ID != "run_tx_outer" {
-			t.Fatalf("uncommitted run=%+v found=%v err=%v", run, found, err)
-		}
+	checkOuterProjection(t, ctx, store, op)
+	checkCommittedProjection(t, ctx, pool, store, op)
+	checkDiscardedProjection(t, store)
+}
 
-		savepointErr := tx.WithinSavepoint(ctx, func(nested *entities.StoreTx) error {
-			locked, found, err := nested.Operations().Lock(ctx, op)
-			if err != nil || !found {
-				t.Fatalf("nested lock found=%v err=%v", found, err)
-			}
-			if err := nested.Operations().AppendEvent(ctx, &locked, contract.Event{
-				Kind: "warning", Stage: "tx-health-nested", Message: "Node step failed: nested",
-				CandidateDiagnostic: &contract.CandidateDiagnostic{DeploymentID: "dep-nested", Status: "failed"},
-			}); err != nil {
-				return err
-			}
-			if err := nested.Steps().Insert(ctx, op, "tx-step-nested", "hash-nested", 0, "exec-nested"); err != nil {
-				return err
-			}
-			if _, err := nested.Steps().Fail(ctx, op, "tx-step-nested", contract.Unavailable, "nested failure"); err != nil {
-				return err
-			}
-			if err := nested.Retention().InsertRun(ctx, entities.RetentionRunInsert{
-				ID: "run_tx_nested", OperationID: op, Status: string(retention.RunRunning),
-				PlannedItems: json.RawMessage(`[]`), RemovedItems: json.RawMessage(`[]`),
-				Errors: json.RawMessage(`[]`), StartedAt: time.Now().UTC(), GCGeneration: 1,
-			}); err != nil {
-				return err
-			}
-			diagnostics, err := nested.Results().CandidateDiagnostics(ctx, op, 0, 100)
-			if err != nil || len(diagnostics) != 2 {
-				t.Fatalf("nested diagnostics=%+v err=%v", diagnostics, err)
-			}
-			nestedRun, found, err := nested.Retention().LatestRunForOperation(ctx, op)
-			if err != nil || !found || nestedRun.ID != "run_tx_nested" {
-				t.Fatalf("nested run=%+v found=%v err=%v", nestedRun, found, err)
-			}
-			if stage, err := nested.Results().FailedStage(ctx, op, 0); err != nil || stage != "tx-health" {
-				t.Fatalf("nested stage=%q err=%v", stage, err)
-			}
-			return errProjectionRollback
-		})
-		if savepointErr != errProjectionRollback {
-			t.Fatalf("savepoint error=%v, want exact sentinel", savepointErr)
+func checkOuterProjection(t *testing.T, ctx context.Context, store *entities.Store, op contract.OperationID) {
+	t.Helper()
+	if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		seedOuterProjection(t, ctx, tx, op)
+		checkOuterProjectionReads(t, ctx, tx, op)
+		if err := runTxNestedProjectionSavepoint(t, ctx, tx, op); err != nil {
+			return err
 		}
-		diagnostics, err = tx.Results().CandidateDiagnostics(ctx, op, 0, 100)
-		if err != nil || len(diagnostics) != 1 {
-			t.Fatalf("post-savepoint diagnostics=%+v err=%v", diagnostics, err)
-		}
-		run, found, err = tx.Retention().LatestRunForOperation(ctx, op)
-		if err != nil || !found || run.ID != "run_tx_outer" {
-			t.Fatalf("post-savepoint run=%+v found=%v err=%v", run, found, err)
-		}
+		checkPostSavepointProjection(t, ctx, tx, op)
 		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}
+}
 
-	// The committed root writes are observable through the pool view; the
-	// discarded nested scope is not.
+func seedOuterProjection(t *testing.T, ctx context.Context, tx *entities.StoreTx, op contract.OperationID) {
+	t.Helper()
+	locked, found, err := tx.Operations().Lock(ctx, op)
+	if err != nil || !found {
+		t.Fatalf("lock operation found=%v err=%v", found, err)
+	}
+	if err := tx.Operations().AppendEvent(ctx, &locked, contract.Event{
+		Kind: "warning", Stage: "tx-health", Message: "Node step failed: tx-health",
+		CandidateDiagnostic: &contract.CandidateDiagnostic{DeploymentID: "dep-outer", Status: "failed", RedactionContext: "logs"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Steps().Insert(ctx, op, "tx-step-outer", "hash-outer", 0, "exec-outer"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Steps().Fail(ctx, op, "tx-step-outer", contract.Unavailable, "outer failure"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Retention().InsertRun(ctx, entities.RetentionRunInsert{
+		ID: "run_tx_outer", OperationID: op, Status: string(retention.RunRunning),
+		PlannedItems: json.RawMessage(`[]`), RemovedItems: json.RawMessage(`[]`),
+		Errors: json.RawMessage(`[]`), StartedAt: time.Now().UTC(), GCGeneration: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func checkOuterProjectionReads(t *testing.T, ctx context.Context, tx *entities.StoreTx, op contract.OperationID) {
+	t.Helper()
+	diagnostics, err := tx.Results().CandidateDiagnostics(ctx, op, 0, 100)
+	if err != nil || len(diagnostics) != 1 || diagnostics[0].DeploymentID != "dep-outer" {
+		t.Fatalf("uncommitted diagnostics=%+v err=%v", diagnostics, err)
+	}
+	if stage, err := tx.Results().FailedStage(ctx, op, 0); err != nil || stage != "tx-health" {
+		t.Fatalf("uncommitted stage=%q err=%v", stage, err)
+	}
+	run, found, err := tx.Retention().LatestRunForOperation(ctx, op)
+	if err != nil || !found || run.ID != "run_tx_outer" {
+		t.Fatalf("uncommitted run=%+v found=%v err=%v", run, found, err)
+	}
+}
+
+func runTxNestedProjectionSavepoint(t *testing.T, ctx context.Context, tx *entities.StoreTx, op contract.OperationID) error {
+	t.Helper()
+	savepointErr := tx.WithinSavepoint(ctx, func(nested *entities.StoreTx) error {
+		seedNestedProjection(t, ctx, nested, op)
+		checkNestedProjectionReads(t, ctx, nested, op)
+		return errProjectionRollback
+	})
+	if !errors.Is(savepointErr, errProjectionRollback) {
+		t.Fatalf("savepoint error=%v, want exact sentinel", savepointErr)
+	}
+	return nil
+}
+
+func seedNestedProjection(t *testing.T, ctx context.Context, nested *entities.StoreTx, op contract.OperationID) {
+	t.Helper()
+	locked, found, err := nested.Operations().Lock(ctx, op)
+	if err != nil || !found {
+		t.Fatalf("nested lock found=%v err=%v", found, err)
+	}
+	if err := nested.Operations().AppendEvent(ctx, &locked, contract.Event{
+		Kind: "warning", Stage: "tx-health-nested", Message: "Node step failed: nested",
+		CandidateDiagnostic: &contract.CandidateDiagnostic{DeploymentID: "dep-nested", Status: "failed"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := nested.Steps().Insert(ctx, op, "tx-step-nested", "hash-nested", 0, "exec-nested"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := nested.Steps().Fail(ctx, op, "tx-step-nested", contract.Unavailable, "nested failure"); err != nil {
+		t.Fatal(err)
+	}
+	if err := nested.Retention().InsertRun(ctx, entities.RetentionRunInsert{
+		ID: "run_tx_nested", OperationID: op, Status: string(retention.RunRunning),
+		PlannedItems: json.RawMessage(`[]`), RemovedItems: json.RawMessage(`[]`),
+		Errors: json.RawMessage(`[]`), StartedAt: time.Now().UTC(), GCGeneration: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func checkNestedProjectionReads(t *testing.T, ctx context.Context, nested *entities.StoreTx, op contract.OperationID) {
+	t.Helper()
+	diagnostics, err := nested.Results().CandidateDiagnostics(ctx, op, 0, 100)
+	if err != nil || len(diagnostics) != 2 {
+		t.Fatalf("nested diagnostics=%+v err=%v", diagnostics, err)
+	}
+	nestedRun, found, err := nested.Retention().LatestRunForOperation(ctx, op)
+	if err != nil || !found || nestedRun.ID != "run_tx_nested" {
+		t.Fatalf("nested run=%+v found=%v err=%v", nestedRun, found, err)
+	}
+	if stage, err := nested.Results().FailedStage(ctx, op, 0); err != nil || stage != "tx-health" {
+		t.Fatalf("nested stage=%q err=%v", stage, err)
+	}
+}
+
+func checkPostSavepointProjection(t *testing.T, ctx context.Context, tx *entities.StoreTx, op contract.OperationID) {
+	t.Helper()
+	diagnostics, err := tx.Results().CandidateDiagnostics(ctx, op, 0, 100)
+	if err != nil || len(diagnostics) != 1 {
+		t.Fatalf("post-savepoint diagnostics=%+v err=%v", diagnostics, err)
+	}
+	run, found, err := tx.Retention().LatestRunForOperation(ctx, op)
+	if err != nil || !found || run.ID != "run_tx_outer" {
+		t.Fatalf("post-savepoint run=%+v found=%v err=%v", run, found, err)
+	}
+}
+
+func checkCommittedProjection(t *testing.T, ctx context.Context, pool *pgxpool.Pool, store *entities.Store, op contract.OperationID) {
+	t.Helper()
 	diagnostics, err := store.Results().CandidateDiagnostics(ctx, op, 0, 100)
 	if err != nil || len(diagnostics) != 1 || diagnostics[0].DeploymentID != "dep-outer" {
 		t.Fatalf("committed diagnostics=%+v err=%v", diagnostics, err)
@@ -127,8 +168,11 @@ func TestIntegrationEntitiesTxProjectionVisibility(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_retention_runs WHERE operation_id=$1`, op).Scan(&runs); err != nil || runs != 1 {
 		t.Fatalf("retention runs=%d err=%v", runs, err)
 	}
+}
 
-	// A wholly discarded StoreTx is invisible to the pool view.
+func checkDiscardedProjection(t *testing.T, store *entities.Store) {
+	t.Helper()
+	ctx := context.Background()
 	discardOp := insertDefinitionOperation(t, store, "platform.deploy", "env/tx-projection/staging", "tx-discard", json.RawMessage(`{}`))
 	if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
 		locked, found, err := tx.Operations().Lock(ctx, discardOp)
@@ -155,7 +199,7 @@ func TestIntegrationEntitiesTxProjectionVisibility(t *testing.T) {
 			t.Fatalf("discarded run found=%v err=%v", found, err)
 		}
 		return errProjectionRollback
-	}); err != errProjectionRollback {
+	}); !errors.Is(err, errProjectionRollback) {
 		t.Fatalf("discard error=%v", err)
 	}
 	if diagnostics, err := store.Results().CandidateDiagnostics(ctx, discardOp, 0, 10); err != nil || len(diagnostics) != 0 {
