@@ -1963,7 +1963,7 @@ func (b *packBuild) runBuild(ctx context.Context) error {
 	)
 	defer cancel()
 	b.packDrained = false
-	_, stderr, drained, err := runArgvCleanPack(buildRunCtx, args, b.isolation, b.rt, b.step.ID(), b.report)
+	stdout, stderr, drained, err := runArgvCleanPack(buildRunCtx, args, b.isolation, b.rt, b.step.ID(), b.report)
 	b.packDrained = drained
 	if err == nil {
 		return nil
@@ -1978,7 +1978,12 @@ func (b *packBuild) runBuild(ctx context.Context) error {
 			engine.ErrPermanent,
 		)
 	}
-	return fmt.Errorf("%w: pack build failed: %s", engine.ErrPermanent, commandDetail(err, stderr))
+	detail := commandDetail(err, stderr)
+	output := strings.ToLower(stdout + "\n" + stderr)
+	if strings.Contains(output, "closed pipe") || strings.Contains(output, "no space left on device") {
+		return fmt.Errorf("%w: pack build failed: %s; inspect builder-node Docker/containerd logs and check free space and inodes on their storage filesystems; a closed pipe can have multiple causes (see `eregion guide agents`)", engine.ErrPermanent, detail)
+	}
+	return fmt.Errorf("%w: pack build failed: %s", engine.ErrPermanent, detail)
 }
 
 func (b *packBuild) publishAndTag(ctx context.Context) (packCompletion, error) {

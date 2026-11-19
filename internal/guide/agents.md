@@ -309,6 +309,19 @@ run-image pin. Repeat `--buildpack` in the desired order, or omit it for builder
 detection. `--builder ''` clears the builder and leaves the recipe incomplete;
 a Git deploy then fails with an actionable error before any operation/build,
 while explicit image/artifact/release deploys remain builder-independent.
+
+If Pack reports a closed pipe or no space, inspect the build operation logs and
+the builder node's Docker and containerd daemon logs (for example,
+`journalctl -u docker -u containerd`). A closed pipe alone does not establish a
+disk failure. Check both free bytes and free inodes with `df -h` and `df -i` on
+the actual Docker and containerd storage filesystems and the Eregion build
+workspace. `docker info --format '{{.DockerRootDir}}'` identifies Docker's data
+root; containerd can use a separate, configured root. Run these checks on the
+daemon host if Docker is remote. If storage is exhausted, grow the affected
+filesystem or review reclaimable artifacts on the connected node with
+`eregion prune --dry-run` before choosing any cleanup. Eregion does not
+automatically delete artifacts in response to this failure.
+
 Configure optional targets with `--target web=./cmd/web`, Node inputs with
 `--frontend-directory` and repeated `--frontend-script`, and advanced inputs
 with `--go-version`, `--go-build-flags` and `--node-version`. Supplied typed
