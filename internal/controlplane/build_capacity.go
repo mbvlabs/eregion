@@ -83,8 +83,9 @@ func (s *Service) buildTransportFor(ctx context.Context, name string) (node.Tran
 	if err != nil {
 		return nil, "", err
 	}
-	if _, local := tr.(*node.Local); local && s.localBuildIdentityVerified && s.registryHostIdentity != nil &&
-		s.localNode == name && s.registryHostIdentity.NodeName == name {
+	if local, ok := tr.(*node.Local); ok && s.registryHostIdentity != nil &&
+		local.NodeIdentity() == name && s.registryHostIdentity.NodeName == name &&
+		local.StateDir() == s.registryHostIdentity.StateDir {
 		binding := s.registryHostIdentity
 		hash := sha256.Sum256([]byte(strings.Join([]string{
 			binding.NodeName, binding.HostKeyType, binding.HostKeyFingerprint, binding.StateDir,

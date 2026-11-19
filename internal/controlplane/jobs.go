@@ -543,11 +543,6 @@ func (s *Service) startLocalTransport(config WorkerConfig) error {
 	}
 	s.transport = local
 	s.localNode = localName
-	if s.registryHostIdentity != nil && s.registryHostIdentity.NodeName == localName {
-		if canonical, err := CanonicalRegistryHostStateDir(stateDir); err == nil && canonical == s.registryHostIdentity.StateDir {
-			s.localBuildIdentityVerified = true
-		}
-	}
 	return nil
 }
 

@@ -37,8 +37,13 @@ func TestIntegrationBuildDispatchAndRetirement(t *testing.T) { //nolint:gocognit
 	if _, err := AssignWorkspace(context.Background(), store, "test", identity); err != nil {
 		t.Fatal(err)
 	}
+	local, err := node.NewLocal(stateDir, "local", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver := NewNodeResolver(store.Nodes(), ResolverConfig{}, func() node.Transport { return local })
 	run, err := New(store, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
-		Concurrency: 1, TestOnly: true, NodeStateDir: stateDir, LocalNodeName: "local",
+		Concurrency: 1, TestOnly: true, Transport: local, Resolver: resolver,
 		RegistryEndpoint: "127.0.0.1:5000", RegistryHostIdentity: &identity,
 	})
 	if err != nil {

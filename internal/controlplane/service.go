@@ -35,9 +35,6 @@ type Service struct {
 	transport node.Transport
 	// localNode is the identity of the in-process local transport, if any.
 	localNode string
-	// localBuildIdentityVerified ties the actual local dispatcher state path to
-	// the workspace's observed physical host identity for claim retirement.
-	localBuildIdentityVerified bool
 	// resolver reaches the node a piece of work is placed on: the enrolled
 	// node's own pinned SSH transport, or transport for the node it serves.
 	resolver *NodeResolver
