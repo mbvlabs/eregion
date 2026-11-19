@@ -522,7 +522,7 @@ func assertCorruptSecretSnapshotFailsClosed(
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		if _, err := f.pool.Exec(f.ctx, `UPDATE eregion_platform_deployments SET secret_revisions=$2 WHERE id=$1`, f.deploymentID, original); err != nil {
+		if _, err := f.pool.Exec(f.ctx, `UPDATE eregion_platform_deployments SET secret_revisions=$2 WHERE id=$1`, f.deploymentID, string(original)); err != nil {
 			t.Errorf("restore snapshot: %v", err)
 		}
 	})

@@ -1295,7 +1295,7 @@ func seedPreRecordFailure(t *testing.T, fixture *deploymentRetryFixture, previou
 func repairPreRecordFailure(t *testing.T, fixture *deploymentRetryFixture, previous platform.Deployment, previousInstances []byte, failLookup bool) {
 	t.Helper()
 	if failLookup {
-		if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_platform_deployments SET instances=$2 WHERE id=$1`, previous.ID, previousInstances); err != nil {
+		if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_platform_deployments SET instances=$2 WHERE id=$1`, previous.ID, string(previousInstances)); err != nil {
 			t.Fatal(err)
 		}
 		return
@@ -1778,7 +1778,7 @@ func assertPinnedRevisionLookupFailureRetainsOwner(t *testing.T) {
 	assertOperationNotTerminal(t, fixture, op.ID, "pinned revision lookup failure")
 	assertOwnerRetained(t, fixture, env, "pinned revision lookup failure")
 	disableRevisionTriggers(t, fixture)
-	if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_platform_environment_revisions SET runtime=$2 WHERE id=$1`, previous.RevisionID, runtime); err != nil {
+	if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_platform_environment_revisions SET runtime=$2 WHERE id=$1`, previous.RevisionID, string(runtime)); err != nil {
 		t.Fatal(err)
 	}
 	enableRevisionTriggers(t, fixture)

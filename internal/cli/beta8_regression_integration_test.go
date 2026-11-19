@@ -1098,7 +1098,7 @@ func beta8InsertEvent(
 		`INSERT INTO eregion_operation_events(operation_id,sequence,event) VALUES ($1,$2,$3)`,
 		op.ID,
 		int64(event.Sequence),
-		raw,
+		string(raw),
 	); err != nil {
 		return err
 	}

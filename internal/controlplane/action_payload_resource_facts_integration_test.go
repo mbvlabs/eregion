@@ -67,7 +67,7 @@ func TestIntegrationActionPayloadResourceStoredFactsFailClosed(t *testing.T) {
 	}
 	if _, err := pool.Exec(ctx, `UPDATE eregion_platform_resources SET state='ready',volumes=$2::jsonb,
 		health_state='healthy',health_checked_at=clock_timestamp(),updated_at=clock_timestamp()
-		WHERE id=$1`, resourceID, volumes); err != nil {
+		WHERE id=$1`, resourceID, string(volumes)); err != nil {
 		t.Fatal(err)
 	}
 	var storedUpdatedAt time.Time
@@ -102,7 +102,7 @@ func TestIntegrationActionPayloadResourceStoredFactsFailClosed(t *testing.T) {
 	// even when the stored spec is valid.
 	if _, err := pool.Exec(ctx, `UPDATE eregion_platform_resources SET spec=$2::jsonb,
 		volumes='[{"name":"er-res-00000000000000000000000000000000-data","destination":"/data"}]'::jsonb,
-		updated_at=clock_timestamp() WHERE id=$1`, resourceID, validSpec); err != nil {
+		updated_at=clock_timestamp() WHERE id=$1`, resourceID, string(validSpec)); err != nil {
 		t.Fatal(err)
 	}
 	if err := readActionPayloadError(t, service, op); contract.Classify(err).Code != contract.Unavailable {

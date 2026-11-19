@@ -53,6 +53,9 @@ func ParseDatabaseConfig(dsn string) (*pgxpool.Config, error) {
 	}
 	config.MaxConns = 12
 	config.ConnConfig.ConnectTimeout = 5 * time.Second
+	// Named prepared statements belong to a backend session, which a
+	// transaction pooler may change between queries.
+	config.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeExec
 	config.ConnConfig.RuntimeParams["application_name"] = "eregion"
 	config.ConnConfig.Tracer = &readinessTracer{}
 	return config, nil

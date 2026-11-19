@@ -144,7 +144,7 @@ func (f candidateCaptureFixture) recordCleanupIntent(t *testing.T) {
 		context.Background(),
 		`UPDATE eregion_platform_deployments SET instances=$2 WHERE id=$1`,
 		f.dep.ID,
-		encoded,
+		string(encoded),
 	); err != nil {
 		t.Fatal(err)
 	}

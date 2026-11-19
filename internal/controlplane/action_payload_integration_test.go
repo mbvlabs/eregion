@@ -194,7 +194,7 @@ func assertActionPayloadResource(t *testing.T, ctx context.Context, pool *pgxpoo
 	}
 	if _, err := pool.Exec(ctx, `UPDATE eregion_platform_resources SET state='ready',container_name='resource-container',
 		network_name='resource-network',volumes=$2::jsonb,
-		health_state='healthy',health_checked_at=clock_timestamp() WHERE operation_id=$1`, resource.ID, volumes); err != nil {
+		health_state='healthy',health_checked_at=clock_timestamp() WHERE operation_id=$1`, resource.ID, string(volumes)); err != nil {
 		t.Fatal(err)
 	}
 	var r resourcePayload

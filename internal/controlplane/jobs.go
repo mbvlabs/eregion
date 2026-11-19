@@ -576,7 +576,7 @@ func newWorkerRiverConfig(logger *slog.Logger, config WorkerConfig, service *Ser
 	riverConfig := &river.Config{
 		Workers: workers, Logger: logger, MaxAttempts: operations.TestMaxAttempts,
 		JobTimeout: jobTimeout, RescueStuckJobsAfter: 2 * time.Minute,
-		SoftStopTimeout: 5 * time.Second, TestOnly: config.TestOnly,
+		SoftStopTimeout: 5 * time.Second, TestOnly: config.TestOnly, PollOnly: true,
 	}
 	if config.Metrics != nil {
 		riverConfig.Middleware = []rivertype.Middleware{workerMetricsMiddleware(config.Metrics)}

@@ -69,7 +69,7 @@ func webhookIntegrationFixture(t *testing.T, pool *pgxpool.Pool) (api.WebhookAdm
         (id,environment_id,number,actor_kind,actor_subject,operation,summary,source,auto_deploy,
          webhook_secret_name,runtime,processes,config,secret_names,deploy_intent,created_at,retention,resources)
         VALUES($1,$2,1,'system','integration','environment.created','integration fixture',
-         $3,true,'WEBHOOK_SECRET',$4,$5,'{}'::jsonb,'{}',false,clock_timestamp(),'{}'::jsonb,ARRAY[]::text[])`, revisionID, envID, source, runtime, processes); err != nil {
+         $3,true,'WEBHOOK_SECRET',$4,$5,'{}'::jsonb,'{}',false,clock_timestamp(),'{}'::jsonb,ARRAY[]::text[])`, revisionID, envID, string(source), string(runtime), string(processes)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE eregion_platform_environments SET current_revision_id=$2 WHERE id=$1`, envID, revisionID); err != nil {
@@ -487,7 +487,7 @@ func TestIntegrationWebhookLegacyReconcileNeverResubmits(t *testing.T) {
         (id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state,attempt,completed_steps,last_sequence,created_at,updated_at,error_code)
         VALUES($1,$2,$3,$4,$5,$6,$7,$8,'succeeded',1,0,0,clock_timestamp(),clock_timestamp(),'')`,
 		operationID, record.Kind, record.Target, record.Actor.Kind, record.Actor.Subject,
-		"ghdelivery-"+rawDelivery, sha256Hex(canonical), canonical); err != nil {
+		"ghdelivery-"+rawDelivery, sha256Hex(canonical), string(canonical)); err != nil {
 		t.Fatal(err)
 	}
 	updated, found, err := run.WebhookDeliveries.ReconcileLegacy(ctx, record, "ghdelivery-"+rawDelivery, canonical)
@@ -551,7 +551,7 @@ func TestIntegrationWebhookHTTPLegacyPendingRetainsOperation(t *testing.T) {
         (id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state,attempt,completed_steps,last_sequence,created_at,updated_at,error_code)
         VALUES($1,$2,$3,$4,$5,$6,$7,$8,'succeeded',1,0,0,clock_timestamp(),clock_timestamp(),'')`,
 		operationID, record.Kind, record.Target, record.Actor.Kind, record.Actor.Subject,
-		"ghdelivery-"+rawDelivery, sha256Hex(canonical), canonical); err != nil {
+		"ghdelivery-"+rawDelivery, sha256Hex(canonical), string(canonical)); err != nil {
 		t.Fatal(err)
 	}
 	handler := newWebhookIntegrationHandler(t, pool, run, secrets)
@@ -764,7 +764,7 @@ func TestIntegrationWebhookWorkerRejectsRebindAndDeletedEnvironment(t *testing.T
          webhook_secret_name,runtime,processes,config,secret_names,deploy_intent,created_at,retention,resources)
         SELECT $1,environment_id,2,'system','integration','environment.updated','rebind',$2,true,
          'WEBHOOK_SECRET',$3,$4,'{}'::jsonb,'{}',false,clock_timestamp(),'{}'::jsonb,ARRAY[]::text[]
-        FROM eregion_platform_environment_revisions WHERE id=$5`, newRevisionID, otherSource, runtime, processes, record.RevisionID); err != nil {
+        FROM eregion_platform_environment_revisions WHERE id=$5`, newRevisionID, string(otherSource), string(runtime), string(processes), record.RevisionID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE eregion_platform_environments SET current_revision_id=$2 WHERE id=$1`, record.EnvironmentID, newRevisionID); err != nil {

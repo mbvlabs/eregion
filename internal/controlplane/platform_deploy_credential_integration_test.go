@@ -496,7 +496,7 @@ func TestIntegrationDeployRetryPinsGitReadCredentialIntoLegacySnapshot(t *testin
 		ctx,
 		`UPDATE eregion_platform_deployments SET secret_revisions=$2 WHERE operation_id=$1`,
 		f.deploy.ID,
-		legacyRefs,
+		string(legacyRefs),
 	); err != nil {
 		t.Fatal(err)
 	}
