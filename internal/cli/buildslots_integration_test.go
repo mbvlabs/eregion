@@ -30,6 +30,14 @@ func TestIntegrationBuildSlotsRPC(t *testing.T) {
 	if _, err := dispatchNodeMethod(ctx, app, request); contract.Classify(err).Code != contract.NotFound {
 		t.Fatalf("missing clear preview: %v", err)
 	}
+	request.Params = json.RawMessage(`{"operation_id":"op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","legacy_local":true}`)
+	if _, err := dispatchNodeMethod(ctx, app, request); contract.Classify(err).Code != contract.NotFound {
+		t.Fatalf("legacy local preview: %v", err)
+	}
+	request.Params = json.RawMessage(`{"operation_id":"op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","legacy_local":"true"}`)
+	if _, err := dispatchNodeMethod(ctx, app, request); contract.Classify(err).Code != contract.ValidationFailed {
+		t.Fatalf("invalid legacy local option: %v", err)
+	}
 	request.Params = json.RawMessage(`{"operation_id":"op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","force":true}`)
 	if _, err := dispatchNodeMethod(ctx, app, request); contract.Classify(err).Code != contract.ValidationFailed {
 		t.Fatalf("force accepted: %v", err)

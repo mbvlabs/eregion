@@ -296,6 +296,18 @@ terminal operation with a retained slot, preview
 `eregion build slots clear <operation-id> --dry-run`, then rerun without
 `--dry-run` to retry retirement. Clear does not force release if the builder
 cannot confirm the build has stopped and cannot restart.
+For an unverified legacy local claim, an operator may explicitly preview
+`eregion build slots clear <operation-id> --legacy-local --dry-run` and then
+retry without `--dry-run`. This only succeeds on the verified workspace host
+when the original dispatch and local durable history prove quiescence; it
+never forces release or falls back to a remote builder.
+The claim must match the current node record, and the original Pack dispatch
+must match the claim's attempt, execution ID and input hash. The node must
+have uninterrupted uncertainty-tracked build history and either a matching
+completed effect or a matching pre-apply task. Missing or older history,
+uncertain apply, conflicting records, or a held effect lock retain the slot.
+Preview does not perform these proofs and is not a promise that clear will
+succeed. Successful legacy recovery is distinguished in the audit detail.
 
 An environment has an optional Git Buildpacks recipe; there is no persistent
 image source or `source.kind` mode. Omit `[source]`/`--git-url` for an

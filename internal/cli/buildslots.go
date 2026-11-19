@@ -21,7 +21,7 @@ func (a *app) buildSlotsSpec() spec {
 	list := operationMeta("List build capacity reservations", "eregion build slots list --json")
 	clear := operationMeta("Retry safe cleanup of a terminal build reservation", "eregion build slots clear op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --dry-run --json")
 	clear.Mutating, clear.DryRun = true, true
-	clear.WhenToUse = []string{"Preview without contacting the builder or writing. Clear retries retirement on the pinned builder; it never forces release."}
+	clear.WhenToUse = []string{"Preview without contacting the builder or writing. Use --legacy-local only for a legacy unverified local claim; cleanup never forces release."}
 	return spec{use: "slots", meta: group,
 		run: func(cmd *cobra.Command, _ []string) (result, error) { return a.help(cmd), nil },
 		children: []spec{
@@ -33,6 +33,7 @@ func (a *app) buildSlotsSpec() spec {
 				return contract.OperationID(args[0]).Validate()
 			}, flags: func(cmd *cobra.Command) {
 				cmd.Flags().Bool("dry-run", false, "Preview without contacting the builder or changing anything")
+				cmd.Flags().Bool("legacy-local", false, "Prove retirement of a legacy unverified local claim")
 			}, run: a.buildSlotsClear},
 		}}
 }
@@ -70,9 +71,11 @@ func (a *app) buildSlotsClear(cmd *cobra.Command, args []string) (result, error)
 		return result{}, err
 	}
 	dryRun, _ := cmd.Flags().GetBool("dry-run")
+	legacyLocal, _ := cmd.Flags().GetBool("legacy-local")
 	raw, err := client.call(cmd.Context(), methodBuildSlotsClear, struct {
 		OperationID contract.OperationID `json:"operation_id"`
-	}{contract.OperationID(args[0])}, rpcCallOptions{DryRun: dryRun})
+		LegacyLocal bool                 `json:"legacy_local,omitempty"`
+	}{contract.OperationID(args[0]), legacyLocal}, rpcCallOptions{DryRun: dryRun})
 	if err != nil {
 		return result{}, err
 	}
@@ -104,9 +107,10 @@ func dispatchBuildSlots(ctx context.Context, app api.AppService, actor contract.
 	}
 	var params struct {
 		OperationID contract.OperationID `json:"operation_id"`
+		LegacyLocal bool                 `json:"legacy_local,omitempty"`
 	}
 	if decoder.Decode(&params) != nil || decoder.Decode(new(any)) != io.EOF {
 		return nil, contract.NewFault(contract.ValidationFailed, "invalid build slot cleanup request", "Pass one operation ID.")
 	}
-	return app.ClearBuildSlot(ctx, actor, params.OperationID, request.DryRun)
+	return app.ClearBuildSlot(ctx, actor, params.OperationID, request.DryRun, params.LegacyLocal)
 }

@@ -102,6 +102,19 @@ func RetireBuild(ctx context.Context, e *engine.Engine, exec engine.Execution) (
 	return ResponseFromStatus(status), nil
 }
 
+// RetireProvenBuild is the local-only strict retirement path for legacy claims.
+// inputsHash and exec must come from the original durable dispatch history.
+func RetireProvenBuild(ctx context.Context, e *engine.Engine, exec engine.Execution, inputsHash string) (Response, error) {
+	if !platform.IsPackStep(exec.Step) {
+		return Response{Status: engine.StatusFailed, ErrorCode: string(contract.ValidationFailed), Detail: "retirement requires a Pack step"}, nil
+	}
+	status, err := e.RetireProvenBuild(ctx, exec, inputsHash)
+	if err != nil {
+		return Response{}, err
+	}
+	return ResponseFromStatus(status), nil
+}
+
 // run executes one run request against the request-scoped engine.
 func (d *Dispatcher) run(ctx context.Context, requestEngine engine.Engine, request Request, registry *secrets.Registry, report engine.Reporter) (Response, error) {
 	if d.hooks.BeforeRun != nil {

@@ -136,6 +136,11 @@ func (l *Local) NodeIdentity() string { return l.name }
 // StateDir is the state directory used by the local dispatcher.
 func (l *Local) StateDir() string { return l.dispatcher.engine.StateDir }
 
+// RetireProvenBuild uses this dispatcher's own engine; it is not a wire method.
+func (l *Local) RetireProvenBuild(ctx context.Context, exec engine.Execution, inputsHash string) (Response, error) {
+	return RetireProvenBuild(ctx, l.dispatcher.engine, exec, inputsHash)
+}
+
 func (l *Local) SetHooks(hooks Hooks) { l.dispatcher.SetHooks(hooks) }
 
 func (l *Local) Call(ctx context.Context, request Request, onEvent func(Event)) (Response, error) {

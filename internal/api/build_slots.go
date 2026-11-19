@@ -25,7 +25,7 @@ type BuildSlotClearResult struct {
 
 type BuildSlotsService interface {
 	ListBuildSlots(context.Context, contract.Actor) ([]BuildSlot, error)
-	ClearBuildSlot(context.Context, contract.Actor, contract.OperationID, bool) (BuildSlotClearResult, error)
+	ClearBuildSlot(context.Context, contract.Actor, contract.OperationID, bool, bool) (BuildSlotClearResult, error)
 }
 
 func (s AppService) buildSlots(actor contract.Actor) (BuildSlotsService, error) {
@@ -50,7 +50,7 @@ func (s AppService) ListBuildSlots(ctx context.Context, actor contract.Actor) ([
 	return service.ListBuildSlots(ctx, actor)
 }
 
-func (s AppService) ClearBuildSlot(ctx context.Context, actor contract.Actor, id contract.OperationID, dryRun bool) (BuildSlotClearResult, error) {
+func (s AppService) ClearBuildSlot(ctx context.Context, actor contract.Actor, id contract.OperationID, dryRun, legacyLocal bool) (BuildSlotClearResult, error) {
 	service, err := s.buildSlots(actor)
 	if err != nil {
 		return BuildSlotClearResult{}, err
@@ -58,5 +58,5 @@ func (s AppService) ClearBuildSlot(ctx context.Context, actor contract.Actor, id
 	if err := id.Validate(); err != nil {
 		return BuildSlotClearResult{}, err
 	}
-	return service.ClearBuildSlot(ctx, actor, id, dryRun)
+	return service.ClearBuildSlot(ctx, actor, id, dryRun, legacyLocal)
 }
