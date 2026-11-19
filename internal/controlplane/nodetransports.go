@@ -130,23 +130,41 @@ func (r *NodeResolver) Close() {
 
 // TransportFor implements NodeTransports.
 func (r *NodeResolver) TransportFor(ctx context.Context, nodeName string) (node.Transport, error) {
+	tr, _, err := r.transportForBuild(ctx, nodeName)
+	return tr, err
+}
+
+// transportForBuild returns the identity of the same node record used to
+// construct the authenticated transport. It is stored with build claims.
+func (r *NodeResolver) transportForBuild(ctx context.Context, nodeName string) (node.Transport, string, error) {
 	rec, err := loadNodeConn(ctx, r.nodes, nodeName)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
+	identity := buildNodeIdentity(rec)
 	switch rec.Enrollment {
 	case platform.EnrollmentPending, platform.EnrollmentFailed:
-		return nil, placementViolation(ReasonNotEnrolled, rec.Name, fmt.Sprintf("node %q is not enrolled (%s)", rec.Name, rec.Enrollment),
+		return nil, "", placementViolation(ReasonNotEnrolled, rec.Name, fmt.Sprintf("node %q is not enrolled (%s)", rec.Name, rec.Enrollment),
 			"Finish node enrollment.", nil)
 	case platform.EnrollmentEnrolled:
 		if rec.Transport == "ssh" {
-			return r.cached(ctx, rec, false)
+			tr, err := r.cached(ctx, rec, false)
+			return tr, identity + ":ssh", err
 		}
 	case platform.EnrollmentRegistered:
 		// A registered node has not completed enrollment; fall through to the
 		// worker's own transport when it authenticates as that node.
 	}
-	return r.fallbackFor(rec.Name)
+	tr, err := r.fallbackFor(rec.Name)
+	return tr, identity + ":unverified", err
+}
+
+func buildNodeIdentity(rec entities.NodeConnection) string {
+	sum := sha256.Sum256([]byte(strings.Join([]string{
+		rec.Name, string(rec.Enrollment), rec.Transport, rec.ExpectedIdentityFP,
+		rec.IdentityKey, rec.IdentityFP, connectionKey(rec, false),
+	}, "\x00")))
+	return hex.EncodeToString(sum[:])
 }
 
 // Direct returns an uncached transport over the node's direct SSH address,

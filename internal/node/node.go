@@ -21,10 +21,11 @@ type Method string
 // it carries no execution identity: there is no effect to journal. Its result
 // is a retention.Inventory.
 const (
-	MethodRun       Method = "run"
-	MethodStatus    Method = "status"
-	MethodObserve   Method = "observe"
-	MethodInventory Method = "inventory"
+	MethodRun         Method = "run"
+	MethodStatus      Method = "status"
+	MethodObserve     Method = "observe"
+	MethodInventory   Method = "inventory"
+	MethodRetireBuild Method = "retire_build"
 )
 
 // ObservePayload asks a node for its read-only Docker ownership observation.

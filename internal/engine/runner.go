@@ -132,7 +132,24 @@ func New(stateDir, node string, registry *secrets.Registry) (*Engine, error) {
 	if err := EnsureDir(stateDir); err != nil {
 		return nil, err
 	}
+	if err := initializeBuildHistory(stateDir); err != nil {
+		return nil, err
+	}
 	return &Engine{StateDir: stateDir, Node: node, Secrets: registry, LockTimeout: 20 * time.Second}, nil
+}
+
+// An existing pre-upgrade journal may already have compacted interrupted
+// builds. Its missing entries cannot prove that a build never started.
+func initializeBuildHistory(stateDir string) error {
+	history := filepath.Join(stateDir, "build-history-v1")
+	if _, err := os.Stat(history); !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if _, err := os.Stat(JournalPath(stateDir)); !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	_, err := WriteFileOnce(history, []byte("1\n"), 0o600)
+	return err
 }
 
 func (e *Engine) JournalPath() string { return JournalPath(e.StateDir) }
@@ -333,6 +350,10 @@ func (e *Engine) Run(ctx context.Context, step Step, exec Execution, report Repo
 	}
 	defer effectLock()
 
+	if err := e.checkRunFence(step, exec); err != nil {
+		return TaskStatus{}, err
+	}
+
 	// Re-read everything under the effect lock. This closes the status->run race.
 	if status, recovered, err := e.recoveredEffectStatus(exec, inputsHash); recovered {
 		return status, err
@@ -343,6 +364,11 @@ func (e *Engine) Run(ctx context.Context, step Step, exec Execution, report Repo
 	}
 	if status, completed, err := completedTaskStatus(journal, exec, inputsHash); completed {
 		return status, err
+	}
+	if requiresRetirementFence(step) {
+		if task, exists := journal.Tasks[exec.EffectKey()]; exists && task.Phase == PhaseApplying {
+			return TaskStatus{}, fmt.Errorf("%w: an earlier build apply may still be running", ErrPermanent)
+		}
 	}
 	running, err := newRunningTask(exec, inputsHash, journal)
 	if err != nil {
@@ -355,6 +381,32 @@ func (e *Engine) Run(ctx context.Context, step Step, exec Execution, report Repo
 	defer release()
 
 	return e.checkApplyAndRecord(ctx, step, exec, &running, report, inputsHash, journal)
+}
+
+func requiresRetirementFence(step Step) bool {
+	fenced, ok := step.(interface{ RequiresRetirementFence() bool })
+	return ok && fenced.RequiresRetirementFence()
+}
+
+func (e *Engine) checkRunFence(step Step, exec Execution) error {
+	retired, err := e.retirementExists(exec)
+	if err != nil {
+		return err
+	}
+	if retired {
+		return fmt.Errorf("%w: effect has been retired", ErrPermanent)
+	}
+	if !requiresRetirementFence(step) {
+		return nil
+	}
+	uncertain, err := e.applyUncertain(exec)
+	if err != nil {
+		return err
+	}
+	if uncertain {
+		return fmt.Errorf("%w: an earlier build apply may still be running", ErrPermanent)
+	}
+	return nil
 }
 
 // effectLockHeldStatus reports the observed owner of an effect whose lock is
@@ -638,16 +690,50 @@ func (e *Engine) checkApplyAndRecord(ctx context.Context, step Step, exec Execut
 		result.Result = check.Result
 	}
 	if !check.Complete {
-		if err := e.beginApply(step, exec, running, report, check); err != nil {
-			return TaskStatus{}, err
-		}
-		result, err = step.Apply(ctx, e.stepRuntime(), report)
+		var status TaskStatus
+		result, status, err = e.applyStep(ctx, step, exec, running, report, check)
 		if err != nil {
-			return e.fail(exec, *running, err, result.Result)
+			return status, err
 		}
 		executed = true
 	}
 	return e.recordCompletion(exec, running, check, result, executed, inputsHash, journal)
+}
+
+func (e *Engine) applyStep(ctx context.Context, step Step, exec Execution, running *Task, report Reporter, check CheckResult) (ApplyResult, TaskStatus, error) {
+	fenced := requiresRetirementFence(step)
+	if fenced {
+		if err := e.markApplyUncertain(exec); err != nil {
+			return ApplyResult{}, TaskStatus{}, err
+		}
+	}
+	if err := e.beginApply(step, exec, running, report, check); err != nil {
+		return ApplyResult{}, TaskStatus{}, err
+	}
+	result, err := step.Apply(ctx, e.stepRuntime(), report)
+	if err != nil {
+		status, failErr := e.failedApply(exec, running, result, err, fenced)
+		return result, status, failErr
+	}
+	if fenced {
+		if err := e.clearApplyUncertain(exec); err != nil {
+			return result, TaskStatus{}, err
+		}
+	}
+	return result, TaskStatus{}, nil
+}
+
+func (e *Engine) failedApply(exec Execution, running *Task, result ApplyResult, cause error, fenced bool) (TaskStatus, error) {
+	if fenced && errors.Is(cause, ErrApplyQuiescent) {
+		if err := e.clearApplyUncertain(exec); err != nil {
+			return TaskStatus{}, errors.Join(cause, err)
+		}
+		running.Phase = PhaseChecking
+		if err := e.saveTask(exec, *running); err != nil {
+			return TaskStatus{}, errors.Join(cause, err)
+		}
+	}
+	return e.fail(exec, *running, cause, result.Result)
 }
 
 // stepRuntime is the execution context shared by Check and Apply.

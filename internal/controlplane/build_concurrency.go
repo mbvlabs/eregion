@@ -68,7 +68,7 @@ func applyBuildConcurrency(ctx context.Context, tx *entities.StoreTx, nodeName s
 	result := api.BuildConcurrencyResult{Node: nodeName, Previous: node.BuildConcurrency, Effective: node.BuildConcurrency, Warnings: []string{
 		"Higher concurrency consumes additional CPU, memory, disk and cache space.",
 		"Worker concurrency and database pool limits can prevent reaching this capacity.",
-		"The limit bounds live advisory admissions; a detached build after database session loss may outlive its slot.",
+		"Uncertain build outcomes retain capacity until recovered or manually investigated.",
 		"Reducing capacity does not cancel running builds or restart workers.",
 	}}
 	if input == nil {

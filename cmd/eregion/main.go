@@ -8,6 +8,7 @@ import (
 
 	"github.com/mbvlabs/eregion/internal/cli"
 	"github.com/mbvlabs/eregion/internal/containerresolver"
+	"github.com/mbvlabs/eregion/internal/platform"
 )
 
 func main() {
@@ -15,6 +16,9 @@ func main() {
 }
 
 func run() int {
+	if len(os.Args) == 2 && os.Args[1] == platform.PackHelperInvocation {
+		return platform.RunPackHelper()
+	}
 	if containerresolver.IsInvocation(os.Args[1:]) {
 		return containerresolver.Run(os.Args[2:], os.Stderr)
 	}

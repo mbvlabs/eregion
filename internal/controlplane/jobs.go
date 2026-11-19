@@ -543,6 +543,11 @@ func (s *Service) startLocalTransport(config WorkerConfig) error {
 	}
 	s.transport = local
 	s.localNode = localName
+	if s.registryHostIdentity != nil && s.registryHostIdentity.NodeName == localName {
+		if canonical, err := CanonicalRegistryHostStateDir(stateDir); err == nil && canonical == s.registryHostIdentity.StateDir {
+			s.localBuildIdentityVerified = true
+		}
+	}
 	return nil
 }
 
@@ -1320,6 +1325,9 @@ func (w *workloadRepairWorker) Work(ctx context.Context, _ *river.Job[jobargs.Wo
 // returned by Work. Domain terminal state cannot depend on an in-process callback.
 func (s *Service) Reconcile(ctx context.Context) error {
 	var failures []error
+	if err := s.reconcileTerminalBuildCapacity(ctx); err != nil {
+		failures = append(failures, fmt.Errorf("reconcile terminal build capacity: %w", err))
+	}
 	if err := s.reconcileTerminalDefinitionRuns(ctx); err != nil {
 		failures = append(failures, fmt.Errorf("reconcile terminal definition runs: %w", err))
 	}

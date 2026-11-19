@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/mbvlabs/eregion/internal/secrets"
@@ -81,6 +82,11 @@ func selectTasks(journal *Journal, retention Retention) []string {
 func terminalTaskKeys(journal *Journal) []string {
 	terminal := make([]string, 0, len(journal.Tasks))
 	for key, task := range journal.Tasks {
+		// A removed Pack task could make an interrupted old apply look as if
+		// it never started. Keep its evidence, including pre-fence history.
+		if strings.HasPrefix(task.Step, "platform-pack-") {
+			continue
+		}
 		if task.Status == TaskRunning {
 			continue
 		}
@@ -118,6 +124,9 @@ func runningExpiredKeys(journal *Journal, retention Retention, cutoff time.Time)
 	}
 	var drop []string
 	for key, task := range journal.Tasks {
+		if strings.HasPrefix(task.Step, "platform-pack-") {
+			continue
+		}
 		if task.Status != TaskRunning {
 			continue
 		}

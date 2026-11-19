@@ -120,27 +120,9 @@ func (s *Service) mutateOwnedOrClaim(ctx context.Context, id contract.OperationI
 func (s *Service) beginStep(ctx context.Context, id contract.OperationID, attempt uint32, step, inputsHash, executionID string) (bool, error) {
 	already := false
 	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
-		record, found, err := tx.Steps().GetForUpdate(ctx, id, step)
-		if err != nil {
-			return unavailable(err)
-		}
-		if !found {
-			if err := tx.Steps().Insert(ctx, id, step, inputsHash, attempt, executionID); err != nil {
-				return err
-			}
-			return appendEvent(ctx, tx, op, contract.Event{Kind: "step", Stage: step, ExecutionID: executionID, Message: "Node step started."})
-		}
-		if record.InputsHash != inputsHash {
-			return contract.NewFault(contract.PreconditionFailed, "step inputs changed for an existing effect", "Never reuse an operation ID with different inputs; inspect the node journal.")
-		}
-		if record.State == "completed" {
-			already = true
-			return nil
-		}
-		if _, err := tx.Steps().Restart(ctx, id, step, attempt, executionID); err != nil {
-			return err
-		}
-		return appendEvent(ctx, tx, op, contract.Event{Kind: "step", Stage: step, ExecutionID: executionID, Message: "Node step retried."})
+		var err error
+		already, err = beginStepTx(ctx, tx, op, attempt, step, inputsHash, executionID)
+		return err
 	})
 	if err != nil {
 		return false, err
@@ -149,6 +131,29 @@ func (s *Service) beginStep(ctx context.Context, id contract.OperationID, attemp
 		return false, errNotOwned
 	}
 	return already, nil
+}
+
+func beginStepTx(ctx context.Context, tx *entities.StoreTx, op *contract.Operation, attempt uint32, step, inputsHash, executionID string) (bool, error) {
+	record, found, err := tx.Steps().GetForUpdate(ctx, op.ID, step)
+	if err != nil {
+		return false, unavailable(err)
+	}
+	if !found {
+		if err := tx.Steps().Insert(ctx, op.ID, step, inputsHash, attempt, executionID); err != nil {
+			return false, err
+		}
+		return false, appendEvent(ctx, tx, op, contract.Event{Kind: "step", Stage: step, ExecutionID: executionID, Message: "Node step started."})
+	}
+	if record.InputsHash != inputsHash {
+		return false, contract.NewFault(contract.PreconditionFailed, "step inputs changed for an existing effect", "Never reuse an operation ID with different inputs; inspect the node journal.")
+	}
+	if record.State == "completed" {
+		return true, nil
+	}
+	if _, err := tx.Steps().Restart(ctx, op.ID, step, attempt, executionID); err != nil {
+		return false, err
+	}
+	return false, appendEvent(ctx, tx, op, contract.Event{Kind: "step", Stage: step, ExecutionID: executionID, Message: "Node step retried."})
 }
 
 // ackStep records a completed effect at most once. Only the transaction that

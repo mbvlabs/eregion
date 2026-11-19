@@ -388,6 +388,10 @@ func (w *platformWorker) settle(
 	if err == nil {
 		return nil
 	}
+	var snooze *river.JobSnoozeError
+	if errors.As(err, &snooze) {
+		return err
+	}
 	if errors.Is(err, errOperationTerminal) {
 		return nil
 	}
@@ -2047,6 +2051,20 @@ func (w *platformWorker) runStepOn(
 	payload any,
 	secrets map[string]string,
 ) (json.RawMessage, error) {
+	return w.runStepOnWithBuild(ctx, tr, id, attempt, stepID, payload, secrets, "", "", "")
+}
+
+func (w *platformWorker) runStepOnBuild(ctx context.Context, tr node.Transport, id contract.OperationID, attempt uint32, payload any, secrets map[string]string, nodeName, identity, source string) (json.RawMessage, error) {
+	return w.runStepOnWithBuild(ctx, tr, id, attempt, deploymentPackStep, payload, secrets, nodeName, identity, source)
+}
+
+func (w *platformWorker) runStepOnWithBuild( //nolint:gocognit // The effect protocol keeps status, dispatch and acknowledgement together.
+	ctx context.Context, tr node.Transport, id contract.OperationID, attempt uint32,
+	stepID string, payload any, secrets map[string]string, buildNode, buildIdentity, buildSource string,
+) (json.RawMessage, error) {
+	if platform.IsPackStep(stepID) && (buildNode == "" || buildIdentity == "" || stepID != deploymentPackStep) {
+		return nil, contract.NewFault(contract.PreconditionFailed, "build dispatch has no pinned capacity admission", "Use the build execution path with its original builder.")
+	}
 	if tr == nil {
 		return nil, contract.NewFault(
 			contract.Unavailable,
@@ -2104,6 +2122,24 @@ func (w *platformWorker) runStepOn(
 			return w.nodeEffectDispatch(ctx, tr, id, attempt, exec, stepID, inputsHash, raw, secrets, fence.rowExists)
 		},
 		Begin: func(ctx context.Context) error {
+			if buildNode != "" {
+				already, err := w.service.beginBuildDispatch(ctx, id, attempt, buildNode, buildIdentity, inputsHash, exec.ExecutionID())
+				if err != nil {
+					var snooze *river.JobSnoozeError
+					if errors.As(err, &snooze) {
+						w.service.appendWorkerEvent(ctx, id, attempt, deploymentBuildStageLabel,
+							fmt.Sprintf("build_queued on node %s; build capacity is busy", buildNode))
+					}
+					return err
+				}
+				fence.rowExists, fence.begunThisAttempt = true, true
+				if already {
+					return errNodeEffectAlreadyCompleted
+				}
+				w.service.appendWorkerEvent(ctx, id, attempt, deploymentBuildStageLabel,
+					fmt.Sprintf("build_running on node %s; %s", buildNode, buildSource))
+				return nil
+			}
 			return fence.ensureDispatchBegun(ctx, w, id, attempt, stepID, inputsHash, exec.ExecutionID())
 		},
 		Completed: func(ctx context.Context, response node.Response, recovered bool) error {

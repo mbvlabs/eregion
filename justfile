@@ -34,14 +34,20 @@ integration:
     @test -n "${EREGION_TEST_DATABASE_URL:-}" || { echo "Set EREGION_TEST_DATABASE_URL to a disposable PostgreSQL test server (role requires CREATEDB)." >&2; exit 1; }
     go test -count=1 -v ./internal/controlplane -run '^TestIntegration' -timeout 600s
     go test -count=1 -v ./internal/cli -run '^TestIntegrationCLIRegression' -timeout 600s
+    go test -count=1 -v ./internal/cli -run '^TestIntegrationBuildSlotsRPC$' -timeout 120s
     go test -count=1 -v ./internal/host -run '^TestIntegration' -timeout 600s
+    go test -count=1 -v ./internal/noded -run '^TestIntegration' -timeout 120s
+    go test -count=1 -v ./internal/platform -run '^TestIntegrationPack' -timeout 120s
 
 # Run the same suite with the race detector.
 integration-race:
     @test -n "${EREGION_TEST_DATABASE_URL:-}" || { echo "Set EREGION_TEST_DATABASE_URL to a disposable PostgreSQL test server (role requires CREATEDB)." >&2; exit 1; }
     go test -race -count=1 -v ./internal/controlplane -run '^TestIntegration' -timeout 600s
     go test -race -count=1 -v ./internal/cli -run '^TestIntegrationCLIRegression' -timeout 600s
+    go test -race -count=1 -v ./internal/cli -run '^TestIntegrationBuildSlotsRPC$' -timeout 120s
     go test -race -count=1 -v ./internal/host -run '^TestIntegration' -timeout 600s
+    go test -race -count=1 -v ./internal/noded -run '^TestIntegration' -timeout 120s
+    go test -race -count=1 -v ./internal/platform -run '^TestIntegrationPack' -timeout 120s
 
 # Check formatting, static analysis, and build without executing tests.
 check: fmt-check lint build

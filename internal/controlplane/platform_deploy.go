@@ -299,29 +299,39 @@ func (w *platformWorker) executeBuildPack(ctx context.Context, id contract.Opera
 	if err != nil {
 		return nil, err
 	}
-	releaseSlot, err := w.service.acquireBuildSlot(ctx, buildNode.Name, func() {
-		w.service.appendWorkerEvent(ctx, id, attempt, deploymentBuildStageLabel,
-			fmt.Sprintf("build_queued on node %s; build capacity is busy", buildNode.Name))
-	})
+	if tr == nil || w.service.resolver == nil {
+		return nil, contract.NewFault(contract.Unavailable, "node transport is not configured", "Run this work in a worker configured with a node transport.")
+	}
+	tr, identity, err := w.service.buildTransportFor(ctx, buildNode.Name)
 	if err != nil {
 		return nil, err
 	}
-	defer releaseSlot()
+	if err := w.service.adoptBuildCapacity(ctx, id, attempt, buildNode.Name, identity); err != nil {
+		return nil, err
+	}
 	if cancelled, _ := w.service.buildCancelled(ctx, build.ID); cancelled {
 		return nil, errPlatformCancelled
 	}
 	if err := w.service.checkCancelled(ctx, id); err != nil {
 		return nil, err
 	}
-	w.service.appendWorkerEvent(ctx, id, attempt, deploymentBuildStageLabel,
-		fmt.Sprintf("build_running on node %s; %s", buildNode.Name, build.Source.Type))
 	buildSecrets, err := buildCredentialSecrets(ctx, w, build, release, secretValues)
 	if err != nil {
 		return nil, err
 	}
-	result, buildErr := w.runStepOn(ctx, tr, id, attempt, deploymentPackStep, payload, buildSecrets)
+	result, buildErr := w.runStepOnBuild(ctx, tr, id, attempt, payload, buildSecrets, buildNode.Name, identity, build.Source.Type)
 	if buildErr != nil {
+		var snooze *river.JobSnoozeError
+		if errors.As(buildErr, &snooze) {
+			return nil, buildErr
+		}
 		return nil, w.handleBuildPackFailure(ctx, id, release, build, buildErr)
+	}
+	// A successful node effect has a durable node record which prevents a
+	// delayed older Run from starting another build. Failed or uncertain
+	// effects deliberately keep their reservation.
+	if err := w.service.releaseBuildCapacity(ctx, id, attempt, buildNode.Name); err != nil {
+		return nil, err
 	}
 	if cancelled, _ := w.service.buildCancelled(ctx, build.ID); cancelled {
 		return nil, errPlatformCancelled
@@ -1791,6 +1801,10 @@ func (w *platformWorker) finishDeploymentFailure(
 ) error {
 	if cause == nil {
 		return nil
+	}
+	var snooze *river.JobSnoozeError
+	if errors.As(cause, &snooze) {
+		return cause
 	}
 	if w.service.workerInterrupted(ctx, id, cause) {
 		return cause

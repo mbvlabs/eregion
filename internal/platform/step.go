@@ -34,6 +34,9 @@ import (
 	"github.com/mbvlabs/eregion/internal/secrets"
 )
 
+// IsPackStep identifies the only effects accepted by build retirement.
+func IsPackStep(step string) bool { return packStepPattern.MatchString(step) }
+
 // Family is one node step family. Node builds its default registry from these
 // without importing controlplane code.
 type Family struct {
@@ -1499,7 +1502,8 @@ func (s *sharedPackStep) SharedHostResources() []string {
 	return resources
 }
 
-func (s *PackStep) ID() string { return s.payload.Step }
+func (s *PackStep) ID() string                    { return s.payload.Step }
+func (s *PackStep) RequiresRetirementFence() bool { return true }
 func (s *PackStep) Describe() string {
 	return "Build " + s.payload.Image + " with Cloud Native Buildpacks"
 }
@@ -1587,19 +1591,20 @@ func (s *PackStep) Check(ctx context.Context, rt engine.Runtime) (engine.CheckRe
 }
 
 type packBuild struct {
-	step       *PackStep
-	rt         engine.Runtime
-	report     engine.Reporter
-	work       string
-	isolation  []string
-	source     string
-	commit     string
-	builder    string
-	platform   string
-	registry   registryContainer
-	network    string
-	repository string
-	tag        string
+	step        *PackStep
+	rt          engine.Runtime
+	report      engine.Reporter
+	work        string
+	isolation   []string
+	source      string
+	commit      string
+	builder     string
+	platform    string
+	registry    registryContainer
+	network     string
+	repository  string
+	tag         string
+	packDrained bool
 }
 
 func (s *PackStep) Apply(
@@ -1607,9 +1612,9 @@ func (s *PackStep) Apply(
 	rt engine.Runtime,
 	report engine.Reporter,
 ) (result engine.ApplyResult, applyErr error) {
-	b := &packBuild{step: s, rt: rt, report: report}
+	b := &packBuild{step: s, rt: rt, report: report, packDrained: true}
 	if err := b.prepareWork(); err != nil {
-		return engine.ApplyResult{}, err
+		return engine.ApplyResult{}, fmt.Errorf("%w: %w", engine.ErrApplyQuiescent, err)
 	}
 	defer b.cleanupWork()
 	buildCtx, stopBuild := context.WithCancel(ctx)
@@ -1620,10 +1625,10 @@ func (s *PackStep) Apply(
 		stopBuild,
 	)
 	if err := b.prepareSource(buildCtx); err != nil {
-		return engine.ApplyResult{}, err
+		return engine.ApplyResult{}, fmt.Errorf("%w: %w", engine.ErrApplyQuiescent, err)
 	}
 	if err := b.prepareBuilder(buildCtx); err != nil {
-		return engine.ApplyResult{}, err
+		return engine.ApplyResult{}, fmt.Errorf("%w: %w", engine.ErrApplyQuiescent, err)
 	}
 	if err := b.prepareNetwork(buildCtx); err != nil {
 		return engine.ApplyResult{}, err
@@ -1631,6 +1636,9 @@ func (s *PackStep) Apply(
 	defer func() {
 		cleanupErr := b.removeNetwork(context.WithoutCancel(ctx))
 		if cleanupErr == nil {
+			if applyErr != nil && b.packDrained {
+				applyErr = fmt.Errorf("%w: %w", engine.ErrApplyQuiescent, applyErr)
+			}
 			return
 		}
 		if report != nil {
@@ -1638,6 +1646,8 @@ func (s *PackStep) Apply(
 		}
 		if applyErr != nil {
 			applyErr = fmt.Errorf("%w; cleaning the build network failed: %w", applyErr, cleanupErr)
+		} else {
+			applyErr = fmt.Errorf("cleaning the build network failed: %w", cleanupErr)
 		}
 	}()
 	if err := b.runBuild(buildCtx); err != nil {
@@ -1952,7 +1962,9 @@ func (b *packBuild) runBuild(ctx context.Context) error {
 		time.Duration(b.step.payload.TimeoutSeconds)*time.Second,
 	)
 	defer cancel()
-	_, stderr, err := runArgvCleanPack(buildRunCtx, args, b.isolation, b.rt, b.step.ID(), b.report)
+	b.packDrained = false
+	_, stderr, drained, err := runArgvCleanPack(buildRunCtx, args, b.isolation, b.rt, b.step.ID(), b.report)
+	b.packDrained = drained
 	if err == nil {
 		return nil
 	}
@@ -4061,8 +4073,70 @@ func runArgvCleanPack(
 	rt engine.Runtime,
 	step string,
 	report engine.Reporter,
-) (string, string, error) {
-	return runArgvWithEnvGrace(ctx, argv, env, rt, step, report, packBuildKillGrace)
+) (string, string, bool, error) {
+	if err := validateArgv(argv); err != nil {
+		return "", "", false, err
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return "", "", false, err
+	}
+	request, err := json.Marshal(argv)
+	if err != nil {
+		return "", "", false, err
+	}
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		return "", "", false, err
+	}
+	defer func() { _ = reader.Close() }()
+	defer func() { _ = writer.Close() }()
+	command := exec.CommandContext(ctx, executable, PackHelperInvocation)
+	command.SysProcAttr = packHelperSysProcAttr()
+	command.Env = env
+	command.Stdin = bytes.NewReader(request)
+	command.ExtraFiles = []*os.File{writer}
+	command.Cancel = func() error { return command.Process.Signal(syscall.SIGTERM) }
+	command.WaitDelay = 20 * time.Second
+	registry := rt.Secrets
+	if registry == nil {
+		registry = &secrets.Registry{}
+	}
+	capture := &commandCapture{registry: registry, step: step, report: report}
+	streamSafe := rt.Secrets == nil || rt.SecretValues != nil
+	if registry.RequiresWholeTextRedaction() {
+		streamSafe = false
+	}
+	stdout := &lineSink{capture: capture, stream: "stdout", streaming: streamSafe}
+	stderr := &lineSink{capture: capture, stream: "stderr", streaming: streamSafe}
+	command.Stdout, command.Stderr = stdout, stderr
+	if err := command.Start(); err != nil {
+		return "", "", false, err
+	}
+	_ = writer.Close()
+	err = command.Wait()
+	stdout.Flush()
+	stderr.Flush()
+	capture.finish()
+	var result packHelperResult
+	decodeErr := json.NewDecoder(io.LimitReader(reader, 1024)).Decode(&result)
+	drained := decodeErr == nil && command.ProcessState != nil && command.ProcessState.Success()
+	if !drained {
+		if err == nil {
+			err = decodeErr
+		}
+		if err == nil {
+			err = errors.New("supervisor did not exit successfully")
+		}
+		return stdout.String(), stderr.String(), false, fmt.Errorf("pack supervisor did not prove quiescence: %w", err)
+	}
+	if ctx.Err() != nil {
+		return stdout.String(), stderr.String(), true, ctx.Err()
+	}
+	if result.ExitCode != 0 {
+		return stdout.String(), stderr.String(), true, fmt.Errorf("pack exited with status %d", result.ExitCode)
+	}
+	return stdout.String(), stderr.String(), true, nil
 }
 
 func runArgvWithEnv(

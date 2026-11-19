@@ -93,6 +93,7 @@ func (a *app) buildSpec() spec {
 		meta: deliveryReadMeta("Inspect, follow, stop, or retry Buildpacks builds", "eregion build list api production --json"),
 		run:  func(cmd *cobra.Command, _ []string) (result, error) { return a.help(cmd), nil },
 		children: []spec{
+			a.buildSlotsSpec(),
 			{
 				use:  "list <app> <environment>",
 				meta: deliveryReadMeta("List builds for one environment", "eregion build list api production --json"),

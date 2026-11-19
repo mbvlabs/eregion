@@ -118,6 +118,17 @@ func handle(config Config, steps *node.StepRegistry, request node.Request) node.
 	if request.Method == node.MethodStatus {
 		return statusResponse(config, request)
 	}
+	if request.Method == node.MethodRetireBuild {
+		nodeEngine, err := engine.New(config.StateDir, config.Node, &secrets.Registry{})
+		if err != nil {
+			return node.Response{Status: engine.StatusFailed, ErrorCode: string(contract.Internal), Detail: err.Error()}
+		}
+		response, err := node.RetireBuild(context.Background(), nodeEngine, request.Execution)
+		if err != nil {
+			return node.Response{Status: engine.StatusFailed, ErrorCode: string(contract.Internal), Detail: err.Error()}
+		}
+		return response
+	}
 	if request.Method == node.MethodRun {
 		return runResponse(config, steps, request)
 	}
@@ -267,6 +278,13 @@ func runResponse(config Config, steps *node.StepRegistry, request node.Request) 
 	nodeEngine, err := engine.New(config.StateDir, config.Node, &secrets.Registry{})
 	if err != nil {
 		return node.Response{Status: engine.StatusFailed, ErrorCode: string(contract.Internal), Detail: err.Error()}
+	}
+	retired, err := nodeEngine.IsRetired(request.Execution)
+	if err != nil {
+		return node.Response{Status: engine.StatusFailed, ErrorCode: string(contract.Internal), Detail: err.Error()}
+	}
+	if retired {
+		return node.Response{Status: engine.StatusFailed, ErrorCode: string(contract.PreconditionFailed), Detail: "effect has been retired"}
 	}
 	status, err := nodeEngine.Status(context.Background(), request.Execution)
 	if err != nil {

@@ -171,7 +171,7 @@ func TestIntegrationEnvironmentBuildNodeIsValidatedAndGated(t *testing.T) {
 	}
 }
 
-func TestIntegrationReleaseBuildSlotQueuesAndRuns(t *testing.T) {
+func TestIntegrationReleaseBuildSlotQueuesAndRuns(t *testing.T) { //nolint:gocognit // The complete queued-to-running River flow is one scenario.
 	pool, _ := testPool(t, true)
 	transport := &scriptedPlatformTransport{results: map[string]json.RawMessage{
 		deploymentPackStep: json.RawMessage(
@@ -263,12 +263,12 @@ func TestIntegrationReleaseBuildSlotQueuesAndRuns(t *testing.T) {
 		contract.Succeeded,
 	)
 
-	previousWait, previousPoll := buildSlotWait, buildSlotPoll
-	buildSlotWait, buildSlotPoll = 250*time.Millisecond, 25*time.Millisecond
-	t.Cleanup(func() { buildSlotWait, buildSlotPoll = previousWait, previousPoll })
-
-	held, err := s.acquireBuildSlot(ctx, "local", nil)
-	if err != nil {
+	// Model a retained reservation belonging to a previous operation.
+	var holder string
+	if err := pool.QueryRow(ctx, `SELECT id FROM eregion_operations ORDER BY created_at LIMIT 1`).Scan(&holder); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO eregion_build_capacity_claims(operation_id,node_name,builder_identity,attempt) VALUES ($1,'local','test',1)`, holder); err != nil {
 		t.Fatal(err)
 	}
 	released := false
@@ -277,7 +277,9 @@ func TestIntegrationReleaseBuildSlotQueuesAndRuns(t *testing.T) {
 			return
 		}
 		released = true
-		held()
+		if _, err := pool.Exec(ctx, `DELETE FROM eregion_build_capacity_claims WHERE operation_id=$1`, holder); err != nil {
+			t.Error(err)
+		}
 	}
 	// Cleanup runs before the pool is closed, even after a fatal assertion.
 	t.Cleanup(releaseHeld)
@@ -289,9 +291,23 @@ func TestIntegrationReleaseBuildSlotQueuesAndRuns(t *testing.T) {
 		"build-blocked",
 		map[string]any{},
 	)
-	blocked = platformAwait(t, s, blocked, contract.Failed)
-	if blocked.ErrorCode != contract.PreconditionFailed {
-		t.Fatalf("capacity failure code=%s", blocked.ErrorCode)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		page, err := s.Events(ctx, testActor, contract.Cursor{OperationID: blocked.ID}, 200)
+		if err != nil {
+			t.Fatal(err)
+		}
+		queued := false
+		for _, event := range page.Events {
+			queued = queued || strings.Contains(event.Message, "build_queued")
+		}
+		if queued {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("build did not snooze at capacity")
+		}
+		time.Sleep(25 * time.Millisecond)
 	}
 	assertBuildSlotEvent(t, ctx, s, blocked.ID, "build_queued")
 	if got := transport.runCount(deploymentPackStep); got != 0 {
@@ -299,15 +315,7 @@ func TestIntegrationReleaseBuildSlotQueuesAndRuns(t *testing.T) {
 	}
 	releaseHeld()
 
-	ready := platformSubmit(
-		t,
-		s,
-		platform.KindDeploy,
-		"env/live/production",
-		"build-ready",
-		map[string]any{},
-	)
-	ready = platformAwait(t, s, ready, contract.Succeeded)
+	ready := platformAwait(t, s, blocked, contract.Succeeded)
 	release, err := s.releaseForOperation(ctx, ready.ID)
 	if err != nil || release.Status != platform.ReleaseReady ||
 		!strings.HasPrefix(release.ImageID, "sha256:") {
@@ -319,6 +327,10 @@ func TestIntegrationReleaseBuildSlotQueuesAndRuns(t *testing.T) {
 	}
 	if got := transport.runCount(deploymentPackStep); got != 1 {
 		t.Fatalf("pack ran %d times", got)
+	}
+	var claims int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_build_capacity_claims WHERE operation_id=$1`, ready.ID).Scan(&claims); err != nil || claims != 0 {
+		t.Fatalf("completed build capacity claims = %d, %v; want none", claims, err)
 	}
 	assertBuildSlotEvent(t, ctx, s, ready.ID, "build_running")
 }

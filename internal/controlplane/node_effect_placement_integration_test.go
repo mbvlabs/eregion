@@ -367,7 +367,7 @@ func (t *cancelLostPackTransport) Call(ctx context.Context, request node.Request
 		}
 		return node.Response{Status: engine.StatusFailed, Attempt: request.Execution.Attempt,
 			ExecutionID: request.Execution.ExecutionID(), Detail: "known pack failure"}, nil
-	case node.MethodObserve, node.MethodInventory:
+	case node.MethodObserve, node.MethodInventory, node.MethodRetireBuild:
 		return node.Response{}, errors.New("unexpected node method")
 	default:
 		return node.Response{}, errors.New("unexpected node method")
@@ -426,6 +426,10 @@ func TestIntegrationCancellationLostBuildResponsePreservesUnknown(t *testing.T) 
 	} else if !errors.Is(err, errNodeEffectOutcomeUnknown) {
 		t.Fatalf("lost build response = %v, want unknown-outcome classification", err)
 	}
+	var claims int
+	if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM eregion_build_capacity_claims WHERE operation_id=$1 AND node_name='local'`, deploy.ID).Scan(&claims); err != nil || claims != 1 {
+		t.Fatalf("lost build capacity claims = %d, %v; want one retained claim", claims, err)
+	}
 	current, err := s.Get(context.Background(), testActor, deploy.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -457,6 +461,10 @@ func TestIntegrationCancellationKnownBuildFailureStillWaitsForLiveEffect(t *test
 		t.Fatal("known build failure was reported as success")
 	} else if code := contract.Classify(err).Code; code != contract.Unavailable {
 		t.Fatalf("guard error code = %s, want unavailable: %v", code, err)
+	}
+	var claims int
+	if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM eregion_build_capacity_claims WHERE operation_id=$1`, deploy.ID).Scan(&claims); err != nil || claims != 1 {
+		t.Fatalf("failed build capacity claims = %d, %v; want one retained claim", claims, err)
 	}
 	current, err := s.Get(context.Background(), testActor, deploy.ID)
 	if err != nil {

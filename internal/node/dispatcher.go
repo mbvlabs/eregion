@@ -81,10 +81,25 @@ func (d *Dispatcher) Call(ctx context.Context, request Request, onEvent func(Eve
 		}
 		return ResponseFromStatus(status), nil
 	}
+	if request.Method == MethodRetireBuild {
+		return RetireBuild(ctx, &requestEngine, request.Execution)
+	}
 	if request.Method == MethodRun {
 		return d.run(ctx, requestEngine, request, registry, report)
 	}
 	return Response{}, fmt.Errorf("unknown node method %q", request.Method)
+}
+
+// RetireBuild accepts only Pack identities, with no payload or secrets needed.
+func RetireBuild(ctx context.Context, e *engine.Engine, exec engine.Execution) (Response, error) {
+	if !platform.IsPackStep(exec.Step) {
+		return Response{Status: engine.StatusFailed, ErrorCode: string(contract.ValidationFailed), Detail: "retirement requires a Pack step"}, nil
+	}
+	status, err := e.RetireBuild(ctx, exec)
+	if err != nil {
+		return Response{}, err
+	}
+	return ResponseFromStatus(status), nil
 }
 
 // run executes one run request against the request-scoped engine.

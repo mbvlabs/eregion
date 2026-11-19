@@ -100,6 +100,8 @@ const (
 	methodFollow              = "operations.follow"
 	methodBuildConcurrencyGet = "server.build-concurrency.get"
 	methodBuildConcurrencySet = "server.build-concurrency.set"
+	methodBuildSlotsList      = "build.slots.list"
+	methodBuildSlotsClear     = "build.slots.clear"
 	methodDiagnose            = "operations.diagnose"
 	methodCancel              = "operations.cancel"
 	methodInventory           = "platform.inventory"
@@ -1315,7 +1317,8 @@ func serveNodeRPC(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer
 	}
 
 	logger := slog.New(slog.NewTextHandler(safeLogWriter{out: stderr, registry: registry}, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	app, closeRuntime, err := openNodeApp(ctx, logger, registry, request.Method == methodBuildConcurrencyGet || request.Method == methodBuildConcurrencySet)
+	clearSlot := request.Method == methodBuildSlotsClear && !request.DryRun
+	app, closeRuntime, err := openNodeApp(ctx, logger, registry, request.Method == methodBuildConcurrencyGet || request.Method == methodBuildConcurrencySet || clearSlot, clearSlot)
 	if err != nil {
 		return writeRPCResult(stdout, nil, err)
 	}
@@ -1684,7 +1687,7 @@ func readWorkspaceFromDSN(ctx context.Context, dsn string) (controlplane.Workspa
 	return controlplane.ReadWorkspace(ctx, store)
 }
 
-func openNodeApp(ctx context.Context, logger *slog.Logger, registry *secrets.Registry, buildConcurrency bool) (api.AppService, func(), error) {
+func openNodeApp(ctx context.Context, logger *slog.Logger, registry *secrets.Registry, buildConcurrency, localRetirement bool) (api.AppService, func(), error) {
 	if err := host.LoadServiceEnv(host.ServiceEnvPath); err != nil {
 		return api.AppService{}, nil, contract.NewFault(contract.Unavailable, "the node service configuration is not readable", err.Error())
 	}
@@ -1729,6 +1732,7 @@ func openNodeApp(ctx context.Context, logger *slog.Logger, registry *secrets.Reg
 		return api.AppService{}, nil, endpointErr
 	}
 	var registryHostIdentity *controlplane.RegistryHostIdentity
+	var nodeStateDir string
 	if buildConcurrency {
 		identity, identityErr := host.LocalRegistryIdentity()
 		if identityErr != nil {
@@ -1736,10 +1740,14 @@ func openNodeApp(ctx context.Context, logger *slog.Logger, registry *secrets.Reg
 			return api.AppService{}, nil, contract.NewFault(contract.PreconditionFailed, "the main node identity is not verified", "Check the managed node configuration and public SSH host identity.")
 		}
 		registryHostIdentity = &identity
+		if localRetirement {
+			nodeStateDir = identity.StateDir
+		}
 	}
 	run, err := controlplane.New(store, logger, controlplane.WorkerConfig{ //nolint:contextcheck // Runtime construction owns its initialization context; request context governs subsequent work.
 		Concurrency: 0, SecretResolver: resolver, LocalNodeName: os.Getenv("EREGION_NODE_NAME"),
-		Redaction: registry, Vault: parts.Vault,
+		NodeStateDir: nodeStateDir,
+		Redaction:    registry, Vault: parts.Vault,
 		RegistryEndpoint:     registryEndpoint,
 		RegistryHostIdentity: registryHostIdentity,
 		DomainDNS:            parts.DomainDNS,
@@ -1784,6 +1792,7 @@ type nodeMethodGroup int
 const (
 	nodeMethodUnknown nodeMethodGroup = iota
 	nodeMethodBuildConcurrency
+	nodeMethodBuildSlots
 	nodeMethodSubmit
 	nodeMethodOperation
 	nodeMethodRetention
@@ -1796,6 +1805,8 @@ const (
 var nodeMethodGroups = map[string]nodeMethodGroup{
 	methodBuildConcurrencyGet: nodeMethodBuildConcurrency,
 	methodBuildConcurrencySet: nodeMethodBuildConcurrency,
+	methodBuildSlotsList:      nodeMethodBuildSlots,
+	methodBuildSlotsClear:     nodeMethodBuildSlots,
 	methodTest:                nodeMethodSubmit,
 	methodSubmit:              nodeMethodSubmit,
 	methodGet:                 nodeMethodOperation,
@@ -1833,6 +1844,8 @@ func dispatchNodeMethod(ctx context.Context, app api.AppService, request rpc.Req
 	switch nodeMethodGroups[request.Method] {
 	case nodeMethodBuildConcurrency:
 		return dispatchBuildConcurrency(ctx, app, actor, request)
+	case nodeMethodBuildSlots:
+		return dispatchBuildSlots(ctx, app, actor, request)
 	case nodeMethodSubmit:
 		return dispatchNodeSubmit(ctx, app, request, actor)
 	case nodeMethodOperation:

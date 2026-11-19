@@ -282,9 +282,20 @@ capacity. It defaults to 1 and accepts 1–16 through
 `server build-concurrency set N --dry-run --json` and an explicitly authorized
 real update. Higher values increase CPU, memory, disk and cache pressure and
 do not override worker/pool limits or promise throughput. Lowering capacity
-does not stop existing builds; new admissions wait for occupancy to fall below
-the value. Do not raise capacity merely to verify a build. The slot setting is
-not a hard live-process ceiling after worker/database-session loss.
+does not stop existing builds; River reschedules builds that cannot claim
+capacity. FIFO order is not guaranteed. Claims survive worker and database
+connection loss. If the builder cannot confirm that an abandoned build is
+quiescent and cannot restart, its claim continues to count against capacity.
+Do not raise capacity merely to verify a build. Before switching from the old
+session-based build slots, drain the old workers and their in-flight builds;
+do not run both admission schemes at the same time.
+
+Use `eregion build slots list` to inspect reservations. If a build is still
+active, stop it with `eregion build stop` or cancel its operation. For a
+terminal operation with a retained slot, preview
+`eregion build slots clear <operation-id> --dry-run`, then rerun without
+`--dry-run` to retry retirement. Clear does not force release if the builder
+cannot confirm the build has stopped and cannot restart.
 
 An environment has an optional Git Buildpacks recipe; there is no persistent
 image source or `source.kind` mode. Omit `[source]`/`--git-url` for an

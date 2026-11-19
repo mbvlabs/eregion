@@ -16,6 +16,16 @@ type EregionAccessGrant struct {
 	CreatedAt pgtype.Timestamptz
 }
 
+type EregionBuildCapacityClaim struct {
+	OperationID     string
+	ClaimID         string
+	NodeName        string
+	BuilderIdentity string
+	Attempt         int64
+	CreatedAt       pgtype.Timestamptz
+	CheckedAt       pgtype.Timestamptz
+}
+
 type EregionDefinitionDnsPolicy struct {
 	Singleton bool
 	Revision  int64

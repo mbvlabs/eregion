@@ -70,7 +70,7 @@ func (f *retentionFakeTransport) Call(_ context.Context, request node.Request, _
 				Attempt: request.Execution.Attempt, ExecutionID: request.Execution.ExecutionID()}, nil
 		}
 		return node.Response{Status: engine.StatusCompleted, Result: json.RawMessage(`{"removed":true}`)}, nil
-	case node.MethodObserve:
+	case node.MethodObserve, node.MethodRetireBuild:
 		return node.Response{}, fmt.Errorf("unexpected method %q", request.Method)
 	default:
 		return node.Response{}, fmt.Errorf("unexpected method %q", request.Method)
