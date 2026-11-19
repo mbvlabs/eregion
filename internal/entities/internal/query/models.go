@@ -495,8 +495,3 @@ type EregionWorkspace struct {
 	RegistryHostKeyFingerprint pgtype.Text
 	RegistryHostStateDir       pgtype.Text
 }
-
-type PgStatSsl struct {
-	Pid int64
-	Ssl bool
-}

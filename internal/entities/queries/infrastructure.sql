@@ -9,7 +9,6 @@ SELECT cardinality(current_schemas(false))::integer AS schema_count,
 -- name: DatabaseFacts :one
 SELECT current_user::text AS role_name, current_database()::text AS database_name,
        current_setting('server_version_num')::integer AS server_version,
-       coalesce((SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()), false)::boolean AS tls,
        has_database_privilege(current_user, current_database(), 'CREATE')::boolean AS can_create_database,
        coalesce(has_schema_privilege(current_user, current_schema(), 'CREATE'), false)::boolean AS can_create_schema;
 

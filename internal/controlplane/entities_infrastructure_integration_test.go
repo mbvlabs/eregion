@@ -79,6 +79,9 @@ func TestIntegrationEntitiesInfrastructureFactsAndSession(t *testing.T) {
 		facts.User != pool.Config().ConnConfig.User || !facts.CanCreateDatabase || !facts.CanCreateSchema {
 		t.Fatalf("database facts = %+v", facts)
 	}
+	if cfg := pool.Config().ConnConfig; len(cfg.Fallbacks) == 0 && facts.TLS != (cfg.TLSConfig != nil) {
+		t.Fatalf("database wire TLS = %v, configured TLS = %v", facts.TLS, cfg.TLSConfig != nil)
+	}
 	conn, err := pool.Acquire(ctx)
 	if err != nil {
 		t.Fatal(err)

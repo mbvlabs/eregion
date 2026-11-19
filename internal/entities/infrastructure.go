@@ -2,6 +2,7 @@ package entities
 
 import (
 	"context"
+	"crypto/tls"
 	"database/sql"
 	"encoding/json"
 
@@ -30,10 +31,19 @@ func (s *Store) DatabaseVersion(ctx context.Context) (int, error) {
 }
 
 func (s *Store) DatabaseFacts(ctx context.Context) (DatabaseFacts, error) {
-	row, err := query.New(s.pool).DatabaseFacts(ctx)
+	conn, err := s.pool.Acquire(ctx)
+	if err != nil {
+		return DatabaseFacts{}, err
+	}
+	defer conn.Release()
+	row, err := query.New(conn).DatabaseFacts(ctx)
+	// pg_stat_ssl describes the backend hop, not our transport when a
+	// pooler terminates TLS.
+	wire, _ := conn.Conn().PgConn().Conn().(*tls.Conn)
 	return DatabaseFacts{
 		User: row.RoleName, Database: row.DatabaseName, ServerVersion: int(row.ServerVersion),
-		TLS: row.Tls, CanCreateDatabase: row.CanCreateDatabase, CanCreateSchema: row.CanCreateSchema,
+		TLS:               wire != nil && wire.ConnectionState().HandshakeComplete,
+		CanCreateDatabase: row.CanCreateDatabase, CanCreateSchema: row.CanCreateSchema,
 	}, err
 }
 

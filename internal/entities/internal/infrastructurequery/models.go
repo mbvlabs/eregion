@@ -3,8 +3,3 @@
 //   sqlc v1.31.1
 
 package infrastructurequery
-
-type PgStatSsl struct {
-	Pid int64
-	Ssl bool
-}
