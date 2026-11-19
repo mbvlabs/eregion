@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
@@ -30,114 +29,10 @@ func operationsSubmission(key string) operations.Submission {
 	}
 }
 
-// TestIntegrationImageIdentityBuildPersistsManifestAndConfigSeparately drives
-// the real service/worker build path with distinct M, C and R observations.
+// TestIntegrationImageIdentityBuildPersistsManifestAndConfigSeparately checks
+// the real worker's build and persistence against the registry's actual digests.
 func TestIntegrationImageIdentityBuildPersistsManifestAndConfigSeparately(t *testing.T) {
-	t.Setenv("EREGION_NODE_STATE_DIR", "")
-	t.Setenv("EREGION_DATABASE_URL", "")
-	pool, _ := testPool(t, true)
-	manifest := "sha256:" + strings.Repeat("b", 64)
-	config := "sha256:" + strings.Repeat("a", 64)
-	runtimeID := "sha256:" + strings.Repeat("c", 64)
-	commit := "1234567890abcdef1234567890abcdef12345678"
-	transport := &scriptedPlatformTransport{results: map[string]json.RawMessage{
-		deploymentPackStep: json.RawMessage(
-			`{"reference":"127.0.0.1:5000/live@` + manifest + `","image_id":"` + config + `","runtime_id":"` + runtimeID + `","commit":"` + commit + `"}`,
-		),
-		deploymentImageStep: json.RawMessage(`{"stdout":"` + runtimeID + `"}`),
-	}}
-	run, err := New(newTestEntities(t, pool), integrationDiscardLogger(), WorkerConfig{
-		Concurrency: 2, TestOnly: true, Transport: transport, RegistryEndpoint: "127.0.0.1:5000",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	s := run.Service
-	s.routeSwitch = func(context.Context, platform.Environment, []string) error { return nil }
-	s.routeSync = func(context.Context) error { return nil }
-	s.publicVerify = func(context.Context, platform.Environment, string) error { return nil }
-	startWorkers(t, run)
-	ctx := context.Background()
-	platformAwait(
-		t,
-		s,
-		platformSubmit(
-			t,
-			s,
-			platform.KindNodeRegister,
-			"platform",
-			"identity-build-node",
-			map[string]any{
-				"name": "local", "roles": []string{platform.RoleApplication, platform.RoleBuilder},
-				"capabilities": []string{platform.CapabilityDocker, platform.CapabilityBuildpacks},
-			},
-		),
-		contract.Succeeded,
-	)
-	platformAwait(
-		t,
-		s,
-		platformSubmit(
-			t,
-			s,
-			platform.KindAppCreate,
-			"platform",
-			"identity-build-app",
-			map[string]any{"name": "identity"},
-		),
-		contract.Succeeded,
-	)
-	platformAwait(
-		t,
-		s,
-		platformSubmit(
-			t,
-			s,
-			platform.KindEnvironmentCreate,
-			"app/identity",
-			"identity-build-env",
-			map[string]any{
-				"name": "production", "node": "local", "container_port": 8080,
-				"source": map[string]any{
-					"url": "https://github.com/acme/app.git", "ref": commit,
-					"builder": "paketobuildpacks/builder-jammy-base",
-				},
-				"domain": "identity.example.com", "domain_primary": true,
-			},
-		),
-		contract.Succeeded,
-	)
-	previousWait, previousPoll := buildSlotWait, buildSlotPoll
-	buildSlotWait, buildSlotPoll = 250*time.Millisecond, 25*time.Millisecond
-	t.Cleanup(func() { buildSlotWait, buildSlotPoll = previousWait, previousPoll })
-	deploy := platformSubmit(
-		t,
-		s,
-		platform.KindDeploy,
-		"env/identity/production",
-		"identity-build-deploy",
-		map[string]any{},
-	)
-	completed := platformAwait(t, s, deploy, contract.Succeeded)
-	var image, imageID string
-	if err := pool.QueryRow(ctx, `SELECT image,image_id FROM eregion_platform_releases WHERE operation_id=$1`, completed.ID).
-		Scan(&image, &imageID); err != nil {
-		t.Fatal(err)
-	}
-	if image != "127.0.0.1:5000/live@"+manifest {
-		t.Fatalf("release image=%q, want the canonical manifest reference", image)
-	}
-	if imageID != config {
-		t.Fatalf("release image_id=%q, want manifest config digest %s", imageID, config)
-	}
-	if imageID == runtimeID || imageID == manifest {
-		t.Fatalf("release image_id conflated config with runtime/manifest identity: %q", imageID)
-	}
-	for _, step := range transport.runs {
-		if step == "platform-pack-02-v1" || step == "platform-image-01-v1" {
-			t.Fatalf("build executed an obsolete identity generation: %s", step)
-		}
-	}
+	testVerifiedLocalPack(t)
 }
 
 // captureNodeTransport records real dispatcher requests without executing host

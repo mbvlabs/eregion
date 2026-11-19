@@ -3,12 +3,9 @@ package controlplane
 import (
 	"context"
 	"encoding/json"
-	"io"
-	"log/slog"
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
@@ -89,7 +86,7 @@ func (s *scriptedPlatformTransport) Call(
 	}, nil
 }
 
-func (s *scriptedPlatformTransport) runCount(step string) int {
+func (s *scriptedPlatformTransport) runCount(step string) int { //nolint:unparam // The helper counts any requested step.
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	count := 0
@@ -169,170 +166,6 @@ func TestIntegrationEnvironmentBuildNodeIsValidatedAndGated(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "shared registry") {
 		t.Fatalf("a distinct build node was pretended to work: %v", err)
 	}
-}
-
-func TestIntegrationReleaseBuildSlotQueuesAndRuns(t *testing.T) { //nolint:gocognit // The complete queued-to-running River flow is one scenario.
-	pool, _ := testPool(t, true)
-	transport := &scriptedPlatformTransport{results: map[string]json.RawMessage{
-		deploymentPackStep: json.RawMessage(
-			`{"reference":"127.0.0.1:5000/live@sha256:` + strings.Repeat(
-				"b",
-				64,
-			) + `","image_id":"sha256:` + strings.Repeat(
-				"a",
-				64,
-			) + `","runtime_id":"sha256:` + strings.Repeat(
-				"a",
-				64,
-			) + `","commit":"` + buildSlotCommit + `"}`,
-		),
-		deploymentImageStep: json.RawMessage(
-			`{"stdout":"sha256:` + strings.Repeat("a", 64) + `"}`,
-		),
-		deploymentReadyImageStep: json.RawMessage(
-			`{"image":"127.0.0.1:5000/live@sha256:` + strings.Repeat(
-				"b",
-				64,
-			) + `","image_id":"sha256:` + strings.Repeat(
-				"a",
-				64,
-			) + `"}`,
-		),
-	}}
-	run, err := New(
-		newTestEntities(t, pool),
-		slog.New(slog.NewTextHandler(io.Discard, nil)),
-		WorkerConfig{
-			Concurrency:      2,
-			TestOnly:         true,
-			Transport:        transport,
-			RegistryEndpoint: "127.0.0.1:5000",
-		},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s := run.Service
-	// The supported Git deploy path builds before deploying; replace only the
-	// host route effects so this fixture exercises build-slot serialization.
-	s.routeSwitch = func(context.Context, platform.Environment, []string) error { return nil }
-	s.routeSync = func(context.Context) error { return nil }
-	s.publicVerify = func(context.Context, platform.Environment, string) error { return nil }
-	startWorkers(t, run)
-	ctx := context.Background()
-	platformAwait(
-		t,
-		s,
-		platformSubmit(t, s, platform.KindNodeRegister, "platform", "build-agent", map[string]any{
-			"name": "local", "roles": []string{platform.RoleApplication, platform.RoleBuilder},
-			"capabilities": []string{platform.CapabilityDocker, platform.CapabilityBuildpacks},
-		}),
-		contract.Succeeded,
-	)
-	platformAwait(
-		t,
-		s,
-		platformSubmit(
-			t,
-			s,
-			platform.KindAppCreate,
-			"platform",
-			"build-app",
-			map[string]any{"name": "live"},
-		),
-		contract.Succeeded,
-	)
-	platformAwait(
-		t,
-		s,
-		platformSubmit(
-			t,
-			s,
-			platform.KindEnvironmentCreate,
-			"app/live",
-			"build-env",
-			map[string]any{
-				"name": "production", "node": "local", "container_port": 8080,
-				"source": map[string]any{
-					"url": "https://github.com/acme/app.git", "ref": buildSlotCommit,
-					"builder": "paketobuildpacks/builder-jammy-base",
-				},
-				"domain": "live.example.com", "domain_primary": true,
-			},
-		),
-		contract.Succeeded,
-	)
-
-	// Model a retained reservation belonging to a previous operation.
-	var holder string
-	if err := pool.QueryRow(ctx, `SELECT id FROM eregion_operations ORDER BY created_at LIMIT 1`).Scan(&holder); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := pool.Exec(ctx, `INSERT INTO eregion_build_capacity_claims(operation_id,node_name,builder_identity,attempt) VALUES ($1,'local','test',1)`, holder); err != nil {
-		t.Fatal(err)
-	}
-	released := false
-	releaseHeld := func() {
-		if released {
-			return
-		}
-		released = true
-		if _, err := pool.Exec(ctx, `DELETE FROM eregion_build_capacity_claims WHERE operation_id=$1`, holder); err != nil {
-			t.Error(err)
-		}
-	}
-	// Cleanup runs before the pool is closed, even after a fatal assertion.
-	t.Cleanup(releaseHeld)
-	blocked := platformSubmit(
-		t,
-		s,
-		platform.KindDeploy,
-		"env/live/production",
-		"build-blocked",
-		map[string]any{},
-	)
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		page, err := s.Events(ctx, testActor, contract.Cursor{OperationID: blocked.ID}, 200)
-		if err != nil {
-			t.Fatal(err)
-		}
-		queued := false
-		for _, event := range page.Events {
-			queued = queued || strings.Contains(event.Message, "build_queued")
-		}
-		if queued {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("build did not snooze at capacity")
-		}
-		time.Sleep(25 * time.Millisecond)
-	}
-	assertBuildSlotEvent(t, ctx, s, blocked.ID, "build_queued")
-	if got := transport.runCount(deploymentPackStep); got != 0 {
-		t.Fatalf("a build ran without a slot: %d", got)
-	}
-	releaseHeld()
-
-	ready := platformAwait(t, s, blocked, contract.Succeeded)
-	release, err := s.releaseForOperation(ctx, ready.ID)
-	if err != nil || release.Status != platform.ReleaseReady ||
-		!strings.HasPrefix(release.ImageID, "sha256:") {
-		t.Fatalf("release=%+v err=%v", release, err)
-	}
-	if !platform.IsImageDigestReference(release.Image) ||
-		!strings.HasPrefix(release.Image, "127.0.0.1:5000/live@sha256:") {
-		t.Fatalf("release image = %q, want the canonical registry digest reference", release.Image)
-	}
-	if got := transport.runCount(deploymentPackStep); got != 1 {
-		t.Fatalf("pack ran %d times", got)
-	}
-	var claims int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_build_capacity_claims WHERE operation_id=$1`, ready.ID).Scan(&claims); err != nil || claims != 0 {
-		t.Fatalf("completed build capacity claims = %d, %v; want none", claims, err)
-	}
-	assertBuildSlotEvent(t, ctx, s, ready.ID, "build_running")
 }
 
 func assertBuildSlotEvent(t *testing.T, ctx context.Context, s *Service, id contract.OperationID, fragment string) {

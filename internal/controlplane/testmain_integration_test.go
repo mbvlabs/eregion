@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/mbvlabs/eregion/internal/platform"
 )
 
 // secureTestTempRoot creates a private temporary root and resolves every
@@ -30,6 +32,9 @@ func secureTestTempRoot(base, pattern string) (string, error) {
 // TestMain keeps temporary credential and state directories under a private
 // canonical root instead of an ambient group-writable GOTMPDIR.
 func TestMain(m *testing.M) {
+	if len(os.Args) == 2 && os.Args[1] == platform.PackHelperInvocation {
+		os.Exit(platform.RunPackHelper())
+	}
 	dir, err := secureTestTempRoot("/tmp", "eregion-controlplane-tests-")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "test temporary root:", err)

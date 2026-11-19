@@ -39,6 +39,8 @@ jobs:
 
   integration:
     runs-on: ubuntu-latest
+    env:
+      EREGION_TEST_REAL_PACK_REGISTRY: 127.0.0.1:5000
     services:
       postgres:
         image: postgres:18-alpine
@@ -60,6 +62,14 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: just
+      - name: Prepare isolated Pack build prerequisites
+        run: |
+          curl --fail --location --retry 3 --output "$RUNNER_TEMP/pack.tgz" https://github.com/buildpacks/pack/releases/download/v0.40.9/pack-v0.40.9-linux.tgz
+          echo "dc0ee1e931cf8a106d7555a01a214864f9acb60b77adf15d69b74df4404758e9  $RUNNER_TEMP/pack.tgz" | sha256sum -c
+          tar -xzf "$RUNNER_TEMP/pack.tgz" -C "$RUNNER_TEMP" pack
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+          docker run -d --name eregion-registry -p 127.0.0.1:5000:5000 registry:2.8.3@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+          docker pull paketobuildpacks/builder-jammy-base:latest
       - run: just integration
         env:
           EREGION_TEST_DATABASE_URL: postgres://postgres:eregion-ci-only@127.0.0.1:5432/postgres?sslmode=disable

@@ -2,8 +2,6 @@ package controlplane
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,9 +14,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/contract"
-	"github.com/mbvlabs/eregion/internal/engine"
 	"github.com/mbvlabs/eregion/internal/jobargs"
-	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/mbvlabs/eregion/internal/vault"
 	"github.com/riverqueue/river"
@@ -143,91 +139,6 @@ func (r *snapshotSecretResolver) snapshot() []secretSnapshotCall {
 	return append([]secretSnapshotCall(nil), r.calls...)
 }
 
-// gitReadTransport blocks the first attempt's pack status call until the test
-// cancels it, which models a worker that died after recording its secret
-// snapshot but before it could build. The next attempt records the credential
-// the node would receive.
-type gitReadTransport struct {
-	*scriptedDeployTransport
-	commit      string
-	blocked     chan struct{}
-	packSecrets chan map[string]string
-
-	runtimeMu sync.Mutex
-	runtimeID string
-}
-
-func (t *gitReadTransport) Call(
-	ctx context.Context,
-	request node.Request,
-	onEvent func(node.Event),
-) (node.Response, error) {
-	if request.Execution.Step == deploymentImageStep && request.Method == node.MethodRun {
-		t.runtimeMu.Lock()
-		runtimeID := t.runtimeID
-		t.runtimeMu.Unlock()
-		if runtimeID != "" {
-			result, _ := json.Marshal(map[string]string{"stdout": runtimeID})
-			return node.Response{
-				Status: engine.StatusCompleted, ExecutionID: request.Execution.ExecutionID(),
-				Executed: true, Result: result,
-			}, nil
-		}
-	}
-	if request.Execution.Step != deploymentPackStep {
-		return t.scriptedDeployTransport.Call(ctx, request, onEvent)
-	}
-	switch request.Method {
-	case node.MethodStatus:
-		if request.Execution.Attempt == 1 {
-			select {
-			case <-t.blocked:
-			default:
-				close(t.blocked)
-			}
-			<-ctx.Done()
-			return node.Response{}, ctx.Err()
-		}
-		return node.Response{
-			Status:      engine.StatusAbsent,
-			ExecutionID: request.Execution.ExecutionID(),
-		}, nil
-	case node.MethodRun:
-		select {
-		case t.packSecrets <- request.Secrets:
-		default:
-		}
-		var payload platform.PackPayload
-		_ = json.Unmarshal(request.Payload, &payload)
-		local := payload.Image
-		if colon := strings.LastIndexByte(local, ':'); colon > strings.LastIndexByte(local, '/') {
-			local = local[:colon]
-		}
-		sum := sha256.Sum256([]byte(payload.Image))
-		runtimeID := "sha256:" + hex.EncodeToString(sum[:])
-		t.runtimeMu.Lock()
-		t.runtimeID = runtimeID
-		t.runtimeMu.Unlock()
-		manifest := sha256.Sum256([]byte("manifest:" + payload.Image))
-		result, _ := json.Marshal(map[string]string{
-			"commit":     t.commit,
-			"image_id":   runtimeID,
-			"runtime_id": runtimeID,
-			"reference": payload.Registry + "/" + local + "@sha256:" + hex.EncodeToString(
-				manifest[:],
-			),
-		})
-		return node.Response{
-			Status: engine.StatusCompleted, ExecutionID: request.Execution.ExecutionID(),
-			Executed: true, Result: result,
-		}, nil
-	case node.MethodObserve, node.MethodInventory, node.MethodRetireBuild:
-		return node.Response{}, fmt.Errorf("unexpected method %q", request.Method)
-	default:
-		return node.Response{}, fmt.Errorf("unexpected method %q", request.Method)
-	}
-}
-
 // runPlatformAttempt dispatches one platform operation the way the River
 // worker does, without needing a real River job to be claimed and retried.
 func runPlatformAttempt(
@@ -243,14 +154,14 @@ func runPlatformAttempt(
 	})
 }
 
-// credentialDeployFixture is one deployable private-git environment with no
-// River workers running, so each attempt is dispatched directly.
+// credentialDeployFixture exercises deployment secret preparation at the
+// durable boundary, without dispatching a Git clone or Pack effect.
 type credentialDeployFixture struct {
-	pool      *pgxpool.Pool
-	service   *Service
-	resolver  *snapshotSecretResolver
-	transport *gitReadTransport
-	deploy    contract.Operation
+	pool     *pgxpool.Pool
+	service  *Service
+	resolver *snapshotSecretResolver
+	deploy   contract.Operation
+	secrets  map[string]string
 }
 
 func newCredentialDeployFixture(t *testing.T) *credentialDeployFixture {
@@ -258,14 +169,8 @@ func newCredentialDeployFixture(t *testing.T) *credentialDeployFixture {
 	pool, _ := testPool(t, true)
 	resolver := newSnapshotSecretResolver()
 	resolver.set(gitReadSecretName, gitReadRevision, gitReadValue)
-	transport := &gitReadTransport{
-		scriptedDeployTransport: newScriptedDeployTransport(),
-		commit:                  submittedGitCommit,
-		blocked:                 make(chan struct{}),
-		packSecrets:             make(chan map[string]string, 1),
-	}
 	run, err := New(newTestEntities(t, pool), slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
-		Concurrency: 0, TestOnly: true, Transport: transport, NodeStateDir: t.TempDir(),
+		Concurrency: 0, TestOnly: true, NodeStateDir: t.TempDir(),
 		LocalNodeName: "local", SecretResolver: resolver, RegistryEndpoint: "127.0.0.1:5000",
 	})
 	if err != nil {
@@ -276,7 +181,7 @@ func newCredentialDeployFixture(t *testing.T) *credentialDeployFixture {
 	s.publicVerify = func(context.Context, platform.Environment, string) error { return nil }
 
 	// Setup operations are dispatched synchronously; no River workers run in
-	// this test, so the deploy below cannot race the simulated attempts.
+	// this test, so the deploy cannot race the manually claimed attempts.
 	ctx := context.Background()
 	for _, op := range []contract.Operation{
 		platformSubmit(t, s, platform.KindNodeRegister, "platform", "credential-node", map[string]any{
@@ -300,10 +205,9 @@ func newCredentialDeployFixture(t *testing.T) *credentialDeployFixture {
 		}
 	}
 	return &credentialDeployFixture{
-		pool:      pool,
-		service:   s,
-		resolver:  resolver,
-		transport: transport,
+		pool:     pool,
+		service:  s,
+		resolver: resolver,
 		deploy: platformSubmit(
 			t,
 			s,
@@ -315,36 +219,11 @@ func newCredentialDeployFixture(t *testing.T) *credentialDeployFixture {
 	}
 }
 
-// loseFirstAttempt waits until the first attempt has recorded its secret
-// snapshot and reached the build, then cancels it without terminalizing the
-// operation, like a rescued worker whose process disappeared.
+// loseFirstAttempt stops at the durable snapshot boundary without issuing a
+// node effect. The next attempt reloads the deployment from PostgreSQL.
 func (f *credentialDeployFixture) loseFirstAttempt(t *testing.T) {
 	t.Helper()
-	firstCtx, cancelFirst := context.WithCancel(context.Background())
-	firstErr := make(chan error, 1)
-	go func() {
-		firstErr <- runPlatformAttempt(firstCtx, f.service, f.deploy.ID, 1)
-	}()
-	select {
-	case <-f.transport.blocked:
-	case err := <-firstErr:
-		cancelFirst()
-		t.Fatalf("the first attempt ended before the build: %v", err)
-	case <-time.After(30 * time.Second):
-		cancelFirst()
-		t.Fatal("the first attempt never reached the build step")
-	}
-	cancelFirst()
-	if err := <-firstErr; err == nil {
-		t.Fatal("the cancelled first attempt reported success")
-	}
-	current, err := f.service.Get(context.Background(), testActor, f.deploy.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if current.State.Terminal() {
-		t.Fatalf("simulated worker loss terminalized the operation: %+v", current)
-	}
+	f.prepareSecrets(t, 1)
 }
 
 func (f *credentialDeployFixture) secretSnapshot(
@@ -365,39 +244,57 @@ func (f *credentialDeployFixture) secretSnapshot(
 
 func (f *credentialDeployFixture) retry(t *testing.T) {
 	t.Helper()
-	if err := runPlatformAttempt(context.Background(), f.service, f.deploy.ID, 2); err != nil {
-		t.Fatalf("second attempt: %v", err)
+	run := f.prepareSecrets(t, 2)
+	values := cloneMap(run.secretValues)
+	values[run.credentialKey] = run.credentialVal
+	build, found, err := f.service.buildByOperation(context.Background(), f.deploy.ID)
+	if err != nil || !found {
+		t.Fatalf("load retry build: found=%v err=%v", found, err)
 	}
-	current, err := f.service.Get(context.Background(), testActor, f.deploy.ID)
+	f.secrets, err = buildCredentialSecrets(context.Background(), &platformWorker{service: f.service}, build, run.release, values)
 	if err != nil {
 		t.Fatal(err)
-	}
-	if current.State != contract.Succeeded {
-		message := ""
-		if current.LatestResult != nil {
-			message = current.LatestResult.Message
-		}
-		t.Fatalf("second attempt state = %s (%s: %s), want succeeded", current.State, current.ErrorCode, message)
 	}
 }
 
 func (f *credentialDeployFixture) buildSecrets(t *testing.T) map[string]string {
 	t.Helper()
-	select {
-	case secrets := <-f.transport.packSecrets:
-		return secrets
-	default:
-		t.Fatal("the retry never ran the build")
-		return nil
+	return f.secrets
+}
+
+func (f *credentialDeployFixture) prepareSecrets(t *testing.T, attempt uint32) *deploymentRun {
+	t.Helper()
+	ctx := context.Background()
+	if _, _, ok, err := f.service.claimAttempt(ctx, f.deploy.ID, attempt, "test"); err != nil || !ok {
+		t.Fatalf("claim attempt %d: %v %v", attempt, ok, err)
 	}
+	dep, found, err := f.service.deploymentByOperation(ctx, f.deploy.ID)
+	if err != nil || !found {
+		t.Fatalf("load deployment: found=%v err=%v", found, err)
+	}
+	env, err := f.service.environment(ctx, dep.App, dep.Environment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err = f.service.pinnedDeploymentEnvironment(ctx, dep, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release, err := f.service.releaseByID(ctx, dep.ReleaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := &deploymentRun{id: f.deploy.ID, attempt: attempt, dep: dep, env: env, release: release}
+	if done, err := (&platformWorker{service: f.service}).prepareDeploymentSecrets(ctx, run); err != nil || done {
+		t.Fatalf("prepare attempt %d secrets: done=%v err=%v", attempt, done, err)
+	}
+	return run
 }
 
 // TestIntegrationDeployRetryResolvesPinnedGitReadCredential reproduces the
-// rescued-deploy defect: the first attempt records the secret snapshot and then
-// disappears, and the second attempt must still get the git read credential
-// from that snapshot. Before the fix the retry saw a non-empty snapshot and
-// never resolved the credential, so the build failed with
-// precondition_failed "git read credential is unavailable".
+// recovered secret-preparation boundary: after the first snapshot, the next
+// attempt must resolve the Git credential from that durable pin. Actual Pack
+// execution is tested separately with a verified local transport.
 func TestIntegrationDeployRetryResolvesPinnedGitReadCredential(t *testing.T) {
 	f := newCredentialDeployFixture(t)
 	ctx := context.Background()
@@ -413,13 +310,11 @@ func TestIntegrationDeployRetryResolvesPinnedGitReadCredential(t *testing.T) {
 		)
 	}
 
-	// The second attempt is the rescued or River-retried job: the snapshot
-	// exists, so the credential must come from it rather than from a fresh
-	// name lookup.
+	// A new attempt reloads the snapshot instead of resolving the active name.
 	f.retry(t)
 	if secrets := f.buildSecrets(t); secrets[gitReadSecretName] != gitReadValue {
 		t.Fatalf(
-			"build received credential %q, want the resolved value",
+			"build credential selection = %q, want the resolved value",
 			secrets[gitReadSecretName],
 		)
 	}
@@ -443,8 +338,7 @@ func TestIntegrationDeployRetryResolvesPinnedGitReadCredential(t *testing.T) {
 		t.Fatalf("retry resolution = %+v, want pinned %q", calls[1], wantPin)
 	}
 
-	// The credential value is only ever handed to the node step: never in the
-	// operation input, its durable events, or the secret snapshot.
+	// The selected value must not appear in durable input, events or snapshot.
 	var input []byte
 	if err := f.pool.QueryRow(ctx, `SELECT input FROM eregion_operations WHERE id=$1`, f.deploy.ID).
 		Scan(&input); err != nil {

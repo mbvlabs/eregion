@@ -29,10 +29,14 @@ test: integration
 # Run integration tests with the race detector.
 race: integration-race
 
-# Run live PostgreSQL/River/API/process-crash tests against isolated test databases.
+# Run integration tests with a disposable PostgreSQL server and isolated Docker
+# daemon. Real Pack tests also require Pack on PATH, a local Paketo builder and
+# EREGION_TEST_REAL_PACK_REGISTRY pointing to the pinned eregion-registry on
+# loopback; they create images, volumes and networks on that daemon.
 integration:
     @test -n "${EREGION_TEST_DATABASE_URL:-}" || { echo "Set EREGION_TEST_DATABASE_URL to a disposable PostgreSQL test server (role requires CREATEDB)." >&2; exit 1; }
-    go test -count=1 -v ./internal/controlplane -run '^TestIntegration' -timeout 600s
+    @test -n "${EREGION_TEST_REAL_PACK_REGISTRY:-}" && command -v pack >/dev/null || { echo "Install Pack and set EREGION_TEST_REAL_PACK_REGISTRY to the registry on an isolated test Docker daemon." >&2; exit 1; }
+    go test -count=1 -v ./internal/controlplane -run '^TestIntegration' -timeout 20m
     go test -count=1 -v ./internal/cli -run '^TestIntegrationCLIRegression' -timeout 600s
     go test -count=1 -v ./internal/cli -run '^TestIntegrationBuildSlotsRPC$' -timeout 120s
     go test -count=1 -v ./internal/host -run '^TestIntegration' -timeout 600s
@@ -42,7 +46,8 @@ integration:
 # Run the same suite with the race detector.
 integration-race:
     @test -n "${EREGION_TEST_DATABASE_URL:-}" || { echo "Set EREGION_TEST_DATABASE_URL to a disposable PostgreSQL test server (role requires CREATEDB)." >&2; exit 1; }
-    go test -race -count=1 -v ./internal/controlplane -run '^TestIntegration' -timeout 600s
+    @test -n "${EREGION_TEST_REAL_PACK_REGISTRY:-}" && command -v pack >/dev/null || { echo "Install Pack and set EREGION_TEST_REAL_PACK_REGISTRY to the registry on an isolated test Docker daemon." >&2; exit 1; }
+    go test -race -count=1 -v ./internal/controlplane -run '^TestIntegration' -timeout 20m
     go test -race -count=1 -v ./internal/cli -run '^TestIntegrationCLIRegression' -timeout 600s
     go test -race -count=1 -v ./internal/cli -run '^TestIntegrationBuildSlotsRPC$' -timeout 120s
     go test -race -count=1 -v ./internal/host -run '^TestIntegration' -timeout 600s

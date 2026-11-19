@@ -32,8 +32,8 @@ func claimBuildCapacityTx(ctx context.Context, tx *entities.StoreTx, id contract
 		return false, unavailable(err)
 	}
 	current := buildNodeIdentity(rec)
-	if identity == "" {
-		identity = current + ":unverified"
+	if identity == "" || strings.HasSuffix(identity, ":unverified") {
+		return false, contract.NewFault(contract.PreconditionFailed, "builder identity is unverified", "Configure a verified builder transport before building.")
 	}
 	if !strings.HasPrefix(identity, current+":") {
 		return false, contract.NewFault(contract.PreconditionFailed, "build node identity changed", "Inspect the original builder before retrying.")
@@ -76,8 +76,8 @@ func (s *Service) adoptBuildCapacity(ctx context.Context, id contract.OperationI
 }
 
 // buildTransportFor binds a local fallback to the already verified physical
-// registry-host identity. Name-only fallback transports may still execute
-// builds, but their claims cannot be automatically retired.
+// registry-host identity. Name-only fallback transports remain unverified and
+// cannot reserve capacity for a new build.
 func (s *Service) buildTransportFor(ctx context.Context, name string) (node.Transport, string, error) {
 	tr, identity, err := s.resolver.transportForBuild(ctx, name)
 	if err != nil {

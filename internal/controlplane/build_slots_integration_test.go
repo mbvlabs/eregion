@@ -149,7 +149,19 @@ func setupLegacyLocalBuildSlot(t *testing.T) (*Service, *pgxpool.Pool, *engine.E
 	}
 	exec := engine.Execution{OperationID: op.ID, Attempt: 1, Step: deploymentPackStep}
 	hash := engine.InputsHash(exec.Step, []byte("original"))
-	if _, err := s.beginBuildDispatch(ctx, op.ID, 1, "local", "", hash, exec.ExecutionID()); err != nil {
+	_, pinned, err := s.buildTransportFor(ctx, "local")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.beginBuildDispatch(ctx, op.ID, 1, "local", pinned, hash, exec.ExecutionID()); err != nil {
+		t.Fatal(err)
+	}
+	rec, found, err := s.entities.Nodes().Connection(ctx, "local")
+	if err != nil || !found {
+		t.Fatalf("load local node: found=%v err=%v", found, err)
+	}
+	// Represent a pre-guard claim; current dispatch cannot create this identity.
+	if _, err := pool.Exec(ctx, `UPDATE eregion_build_capacity_claims SET builder_identity=$2 WHERE operation_id=$1`, op.ID, buildNodeIdentity(rec)+":unverified"); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.failPlatformOperation(ctx, op.ID, 1, contract.Unavailable, "test"); err != nil {
