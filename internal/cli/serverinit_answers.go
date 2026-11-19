@@ -12,14 +12,15 @@ import (
 // flow has a key here and a flag; flags win. Secrets are never a key: the DSN
 // is named by the path of a protected file.
 type answersFile struct {
-	Host            string `toml:"host"`
-	Port            int    `toml:"port"`
-	Identity        string `toml:"identity"`
-	Node            string `toml:"node"`
-	Workspace       string `toml:"workspace-name"`
-	Hostname        string `toml:"hostname"`
-	DatabaseURLFile string `toml:"database_url_file"`
-	AdminUser       string `toml:"admin_user"`
+	Host                     string `toml:"host"`
+	Port                     int    `toml:"port"`
+	Identity                 string `toml:"identity"`
+	Node                     string `toml:"node"`
+	Workspace                string `toml:"workspace-name"`
+	Hostname                 string `toml:"hostname"`
+	DatabaseURLFile          string `toml:"database_url_file"`
+	MigrationDatabaseURLFile string `toml:"migration_database_url_file"`
+	AdminUser                string `toml:"admin_user"`
 }
 
 // parseAnswersFile decodes the answers strictly: an unknown key is a typo, not
@@ -46,19 +47,21 @@ func (a answersFile) answers() serverInitAnswers {
 		Host: a.Host, Port: port, Identity: strings.TrimSpace(a.Identity),
 		Node: strings.TrimSpace(a.Node), Workspace: strings.TrimSpace(a.Workspace),
 		Hostname: strings.TrimSpace(a.Hostname), DatabaseURLFile: strings.TrimSpace(a.DatabaseURLFile),
-		AdminUser: strings.TrimSpace(a.AdminUser),
+		MigrationDatabaseURLFile: strings.TrimSpace(a.MigrationDatabaseURLFile),
+		AdminUser:                strings.TrimSpace(a.AdminUser),
 	}
 }
 
 // supplied reports which questions the file answered.
 func (a answersFile) supplied() map[string]bool {
 	return map[string]bool{
-		"host":              a.Host != "",
-		"identity":          a.Identity != "",
-		"node":              a.Node != "",
-		"workspace_name":    a.Workspace != "",
-		"hostname":          a.Hostname != "",
-		"database_url_file": a.DatabaseURLFile != "",
-		"admin_user":        a.AdminUser != "",
+		"host":                        a.Host != "",
+		"identity":                    a.Identity != "",
+		"node":                        a.Node != "",
+		"workspace_name":              a.Workspace != "",
+		"hostname":                    a.Hostname != "",
+		"database_url_file":           a.DatabaseURLFile != "",
+		"migration_database_url_file": a.MigrationDatabaseURLFile != "",
+		"admin_user":                  a.AdminUser != "",
 	}
 }

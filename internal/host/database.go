@@ -18,6 +18,7 @@ type DatabaseState struct {
 	ServerVersion     int    `json:"server_version"`
 	User              string `json:"user"`
 	Database          string `json:"database"`
+	Schema            string `json:"-"`
 	TLS               bool   `json:"tls"`
 	CanCreateDatabase bool   `json:"can_create_database"`
 	CanCreateSchema   bool   `json:"can_create_schema"`
@@ -44,6 +45,7 @@ func (s DatabaseState) Detail() string {
 type Database interface {
 	Inspect(context.Context, string) (DatabaseState, error)
 	Migrate(context.Context, string) (DatabaseState, error)
+	SameDatabase(context.Context, string, string) (bool, error)
 	// ReadWorkspace is a read-only identity observation. It never creates the
 	// workspace row, so status, node.info and export remain safe on an
 	// unconfigured installation.
@@ -57,6 +59,23 @@ type Database interface {
 // PostgresDatabase uses controlplane.Open/PlanMigrations/Migrate.
 type PostgresDatabase struct{}
 
+func (PostgresDatabase) SameDatabase(ctx context.Context, runtimeURL, migrationURL string) (bool, error) {
+	runtimePool, err := controlplane.Open(ctx, runtimeURL)
+	if err != nil {
+		return false, databaseError(runtimeURL, err)
+	}
+	defer runtimePool.Close()
+	migrationPool, err := controlplane.Open(ctx, migrationURL)
+	if err != nil {
+		return false, databaseError(migrationURL, err)
+	}
+	defer migrationPool.Close()
+	same, err := entities.SameDatabase(ctx, runtimePool, migrationPool)
+	if err != nil {
+		return false, contract.NewFault(contract.Unavailable, "could not verify that both database URLs reach the same server", "Check connectivity and that both roles can use PostgreSQL advisory locks.")
+	}
+	return same, nil
+}
 func (PostgresDatabase) Inspect(ctx context.Context, dsn string) (DatabaseState, error) {
 	pool, err := controlplane.Open(ctx, dsn)
 	if err != nil {
@@ -132,6 +151,7 @@ func inspectDatabase(ctx context.Context, pool *pgxpool.Pool, dsn string) (Datab
 		return DatabaseState{}, databaseError(dsn, err)
 	}
 	state.User, state.Database, state.ServerVersion = facts.User, facts.Database, facts.ServerVersion
+	state.Schema = facts.Schema
 	state.TLS, state.CanCreateDatabase, state.CanCreateSchema = facts.TLS, facts.CanCreateDatabase, facts.CanCreateSchema
 	parsed, err := parseDatabaseURL(dsn)
 	if err != nil {

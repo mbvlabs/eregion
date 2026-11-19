@@ -45,12 +45,16 @@ type PendingInit struct {
 	// Workspace is the requested portable identity; WorkspaceID is filled from
 	// the authoritative database read before the handoff. Neither is guessed
 	// from the access key or node name.
-	Workspace       string `json:"workspace,omitempty"`
-	WorkspaceID     string `json:"workspace_id,omitempty"`
-	AccessKey       string `json:"access_key"`
-	Hostname        string `json:"hostname"`
-	DatabaseURLFile string `json:"database_url_file,omitempty"`
-	AdminUser       string `json:"admin_user"`
+	Workspace                string `json:"workspace,omitempty"`
+	WorkspaceID              string `json:"workspace_id,omitempty"`
+	AccessKey                string `json:"access_key"`
+	Hostname                 string `json:"hostname"`
+	DatabaseURLFile          string `json:"database_url_file,omitempty"`
+	MigrationDatabaseURLFile string `json:"migration_database_url_file,omitempty"`
+	// SplitDatabaseRoles records that migrations use a different PostgreSQL
+	// role. The URL itself is never stored: only its protected file path is.
+	SplitDatabaseRoles bool   `json:"split_database_roles,omitempty"`
+	AdminUser          string `json:"admin_user"`
 	// Facts learned during init, so --resume does not need first contact.
 	PublicIPv4    string `json:"public_ipv4,omitempty"`
 	Platform      string `json:"platform,omitempty"`

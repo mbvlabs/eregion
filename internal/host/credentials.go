@@ -156,11 +156,11 @@ func ensureState(cfg Config) error {
 // secretsForRedaction returns every secret bootstrap holds in memory. Callers
 // register them before producing any output.
 func secretsForRedaction(cfg Config, credentials Credentials) []string {
-	values := []string{cfg.DatabaseURL}
-	if strings.Contains(cfg.DatabaseURL, ":") {
+	values := []string{cfg.DatabaseURL, cfg.MigrationDatabaseURL}
+	for _, dsn := range []string{cfg.DatabaseURL, cfg.MigrationDatabaseURL} {
 		// The URL password is often quoted or embedded in an error; register
 		// the individual password too.
-		if parsed, err := parseDatabaseURL(cfg.DatabaseURL); err == nil {
+		if parsed, err := parseDatabaseURL(dsn); err == nil {
 			values = append(values, parsed.password)
 		}
 	}

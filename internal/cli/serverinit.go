@@ -54,8 +54,8 @@ func (a *app) serverSpecs() []spec {
 	meta.Summary = "Set up a fresh server as the main node (control plane)"
 	meta.WhenToUse = []string{"Run it bare in a terminal for the guided setup. Agents pass every answer, a host key decision, --secrets-out and --confirm <server>; JSON and no-TTY use never prompt."}
 	meta.Mutating, meta.DryRun, meta.Prompts, meta.Remote = true, true, true, true
-	meta.InputFlags = []string{"host", "identity", "password-stdin", "node", "workspace-name", "hostname", "database-url-file", "admin-user", "answers", "host-key-fingerprint", "accept-new-host-key", "secrets-out", "confirm", "skip-doctor"}
-	meta.Environment = []string{"EREGION_DATABASE_URL", "EREGION_WORKSPACE_FILE"}
+	meta.InputFlags = []string{"host", "identity", "password-stdin", "node", "workspace-name", "hostname", "database-url-file", "migration-database-url-file", "admin-user", "answers", "host-key-fingerprint", "accept-new-host-key", "secrets-out", "confirm", "skip-doctor"}
+	meta.Environment = []string{"EREGION_DATABASE_URL", "EREGION_MIGRATION_DATABASE_URL", "EREGION_WORKSPACE_FILE"}
 	meta.NeedsRestart = "never"
 	meta.ErrorCodes = append(meta.ErrorCodes, contract.ValidationFailed, contract.PreconditionFailed, contract.DoctorFailed, contract.ConfirmationRequired, contract.MissingTool, contract.RemoteUnreachable, contract.NotFound)
 	return []spec{{
@@ -73,7 +73,8 @@ func (a *app) serverSpecs() []spec {
 				f.String("node", "", "Main node name (default main)")
 				f.String("workspace-name", "", "Portable workspace name (e.g. thelab); separate from the node name")
 				f.String("hostname", "", "Public hostname of the main node, used exactly as given (e.g. app.example.com)")
-				f.String("database-url-file", "", "External PostgreSQL URL file; otherwise EREGION_DATABASE_URL")
+				f.String("database-url-file", "", "PostgreSQL runtime URL file (also used for migrations by default); otherwise EREGION_DATABASE_URL")
+				f.String("migration-database-url-file", "", "Optional separate PostgreSQL migration URL file; otherwise EREGION_MIGRATION_DATABASE_URL")
 				f.String("admin-user", "admin", "Unprivileged operator account on the server")
 				f.String("answers", "", "TOML file with the answers; flags override it")
 				f.String("host-key-fingerprint", "", "Expected SHA256 host key fingerprint")
@@ -92,20 +93,25 @@ func (a *app) serverSpecs() []spec {
 }
 
 // serverInitAnswers are the answers from the answers file, flags and prompts.
-// DatabaseURL is loaded from the protected file and never persisted.
+// DatabaseURL and MigrationDatabaseURL are loaded from protected files or the
+// environment and never persisted; only the file paths and the choice between
+// shared and split roles are saved.
 type serverInitAnswers struct {
-	Host            string
-	User            string
-	Port            string
-	Identity        string
-	PasswordStdin   bool
-	Node            string
-	Workspace       string
-	Hostname        string
-	DatabaseURLFile string
-	DatabaseURL     string
-	AccessKey       string
-	AdminUser       string
+	Host                     string
+	User                     string
+	Port                     string
+	Identity                 string
+	PasswordStdin            bool
+	Node                     string
+	Workspace                string
+	Hostname                 string
+	DatabaseURLFile          string
+	DatabaseURL              string
+	MigrationDatabaseURLFile string
+	MigrationDatabaseURL     string
+	SplitDatabaseRoles       bool
+	AccessKey                string
+	AdminUser                string
 }
 
 type serverInitSummary struct {
@@ -624,6 +630,13 @@ func (r *serverInit) prepareResume() error {
 	if v := flagString(r.cmd, "identity"); v != "" {
 		r.answers.Identity = v
 	}
+	if v := flagString(r.cmd, "database-url-file"); v != "" {
+		r.answers.DatabaseURLFile = v
+	}
+	if v := flagString(r.cmd, "migration-database-url-file"); v != "" {
+		r.answers.MigrationDatabaseURLFile = v
+		r.answers.SplitDatabaseRoles = true
+	}
 	r.answers.PasswordStdin = boolFlag(r.cmd, "password-stdin")
 	if err := r.loadDatabaseURL(); err != nil {
 		return err
@@ -732,7 +745,8 @@ func answersFromPending(p *host.PendingInit) serverInitAnswers {
 	return serverInitAnswers{
 		Host: p.Host, User: p.User, Port: strconv.Itoa(port), Identity: p.Identity,
 		Node: p.Node, Workspace: p.Workspace, AccessKey: p.AccessKey, Hostname: p.Hostname,
-		DatabaseURLFile: p.DatabaseURLFile, AdminUser: p.AdminUser,
+		DatabaseURLFile: p.DatabaseURLFile, MigrationDatabaseURLFile: p.MigrationDatabaseURLFile,
+		SplitDatabaseRoles: p.SplitDatabaseRoles, AdminUser: p.AdminUser,
 	}
 }
 
@@ -817,6 +831,7 @@ func applyAnswerFlags(cmd *cobra.Command, ans *serverInitAnswers, given map[stri
 	take("workspace_name", "workspace-name", &ans.Workspace)
 	take("hostname", "hostname", &ans.Hostname)
 	take("database_url_file", "database-url-file", &ans.DatabaseURLFile)
+	take("migration_database_url_file", "migration-database-url-file", &ans.MigrationDatabaseURLFile)
 	take("admin_user", "admin-user", &ans.AdminUser)
 	ans.PasswordStdin = boolFlag(cmd, "password-stdin")
 }
@@ -860,12 +875,18 @@ func (r *serverInit) completeHostname(ans *serverInitAnswers, given map[string]b
 
 func (r *serverInit) completeDatabaseURL(ans *serverInitAnswers, given map[string]bool) error {
 	if given["database_url_file"] && ans.DatabaseURLFile != "" {
-		return r.loadDatabaseURLFile(ans)
+		if err := r.loadDatabaseURLFile(ans); err != nil {
+			return err
+		}
+	} else {
+		if err := r.chooseDatabaseURL(ans); err != nil {
+			return err
+		}
+		if err := r.loadDatabaseURLFile(ans); err != nil {
+			return err
+		}
 	}
-	if err := r.chooseDatabaseURL(ans); err != nil {
-		return err
-	}
-	return r.loadDatabaseURLFile(ans)
+	return r.completeMigrationDatabaseURL(ans, given)
 }
 
 func (r *serverInit) chooseDatabaseURL(ans *serverInitAnswers) error {
@@ -876,7 +897,7 @@ func (r *serverInit) chooseDatabaseURL(ans *serverInitAnswers) error {
 	if !r.interactive {
 		return contract.NewFault(contract.InputRequired, "the control plane needs an external PostgreSQL URL", "Pass --database-url-file with an owner-only file.")
 	}
-	v, err := ui.Secret("External PostgreSQL URL (postgres://user:password@host:5432/db)")
+	v, err := ui.Secret("PostgreSQL runtime URL (postgres://user:password@host:5432/db)")
 	if err != nil {
 		return err
 	}
@@ -893,6 +914,50 @@ func (r *serverInit) loadDatabaseURLFile(ans *serverInitAnswers) error {
 		return contract.NewFault(contract.ValidationFailed, "could not read the database URL file", err.Error())
 	}
 	ans.DatabaseURL = strings.TrimSpace(string(raw))
+	return nil
+}
+
+// completeMigrationDatabaseURL asks whether migrations use a second role. The
+// default shares the runtime URL; a separate role is optional.
+func (r *serverInit) completeMigrationDatabaseURL(ans *serverInitAnswers, given map[string]bool) error {
+	if given["migration_database_url_file"] && ans.MigrationDatabaseURLFile != "" {
+		ans.SplitDatabaseRoles = true
+		return r.loadMigrationDatabaseURLFile(ans)
+	}
+	if env := strings.TrimSpace(os.Getenv("EREGION_MIGRATION_DATABASE_URL")); env != "" {
+		ans.SplitDatabaseRoles = true
+		ans.MigrationDatabaseURL = env
+		return nil
+	}
+	if !r.interactive {
+		return nil
+	}
+	separate, err := ui.YesNoDefault("Use a separate PostgreSQL URL for migrations?",
+		"The default uses one URL. Select yes to use a different user for schema changes in the same database. Use direct or session-pooled endpoints.", false)
+	if err != nil || !separate {
+		return err
+	}
+	ans.SplitDatabaseRoles = true
+	v, err := ui.Secret("Migration PostgreSQL URL (postgres://migration-user:password@host:5432/db)")
+	if err != nil {
+		return err
+	}
+	ans.MigrationDatabaseURL = v
+	return nil
+}
+
+func (r *serverInit) loadMigrationDatabaseURLFile(ans *serverInitAnswers) error {
+	if ans.MigrationDatabaseURL != "" || ans.MigrationDatabaseURLFile == "" {
+		return nil
+	}
+	raw, err := host.ReadPrivateInput(expandHome(ans.MigrationDatabaseURLFile))
+	if err != nil {
+		return contract.NewFault(contract.ValidationFailed, "could not read the migration database URL file", err.Error())
+	}
+	ans.MigrationDatabaseURL = strings.TrimSpace(string(raw))
+	if ans.MigrationDatabaseURL == "" {
+		return contract.NewFault(contract.InputRequired, "the migration database URL file is empty", "Provide a PostgreSQL migration URL, or omit the separate migration URL to share the runtime URL.")
+	}
 	return nil
 }
 
@@ -980,10 +1045,13 @@ func (r *serverInit) validate() error {
 	if ans.DatabaseURL == "" {
 		return contract.NewFault(contract.InputRequired, "the control plane needs an external PostgreSQL URL", "Pass --database-url-file with an owner-only file.")
 	}
+	if r.needsMigrationURL() {
+		return contract.NewFault(contract.InputRequired, "migrations need the separate PostgreSQL URL", "Pass --migration-database-url-file with an owner-only file, set EREGION_MIGRATION_DATABASE_URL, or choose the shared URL at the prompt.")
+	}
 	if err := checkIdentity(ans.Identity); err != nil {
 		return err
 	}
-	r.a.secrets.Add(ans.DatabaseURL)
+	r.a.secrets.Add(ans.DatabaseURL, ans.MigrationDatabaseURL)
 	return nil
 }
 
@@ -1261,6 +1329,8 @@ func (r *serverInit) resolveNodeBinary(ctx context.Context) error {
 func (r *serverInit) hostConfig() (host.Config, error) {
 	cfg := host.DefaultConfig(host.RoleMain, r.answers.Node)
 	cfg.DatabaseURL = r.answers.DatabaseURL
+	cfg.MigrationDatabaseURL = r.answers.MigrationDatabaseURL
+	cfg.SplitDatabaseRoles = r.answers.SplitDatabaseRoles
 	cfg.Workspace = r.answers.Workspace
 	cfg.Hostname = r.answers.Hostname
 	cfg.AdminUser = r.answers.AdminUser
@@ -1279,6 +1349,11 @@ func (r *serverInit) applyHost(ctx context.Context) error {
 	}
 	report, err := r.apply(ctx, r.session, r.hostPlan)
 	if err != nil {
+		// A split-role apply carries the migration credential in the uploaded
+		// bundle. Do not leave it on the host; a fresh resume uploads again.
+		if r.answers.SplitDatabaseRoles {
+			r.removeSession(ctx)
+		}
 		return withResumeHint(err, r.answers.AccessKey)
 	}
 	r.removeSession(ctx)
@@ -1360,25 +1435,49 @@ func (r *serverInit) readVaultKeyring(ctx context.Context) error {
 	return nil
 }
 
-// loadDatabaseURL reads the DSN again on a resume. It is never stored in the
-// pending state, only the protected file path is; a URL typed at the prompt
-// is asked for again.
+func (r *serverInit) needsMigrationURL() bool {
+	return r.answers.SplitDatabaseRoles && r.answers.MigrationDatabaseURL == "" &&
+		(r.pending == nil || !r.pending.Done(phaseHost))
+}
+
+// loadDatabaseURL reloads URLs on resume. Only protected file paths and the
+// shared/split choice are persisted; typed URLs are asked for again as needed.
 func (r *serverInit) loadDatabaseURL() error {
 	if r.answers.DatabaseURLFile != "" {
-		raw, err := host.ReadPrivateInput(expandHome(r.answers.DatabaseURLFile))
-		if err != nil {
-			return contract.NewFault(contract.ValidationFailed, "could not read the database URL file", err.Error())
+		if err := r.loadDatabaseURLFile(&r.answers); err != nil {
+			return err
 		}
-		r.answers.DatabaseURL = strings.TrimSpace(string(raw))
+	} else {
+		if err := r.chooseDatabaseURL(&r.answers); err != nil {
+			return err
+		}
+	}
+	if r.pending.Done(phaseHost) {
 		return nil
 	}
-	r.answers.DatabaseURL = strings.TrimSpace(os.Getenv("EREGION_DATABASE_URL"))
-	if r.answers.DatabaseURL == "" && r.interactive {
-		v, err := ui.Secret("External PostgreSQL URL (postgres://user:password@host:5432/db)")
+	return r.loadMigrationDatabaseURL()
+}
+
+func (r *serverInit) loadMigrationDatabaseURL() error {
+	if r.answers.MigrationDatabaseURLFile != "" {
+		r.answers.SplitDatabaseRoles = true
+		return r.loadMigrationDatabaseURLFile(&r.answers)
+	}
+	if env := strings.TrimSpace(os.Getenv("EREGION_MIGRATION_DATABASE_URL")); env != "" {
+		r.answers.SplitDatabaseRoles = true
+		r.answers.MigrationDatabaseURL = env
+		return nil
+	}
+	if !r.answers.SplitDatabaseRoles {
+		r.answers.MigrationDatabaseURL = ""
+		return nil
+	}
+	if r.interactive {
+		v, err := ui.Secret("Migration PostgreSQL URL (postgres://migration-user:password@host:5432/db)")
 		if err != nil {
 			return err
 		}
-		r.answers.DatabaseURL = v
+		r.answers.MigrationDatabaseURL = v
 	}
 	return nil
 }
@@ -1475,7 +1574,8 @@ func (r *serverInit) savePending() error {
 		p.WorkspaceID = r.workspace.ID
 	}
 	p.Node, p.Workspace, p.Hostname = r.answers.Node, workspace, r.answers.Hostname
-	p.DatabaseURLFile, p.AdminUser = r.answers.DatabaseURLFile, r.answers.AdminUser
+	p.DatabaseURLFile, p.MigrationDatabaseURLFile = r.answers.DatabaseURLFile, r.answers.MigrationDatabaseURLFile
+	p.SplitDatabaseRoles, p.AdminUser = r.answers.SplitDatabaseRoles, r.answers.AdminUser
 	if r.hostKey != "" {
 		p.HostKey = r.hostKey
 		if _, fingerprint, ok := strings.Cut(r.hostKey, " "); ok {
@@ -1731,12 +1831,11 @@ func (r *serverInit) showPlan(plan host.Plan) {
 	fmt.Fprintf(&b, "hostname      %s\n", r.answers.Hostname)
 	fmt.Fprintf(&b, "admin user    %s\n", r.answers.AdminUser)
 	fmt.Fprintf(&b, "node binary   %s\n", r.binaryPath)
-	if r.answers.DatabaseURLFile != "" {
-		fmt.Fprintf(&b, "database      external PostgreSQL from %s\n", r.answers.DatabaseURLFile)
-	} else if os.Getenv("EREGION_DATABASE_URL") != "" {
-		b.WriteString("database      external PostgreSQL from EREGION_DATABASE_URL\n")
+	fmt.Fprintf(&b, "database      external PostgreSQL from %s\n", databaseInputSource(r.answers.DatabaseURLFile, "EREGION_DATABASE_URL"))
+	if r.answers.SplitDatabaseRoles {
+		fmt.Fprintf(&b, "migrations    separate PostgreSQL role from %s\n", databaseInputSource(r.answers.MigrationDatabaseURLFile, "EREGION_MIGRATION_DATABASE_URL"))
 	} else {
-		b.WriteString("database      external PostgreSQL entered at the prompt\n")
+		b.WriteString("migrations    same URL as the database\n")
 	}
 	b.WriteString("\n")
 	for _, step := range r.planRows(plan) {
@@ -1756,6 +1855,16 @@ func (r *serverInit) showPlan(plan host.Plan) {
 		return
 	}
 	r.live.Println(ui.PanelFit(title, body, r.live.Width()))
+}
+
+func databaseInputSource(file, env string) string {
+	if file != "" {
+		return file
+	}
+	if os.Getenv(env) != "" {
+		return env
+	}
+	return "the prompt"
 }
 
 // runDoctorGate is MASTER 6.1's final init gate. It runs after the

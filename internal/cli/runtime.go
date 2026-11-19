@@ -99,6 +99,7 @@ func (a *app) nodeSpecs() []spec {
 func (a *app) nodeServiceSpecs() []spec {
 	migrateMeta := serverMeta("Apply explicit PostgreSQL and River migrations", "eregion node migrate --dry-run --json", "")
 	migrateMeta.DryRun = true
+	migrateMeta.InputFlags = []string{"migration-database-url-file"}
 	serveMeta := serverMeta("Run the authenticated control-plane API", "eregion node serve --listen 127.0.0.1:8080", "A running API/worker service has no static mutation preview; use node migrate --dry-run to inspect schema changes.")
 	serveMeta.Environment = append(serveMeta.Environment, "EREGION_AUTH_FILE")
 	serveMeta.Environment = append(serveMeta.Environment, "EREGION_REGISTRY_LISTEN")
@@ -123,6 +124,7 @@ func (a *app) nodeServiceSpecs() []spec {
 		}, run: a.worker},
 		{use: "migrate", meta: migrateMeta, flags: func(cmd *cobra.Command) {
 			cmd.Flags().Bool("dry-run", false, "Inspect pending schema versions without applying DDL")
+			cmd.Flags().String("migration-database-url-file", "", "Owner-only PostgreSQL migration URL file for separate roles")
 		}, run: a.migrate},
 	}
 }
@@ -198,10 +200,13 @@ func (a *app) client(cmd *cobra.Command) (Backend, error) {
 }
 
 func (a *app) database(ctx context.Context) (*pgxpool.Pool, error) {
+	return a.openDatabase(ctx, os.Getenv("EREGION_DATABASE_URL"))
+}
+
+func (a *app) openDatabase(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 	if runtime.GOOS != "linux" {
 		return nil, contract.NewFault(contract.ValidationFailed, "control-plane commands require Linux", "Use the portable operations client to reach a Linux control plane.")
 	}
-	dsn := os.Getenv("EREGION_DATABASE_URL")
 	if dsn == "" {
 		return nil, contract.NewFault(contract.InputRequired, "EREGION_DATABASE_URL is required", "Supply the external PostgreSQL URL through the environment, not command arguments.")
 	}
@@ -219,7 +224,17 @@ func (a *app) database(ctx context.Context) (*pgxpool.Pool, error) {
 func (a *app) migrate(cmd *cobra.Command, _ []string) (result, error) {
 	ctx, cancel := context.WithTimeout(cmd.Context(), time.Minute)
 	defer cancel()
-	pool, err := a.database(ctx)
+	dsn := os.Getenv("EREGION_DATABASE_URL")
+	if path, _ := cmd.Flags().GetString("migration-database-url-file"); path != "" {
+		raw, err := host.ReadPrivateInput(path)
+		if err != nil {
+			return result{}, err
+		}
+		dsn = strings.TrimSpace(string(raw))
+	} else if cfg, err := host.LoadIntent(host.DefaultLayout()); err == nil && cfg.SplitDatabaseRoles {
+		return result{}, contract.NewFault(contract.InputRequired, "this node uses separate PostgreSQL roles", "Supply the migration credential with --migration-database-url-file.")
+	}
+	pool, err := a.openDatabase(ctx, dsn)
 	if err != nil {
 		return result{}, err
 	}

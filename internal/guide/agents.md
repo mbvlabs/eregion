@@ -226,9 +226,27 @@ eregion server init --host root@203.0.113.10 --hostname app.example.com \
   --confirm lab --json
 ```
 
+By default the runtime and migrations use the same PostgreSQL URL. Pass
+`--migration-database-url-file /protected/migration-database-url` (or set
+`EREGION_MIGRATION_DATABASE_URL`) only when migrations use a distinct role; both
+URLs must reach the same database and installation schema. Use direct or
+session-pooled endpoints for both; transaction pooling is not supported.
+The runtime role needs schema usage and read/write access to Eregion and River
+tables and sequences, including objects created by future migrations. Eregion
+does not create roles or change your provider's grants.
+
+Later host applies use only the runtime URL. Apply pending schema changes with
+the target version of Eregion on the node, then run the normal apply:
+
+```sh
+sudo eregion node migrate --migration-database-url-file /protected/migration-database-url
+eregion apply
+```
+
 An interrupted init is resumed with `--resume --workspace-name <workspace>` and a
 first-contact credential; `--discard --workspace-name <workspace>` drops only the local
-state. `eregion login` imports the transfer bundle from the handoff into private
+state. Only protected file paths and the shared/split choice are saved in the
+unfinished init, so a URL entered at the prompt must be supplied again on resume. `eregion login` imports the transfer bundle from the handoff into private
 workspace access. Use `--file` and `--passphrase-file` when no terminal is available.
 `eregion workspace list|show|use` inspects and selects workspaces without printing
 credentials; `workspace remove <name-or-id> --confirm <name-or-id>` deletes local access and its owned key

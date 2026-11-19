@@ -1,6 +1,9 @@
 -- name: DatabaseVersion :one
 SELECT current_setting('server_version_num')::integer AS version;
 
+-- name: TryDatabaseIdentityLock :one
+SELECT pg_try_advisory_xact_lock(sqlc.arg(lock_key)::bigint);
+
 -- name: DatabaseIdentity :one
 SELECT cardinality(current_schemas(false))::integer AS schema_count,
        coalesce(current_schema(), '')::text AS schema_name,
@@ -8,6 +11,7 @@ SELECT cardinality(current_schemas(false))::integer AS schema_count,
 
 -- name: DatabaseFacts :one
 SELECT current_user::text AS role_name, current_database()::text AS database_name,
+       coalesce(current_schema(), '')::text AS schema_name,
        current_setting('server_version_num')::integer AS server_version,
        has_database_privilege(current_user, current_database(), 'CREATE')::boolean AS can_create_database,
        coalesce(has_schema_privilege(current_user, current_schema(), 'CREATE'), false)::boolean AS can_create_schema;

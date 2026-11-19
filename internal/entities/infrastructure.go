@@ -2,10 +2,15 @@ package entities
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"database/sql"
+	"encoding/binary"
 	"encoding/json"
+	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/entities/internal/infrastructurequery"
 	"github.com/mbvlabs/eregion/internal/entities/internal/query"
 )
@@ -19,12 +24,41 @@ type DatabaseIdentity struct {
 }
 
 type DatabaseFacts struct {
-	User, Database                     string
+	User, Database, Schema             string
 	ServerVersion                      int
 	TLS                                bool
 	CanCreateDatabase, CanCreateSchema bool
 }
 
+// SameDatabase tests whether two endpoints share a database's advisory lock
+// namespace, without relying on matching hostnames or privileged catalog reads.
+func SameDatabase(ctx context.Context, first, second *pgxpool.Pool) (bool, error) {
+	a, err := first.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer rollbackDatabaseIdentityProbe(ctx, a)
+	b, err := second.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer rollbackDatabaseIdentityProbe(ctx, b)
+	var raw [8]byte
+	rand.Read(raw[:])
+	lockKey := int64(binary.LittleEndian.Uint64(raw[:])) //nolint:gosec // All signed lock keys are valid.
+	locked, err := query.New(a).TryDatabaseIdentityLock(ctx, lockKey)
+	if err != nil || !locked {
+		return false, err
+	}
+	other, err := query.New(b).TryDatabaseIdentityLock(ctx, lockKey)
+	return !other, err
+}
+
+func rollbackDatabaseIdentityProbe(ctx context.Context, tx pgx.Tx) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	_ = tx.Rollback(ctx)
+}
 func (s *Store) DatabaseVersion(ctx context.Context) (int, error) {
 	version, err := query.New(s.pool).DatabaseVersion(ctx)
 	return int(version), err
@@ -41,7 +75,7 @@ func (s *Store) DatabaseFacts(ctx context.Context) (DatabaseFacts, error) {
 	// pooler terminates TLS.
 	wire, _ := conn.Conn().PgConn().Conn().(*tls.Conn)
 	return DatabaseFacts{
-		User: row.RoleName, Database: row.DatabaseName, ServerVersion: int(row.ServerVersion),
+		User: row.RoleName, Database: row.DatabaseName, Schema: row.SchemaName, ServerVersion: int(row.ServerVersion),
 		TLS:               wire != nil && wire.ConnectionState().HandshakeComplete,
 		CanCreateDatabase: row.CanCreateDatabase, CanCreateSchema: row.CanCreateSchema,
 	}, err

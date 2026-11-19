@@ -104,6 +104,9 @@ type Config struct {
 	// DatabaseURL is the external PostgreSQL DSN for the main role. It is
 	// loaded from a private file or EREGION_DATABASE_URL, never a flag.
 	DatabaseURL string `json:"-"`
+	// MigrationDatabaseURL is supplied only to privileged bootstrap, never to services.
+	MigrationDatabaseURL string `json:"-"`
+	SplitDatabaseRoles   bool   `json:"split_database_roles,omitempty"`
 
 	APIListen         string `json:"api_listen"`
 	APITLSCert        string `json:"api_tls_cert,omitempty"`
@@ -270,6 +273,10 @@ func (c Config) validateControlPlane() error {
 	return nil
 }
 
+func (c Config) usesSplitDatabaseRoles() bool {
+	return c.SplitDatabaseRoles || c.MigrationDatabaseURL != ""
+}
+
 func (c Config) validateControlPlaneIdentity() error {
 	if c.Hostname != "" {
 		if err := ValidateHostname(c.Hostname); err != nil {
@@ -404,6 +411,10 @@ func (c Config) ConfigHash() (string, error) {
 	if c.DatabaseURL != "" {
 		hash.Write([]byte{0})
 		hash.Write([]byte(engine.HashSecret(c.DatabaseURL)))
+	}
+	if c.MigrationDatabaseURL != "" {
+		hash.Write([]byte{0})
+		hash.Write([]byte(engine.HashSecret(c.MigrationDatabaseURL)))
 	}
 	return hex.EncodeToString(hash.Sum(nil)), nil
 }

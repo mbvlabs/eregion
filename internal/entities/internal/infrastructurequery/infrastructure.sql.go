@@ -41,6 +41,7 @@ func (q *Queries) ApplicationMigrationCatalog(ctx context.Context) (ApplicationM
 
 const databaseFacts = `-- name: DatabaseFacts :one
 SELECT current_user::text AS role_name, current_database()::text AS database_name,
+       coalesce(current_schema(), '')::text AS schema_name,
        current_setting('server_version_num')::integer AS server_version,
        has_database_privilege(current_user, current_database(), 'CREATE')::boolean AS can_create_database,
        coalesce(has_schema_privilege(current_user, current_schema(), 'CREATE'), false)::boolean AS can_create_schema
@@ -49,6 +50,7 @@ SELECT current_user::text AS role_name, current_database()::text AS database_nam
 type DatabaseFactsRow struct {
 	RoleName          string
 	DatabaseName      string
+	SchemaName        string
 	ServerVersion     int64
 	CanCreateDatabase bool
 	CanCreateSchema   bool
@@ -60,6 +62,7 @@ func (q *Queries) DatabaseFacts(ctx context.Context) (DatabaseFactsRow, error) {
 	err := row.Scan(
 		&i.RoleName,
 		&i.DatabaseName,
+		&i.SchemaName,
 		&i.ServerVersion,
 		&i.CanCreateDatabase,
 		&i.CanCreateSchema,
@@ -95,6 +98,17 @@ func (q *Queries) DatabaseVersion(ctx context.Context) (int64, error) {
 	var version int64
 	err := row.Scan(&version)
 	return version, err
+}
+
+const tryDatabaseIdentityLock = `-- name: TryDatabaseIdentityLock :one
+SELECT pg_try_advisory_xact_lock($1::bigint)
+`
+
+func (q *Queries) TryDatabaseIdentityLock(ctx context.Context, lockKey int64) (bool, error) {
+	row := q.db.QueryRowContext(ctx, tryDatabaseIdentityLock, lockKey)
+	var pg_try_advisory_xact_lock bool
+	err := row.Scan(&pg_try_advisory_xact_lock)
+	return pg_try_advisory_xact_lock, err
 }
 
 const unexpectedMigrationObjects = `-- name: UnexpectedMigrationObjects :one

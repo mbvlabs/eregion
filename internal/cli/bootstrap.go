@@ -31,7 +31,7 @@ func (a *app) bootstrapSpecs() []spec {
 		[]string{"eregion node bootstrap plan --role main --node main --database-url-file /root/eregion-db.url --json", "eregion node bootstrap remote --ssh-address root@203.0.113.10:22 --ssh-identity /root/eregion-bootstrap --ssh-known-hosts /root/known_hosts --role main --database-url-file /root/eregion-db.url --apply --json"})
 	parentMeta.Audience = []string{"node"}
 	parentMeta.Platforms = []string{"linux"}
-	parentMeta.Environment = []string{"EREGION_DATABASE_URL"}
+	parentMeta.Environment = []string{"EREGION_DATABASE_URL", "EREGION_MIGRATION_DATABASE_URL"}
 	parentMeta.ErrorCodes = append(parentMeta.ErrorCodes, contract.ValidationFailed, contract.PreconditionFailed, contract.ConfirmationRequired, contract.Forbidden, contract.NotFound)
 	parentMeta.Prompts = false
 
@@ -187,6 +187,7 @@ func bootstrapInputFlags(cmd *cobra.Command) {
 	f.String("node", "main", "Node name; the host step writes it as EREGION_NODE_NAME")
 	f.String("workspace-name", "", "Portable workspace name to assign on the main node")
 	f.String("database-url-file", "", "Owner-only external PostgreSQL URL file; otherwise EREGION_DATABASE_URL")
+	f.String("migration-database-url-file", "", "Owner-only PostgreSQL migration URL file for separate roles")
 	f.String("binary", "", "eregion binary to install on the host; defaults to this executable")
 	f.String("api-listen", "127.0.0.1:8080", "API listener; non-loopback apply is access-changing")
 	f.String("api-tls-cert", "", "TLS certificate source")
@@ -211,6 +212,18 @@ func (a *app) bootstrapConfig(cmd *cobra.Command) (host.Config, error) {
 		cfg.DatabaseURL = strings.TrimSpace(string(raw))
 	}
 	a.secrets.Add(cfg.DatabaseURL)
+	cfg.MigrationDatabaseURL = strings.TrimSpace(os.Getenv("EREGION_MIGRATION_DATABASE_URL"))
+	if path := get("migration-database-url-file"); path != "" {
+		raw, err := host.ReadPrivateInput(path)
+		if err != nil {
+			return cfg, err
+		}
+		cfg.MigrationDatabaseURL = strings.TrimSpace(string(raw))
+		if cfg.MigrationDatabaseURL == "" {
+			return cfg, contract.NewFault(contract.InputRequired, "the migration URL file is empty", "Provide a PostgreSQL migration URL or omit the migration URL file for shared credentials.")
+		}
+	}
+	a.secrets.Add(cfg.MigrationDatabaseURL)
 	cfg.BinaryPath = get("binary")
 	cfg.APIListen, cfg.APITLSCert, cfg.APITLSKey = get("api-listen"), get("api-tls-cert"), get("api-tls-key")
 	cfg.NodeAuthorizedKeysFile = get("node-authorized-keys-file")
@@ -252,6 +265,7 @@ func (a *app) bootstrapRemote(cmd *cobra.Command, _ []string) (result, error) {
 		return result{}, err
 	}
 	defer session.Close()
+	defer cleanupRemoteMigrationURL(cmd, session, cfg)
 	plan, err := remotePlan(cmd.Context(), session)
 	if err != nil {
 		return result{}, err
@@ -362,6 +376,11 @@ func newRemoteSession(ctx context.Context, remote *host.Remote, cfg host.Config,
 		return nil, err
 	}
 	if err := remote.Upload(ctx, dir, files); err != nil {
+		if cfg.MigrationDatabaseURL != "" {
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+			defer cancel()
+			_ = remote.Remove(cleanupCtx, filepath.Join(dir, "migration-database-url"))
+		}
 		return nil, contract.NewFault(contract.Unavailable, "could not upload the bootstrap bundle", err.Error())
 	}
 	return &remoteSession{remote: remote, dir: dir, args: args}, nil
@@ -376,6 +395,17 @@ func (s *remoteSession) Close() {}
 // Remove is the explicit cleanup after a fully successful remote action.
 func (s *remoteSession) Remove(ctx context.Context) error {
 	return s.remote.Remove(ctx, s.dir)
+}
+
+func cleanupRemoteMigrationURL(cmd *cobra.Command, session *remoteSession, cfg host.Config) {
+	if cfg.MigrationDatabaseURL == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(cmd.Context()), 30*time.Second)
+	defer cancel()
+	if err := session.remote.Remove(ctx, filepath.Join(session.dir, "migration-database-url")); err != nil {
+		_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "bootstrap: could not remove the temporary migration URL file from the remote bundle")
+	}
 }
 
 func (s *remoteSession) run(ctx context.Context, action string, extra []string, stderr io.Writer) ([]byte, error) {
@@ -433,6 +463,10 @@ func remoteBundle(cfg host.Config, dir string) ([]host.RemoteFile, []string, err
 	if cfg.DatabaseURL != "" {
 		files = append(files, host.RemoteFile{Name: "database-url", Data: []byte(cfg.DatabaseURL + "\n"), Mode: 0o600})
 		args = append(args, "--database-url-file", filepath.Join(dir, "database-url"))
+	}
+	if cfg.MigrationDatabaseURL != "" {
+		files = append(files, host.RemoteFile{Name: "migration-database-url", Data: []byte(cfg.MigrationDatabaseURL + "\n"), Mode: 0o600})
+		args = append(args, "--migration-database-url-file", filepath.Join(dir, "migration-database-url"))
 	}
 	uploadPair := func(name, source string) error {
 		raw, err := os.ReadFile(source)
@@ -523,6 +557,7 @@ func (a *app) bootstrapRemoteConfirm(cmd *cobra.Command, id string) (result, err
 		return result{}, err
 	}
 	defer session.Close()
+	defer cleanupRemoteMigrationURL(cmd, session, cfg)
 	raw, err := session.run(cmd.Context(), "confirm", []string{id}, cmd.ErrOrStderr())
 	if err != nil {
 		return result{}, err

@@ -2,6 +2,7 @@ package controlplane
 
 import (
 	"database/sql"
+	"net/url"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -10,6 +11,34 @@ import (
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/entities"
 )
+
+func TestIntegrationDatabaseIdentityAcrossPools(t *testing.T) {
+	pool, dsn := testPool(t, false)
+	other, _ := testPool(t, false)
+	ctx := migrationContext(t)
+
+	alias, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatal("test database URL is invalid")
+	}
+	q := alias.Query()
+	q.Set("application_name", "alternate_endpoint")
+	alias.RawQuery = q.Encode()
+	alternate, err := Open(ctx, alias.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(alternate.Close)
+
+	same, err := entities.SameDatabase(ctx, pool, alternate)
+	if err != nil || !same {
+		t.Fatalf("same database: match=%v error=%v", same, err)
+	}
+	same, err = entities.SameDatabase(ctx, pool, other)
+	if err != nil || same {
+		t.Fatalf("different database: match=%v error=%v", same, err)
+	}
+}
 
 func TestIntegrationEntitiesInfrastructureInstallationSchemaPrivileges(t *testing.T) {
 	pool, _ := testPool(t, false)

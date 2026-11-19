@@ -35,6 +35,8 @@ func intentInputsDir(layout Layout) string {
 func saveIntent(cfg Config) error {
 	stored := cfg
 	stored.DatabaseURL = ""
+	stored.MigrationDatabaseURL = ""
+	stored.SplitDatabaseRoles = cfg.usesSplitDatabaseRoles()
 	if installed := filepath.Join(cfg.Layout.BinDir, "eregion"); fileExists(installed) {
 		stored.BinaryPath = installed
 	}
