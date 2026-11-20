@@ -1031,6 +1031,9 @@ func (s *Service) finishPlatformOperation(
 		if op.State.Terminal() {
 			return nil
 		}
+		if op.Kind == platform.KindBuildStop && op.State == contract.Cancelling {
+			return errPlatformCancelled
+		}
 		if err := apply(tx, op); err != nil {
 			return err
 		}
@@ -1095,6 +1098,9 @@ func (s *Service) failPlatformOperationTx(
 	message = s.resultText(message)
 	if op.State.Terminal() {
 		return nil
+	}
+	if op.Kind == platform.KindBuildStop && op.State == contract.Cancelling {
+		return errPlatformCancelled
 	}
 	if err := guardDefinitionDNSTerminalTx(ctx, tx, op); err != nil {
 		return err
@@ -1189,7 +1195,7 @@ func (s *Service) cancelPlatform(
 	message string,
 ) error {
 	message = s.resultText(message)
-	var retry *contract.Operation
+	var retry, stop *contract.Operation
 	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
 		if op.State.Terminal() {
 			return nil
@@ -1197,6 +1203,11 @@ func (s *Service) cancelPlatform(
 		if op.Kind == platform.KindBuildRetry {
 			snapshot := *op
 			retry = &snapshot
+			return nil
+		}
+		if op.Kind == platform.KindBuildStop {
+			snapshot := *op
+			stop = &snapshot
 			return nil
 		}
 		return s.cancelPlatformTx(ctx, tx, op, id, message)
@@ -1212,6 +1223,9 @@ func (s *Service) cancelPlatform(
 			return unknownRetryPack()
 		}
 		return s.reconcileBuildRetry(ctx, *retry)
+	}
+	if stop != nil {
+		return s.cancelRecoveredBuildStop(ctx, id, attempt)
 	}
 	return nil
 }
@@ -2085,6 +2099,10 @@ func (w *platformWorker) runStepOnWithBuild( //nolint:gocognit,gocyclo // The ef
 	buildID platform.BuildID, releaseID platform.ReleaseID,
 	stopDispatch *buildStopDispatch,
 ) (json.RawMessage, error) {
+	if (strings.HasPrefix(stepID, "platform-build-stop-") && (stepID != deploymentBuildStopStep || stopDispatch == nil)) ||
+		(stopDispatch != nil && stepID != deploymentBuildStopStep) {
+		return nil, contract.NewFault(contract.PreconditionFailed, "build stop dispatch requires its pinned admission", "Use the build stop execution path.")
+	}
 	if platform.IsPackStep(stepID) && (buildNode == "" || buildIdentity == "" || buildID == "" || releaseID == "" || stepID != deploymentPackStep) {
 		return nil, contract.NewFault(contract.PreconditionFailed, "build dispatch has no pinned capacity admission", "Use the build execution path with its original builder.")
 	}
@@ -2228,11 +2246,11 @@ func (s *Service) reconcilePlatformOperation(ctx context.Context, op contract.Op
 		return s.reconcileDeployment(ctx, op)
 	}
 	if op.Kind == platform.KindBuildStop {
+		if op.State == contract.Cancelling {
+			return s.cancelRecoveredBuildStop(ctx, op.ID, op.Attempt)
+		}
 		if err := s.recoverBuildStopEffect(ctx, op); err != nil {
 			return err
-		}
-		if op.State == contract.Cancelling {
-			return s.settleReconciledBuildStop(ctx, op, true, "")
 		}
 	}
 	if op.Kind == platform.KindBuildRetry {
@@ -2301,7 +2319,7 @@ func (s *Service) reconcileBuildStop(ctx context.Context, op contract.Operation)
 			return err
 		}
 		if !found {
-			return s.settleReconciledBuildStop(ctx, op, false, "build stop ended before a cancellation marker was dispatched")
+			return s.failReconciledBuildStop(ctx, op, "build stop ended before a cancellation marker was dispatched")
 		}
 		if record.State != "completed" {
 			return contract.NewFault(contract.Unavailable, "build stop has no acknowledged cancellation marker",
@@ -2314,7 +2332,7 @@ func (s *Service) reconcileBuildStop(ctx context.Context, op contract.Operation)
 			func(*entities.StoreTx, *contract.Operation) error { return nil },
 		)
 	}
-	return s.settleReconciledBuildStop(ctx, op, false, "build stop ended before the build was recorded as cancelled")
+	return s.failReconciledBuildStop(ctx, op, "build stop ended before the build was recorded as cancelled")
 }
 
 func (s *Service) reconcileNodeAction(ctx context.Context, op contract.Operation) error {

@@ -353,7 +353,7 @@ func (s *scriptedDeployTransport) Call(
 			Status: engine.StatusCompleted, ExecutionID: request.Execution.ExecutionID(),
 			InputsHash: hash, Executed: true, Result: scriptedResult(request),
 		}, nil
-	case node.MethodObserve, node.MethodObserveImage, node.MethodInventory, node.MethodRetireBuild:
+	case node.MethodObserve, node.MethodObserveImage, node.MethodInventory, node.MethodRetireBuild, node.MethodRetireBuildStopMarker:
 		return node.Response{}, fmt.Errorf("unexpected method %q", request.Method)
 	default:
 		return node.Response{}, fmt.Errorf("unexpected method %q", request.Method)

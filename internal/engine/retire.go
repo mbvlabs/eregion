@@ -53,6 +53,56 @@ func (e *Engine) clearApplyUncertain(exec Execution) error {
 	return syncDir(e.StateDir)
 }
 
+// RetireBuildStopMarker fences only the synchronous build-stop marker effect.
+// The caller must first durably abandon the original dispatch under its
+// operation and intent fence. Completion does not establish that Pack stopped,
+// or that the marker was not written before this fence.
+func (e *Engine) RetireBuildStopMarker(ctx context.Context, exec Execution, inputsHash string) (TaskStatus, error) {
+	if err := exec.Validate(); err != nil {
+		return TaskStatus{}, err
+	}
+	hash, err := hex.DecodeString(inputsHash)
+	if exec.Step != "platform-build-stop-01-v1" || exec.Attempt == 0 ||
+		err != nil || len(hash) != sha256.Size || hex.EncodeToString(hash) != inputsHash {
+		return TaskStatus{}, fmt.Errorf("original build-stop execution and canonical input hash are required")
+	}
+	release, err := Acquire(ctx, e.effectLockPath(exec), LockExclusive, 0)
+	if errors.Is(err, ErrLockHeld) {
+		return TaskStatus{Status: StatusRunning, Detail: "build-stop effect lock is held"}, nil
+	}
+	if err != nil {
+		return TaskStatus{}, err
+	}
+	defer release()
+	fence := e.fencePath(exec, "retired-")
+	identity := exec.ExecutionID() + "\n" + inputsHash + "\n"
+	existing, err := os.ReadFile(fence)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return TaskStatus{}, err
+	}
+	if err == nil && string(existing) != identity {
+		return TaskStatus{Status: StatusStale, Detail: "retirement does not match original execution"}, nil
+	}
+	record, found, err := LoadEffectRecord(e.EffectRecordPath(exec))
+	if err != nil {
+		return TaskStatus{}, err
+	}
+	if found && !matchingProvenEffect(record, exec, inputsHash) {
+		return TaskStatus{Status: StatusStale, Detail: "effect record does not match original execution"}, nil
+	}
+	journal, err := LoadJournal(e.JournalPath())
+	if err != nil {
+		return TaskStatus{}, err
+	}
+	if task, found := journal.Tasks[exec.EffectKey()]; found && !matchingProvenTask(task, exec, inputsHash) {
+		return TaskStatus{Status: StatusStale, Detail: "journal task does not match original execution"}, nil
+	}
+	if err := WriteFileAtomic(fence, []byte(identity), 0o600); err != nil {
+		return TaskStatus{}, err
+	}
+	return TaskStatus{Status: StatusCompleted, ExecutionID: exec.ExecutionID(), Attempt: exec.Attempt, InputsHash: inputsHash, Detail: "build-stop marker fenced; prior marker outcome is not established"}, nil
+}
+
 // RetireBuild fences future runs even when the old apply cannot be proven
 // quiescent. Only a completed result means both properties have been proven.
 func (e *Engine) RetireBuild(ctx context.Context, exec Execution) (TaskStatus, error) {

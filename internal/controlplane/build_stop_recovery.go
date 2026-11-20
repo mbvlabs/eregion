@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"time"
 
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
@@ -143,6 +144,17 @@ func checkBuildStopResponse(response node.Response, exec engine.Execution, hash 
 func (s *Service) beginBuildStopDispatch(ctx context.Context, exec engine.Execution, hash string, dispatch *buildStopDispatch) (bool, error) {
 	already := false
 	_, owned, err := s.mutateOwned(ctx, exec.OperationID, exec.Attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
+		if op.State == contract.Cancelling {
+			return errPlatformCancelled
+		}
+		if op.Kind != platform.KindBuildStop || exec.Step != deploymentBuildStopStep {
+			return contract.NewFault(contract.PreconditionFailed, "invalid build stop admission", "Use the build stop execution path.")
+		}
+		if _, found, err := tx.Steps().GetForUpdate(ctx, op.ID, exec.Step); err != nil {
+			return err
+		} else if found {
+			return contract.NewFault(contract.Unavailable, "build stop already has a dispatch intent", "Recover the original effect; do not redispatch.")
+		}
 		if err := lockOriginalBuildStopClaim(ctx, tx, dispatch); err != nil {
 			return err
 		}
@@ -307,7 +319,7 @@ func (s *Service) recoverBuildStopEffect(ctx context.Context, op contract.Operat
 
 // Recheck intent under the operation lock used by beginStepTx. A worker may
 // have committed its intent after the initial recovery read.
-func (s *Service) settleReconciledBuildStop(ctx context.Context, op contract.Operation, cancel bool, message string) error {
+func (s *Service) failReconciledBuildStop(ctx context.Context, op contract.Operation, message string) error {
 	_, owned, err := s.mutateOwned(ctx, op.ID, op.Attempt, func(tx *entities.StoreTx, current *contract.Operation) error {
 		record, found, err := tx.Steps().GetForUpdate(ctx, op.ID, deploymentBuildStopStep)
 		if err != nil {
@@ -317,8 +329,8 @@ func (s *Service) settleReconciledBuildStop(ctx context.Context, op contract.Ope
 			return contract.NewFault(contract.Unavailable, "build stop has an unacknowledged dispatch intent",
 				"Recover the original authenticated node effect before settling the operation.")
 		}
-		if cancel {
-			return s.cancelPlatformTx(ctx, tx, current, op.ID, "Cancellation reconciled at the build stop boundary.")
+		if current.State == contract.Cancelling {
+			return errPlatformCancelled
 		}
 		return s.failPlatformOperationTx(ctx, tx, current, contract.Unavailable, message)
 	})
@@ -331,7 +343,7 @@ func (s *Service) settleReconciledBuildStop(ctx context.Context, op contract.Ope
 	return nil
 }
 
-func (s *Service) cancelRecoveredBuildStop(ctx context.Context, id contract.OperationID, attempt uint32) error {
+func (s *Service) cancelRecoveredBuildStop(ctx context.Context, id contract.OperationID, attempt uint32) error { //nolint:gocognit,gocyclo // Keep the cancellation fence, node call and guarded settlement in order.
 	op, found, err := s.entities.Operations().Get(ctx, id)
 	if err != nil {
 		return err
@@ -339,8 +351,175 @@ func (s *Service) cancelRecoveredBuildStop(ctx context.Context, id contract.Oper
 	if !found || op.Attempt != attempt {
 		return errNotOwned
 	}
-	if err := s.recoverBuildStopEffect(ctx, op); err != nil {
+	if op.Kind != platform.KindBuildStop || op.State != contract.Cancelling {
+		return unknownCancellingBuildStop()
+	}
+	record, found, err := s.stepRecord(ctx, id, deploymentBuildStopStep)
+	if err != nil {
 		return err
 	}
-	return s.settleReconciledBuildStop(ctx, op, true, "")
+	if !found {
+		return s.settleCancellingBuildStop(ctx, op, nil, nil, "Cancellation reconciled before build stop dispatch.")
+	}
+	normalized, err := s.operationInput(ctx, op)
+	if err != nil {
+		return err
+	}
+	input, err := typedOperationInput[*platform.BuildStopInput](normalized.Input)
+	if err != nil {
+		return err
+	}
+	build, err := s.buildByID(ctx, input.BuildID)
+	if err != nil {
+		return err
+	}
+	exec := engine.Execution{OperationID: id, Attempt: record.Attempt, Step: record.Step, RequestID: newRequestID()}
+	raw, err := json.Marshal(platform.BuildStopPayload{Step: record.Step, OperationID: string(build.OperationID), PackStep: deploymentPackStep})
+	if err != nil {
+		return err
+	}
+	step, err := node.DefaultRegistry().Build(exec, raw)
+	if err != nil {
+		return unknownCancellingBuildStop()
+	}
+	inputs, err := step.Inputs()
+	if err != nil {
+		return err
+	}
+	if record.Step != deploymentBuildStopStep || record.Attempt == 0 || record.Attempt > attempt ||
+		record.ExecutionID != exec.ExecutionID() || record.InputsHash != engine.InputsHash(step.ID(), inputs) {
+		return unknownCancellingBuildStop()
+	}
+	placement, found, err := s.entities.BuildStopPlacement(ctx, id)
+	if err != nil {
+		return unavailable(err)
+	}
+	if !found || placement.Node == "" || placement.Identity == "" || strings.HasSuffix(placement.Identity, ":unverified") {
+		return unknownCancellingBuildStop()
+	}
+	if err := s.checkCancellingBuildStop(ctx, op, &record, &placement); err != nil {
+		return err
+	}
+	tr, identity, err := s.buildTransportFor(ctx, placement.Node)
+	if err != nil || identity != placement.Identity {
+		return unknownCancellingBuildStop()
+	}
+	callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	response, err := tr.Call(callCtx, node.Request{Method: node.MethodRetireBuildStopMarker, RequestID: exec.RequestID, Execution: exec, InputsHash: record.InputsHash}, nil)
+	if err != nil || response.Status != engine.StatusCompleted || response.ExecutionID != record.ExecutionID ||
+		response.Attempt != record.Attempt || response.InputsHash != record.InputsHash {
+		return unknownCancellingBuildStop()
+	}
+	status, err := tr.Call(callCtx, node.Request{Method: node.MethodStatus, RequestID: exec.RequestID, Execution: exec}, nil)
+	if err != nil {
+		return unknownCancellingBuildStop()
+	}
+	message, err := s.ackCancellingBuildStop(ctx, op, &record, &placement, status)
+	if err != nil {
+		return err
+	}
+	return s.settleCancellingBuildStop(ctx, op, &record, &placement, message)
+}
+
+func (s *Service) ackCancellingBuildStop(ctx context.Context, op contract.Operation, record *StepRecord, placement *entities.BuildStopPlacement, status node.Response) (string, error) {
+	if status.Status != engine.StatusCompleted {
+		if (status.Status != engine.StatusAbsent && status.Status != engine.StatusStale &&
+			status.Status != engine.StatusFailed && status.Status != engine.StatusDeferred) ||
+			record.State == "completed" ||
+			(status.ExecutionID != "" && status.ExecutionID != record.ExecutionID) ||
+			(status.Attempt != 0 && status.Attempt != record.Attempt) ||
+			(status.InputsHash != "" && status.InputsHash != record.InputsHash) {
+			return "", unknownCancellingBuildStop()
+		}
+		return "Build stop dispatch was fenced; a prior cancellation marker may have been written. Pack is not confirmed stopped.", nil
+	}
+	if status.ExecutionID != record.ExecutionID || status.Attempt != record.Attempt || status.InputsHash != record.InputsHash {
+		return "", unknownCancellingBuildStop()
+	}
+	guard := func(tx *entities.StoreTx) error {
+		current, found, err := tx.Operations().Lock(ctx, op.ID)
+		if err != nil || !found {
+			return unknownCancellingBuildStop()
+		}
+		return validateCancellingBuildStopTx(ctx, tx, current, record, placement)
+	}
+	if err := s.ackStepWithGuard(ctx, op.ID, op.Attempt, record.Step, record.InputsHash, status.ExecutionID, status.Result, platformStepTotal, record, guard); err != nil {
+		return "", err
+	}
+	record.State = "completed"
+	return "Build stop cancellation marker was recorded before dispatch was fenced. Pack is not confirmed stopped.", nil
+}
+
+func unknownCancellingBuildStop() error {
+	return contract.NewFault(contract.Unavailable, "build stop cancellation cannot be verified",
+		"Inspect the original authenticated node and dispatch intent; no stop was redispatched.")
+}
+
+func validateCancellingBuildStopTx(ctx context.Context, tx *entities.StoreTx, op contract.Operation, record *StepRecord, placement *entities.BuildStopPlacement) error {
+	if op.Kind != platform.KindBuildStop || op.State != contract.Cancelling {
+		return unknownCancellingBuildStop()
+	}
+	records, err := tx.Steps().List(ctx, op.ID)
+	if err != nil {
+		return unavailable(err)
+	}
+	for _, other := range records {
+		if strings.HasPrefix(other.Step, "platform-build-stop-") && other.Step != deploymentBuildStopStep {
+			return unknownCancellingBuildStop()
+		}
+	}
+	step, found, err := tx.Steps().GetForUpdate(ctx, op.ID, deploymentBuildStopStep)
+	if err != nil {
+		return unavailable(err)
+	}
+	actual, placed, err := tx.BuildStopPlacement(ctx, op.ID)
+	if err != nil {
+		return unavailable(err)
+	}
+	if record == nil {
+		if found || placed {
+			return unknownCancellingBuildStop()
+		}
+		return nil
+	}
+	if !found || !placed || placement == nil || actual != *placement ||
+		step.Step != record.Step || step.Attempt != record.Attempt || step.ExecutionID != record.ExecutionID ||
+		step.InputsHash != record.InputsHash || step.State != record.State {
+		return unknownCancellingBuildStop()
+	}
+	rec, found, err := tx.Nodes().Connection(ctx, actual.Node)
+	if err != nil || !found || !strings.HasPrefix(actual.Identity, buildNodeIdentity(rec)+":") {
+		return unknownCancellingBuildStop()
+	}
+	return nil
+}
+
+func (s *Service) checkCancellingBuildStop(ctx context.Context, op contract.Operation, record *StepRecord, placement *entities.BuildStopPlacement) error {
+	_, owned, err := s.mutateOwned(ctx, op.ID, op.Attempt, func(tx *entities.StoreTx, current *contract.Operation) error {
+		return validateCancellingBuildStopTx(ctx, tx, *current, record, placement)
+	})
+	if err != nil {
+		return err
+	}
+	if !owned {
+		return errNotOwned
+	}
+	return nil
+}
+
+func (s *Service) settleCancellingBuildStop(ctx context.Context, op contract.Operation, record *StepRecord, placement *entities.BuildStopPlacement, message string) error {
+	_, owned, err := s.mutateOwned(ctx, op.ID, op.Attempt, func(tx *entities.StoreTx, current *contract.Operation) error {
+		if err := validateCancellingBuildStopTx(ctx, tx, *current, record, placement); err != nil {
+			return err
+		}
+		return s.cancelPlatformTx(ctx, tx, current, op.ID, message)
+	})
+	if err != nil {
+		return err
+	}
+	if !owned {
+		return errNotOwned
+	}
+	return nil
 }

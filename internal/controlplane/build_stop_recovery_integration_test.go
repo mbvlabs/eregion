@@ -6,6 +6,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -24,6 +26,301 @@ type stopRecoveryFixture struct {
 	identity string
 	hash     string
 	payload  []byte
+}
+
+func (f stopRecoveryFixture) local(t *testing.T) *node.Local {
+	t.Helper()
+	local, ok := f.tr.(*node.Local)
+	if !ok {
+		t.Fatalf("expected real local dispatcher, got %T", f.tr)
+	}
+	return local
+}
+
+func TestIntegrationBuildStopCancellationFencesLateRealRun(t *testing.T) {
+	f := newStopRecoveryFixture(t)
+	ctx := context.Background()
+	f.persistIntent(t, nil)
+	local := f.local(t)
+	admitted := make(chan struct{})
+	continueRun := make(chan struct{})
+	var releaseRun sync.Once
+	defer releaseRun.Do(func() { close(continueRun) })
+	local.SetHooks(node.Hooks{BeforeRun: func(ctx context.Context, _ engine.Execution) error {
+		close(admitted)
+		select {
+		case <-continueRun:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}})
+	type runResult struct {
+		response node.Response
+		err      error
+	}
+	late := make(chan runResult, 1)
+	go func() {
+		response, err := f.tr.Call(ctx, node.Request{Method: node.MethodRun, Execution: f.exec, Payload: f.payload}, nil)
+		late <- runResult{response, err}
+	}()
+	select {
+	case <-admitted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("real run did not reach dispatcher")
+	}
+	if _, err := f.service.RequestCancel(ctx, testActor, f.op.ID); err != nil {
+		t.Fatal(err)
+	}
+	// The generic cancellation path must use the same retirement recovery.
+	if err := f.service.cancelPlatform(ctx, f.op.ID, 1, "generic cancellation"); err != nil {
+		t.Fatal(err)
+	}
+	op, err := f.service.Get(ctx, testActor, f.op.ID)
+	if err != nil || op.State != contract.Canceled {
+		t.Fatalf("cancelled operation: %+v %v", op, err)
+	}
+	if op.LatestResult == nil || !strings.Contains(op.LatestResult.Message, "may have been written") {
+		t.Fatalf("uncertain marker outcome not disclosed: %+v", op.LatestResult)
+	}
+	// Let the request, admitted before cancellation, enter the real engine.
+	releaseRun.Do(func() { close(continueRun) })
+	result := <-late
+	if result.err != nil || result.response.Status != engine.StatusFailed || !strings.Contains(result.response.Detail, "retired") {
+		t.Fatalf("late real run: %+v %v", result.response, result.err)
+	}
+	marker := filepath.Join(local.StateDir(), "builds", string(f.pointerBuildFixture.op.ID)+"-"+deploymentPackStep+".cancel")
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("late run wrote marker: %v", err)
+	}
+}
+
+func TestIntegrationBuildStopCancellationSealsAdmission(t *testing.T) {
+	f := newStopRecoveryFixture(t)
+	ctx := context.Background()
+	f.seedBuildClaim(t)
+	build, err := f.service.buildByID(ctx, f.build)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, dispatch, err := f.service.prepareBuildStopDispatch(ctx, f.op.ID, build)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.service.RequestCancel(ctx, testActor, f.op.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.service.beginBuildStopDispatch(ctx, f.exec, f.hash, dispatch); !errors.Is(err, errPlatformCancelled) {
+		t.Fatalf("admission after cancellation: %v", err)
+	}
+	if _, found, err := f.service.stepRecord(ctx, f.op.ID, f.exec.Step); err != nil || found {
+		t.Fatalf("unexpected intent: found=%v err=%v", found, err)
+	}
+	if err := f.service.cancelRecoveredBuildStop(ctx, f.op.ID, 1); err != nil {
+		t.Fatalf("cancel without intent: %v", err)
+	}
+}
+
+func TestIntegrationBuildStopOnlyDispatchesPersistedIntent(t *testing.T) {
+	f := newStopRecoveryFixture(t)
+	ctx := context.Background()
+	worker := &platformWorker{service: f.service}
+	_, err := worker.runStepOn(ctx, f.tr, f.op.ID, 1, f.exec.Step, json.RawMessage(f.payload), nil)
+	if contract.Classify(err).Code != contract.PreconditionFailed {
+		t.Fatalf("generic unfenced dispatch: %v", err)
+	}
+	status, err := f.tr.Call(ctx, node.Request{Method: node.MethodStatus, Execution: f.exec}, nil)
+	if err != nil || status.Status != engine.StatusAbsent {
+		t.Fatalf("unfenced dispatch reached node: %+v %v", status, err)
+	}
+	f.seedBuildClaim(t)
+	build, err := f.service.buildByID(ctx, f.build)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, dispatch, err := f.service.prepareBuildStopDispatch(ctx, f.op.ID, build)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.service.beginBuildStopDispatch(ctx, f.exec, f.hash, dispatch); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.service.beginBuildStopDispatch(ctx, f.exec, f.hash, dispatch); contract.Classify(err).Code != contract.Unavailable {
+		t.Fatalf("duplicate admission: %v", err)
+	}
+}
+
+func TestIntegrationBuildStopRetirementRequiresCancellationAndFreeLock(t *testing.T) {
+	f := newStopRecoveryFixture(t)
+	ctx := context.Background()
+	f.persistIntent(t, nil)
+	if err := f.service.cancelPlatform(ctx, f.op.ID, 1, "not yet cancelling"); contract.Classify(err).Code != contract.Unavailable {
+		t.Fatalf("non-cancelling generic path: %v", err)
+	}
+	if err := f.service.reconcilePlatformOperation(ctx, f.op); contract.Classify(err).Code != contract.Unavailable {
+		t.Fatalf("job loss without cancellation: %v", err)
+	}
+	local := f.local(t)
+	e, err := engine.New(local.StateDir(), "local", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retired, err := e.IsRetired(f.exec); err != nil || retired {
+		t.Fatalf("non-cancelling retirement: %v %v", retired, err)
+	}
+	if _, err := f.service.RequestCancel(ctx, testActor, f.op.ID); err != nil {
+		t.Fatal(err)
+	}
+	release, err := engine.TryEffectLock(ctx, local.StateDir(), f.exec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = f.service.cancelRecoveredBuildStop(ctx, f.op.ID, 1)
+	release()
+	if contract.Classify(err).Code != contract.Unavailable {
+		t.Fatalf("held lock: %v", err)
+	}
+	op, err := f.service.Get(ctx, testActor, f.op.ID)
+	if err != nil || op.State != contract.Cancelling {
+		t.Fatalf("held lock settled cancellation: %+v %v", op, err)
+	}
+	if err := f.service.cancelRecoveredBuildStop(ctx, f.op.ID, 1); err != nil {
+		t.Fatalf("retry after lock release: %v", err)
+	}
+}
+
+func TestIntegrationBuildStopCancellationCannotBeSettledByStaleWorker(t *testing.T) {
+	f := newStopRecoveryFixture(t)
+	ctx := context.Background()
+	f.persistIntent(t, nil)
+	if _, err := f.service.RequestCancel(ctx, testActor, f.op.ID); err != nil {
+		t.Fatal(err)
+	}
+	err := f.service.finishPlatformOperation(ctx, f.op.ID, 1, func(*entities.StoreTx, *contract.Operation) error { return nil })
+	if !errors.Is(err, errPlatformCancelled) {
+		t.Fatalf("stale success: %v", err)
+	}
+	err = f.service.failPlatformOperation(ctx, f.op.ID, 1, contract.PreconditionFailed, "stale failure")
+	if !errors.Is(err, errPlatformCancelled) {
+		t.Fatalf("stale failure: %v", err)
+	}
+	op, err := f.service.Get(ctx, testActor, f.op.ID)
+	if err != nil || op.State != contract.Cancelling {
+		t.Fatalf("stale settlement changed state: %+v %v", op, err)
+	}
+	if err := f.service.cancelRecoveredBuildStop(ctx, f.op.ID, 1); err != nil {
+		t.Fatalf("cancellation recovery: %v", err)
+	}
+}
+
+func TestIntegrationBuildStopCancellationRecoversRunBeforeFence(t *testing.T) {
+	f := newStopRecoveryFixture(t)
+	ctx := context.Background()
+	f.persistIntent(t, nil)
+	if _, err := f.service.RequestCancel(ctx, testActor, f.op.ID); err != nil {
+		t.Fatal(err)
+	}
+	local := f.local(t)
+	release, err := engine.TryEffectLock(ctx, local.StateDir(), f.exec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = f.service.cancelRecoveredBuildStop(ctx, f.op.ID, 1)
+	release()
+	if contract.Classify(err).Code != contract.Unavailable {
+		t.Fatalf("retirement while locked: %v", err)
+	}
+	// The previously authorized request wins before the next retirement.
+	f.dispatchWithoutAck(t)
+	if err := f.service.cancelRecoveredBuildStop(ctx, f.op.ID, 1); err != nil {
+		t.Fatalf("recovery after marker: %v", err)
+	}
+	op, err := f.service.Get(ctx, testActor, f.op.ID)
+	if err != nil || op.State != contract.Canceled || op.LatestResult == nil ||
+		!strings.Contains(op.LatestResult.Message, "marker was recorded") ||
+		!strings.Contains(op.LatestResult.Message, "not confirmed stopped") {
+		t.Fatalf("completed marker cancellation: %+v %v", op, err)
+	}
+	record, found, err := f.service.stepRecord(ctx, f.op.ID, f.exec.Step)
+	if err != nil || !found || record.State != "completed" || record.ExecutionID != f.exec.ExecutionID() {
+		t.Fatalf("marker acknowledgement: %+v %v %v", record, found, err)
+	}
+}
+
+func TestIntegrationBuildStopCancellationRechecksIntent(t *testing.T) { //nolint:gocognit // Exercise each durable comparison across the same recovery boundary.
+	for _, change := range []string{"hash", "attempt", "placement"} {
+		t.Run(change, func(t *testing.T) {
+			f := newStopRecoveryFixture(t)
+			ctx := context.Background()
+			f.persistIntent(t, nil)
+			if _, err := f.service.RequestCancel(ctx, testActor, f.op.ID); err != nil {
+				t.Fatal(err)
+			}
+			op, err := f.service.Get(ctx, testActor, f.op.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			record, found, err := f.service.stepRecord(ctx, f.op.ID, f.exec.Step)
+			if err != nil || !found {
+				t.Fatalf("intent: %+v %v %v", record, found, err)
+			}
+			placement, found, err := f.service.entities.BuildStopPlacement(ctx, f.op.ID)
+			if err != nil || !found {
+				t.Fatalf("placement: %+v %v %v", placement, found, err)
+			}
+			if err := f.service.checkCancellingBuildStop(ctx, op, &record, &placement); err != nil {
+				t.Fatal(err)
+			}
+			switch change {
+			case "hash":
+				_, err = f.pool.Exec(ctx, `UPDATE eregion_operation_steps SET inputs_hash='changed' WHERE operation_id=$1 AND step=$2`, f.op.ID, f.exec.Step)
+			case "attempt":
+				_, err = f.pool.Exec(ctx, `UPDATE eregion_operation_steps SET attempt=attempt+1 WHERE operation_id=$1 AND step=$2`, f.op.ID, f.exec.Step)
+			case "placement":
+				_, err = f.pool.Exec(ctx, `UPDATE eregion_build_stop_placements SET node_identity='changed' WHERE operation_id=$1`, f.op.ID)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := f.service.settleCancellingBuildStop(ctx, op, &record, &placement, "test"); contract.Classify(err).Code != contract.Unavailable {
+				t.Fatalf("changed %s settled: %v", change, err)
+			}
+			op, err = f.service.Get(ctx, testActor, f.op.ID)
+			if err != nil || op.State != contract.Cancelling {
+				t.Fatalf("state after changed %s: %+v %v", change, op, err)
+			}
+		})
+	}
+}
+
+func TestIntegrationBuildStopCancellationRechecksOwnerAttempt(t *testing.T) {
+	f := newStopRecoveryFixture(t)
+	ctx := context.Background()
+	f.persistIntent(t, nil)
+	if _, err := f.service.RequestCancel(ctx, testActor, f.op.ID); err != nil {
+		t.Fatal(err)
+	}
+	op, err := f.service.Get(ctx, testActor, f.op.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, found, err := f.service.stepRecord(ctx, f.op.ID, f.exec.Step)
+	if err != nil || !found {
+		t.Fatalf("intent: %+v %v %v", record, found, err)
+	}
+	placement, found, err := f.service.entities.BuildStopPlacement(ctx, f.op.ID)
+	if err != nil || !found {
+		t.Fatalf("placement: %+v %v %v", placement, found, err)
+	}
+	if err := f.service.checkCancellingBuildStop(ctx, op, &record, &placement); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, claimed, err := f.service.claimPlatform(ctx, f.op.ID, 2); err != nil || !claimed {
+		t.Fatalf("new owner: %v %v", claimed, err)
+	}
+	if err := f.service.settleCancellingBuildStop(ctx, op, &record, &placement, "test"); !errors.Is(err, errNotOwned) {
+		t.Fatalf("stale owner settled: %v", err)
+	}
 }
 
 func newStopRecoveryFixture(t *testing.T) stopRecoveryFixture {

@@ -367,7 +367,7 @@ func (t *cancelLostPackTransport) Call(ctx context.Context, request node.Request
 		}
 		return node.Response{Status: engine.StatusFailed, Attempt: request.Execution.Attempt,
 			ExecutionID: request.Execution.ExecutionID(), Detail: "known pack failure"}, nil
-	case node.MethodObserve, node.MethodObserveImage, node.MethodInventory, node.MethodRetireBuild:
+	case node.MethodObserve, node.MethodObserveImage, node.MethodInventory, node.MethodRetireBuild, node.MethodRetireBuildStopMarker:
 		return node.Response{}, errors.New("unexpected node method")
 	default:
 		return node.Response{}, errors.New("unexpected node method")

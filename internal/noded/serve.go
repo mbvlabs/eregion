@@ -132,6 +132,17 @@ func handle(config Config, steps *node.StepRegistry, request node.Request) node.
 		}
 		return response
 	}
+	if request.Method == node.MethodRetireBuildStopMarker {
+		nodeEngine, err := engine.New(config.StateDir, config.Node, &secrets.Registry{})
+		if err != nil {
+			return node.Response{Status: engine.StatusFailed, ErrorCode: string(contract.Internal), Detail: err.Error()}
+		}
+		response, err := node.RetireBuildStopMarker(context.Background(), nodeEngine, request.Execution, request.InputsHash)
+		if err != nil {
+			return node.Response{Status: engine.StatusFailed, ErrorCode: string(contract.ValidationFailed), Detail: err.Error()}
+		}
+		return response
+	}
 	if request.Method == node.MethodRun {
 		return runResponse(config, steps, request)
 	}

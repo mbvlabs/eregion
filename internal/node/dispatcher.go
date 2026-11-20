@@ -87,10 +87,22 @@ func (d *Dispatcher) Call(ctx context.Context, request Request, onEvent func(Eve
 	if request.Method == MethodRetireBuild {
 		return RetireBuild(ctx, &requestEngine, request.Execution)
 	}
+	if request.Method == MethodRetireBuildStopMarker {
+		return RetireBuildStopMarker(ctx, &requestEngine, request.Execution, request.InputsHash)
+	}
 	if request.Method == MethodRun {
 		return d.run(ctx, requestEngine, request, registry, report)
 	}
 	return Response{}, fmt.Errorf("unknown node method %q", request.Method)
+}
+
+// RetireBuildStopMarker fences a marker dispatch, not its Pack process.
+func RetireBuildStopMarker(ctx context.Context, e *engine.Engine, exec engine.Execution, inputsHash string) (Response, error) {
+	status, err := e.RetireBuildStopMarker(ctx, exec, inputsHash)
+	if err != nil {
+		return Response{}, err
+	}
+	return ResponseFromStatus(status), nil
 }
 
 // RetireBuild accepts only Pack identities, with no payload or secrets needed.

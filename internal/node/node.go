@@ -21,12 +21,13 @@ type Method string
 // it carries no execution identity: there is no effect to journal. Its result
 // is a retention.Inventory.
 const (
-	MethodRun          Method = "run"
-	MethodStatus       Method = "status"
-	MethodObserve      Method = "observe"
-	MethodObserveImage Method = "observe_image"
-	MethodInventory    Method = "inventory"
-	MethodRetireBuild  Method = "retire_build"
+	MethodRun                   Method = "run"
+	MethodStatus                Method = "status"
+	MethodObserve               Method = "observe"
+	MethodObserveImage          Method = "observe_image"
+	MethodInventory             Method = "inventory"
+	MethodRetireBuild           Method = "retire_build"
+	MethodRetireBuildStopMarker Method = "retire_build_stop_marker"
 )
 
 // ObservePayload asks a node for its read-only Docker ownership observation.
@@ -43,11 +44,12 @@ type ObserveImagePayload struct {
 // Request is transport-independent. Secrets are transient and must never be
 // written to River arguments, operation events, or the node journal.
 type Request struct {
-	Method    Method            `json:"method"`
-	RequestID string            `json:"request_id"`
-	Execution engine.Execution  `json:"execution"`
-	Payload   json.RawMessage   `json:"payload,omitempty"`
-	Secrets   map[string]string `json:"secrets,omitempty"`
+	Method     Method            `json:"method"`
+	RequestID  string            `json:"request_id"`
+	Execution  engine.Execution  `json:"execution"`
+	Payload    json.RawMessage   `json:"payload,omitempty"`
+	Secrets    map[string]string `json:"secrets,omitempty"`
+	InputsHash string            `json:"inputs_hash,omitempty"`
 }
 
 // Event is one redacted node observation.
