@@ -62,23 +62,31 @@ func workerHostPrefix(host string) string {
 	return workerClientIDPrefix + workerHostIdentity(host) + "-"
 }
 
-// newWorkerClientID returns this start's unique River client ID. The timestamp
-// keeps IDs readable; the random suffix keeps restarts and same-host processes
-// distinct. The fixed prefix and suffix stay below River's 100-character limit.
+// newWorkerClientID includes a verifiable process incarnation when available.
+// Other platforms and inaccessible procfs retain unique but unrescuable IDs.
 func newWorkerClientID(host string, startedAt time.Time) string {
+	if identity, ok := currentWorkerIncarnation(); ok {
+		random := newRequestID()
+		if len(random) > 12 {
+			random = random[:12]
+		}
+		id := workerHostPrefix(host) + identity + "-" + random
+		if len(id) <= 100 {
+			return id
+		}
+	}
 	return workerHostPrefix(host) + startedAt.UTC().Format("20060102T150405") + "-" + newRequestID()
 }
 
-// shouldRescueJob reports whether a running job's last River attempt was made
-// by an earlier client on this host. Earlier entries are history, not the
-// current owner; a job last attempted by another host or by the new client is
-// left alone.
+// Only a positively identified dead incarnation is safe to recover. Earlier
+// entries are history; legacy and unverifiable owners are left to River.
 func shouldRescueJob(attemptedBy []string, hostPrefix, clientID string) bool {
 	if len(attemptedBy) == 0 {
 		return false
 	}
 	last := attemptedBy[len(attemptedBy)-1]
-	return last != "" && last != clientID && strings.HasPrefix(last, hostPrefix)
+	return last != "" && last != clientID && strings.HasPrefix(last, hostPrefix) &&
+		workerIncarnationDead(strings.TrimPrefix(last, hostPrefix))
 }
 
 // orphanedPlatformJob is one running platform job whose last River attempt came
@@ -95,8 +103,7 @@ type orphanedPlatformJob struct {
 // available, or discards an exhausted job. The platform worker's own timeout is
 // 30 minutes, longer than River's two-minute rescue threshold, so without this
 // a SIGKILLed predecessor would hold accepted work until its timeout expired.
-// Only jobs whose last attempt came from this host are moved; another host may
-// still be alive.
+// Only jobs whose last attempt is proven dead on this host are moved.
 func (s *Service) rescueHostPlatformJobs(
 	ctx context.Context,
 	hostPrefix, clientID string,

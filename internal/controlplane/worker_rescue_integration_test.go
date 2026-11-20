@@ -3,6 +3,8 @@ package controlplane
 import (
 	"context"
 	"os"
+	"os/exec"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -13,15 +15,16 @@ import (
 	"github.com/mbvlabs/eregion/internal/platform"
 )
 
-// TestIntegrationWorkerRescuesThisHostsOrphanedPlatformJobs simulates a worker
-// SIGKILL: platform jobs and their operations are left running under previous
-// client IDs on this host. A new worker must re-queue jobs with attempts left,
-// discard an exhausted one with a terminal operation failure, record both
-// recoveries as operation events, and leave another host's job alone.
+// A real worker process remains alive while another worker is constructed,
+// then is killed. Its observed jobs must only be recovered after its death.
 func TestIntegrationWorkerRescuesThisHostsOrphanedPlatformJobs(t *testing.T) {
-	pool, _ := testPool(t, true)
+	if _, ok := currentWorkerIncarnation(); !ok {
+		t.Skip("verifiable process identity unavailable")
+	}
+	pool, dsn := testPool(t, true)
 	ctx := context.Background()
-	submitter := testRuntime(t, pool, 0)
+	nodeDir := t.TempDir()
+	submitter := testRuntime(t, pool, 0, nodeDir)
 	s := submitter.Service
 
 	rescued := platformSubmit(t, s, platform.KindAppCreate, platform.PlatformTarget().String(), "rescue-orphan",
@@ -30,20 +33,82 @@ func TestIntegrationWorkerRescuesThisHostsOrphanedPlatformJobs(t *testing.T) {
 		map[string]any{"name": "exhausted"})
 	foreign := platformSubmit(t, s, platform.KindAppCreate, platform.PlatformTarget().String(), "rescue-foreign",
 		map[string]any{"name": "foreign"})
+	legacy := platformSubmit(t, s, platform.KindAppCreate, platform.PlatformTarget().String(), "rescue-legacy",
+		map[string]any{"name": "legacy"})
+	reused := platformSubmit(t, s, platform.KindAppCreate, platform.PlatformTarget().String(), "rescue-reused-pid",
+		map[string]any{"name": "reused"})
+	unknown := platformSubmit(t, s, platform.KindAppCreate, platform.PlatformTarget().String(), "rescue-unknown-namespace",
+		map[string]any{"name": "unknown"})
 
 	host, err := os.Hostname()
 	if err != nil {
 		t.Fatal(err)
 	}
 	hostPrefix := workerHostPrefix(host)
-	setRunningPlatformJob(t, ctx, pool, rescued, hostPrefix+"previous-start", 1)
-	setRunningPlatformJob(t, ctx, pool, exhausted, hostPrefix+"previous-start", jobargs.PlatformMaxAttempts)
+	// Prevent the helper from fetching the fixtures before their owner is set.
+	for _, op := range []contract.Operation{rescued, exhausted, foreign, legacy, reused, unknown} {
+		setRunningPlatformJob(t, ctx, pool, op, hostPrefix+"previous-start", 1)
+	}
+	idFile := t.TempDir() + "/worker-id"
+	child := exec.Command(os.Args[0], "-test.run=^TestIntegrationRescueWorkerHelper$")
+	child.Env = append(os.Environ(), "EREGION_RESCUE_WORKER_HELPER=1",
+		"EREGION_RESCUE_DATABASE_URL="+dsn, "EREGION_RESCUE_NODE_DIR="+nodeDir, "EREGION_RESCUE_ID_FILE="+idFile)
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if child.ProcessState == nil {
+			_ = child.Process.Kill()
+			_ = child.Wait()
+		}
+	})
+	var owner string
+	await(t, 10*time.Second, func() bool {
+		data, err := os.ReadFile(idFile)
+		owner = string(data)
+		return err == nil && owner != ""
+	})
+	if !strings.HasPrefix(owner, hostPrefix+"v1.") || len(owner) > 100 {
+		t.Fatalf("unexpected worker ID %q", owner)
+	}
+	parts := strings.Split(strings.TrimPrefix(owner, hostPrefix), ".")
+	startAndNonce := strings.Split(parts[4], "-")
+	start, err := strconv.ParseUint(startAndNonce[0], 36, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts[4] = strconv.FormatUint(start+1, 36) + "-" + startAndNonce[1]
+	setRunningPlatformJob(t, ctx, pool, reused, hostPrefix+strings.Join(parts, "."), 1)
+	parts[2] = "unknown"
+	setRunningPlatformJob(t, ctx, pool, unknown, hostPrefix+strings.Join(parts, "."), 1)
+	setRunningPlatformJob(t, ctx, pool, rescued, owner, 1)
+	setRunningPlatformJob(t, ctx, pool, exhausted, owner, jobargs.PlatformMaxAttempts)
 	setRunningPlatformJob(t, ctx, pool, foreign, workerHostPrefix("another-host")+"live", 1)
+	setRunningPlatformJob(t, ctx, pool, legacy, hostPrefix+"previous-start", 1)
 
-	run := testRuntime(t, pool, 1)
+	run := testRuntime(t, pool, 1, nodeDir)
 	if id := run.Jobs.ID(); !strings.HasPrefix(id, hostPrefix) {
 		t.Fatalf("worker client ID %q does not carry this host's prefix %q", id, hostPrefix)
 	}
+	for _, op := range []contract.Operation{rescued, exhausted, foreign, legacy, unknown} {
+		if state := riverJobState(t, pool, op.ID); state != "running" {
+			t.Fatalf("live or unverified job %s changed state to %q", op.ID, state)
+		}
+	}
+	if state := riverJobState(t, pool, reused.ID); state != "available" {
+		t.Fatalf("different process start with reused PID state = %q, want available", state)
+	}
+	if err := child.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = child.Wait()
+	run = testRuntime(t, pool, 1, nodeDir)
+	assertStartupRescueOutcome(t, pool, run, rescued, exhausted, foreign, legacy)
+}
+
+func assertStartupRescueOutcome(t *testing.T, pool *pgxpool.Pool, run *Runtime, rescued, exhausted, foreign, legacy contract.Operation) {
+	t.Helper()
+	ctx := context.Background()
 	if state := riverJobState(t, pool, rescued.ID); state != "available" {
 		t.Fatalf("this host's orphaned job was not re-queued before start: state %q", state)
 	}
@@ -68,6 +133,9 @@ func TestIntegrationWorkerRescuesThisHostsOrphanedPlatformJobs(t *testing.T) {
 	}
 	if state := riverJobState(t, pool, foreign.ID); state != "running" {
 		t.Fatalf("another host's running job was re-queued: state %q", state)
+	}
+	if state := riverJobState(t, pool, legacy.ID); state != "running" {
+		t.Fatalf("legacy owner's job changed state to %q", state)
 	}
 
 	startWorkers(t, run)
@@ -95,6 +163,25 @@ func TestIntegrationWorkerRescuesThisHostsOrphanedPlatformJobs(t *testing.T) {
 	if other.State != contract.Running {
 		t.Fatalf("another host's operation state = %s, want running", other.State)
 	}
+}
+
+func TestIntegrationRescueWorkerHelper(t *testing.T) {
+	if os.Getenv("EREGION_RESCUE_WORKER_HELPER") != "1" {
+		t.Skip("subprocess helper")
+	}
+	pool, err := Open(context.Background(), os.Getenv("EREGION_RESCUE_DATABASE_URL"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	run := testRuntime(t, pool, 1, os.Getenv("EREGION_RESCUE_NODE_DIR"))
+	if err := run.Jobs.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(os.Getenv("EREGION_RESCUE_ID_FILE"), []byte(run.Jobs.ID()), 0600); err != nil {
+		t.Fatal(err)
+	}
+	select {}
 }
 
 // TestIntegrationWorkerRescueRechecksTheObservedOwner changes the last
