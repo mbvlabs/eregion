@@ -97,13 +97,24 @@ func (s *Service) buildTransportFor(ctx context.Context, name string) (node.Tran
 
 // beginBuildDispatch commits the reservation and the fenced dispatch intent in
 // the same transaction. There is no transaction across the node call.
-func (s *Service) beginBuildDispatch(ctx context.Context, id contract.OperationID, attempt uint32, node, identity, inputsHash, executionID string, buildID platform.BuildID, releaseID platform.ReleaseID) (bool, error) {
+func (s *Service) beginBuildDispatch(ctx context.Context, id contract.OperationID, attempt uint32, node, identity, inputsHash, executionID string, buildID platform.BuildID, releaseID platform.ReleaseID) (bool, error) { //nolint:gocognit // Placement, capacity and intent must commit together under the operation fence.
 	already := false
 	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
 		// Cancellation and Pack intent serialize on this operation row. A
 		// cancellation accepted after the caller's last check wins here.
 		if op.State == contract.Cancelling {
 			return errPlatformCancelled
+		}
+		placement, placed, err := tx.BuildPlacement(ctx, id)
+		if err != nil {
+			return unavailable(err)
+		}
+		records, err := tx.Steps().List(ctx, id)
+		if err != nil {
+			return unavailable(err)
+		}
+		if ambiguousPackHistory(records, placed) || (placed && (placement.Node != node || placement.Identity != identity)) {
+			return unknownBuildPlacement()
 		}
 		completed, err := completedBuildDispatchTx(ctx, tx, id, inputsHash)
 		if err != nil {
@@ -120,6 +131,11 @@ func (s *Service) beginBuildDispatch(ctx context.Context, id contract.OperationI
 		if !acquired {
 			return river.JobSnooze(deploymentOwnerDefer)
 		}
+		if !placed {
+			if err := tx.InsertBuildPlacement(ctx, id, entities.PackPlacement{Node: node, Identity: identity}); err != nil {
+				return unavailable(err)
+			}
+		}
 		if buildID != "" {
 			if err := markBuildDispatchRunningTx(ctx, tx, id, buildID, releaseID); err != nil {
 				return err
@@ -135,6 +151,20 @@ func (s *Service) beginBuildDispatch(ctx context.Context, id contract.OperationI
 		return false, errNotOwned
 	}
 	return already, nil
+}
+
+func unknownBuildPlacement() error {
+	return contract.NewFault(contract.PreconditionFailed, "original build placement is unknown or changed",
+		"Inspect the original builder and its Pack effect; do not guess from the current environment.")
+}
+
+func ambiguousPackHistory(records []entities.StepRecord, placed bool) bool {
+	for _, record := range records {
+		if strings.HasPrefix(record.Step, "platform-pack-") && (!placed || record.Step != deploymentPackStep) {
+			return true
+		}
+	}
+	return false
 }
 
 func completedBuildDispatchTx(ctx context.Context, tx *entities.StoreTx, id contract.OperationID, inputsHash string) (bool, error) {

@@ -76,6 +76,12 @@ type EregionBuildCapacityClaim struct {
 	CheckedAt       pgtype.Timestamptz
 }
 
+type EregionBuildPlacement struct {
+	OperationID  string
+	NodeName     string
+	NodeIdentity string
+}
+
 type EregionBuildStopPlacement struct {
 	OperationID  string
 	NodeName     string

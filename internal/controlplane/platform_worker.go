@@ -2064,7 +2064,7 @@ func (w *platformWorker) runStepOnBuild(ctx context.Context, tr node.Transport, 
 	return w.runStepOnWithBuild(ctx, tr, id, attempt, deploymentPackStep, payload, secrets, nodeName, identity, source, buildID, releaseID, nil)
 }
 
-func (w *platformWorker) runStepOnWithBuild( //nolint:gocognit // The effect protocol keeps status, dispatch and acknowledgement together.
+func (w *platformWorker) runStepOnWithBuild( //nolint:gocognit,gocyclo // The effect protocol keeps status, dispatch and acknowledgement together.
 	ctx context.Context, tr node.Transport, id contract.OperationID, attempt uint32,
 	stepID string, payload any, secrets map[string]string, buildNode, buildIdentity, buildSource string,
 	buildID platform.BuildID, releaseID platform.ReleaseID,
@@ -2125,6 +2125,9 @@ func (w *platformWorker) runStepOnWithBuild( //nolint:gocognit // The effect pro
 	loop := nodeEffectLoop{
 		Status: func(ctx context.Context) (node.Response, error) {
 			response, err := w.nodeEffectStatus(ctx, tr, exec, stepID, inputsHash, fence.rowExists, attempt)
+			if err == nil && buildNode != "" && !fence.rowExists && response.Status != engine.StatusAbsent {
+				return node.Response{}, unknownBuildPlacement()
+			}
 			return validateBuildStopResponse(response, err, stopDispatch, exec, inputsHash, fence.rowExists)
 		},
 		Dispatch: func(ctx context.Context) (node.Response, error) {

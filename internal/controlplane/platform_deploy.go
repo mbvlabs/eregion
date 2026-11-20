@@ -43,17 +43,16 @@ func (w *platformWorker) runBuildRetry(
 	if err != nil {
 		return w.settle(ctx, id, attempt, err)
 	}
-	nodeName := env.Node
-	role, capability := platform.RoleApplication, platform.CapabilityDocker
+	var n platform.Node
 	if old.Source.Type != "image" {
-		nodeName = env.BuildNodeName()
-		role, capability = platform.RoleBuilder, platform.CapabilityBuildpacks
+		n, _, _, err = w.service.buildNodeForOperation(ctx, id, env)
+	} else {
+		n, err = w.service.node(ctx, env.Node)
+		if err == nil {
+			err = w.service.checkPlacement(n, platform.RoleApplication, platform.CapabilityDocker)
+		}
 	}
-	n, err := w.service.node(ctx, nodeName)
 	if err != nil {
-		return w.settle(ctx, id, attempt, err)
-	}
-	if err := w.service.checkPlacement(n, role, capability); err != nil {
 		return w.settle(ctx, id, attempt, err)
 	}
 	tr, err := w.service.resolver.TransportFor(ctx, n.Name)
@@ -287,17 +286,48 @@ func packPayloadForBuild(build platform.BuildRecord, release platform.Release, g
 	return payload, nil
 }
 
-func (w *platformWorker) executeBuildPack(ctx context.Context, id contract.OperationID, attempt uint32, env platform.Environment, release platform.Release, build platform.BuildRecord, tr node.Transport, payload platform.PackPayload, secretValues map[string]string) (json.RawMessage, node.Transport, error) {
-	buildNode, err := w.service.node(ctx, env.BuildNodeName())
+// buildNodeForOperation selects the original builder once Pack has an intent.
+// Both entry paths and the dispatch path use the same placement checks.
+func (s *Service) buildNodeForOperation(ctx context.Context, id contract.OperationID, env platform.Environment) (platform.Node, entities.PackPlacement, bool, error) {
+	placement, placed, err := s.entities.BuildPlacement(ctx, id)
 	if err != nil {
-		return nil, nil, err
+		return platform.Node{}, placement, false, unavailable(err)
 	}
+	nodeName := env.BuildNodeName()
+	records, err := s.entities.Steps().List(ctx, id)
+	if err != nil {
+		return platform.Node{}, placement, false, unavailable(err)
+	}
+	if ambiguousPackHistory(records, placed) {
+		return platform.Node{}, placement, false, unknownBuildPlacement()
+	}
+	if placed {
+		nodeName = placement.Node
+	}
+	buildNode, err := s.node(ctx, nodeName)
+	if err != nil {
+		return platform.Node{}, placement, placed, err
+	}
+	if err := s.checkPlacement(buildNode, platform.RoleBuilder, platform.CapabilityBuildpacks); err != nil {
+		return platform.Node{}, placement, placed, err
+	}
+	return buildNode, placement, placed, nil
+}
+
+func (w *platformWorker) executeBuildPack(ctx context.Context, id contract.OperationID, attempt uint32, env platform.Environment, release platform.Release, build platform.BuildRecord, tr node.Transport, payload platform.PackPayload, secretValues map[string]string) (json.RawMessage, node.Transport, error) {
 	if tr == nil || w.service.resolver == nil {
 		return nil, nil, contract.NewFault(contract.Unavailable, "node transport is not configured", "Run this work in a worker configured with a node transport.")
+	}
+	buildNode, placement, placed, err := w.service.buildNodeForOperation(ctx, id, env)
+	if err != nil {
+		return nil, nil, err
 	}
 	tr, identity, err := w.service.buildTransportFor(ctx, buildNode.Name)
 	if err != nil {
 		return nil, nil, err
+	}
+	if placed && (identity != placement.Identity || identity == "" || strings.HasSuffix(identity, ":unverified")) {
+		return nil, nil, unknownBuildPlacement()
 	}
 	if err := w.service.adoptBuildCapacity(ctx, id, attempt, buildNode.Name, identity); err != nil {
 		return nil, nil, err
@@ -1235,15 +1265,7 @@ func (w *platformWorker) prepareDeploymentArtifact(ctx context.Context, run *dep
 	gitBuild := requiresGitBuild(release)
 	// A deploy from the current revision records a pending release and build.
 	if gitBuild {
-		builder, err := w.service.node(ctx, run.env.BuildNodeName())
-		if err != nil {
-			return true, w.finishDeploymentFailure(ctx, run.id, run.attempt, run.env, run.dep, nil, err)
-		}
-		if err := w.service.checkPlacement(
-			builder,
-			platform.RoleBuilder,
-			platform.CapabilityBuildpacks,
-		); err != nil {
+		if _, _, _, err := w.service.buildNodeForOperation(ctx, run.id, run.env); err != nil {
 			return true, w.finishDeploymentFailure(ctx, run.id, run.attempt, run.env, run.dep, nil, err)
 		}
 	}

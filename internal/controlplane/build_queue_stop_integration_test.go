@@ -17,6 +17,7 @@ import (
 func TestIntegrationBuildStopWhileCapacityQueued(t *testing.T) {
 	f := newStopRecoveryFixture(t)
 	ctx := context.Background()
+	enableQueueStopBuilder(t, ctx, f)
 	original := f.pointerBuildFixture.op.ID
 	if _, _, claimed, err := f.service.claimPlatform(ctx, original, 1); err != nil || !claimed {
 		t.Fatalf("original attempt: %v %v", claimed, err)
@@ -72,6 +73,13 @@ func TestIntegrationBuildStopWhileCapacityQueued(t *testing.T) {
 	marker := filepath.Join(local.StateDir(), "builds", string(original)+"-"+deploymentPackStep+".cancel")
 	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("unexpected node cancellation marker: %v", err)
+	}
+}
+
+func enableQueueStopBuilder(t *testing.T, ctx context.Context, f stopRecoveryFixture) {
+	t.Helper()
+	if _, err := f.pool.Exec(ctx, `UPDATE eregion_platform_nodes SET roles=ARRAY['application','builder'], capabilities=ARRAY['docker','buildpacks'] WHERE name='local'`); err != nil {
+		t.Fatal(err)
 	}
 }
 
