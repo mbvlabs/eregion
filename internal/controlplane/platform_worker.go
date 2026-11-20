@@ -127,6 +127,9 @@ func (w *platformWorker) handleCancellingPlatformWork(ctx context.Context, op co
 	if op.Kind == platform.KindBuildStop {
 		return true, w.service.cancelRecoveredBuildStop(ctx, op.ID, attempt)
 	}
+	if op.Kind == platform.KindBuildRetry {
+		return true, w.service.reconcileBuildRetry(ctx, op)
+	}
 	if op.Kind == platform.KindDomainAdd || op.Kind == platform.KindDomainRemove {
 		normalized, err := platform.Default().Normalize(op.Kind, op.Target, raw)
 		if err != nil {
@@ -1186,8 +1189,14 @@ func (s *Service) cancelPlatform(
 	message string,
 ) error {
 	message = s.resultText(message)
+	var retry *contract.Operation
 	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
 		if op.State.Terminal() {
+			return nil
+		}
+		if op.Kind == platform.KindBuildRetry {
+			snapshot := *op
+			retry = &snapshot
 			return nil
 		}
 		return s.cancelPlatformTx(ctx, tx, op, id, message)
@@ -1197,6 +1206,12 @@ func (s *Service) cancelPlatform(
 	}
 	if !owned {
 		return errNotOwned
+	}
+	if retry != nil {
+		if retry.State != contract.Cancelling {
+			return unknownRetryPack()
+		}
+		return s.reconcileBuildRetry(ctx, *retry)
 	}
 	return nil
 }
@@ -2220,6 +2235,9 @@ func (s *Service) reconcilePlatformOperation(ctx context.Context, op contract.Op
 			return s.settleReconciledBuildStop(ctx, op, true, "")
 		}
 	}
+	if op.Kind == platform.KindBuildRetry {
+		return s.reconcileBuildRetry(ctx, op)
+	}
 	if op.State == contract.Cancelling {
 		return s.cancelPlatform(
 			ctx,
@@ -2229,8 +2247,6 @@ func (s *Service) reconcilePlatformOperation(ctx context.Context, op contract.Op
 		)
 	}
 	switch op.Kind {
-	case platform.KindBuildRetry:
-		return s.reconcileBuildRetry(ctx, op)
 	case platform.KindBuildStop:
 		return s.reconcileBuildStop(ctx, op)
 	case platform.KindNodeCheck, platform.KindNodeReconcile:
@@ -2261,32 +2277,7 @@ func (s *Service) reconcilePlatformOperation(ctx context.Context, op contract.Op
 }
 
 func (s *Service) reconcileBuildRetry(ctx context.Context, op contract.Operation) error {
-	release, err := s.releaseForOperation(ctx, op.ID)
-	if err != nil {
-		if fault := contract.Classify(err); fault.Code == contract.NotFound {
-			return s.failReconciledPlatform(
-				ctx,
-				op,
-				"release execution ended before a durable release was ready",
-				contract.Unavailable,
-			)
-		}
-		return err
-	}
-	if release.Status == platform.ReleaseReady {
-		return s.finishPlatformOperation(
-			ctx,
-			op.ID,
-			op.Attempt,
-			func(*entities.StoreTx, *contract.Operation) error { return nil },
-		)
-	}
-	return s.failReconciledPlatform(
-		ctx,
-		op,
-		"release execution ended before the image was verified or built",
-		contract.Unavailable,
-	)
+	return s.recoverBuildRetry(ctx, op)
 }
 
 func (s *Service) reconcileBuildStop(ctx context.Context, op contract.Operation) error {

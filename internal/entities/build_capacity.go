@@ -81,6 +81,19 @@ func (b *BuildCapacityTx) MatchesForStop(ctx context.Context, claim BuildCapacit
 	return row.ClaimID == claim.ClaimID && row.NodeName == claim.Node && row.BuilderIdentity == claim.Identity, nil
 }
 
+// MatchesForRecovery also checks the attempt while holding the claim lock.
+func (b *BuildCapacityTx) MatchesForRecovery(ctx context.Context, claim BuildCapacityClaim) (bool, error) {
+	matches, err := b.MatchesForStop(ctx, claim)
+	if err != nil || !matches {
+		return matches, err
+	}
+	row, err := b.owner.q.GetBuildCapacityClaim(ctx, string(claim.OperationID))
+	if err != nil {
+		return false, err
+	}
+	return row.Attempt == int64(claim.Attempt), nil
+}
+
 // Exists is used while holding the original operation row lock.
 func (b *BuildCapacityTx) Exists(ctx context.Context, id contract.OperationID) (bool, error) {
 	_, err := b.owner.q.GetBuildCapacityClaim(ctx, string(id))

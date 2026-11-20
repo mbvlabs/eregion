@@ -165,12 +165,19 @@ func (s *Service) ackStep(ctx context.Context, id contract.OperationID, attempt 
 // expected is used by status-only recovery: the observation must still describe
 // the exact dispatch intent after the operation and step rows are locked.
 func (s *Service) ackStepWithExpectedExecution(ctx context.Context, id contract.OperationID, attempt uint32, step, inputsHash, executionID string, result json.RawMessage, total int, expected *StepRecord) error {
+	return s.ackStepWithGuard(ctx, id, attempt, step, inputsHash, executionID, result, total, expected, nil)
+}
+
+func (s *Service) ackStepWithGuard(ctx context.Context, id contract.OperationID, attempt uint32, step, inputsHash, executionID string, result json.RawMessage, total int, expected *StepRecord, guard func(*entities.StoreTx) error) error {
 	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
 		record, found, err := tx.Steps().GetForUpdate(ctx, id, step)
 		if err != nil {
 			return unavailable(err)
 		}
 		if err := validateStepAcknowledgement(record, found, inputsHash, expected); err != nil {
+			return err
+		}
+		if err := runStepAckGuard(guard, tx); err != nil {
 			return err
 		}
 		if record.State == "completed" {
@@ -202,6 +209,13 @@ func (s *Service) ackStepWithExpectedExecution(ctx context.Context, id contract.
 	}
 	if !owned {
 		return errNotOwned
+	}
+	return nil
+}
+
+func runStepAckGuard(guard func(*entities.StoreTx) error, tx *entities.StoreTx) error {
+	if guard != nil {
+		return guard(tx)
 	}
 	return nil
 }
