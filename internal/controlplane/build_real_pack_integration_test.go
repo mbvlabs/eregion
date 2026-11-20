@@ -250,6 +250,14 @@ func TestIntegrationReleaseBuildSlotQueuesAndRuns(t *testing.T) { //nolint:gocog
 	if _, err := pool.Exec(ctx, `INSERT INTO eregion_build_capacity_claims(operation_id,node_name,builder_identity,attempt) VALUES ($1,'local',$2,1)`, seed.ID, pinned); err != nil {
 		t.Fatal(err)
 	}
+	// The seed stands in for an occupied slot, not runnable diagnostic work.
+	// Otherwise the real worker can finish its diagnostic job and maintenance
+	// can retire the seed claim before the retry observes busy capacity.
+	tag, err := pool.Exec(ctx, `UPDATE river_job SET state='scheduled',scheduled_at=now()+interval '1 hour'
+		WHERE id=(SELECT job_id FROM eregion_operations WHERE id=$1) AND kind='diagnostic_test' AND state='available'`, seed.ID)
+	if err != nil || tag.RowsAffected() != 1 {
+		t.Fatalf("park seed diagnostic job: updated=%d err=%v", tag.RowsAffected(), err)
+	}
 	startWorkers(t, run)
 	blocked := platformSubmit(t, s, platform.KindBuildRetry, "build/"+string(old.ID), "queue-retry", map[string]any{})
 	await(t, 30*time.Second, func() bool {
