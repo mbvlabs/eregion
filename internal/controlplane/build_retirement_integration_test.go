@@ -67,7 +67,7 @@ func TestIntegrationBuildDispatchAndRetirement(t *testing.T) { //nolint:gocognit
 	}
 	holder, blocked, invalid := submit("retire-holder"), submit("retire-blocked"), submit("retire-invalid")
 	w := &platformWorker{service: s}
-	_, err = w.executeBuildPack(ctx, blocked, 1, platform.Environment{Node: "local"},
+	_, _, err = w.executeBuildPack(ctx, blocked, 1, platform.Environment{Node: "local"},
 		platform.Release{}, platform.BuildRecord{}, nil, platform.PackPayload{}, nil)
 	if err == nil {
 		t.Fatal("unavailable transport unexpectedly succeeded")

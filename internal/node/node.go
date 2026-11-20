@@ -21,11 +21,12 @@ type Method string
 // it carries no execution identity: there is no effect to journal. Its result
 // is a retention.Inventory.
 const (
-	MethodRun         Method = "run"
-	MethodStatus      Method = "status"
-	MethodObserve     Method = "observe"
-	MethodInventory   Method = "inventory"
-	MethodRetireBuild Method = "retire_build"
+	MethodRun          Method = "run"
+	MethodStatus       Method = "status"
+	MethodObserve      Method = "observe"
+	MethodObserveImage Method = "observe_image"
+	MethodInventory    Method = "inventory"
+	MethodRetireBuild  Method = "retire_build"
 )
 
 // ObservePayload asks a node for its read-only Docker ownership observation.
@@ -33,6 +34,10 @@ const (
 type ObservePayload struct {
 	App         string `json:"app"`
 	Environment string `json:"environment,omitempty"`
+}
+
+type ObserveImagePayload struct {
+	Reference string `json:"reference"`
 }
 
 // Request is transport-independent. Secrets are transient and must never be

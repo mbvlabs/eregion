@@ -1,12 +1,14 @@
 package controlplane
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"runtime"
 	"strconv"
 	"strings"
@@ -214,11 +216,11 @@ func (w *platformWorker) buildRelease(
 	if err != nil {
 		return release, err
 	}
-	result, err := w.executeBuildPack(ctx, id, attempt, env, release, build, tr, payload, secretValues)
+	result, buildTransport, err := w.executeBuildPack(ctx, id, attempt, env, release, build, tr, payload, secretValues)
 	if err != nil {
 		return release, err
 	}
-	return w.finishBuildRelease(ctx, id, attempt, release, build, tr, result)
+	return w.finishBuildRelease(ctx, id, attempt, release, build, buildTransport, result)
 }
 
 func (w *platformWorker) prepareBuildRecord(ctx context.Context, id contract.OperationID, release platform.Release) (platform.BuildRecord, error) {
@@ -285,52 +287,52 @@ func packPayloadForBuild(build platform.BuildRecord, release platform.Release, g
 	return payload, nil
 }
 
-func (w *platformWorker) executeBuildPack(ctx context.Context, id contract.OperationID, attempt uint32, env platform.Environment, release platform.Release, build platform.BuildRecord, tr node.Transport, payload platform.PackPayload, secretValues map[string]string) (json.RawMessage, error) {
+func (w *platformWorker) executeBuildPack(ctx context.Context, id contract.OperationID, attempt uint32, env platform.Environment, release platform.Release, build platform.BuildRecord, tr node.Transport, payload platform.PackPayload, secretValues map[string]string) (json.RawMessage, node.Transport, error) {
 	buildNode, err := w.service.node(ctx, env.BuildNodeName())
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if tr == nil || w.service.resolver == nil {
-		return nil, contract.NewFault(contract.Unavailable, "node transport is not configured", "Run this work in a worker configured with a node transport.")
+		return nil, nil, contract.NewFault(contract.Unavailable, "node transport is not configured", "Run this work in a worker configured with a node transport.")
 	}
 	tr, identity, err := w.service.buildTransportFor(ctx, buildNode.Name)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := w.service.adoptBuildCapacity(ctx, id, attempt, buildNode.Name, identity); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if cancelled, _ := w.service.buildCancelled(ctx, build.ID); cancelled {
-		return nil, errPlatformCancelled
+		return nil, nil, errPlatformCancelled
 	}
 	if err := w.service.checkCancelled(ctx, id); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	buildSecrets, err := buildCredentialSecrets(build, secretValues)
 	if err != nil {
-		return nil, w.failOwnedBuild(ctx, id, attempt, release, build, err)
+		return nil, nil, w.failOwnedBuild(ctx, id, attempt, release, build, err)
 	}
 	result, buildErr := w.runStepOnBuild(ctx, tr, id, attempt, payload, buildSecrets, buildNode.Name, identity, build.Source.Type, build.ID, release.ID)
 	if buildErr != nil {
 		var snooze *river.JobSnoozeError
 		if errors.As(buildErr, &snooze) {
-			return nil, buildErr
+			return nil, nil, buildErr
 		}
-		return nil, w.handleBuildPackFailure(ctx, id, attempt, release, build, buildErr)
+		return nil, nil, w.handleBuildPackFailure(ctx, id, attempt, release, build, buildErr)
 	}
 	// A successful node effect has a durable node record which prevents a
 	// delayed older Run from starting another build. Failed or uncertain
 	// effects deliberately keep their reservation.
 	if err := w.service.releaseBuildCapacity(ctx, id, attempt, buildNode.Name); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if cancelled, _ := w.service.buildCancelled(ctx, build.ID); cancelled {
-		return nil, errPlatformCancelled
+		return nil, nil, errPlatformCancelled
 	}
 	if err := w.service.checkCancelled(ctx, id); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return result, nil
+	return result, tr, nil
 }
 
 func buildCredentialSecrets(build platform.BuildRecord, secretValues map[string]string) (map[string]string, error) {
@@ -375,23 +377,13 @@ func (w *platformWorker) finishBuildRelease(ctx context.Context, id contract.Ope
 	if identityErr != nil {
 		return release, w.failOwnedBuild(ctx, id, attempt, release, build, identityErr)
 	}
-	imageResult, err := w.runStepOn(ctx, tr, id, attempt, deploymentImageStep, platform.ArgvPayload{
-		Step: deploymentImageStep,
-		Argv: []string{
-			"docker",
-			"image",
-			"inspect",
-			"--format",
-			"{{.Id}}",
-			canonicalImage,
-		},
-		IsolatedDocker: true,
-		TimeoutSeconds: 30,
-	}, nil)
+	image, err := observeReleaseImage(ctx, tr, canonicalImage)
 	if err != nil {
-		return release, w.handleBuildPackFailure(ctx, id, attempt, release, build, err)
+		// An unavailable read says nothing about the completed Pack result.
+		// Leave it pending so a later attempt can inspect again without rebuilding.
+		return release, err
 	}
-	imageID := stepStdout(imageResult)
+	imageID := image.ID
 	if !strings.HasPrefix(imageID, "sha256:") || len(imageID) != 71 {
 		fault := contract.NewFault(
 			contract.PreconditionFailed,
@@ -568,24 +560,38 @@ func (w *platformWorker) verifyReleaseImage(
 	if err := w.service.checkCancelled(ctx, id); err != nil {
 		return release, err
 	}
-	result, err := w.runStepOn(ctx, tr, id, attempt, deploymentImageStep, platform.ArgvPayload{
-		Step: deploymentImageStep,
-		Argv: []string{
-			"docker",
-			"image",
-			"inspect",
-			"--format",
-			"{{.Id}}|{{.Os}}|{{.Architecture}}|{{json .RepoDigests}}",
-			release.Image,
-		},
-		IsolatedDocker: true,
-		TimeoutSeconds: 30,
-	}, nil)
-	if err != nil {
-		return release, err
+	var inspection string
+	if !pull {
+		image, err := observeReleaseImage(ctx, tr, release.Image)
+		if err != nil {
+			return release, err
+		}
+		digests, err := json.Marshal(image.RepoDigests)
+		if err != nil {
+			return release, err
+		}
+		inspection = image.ID + "|" + image.OS + "|" + image.Architecture + "|" + string(digests)
+	} else {
+		result, err := w.runStepOn(ctx, tr, id, attempt, deploymentImageStep, platform.ArgvPayload{
+			Step: deploymentImageStep,
+			Argv: []string{
+				"docker",
+				"image",
+				"inspect",
+				"--format",
+				"{{.Id}}|{{.Os}}|{{.Architecture}}|{{json .RepoDigests}}",
+				release.Image,
+			},
+			IsolatedDocker: true,
+			TimeoutSeconds: 30,
+		}, nil)
+		if err != nil {
+			return release, err
+		}
+		inspection = stepStdout(result)
 	}
 	runtimeID, err := platform.VerifyMaterializedImageInspection(
-		stepStdout(result),
+		inspection,
 		release.Image,
 		runtime.GOARCH,
 	)
@@ -596,13 +602,64 @@ func (w *platformWorker) verifyReleaseImage(
 			"The registry artifact changed, the platform differs, or the node image does not carry the pinned repository digest; do not deploy it.",
 		)
 	}
-	if _, err := w.service.entities.Platform().Releases().MarkReadyWithImageID(ctx, release.ID, configDigest); err != nil {
-		return release, unavailable(err)
+	if err := w.service.markOwnedImageReleaseReady(ctx, id, attempt, release.ID, release.Image, configDigest); err != nil {
+		return release, err
 	}
 	release.Status = platform.ReleaseReady
 	release.ImageID = configDigest
 	_ = runtimeID
 	return release, nil
+}
+
+func (s *Service) markOwnedImageReleaseReady(ctx context.Context, id contract.OperationID, attempt uint32, release platform.ReleaseID, image, configDigest string) error {
+	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
+		if op.State == contract.Cancelling {
+			return errPlatformCancelled
+		}
+		var rows int64
+		var err error
+		if op.Kind == platform.KindBuildRetry {
+			rows, err = tx.Platform().Releases().MarkOwnedReadyWithImageID(ctx, release, id, image, configDigest)
+		} else {
+			// Deployments can materialize a release owned by another operation.
+			rows, err = tx.Platform().Releases().MarkReadyWithImageID(ctx, release, configDigest)
+		}
+		if err != nil {
+			return unavailable(err)
+		}
+		if rows != 1 {
+			return pointerIntegrityFault()
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if !owned {
+		return errNotOwned
+	}
+	return nil
+}
+
+func observeReleaseImage(ctx context.Context, tr node.Transport, reference string) (platform.ImageObservation, error) {
+	payload, err := json.Marshal(node.ObserveImagePayload{Reference: reference})
+	if err != nil {
+		return platform.ImageObservation{}, err
+	}
+	response, err := tr.Call(ctx, node.Request{Method: node.MethodObserveImage, RequestID: newRequestID(), Payload: payload}, nil)
+	if err != nil {
+		return platform.ImageObservation{}, err
+	}
+	if response.Status != engine.StatusCompleted {
+		return platform.ImageObservation{}, contract.NewFault(contract.Unavailable, "the node did not return an image observation", response.Detail)
+	}
+	var image platform.ImageObservation
+	decoder := json.NewDecoder(bytes.NewReader(response.Result))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&image) != nil || decoder.Decode(&struct{}{}) != io.EOF || !image.ValidFor(reference) {
+		return platform.ImageObservation{}, contract.NewFault(contract.Unavailable, "the node returned an invalid image observation", "")
+	}
+	return image, nil
 }
 
 // ------------------------------------------------------------ deployment

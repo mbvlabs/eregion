@@ -44,6 +44,12 @@ UPDATE eregion_platform_releases
 SET status='ready',image_id=sqlc.arg(image_id)::text,completed_at=clock_timestamp(),error='',error_code=''
 WHERE id=sqlc.arg(id)::text;
 
+-- name: MarkPlatformOwnedReleaseReadyWithImageID :execrows
+UPDATE eregion_platform_releases
+SET status='ready',image_id=sqlc.arg(image_id)::text,completed_at=clock_timestamp(),error='',error_code=''
+WHERE id=sqlc.arg(id)::text AND operation_id=sqlc.arg(operation_id)::text AND status IN ('pending','ready')
+  AND image=sqlc.arg(image)::text AND image_id=sqlc.arg(image_id)::text;
+
 -- name: MarkPlatformReleaseReadyFromBuild :execrows
 UPDATE eregion_platform_releases
 SET status='ready',image=sqlc.arg(image)::text,image_id=sqlc.arg(image_id)::text,

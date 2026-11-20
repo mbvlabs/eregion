@@ -41,7 +41,7 @@ func (t *releaseRecoveryTransport) Call(_ context.Context, request node.Request,
 	case node.MethodRun:
 		t.runCalls++
 		return node.Response{}, errors.New("recovery dispatched a second command")
-	case node.MethodObserve, node.MethodInventory, node.MethodRetireBuild:
+	case node.MethodObserve, node.MethodObserveImage, node.MethodInventory, node.MethodRetireBuild:
 		return node.Response{}, errors.New("unexpected recovery method")
 	default:
 		return node.Response{}, errors.New("unexpected recovery method")

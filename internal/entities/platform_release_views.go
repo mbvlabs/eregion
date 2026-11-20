@@ -263,6 +263,12 @@ func (s *ReleaseStore) MarkReadyWithImageID(ctx context.Context, id platform.Rel
 	return s.q.MarkPlatformReleaseReadyWithImageID(ctx, query.MarkPlatformReleaseReadyWithImageIDParams{ID: string(id), ImageID: imageID})
 }
 
+func (s *ReleaseStore) MarkOwnedReadyWithImageID(ctx context.Context, id platform.ReleaseID, operationID contract.OperationID, image, imageID string) (int64, error) {
+	return s.q.MarkPlatformOwnedReleaseReadyWithImageID(ctx, query.MarkPlatformOwnedReleaseReadyWithImageIDParams{
+		ID: string(id), OperationID: string(operationID), Image: image, ImageID: imageID,
+	})
+}
+
 func (s *ReleaseStore) MarkReadyFromBuild(ctx context.Context, id platform.ReleaseID, image, imageID, commit string) (int64, error) {
 	return s.q.MarkPlatformReleaseReadyFromBuild(ctx, query.MarkPlatformReleaseReadyFromBuildParams{
 		ID: string(id), Image: image, ImageID: imageID, CommitSha: commit,

@@ -109,6 +109,9 @@ func handle(config Config, steps *node.StepRegistry, request node.Request) node.
 	if request.Method == node.MethodObserve {
 		return observeResponse(request)
 	}
+	if request.Method == node.MethodObserveImage {
+		return node.ObserveImage(context.Background(), request)
+	}
 	if request.Method == node.MethodInventory {
 		return inventoryResponse(config)
 	}

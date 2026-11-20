@@ -1685,6 +1685,33 @@ func (q *Queries) MarkPlatformDeploymentSucceededByOperation(ctx context.Context
 	return result.RowsAffected(), nil
 }
 
+const markPlatformOwnedReleaseReadyWithImageID = `-- name: MarkPlatformOwnedReleaseReadyWithImageID :execrows
+UPDATE eregion_platform_releases
+SET status='ready',image_id=$1::text,completed_at=clock_timestamp(),error='',error_code=''
+WHERE id=$2::text AND operation_id=$3::text AND status IN ('pending','ready')
+  AND image=$4::text AND image_id=$1::text
+`
+
+type MarkPlatformOwnedReleaseReadyWithImageIDParams struct {
+	ImageID     string
+	ID          string
+	OperationID string
+	Image       string
+}
+
+func (q *Queries) MarkPlatformOwnedReleaseReadyWithImageID(ctx context.Context, arg MarkPlatformOwnedReleaseReadyWithImageIDParams) (int64, error) {
+	result, err := q.db.Exec(ctx, markPlatformOwnedReleaseReadyWithImageID,
+		arg.ImageID,
+		arg.ID,
+		arg.OperationID,
+		arg.Image,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const markPlatformReleaseFailedByID = `-- name: MarkPlatformReleaseFailedByID :execrows
 UPDATE eregion_platform_releases
 SET status='failed',error_code=$1::text,error=$2::text,

@@ -145,7 +145,7 @@ func assertBuildCapacityTransportUnavailable(t *testing.T, s *Service, blocked, 
 	// Exercise the production build path with an unavailable transport. No
 	// node or command is emulated, and an error must not release capacity.
 	w := &platformWorker{service: s}
-	_, err := w.executeBuildPack(ctx, blocked, 1, platform.Environment{Node: "local"},
+	_, _, err := w.executeBuildPack(ctx, blocked, 1, platform.Environment{Node: "local"},
 		platform.Release{}, platform.BuildRecord{}, nil, platform.PackPayload{}, nil)
 	if err == nil {
 		t.Fatal("missing transport unexpectedly completed a build")

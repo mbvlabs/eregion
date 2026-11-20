@@ -51,7 +51,7 @@ func (t *resourceTestTransport) Call(_ context.Context, request node.Request, _ 
 			result = json.RawMessage(`{"container_id":"container-from-test"}`)
 		}
 		return node.Response{Status: engine.StatusCompleted, ExecutionID: request.Execution.ExecutionID(), Executed: true, Result: result}, nil
-	case node.MethodObserve, node.MethodInventory, node.MethodRetireBuild:
+	case node.MethodObserve, node.MethodObserveImage, node.MethodInventory, node.MethodRetireBuild:
 		return node.Response{}, fmt.Errorf("unexpected node method %q", request.Method)
 	default:
 		return node.Response{}, fmt.Errorf("unexpected node method %q", request.Method)

@@ -52,6 +52,9 @@ func (d *Dispatcher) Call(ctx context.Context, request Request, onEvent func(Eve
 	if request.Method == MethodObserve {
 		return observeLocal(ctx, request)
 	}
+	if request.Method == MethodObserveImage {
+		return ObserveImage(ctx, request), nil
+	}
 	if request.Method == MethodInventory {
 		return inventoryLocal(ctx, d.dataDir)
 	}
