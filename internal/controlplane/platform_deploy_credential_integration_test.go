@@ -251,7 +251,7 @@ func (f *credentialDeployFixture) retry(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("load retry build: found=%v err=%v", found, err)
 	}
-	f.secrets, err = buildCredentialSecrets(context.Background(), &platformWorker{service: f.service}, build, run.release, values)
+	f.secrets, err = buildCredentialSecrets(build, values)
 	if err != nil {
 		t.Fatal(err)
 	}

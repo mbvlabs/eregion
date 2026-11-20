@@ -208,8 +208,7 @@ func (w *platformWorker) buildRelease(
 			"the build node has no configured registry endpoint",
 			"Apply the node's recorded host intent and start the worker with its configured loopback registry endpoint before building.",
 		)
-		_ = w.service.markBuildFailed(ctx, build.ID, fault, release.ID)
-		return release, fault
+		return release, w.failOwnedBuild(ctx, id, attempt, release, build, fault)
 	}
 	payload, err := packPayloadForBuild(build, release, gitRef, registryEndpoint)
 	if err != nil {
@@ -307,9 +306,9 @@ func (w *platformWorker) executeBuildPack(ctx context.Context, id contract.Opera
 	if err := w.service.checkCancelled(ctx, id); err != nil {
 		return nil, err
 	}
-	buildSecrets, err := buildCredentialSecrets(ctx, w, build, release, secretValues)
+	buildSecrets, err := buildCredentialSecrets(build, secretValues)
 	if err != nil {
-		return nil, err
+		return nil, w.failOwnedBuild(ctx, id, attempt, release, build, err)
 	}
 	result, buildErr := w.runStepOnBuild(ctx, tr, id, attempt, payload, buildSecrets, buildNode.Name, identity, build.Source.Type, build.ID, release.ID)
 	if buildErr != nil {
@@ -317,7 +316,7 @@ func (w *platformWorker) executeBuildPack(ctx context.Context, id contract.Opera
 		if errors.As(buildErr, &snooze) {
 			return nil, buildErr
 		}
-		return nil, w.handleBuildPackFailure(ctx, id, release, build, buildErr)
+		return nil, w.handleBuildPackFailure(ctx, id, attempt, release, build, buildErr)
 	}
 	// A successful node effect has a durable node record which prevents a
 	// delayed older Run from starting another build. Failed or uncertain
@@ -334,7 +333,7 @@ func (w *platformWorker) executeBuildPack(ctx context.Context, id contract.Opera
 	return result, nil
 }
 
-func buildCredentialSecrets(ctx context.Context, w *platformWorker, build platform.BuildRecord, release platform.Release, secretValues map[string]string) (map[string]string, error) {
+func buildCredentialSecrets(build platform.BuildRecord, secretValues map[string]string) (map[string]string, error) {
 	buildSecrets := map[string]string{}
 	if build.Source.CredentialSecretName == "" {
 		return buildSecrets, nil
@@ -346,34 +345,20 @@ func buildCredentialSecrets(ctx context.Context, w *platformWorker, build platfo
 			"git read credential is unavailable",
 			"Set the revision's credential secret in the environment vault before building.",
 		)
-		_ = w.service.markBuildFailed(ctx, build.ID, err, release.ID)
 		return nil, err
 	}
 	buildSecrets[build.Source.CredentialSecretName] = value
 	return buildSecrets, nil
 }
 
-func (w *platformWorker) handleBuildPackFailure(ctx context.Context, id contract.OperationID, release platform.Release, build platform.BuildRecord, buildErr error) error {
+func (w *platformWorker) handleBuildPackFailure(ctx context.Context, id contract.OperationID, attempt uint32, release platform.Release, build platform.BuildRecord, buildErr error) error {
 	if errors.Is(buildErr, errNodeEffectOutcomeUnknown) {
 		// The node may still be building. Do not turn a lost SSH response into
 		// cancellation or a failed build; retain unknown ownership and let the
 		// next attempt reconcile status before any new dispatch.
 		return buildErr
 	}
-	if state, _, stateErr := w.service.operationState(ctx, id); stateErr == nil && state == contract.Cancelling {
-		_ = w.service.markBuildCancelled(ctx, build.ID)
-		return errPlatformCancelled
-	}
-	if errors.Is(buildErr, errPlatformCancelled) {
-		_ = w.service.markBuildCancelled(ctx, build.ID)
-		return errPlatformCancelled
-	}
-	if cancelled, _ := w.service.buildCancelled(ctx, build.ID); cancelled {
-		_ = w.service.markBuildCancelled(ctx, build.ID)
-		return errPlatformCancelled
-	}
-	_ = w.service.markBuildFailed(ctx, build.ID, buildErr, release.ID)
-	return buildErr
+	return w.failOwnedBuild(ctx, id, attempt, release, build, buildErr)
 }
 
 func (w *platformWorker) finishBuildRelease(ctx context.Context, id contract.OperationID, attempt uint32, release platform.Release, build platform.BuildRecord, tr node.Transport, result json.RawMessage) (platform.Release, error) {
@@ -384,13 +369,11 @@ func (w *platformWorker) finishBuildRelease(ctx context.Context, id contract.Ope
 			"build did not record an exact commit",
 			"The git ref must resolve to a commit before the release can be deployed.",
 		)
-		_ = w.service.markBuildFailed(ctx, build.ID, fault, release.ID)
-		return release, fault
+		return release, w.failOwnedBuild(ctx, id, attempt, release, build, fault)
 	}
 	canonicalImage, configDigest, runtimeID, identityErr := builtReleaseIdentity(result)
 	if identityErr != nil {
-		_ = w.service.markBuildFailed(ctx, build.ID, identityErr, release.ID)
-		return release, identityErr
+		return release, w.failOwnedBuild(ctx, id, attempt, release, build, identityErr)
 	}
 	imageResult, err := w.runStepOn(ctx, tr, id, attempt, deploymentImageStep, platform.ArgvPayload{
 		Step: deploymentImageStep,
@@ -406,8 +389,7 @@ func (w *platformWorker) finishBuildRelease(ctx context.Context, id contract.Ope
 		TimeoutSeconds: 30,
 	}, nil)
 	if err != nil {
-		_ = w.service.markBuildFailed(ctx, build.ID, err, release.ID)
-		return release, err
+		return release, w.handleBuildPackFailure(ctx, id, attempt, release, build, err)
 	}
 	imageID := stepStdout(imageResult)
 	if !strings.HasPrefix(imageID, "sha256:") || len(imageID) != 71 {
@@ -416,8 +398,7 @@ func (w *platformWorker) finishBuildRelease(ctx context.Context, id contract.Ope
 			"image inspection did not return an immutable image ID",
 			"Inspect the node image and build operation before retrying.",
 		)
-		_ = w.service.markBuildFailed(ctx, build.ID, fault, release.ID)
-		return release, fault
+		return release, w.failOwnedBuild(ctx, id, attempt, release, build, fault)
 	}
 	if imageID != runtimeID {
 		fault := contract.NewFault(
@@ -425,16 +406,14 @@ func (w *platformWorker) finishBuildRelease(ctx context.Context, id contract.Ope
 			"the local completion tag does not match the built registry image",
 			"Do not accept a mismatched image; retry the build and inspect the registry publication.",
 		)
-		_ = w.service.markBuildFailed(ctx, build.ID, fault, release.ID)
-		return release, fault
+		return release, w.failOwnedBuild(ctx, id, attempt, release, build, fault)
 	}
 	if cancelled, _ := w.service.buildCancelled(ctx, build.ID); cancelled {
 		return release, errPlatformCancelled
 	}
-	if err := w.service.markBuildSucceeded(
+	if err := w.service.markOwnedBuildSucceeded(
 		ctx,
-		build.ID,
-		release.ID,
+		id, attempt, build.ID, release.ID,
 		canonicalImage,
 		commit,
 		configDigest,
@@ -2147,11 +2126,92 @@ func (s *Service) pinDeploymentCredentialSecret(
 
 // --------------------------------------------------------------- build state
 
+// mutateOwnedBuild locks the operation first, then the app, environment,
+// release and build in the normal pointer-writer order. The initial build
+// lookup (including prepareBuildRecord's release fallback) is not authority.
+func (s *Service) mutateOwnedBuild(ctx context.Context, operation contract.OperationID, attempt uint32, build platform.BuildID, release platform.ReleaseID, change func(*entities.StoreTx, *contract.Operation, platform.BuildRecord) error) error {
+	_, owned, err := s.mutateOwned(ctx, operation, attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
+		if err := lockBuildParentsTx(ctx, tx, build, release); err != nil {
+			return err
+		}
+		current, found, err := tx.Platform().Builds().GetByID(ctx, build)
+		if err != nil {
+			return unavailable(err)
+		}
+		if !found || current.OperationID != operation || current.ReleaseID != release {
+			return pointerIntegrityFault()
+		}
+		currentRelease, found, err := tx.Platform().Releases().GetByID(ctx, release)
+		if err != nil {
+			return unavailable(err)
+		}
+		if !found || currentRelease.OperationID != operation || currentRelease.BuildID != build {
+			return pointerIntegrityFault()
+		}
+		return change(tx, op, current)
+	})
+	if err != nil {
+		return err
+	}
+	if !owned {
+		return errNotOwned
+	}
+	return nil
+}
+
+func (w *platformWorker) failOwnedBuild(ctx context.Context, operation contract.OperationID, attempt uint32, release platform.Release, build platform.BuildRecord, cause error) error {
+	cancelled := false
+	err := w.service.mutateOwnedBuild(ctx, operation, attempt, build.ID, release.ID, func(tx *entities.StoreTx, op *contract.Operation, current platform.BuildRecord) error {
+		if op.State == contract.Cancelling || errors.Is(cause, errPlatformCancelled) || current.State == platform.BuildCancelled {
+			cancelled = true
+			if _, err := tx.Platform().Builds().MarkCancelled(ctx, build.ID, contract.Cancelled, "Build stopped by operator."); err != nil {
+				return unavailable(err)
+			}
+			return nil
+		}
+		fault := contract.Classify(cause)
+		if _, err := tx.Platform().Builds().MarkFailed(ctx, build.ID, fault.Code, fault.Message); err != nil {
+			return unavailable(err)
+		}
+		if _, err := tx.Platform().Releases().MarkFailedByID(ctx, release.ID, fault.Code, fault.Message); err != nil {
+			return unavailable(err)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if cancelled {
+		return errPlatformCancelled
+	}
+	return cause
+}
+
+func (s *Service) markOwnedBuildSucceeded(ctx context.Context, operation contract.OperationID, attempt uint32, build platform.BuildID, release platform.ReleaseID, image, commit, imageID string) error {
+	return s.mutateOwnedBuild(ctx, operation, attempt, build, release, func(tx *entities.StoreTx, op *contract.Operation, current platform.BuildRecord) error {
+		if op.State == contract.Cancelling || current.State == platform.BuildCancelled {
+			return errPlatformCancelled
+		}
+		buildRows, err := tx.Platform().Builds().MarkSucceeded(ctx, build, commit)
+		if err != nil {
+			return unavailable(err)
+		}
+		releaseRows, err := tx.Platform().Releases().MarkReadyFromBuild(ctx, release, image, imageID, commit)
+		if err != nil {
+			return unavailable(err)
+		}
+		if buildRows == 0 || releaseRows == 0 {
+			return errPlatformCancelled
+		}
+		return nil
+	})
+}
+
 func (s *Service) markBuildSucceeded(
 	ctx context.Context,
 	id platform.BuildID,
 	releaseID platform.ReleaseID,
-	image, commit, imageID string,
+	image, commit, imageID string, //nolint:unparam // Fixture helper retains the complete transition inputs.
 ) error {
 	err := s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
 		if err := lockBuildParentsTx(ctx, tx, id, releaseID); err != nil {
