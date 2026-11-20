@@ -114,6 +114,7 @@ func lockPendingBuildParentsTx(ctx context.Context, tx *entities.StoreTx, build 
 type buildStopDispatch struct {
 	placement entities.BuildStopPlacement
 	claim     *entities.BuildCapacityClaim
+	build     platform.BuildRecord
 }
 
 func validateBuildStopResponse(response node.Response, err error, dispatch *buildStopDispatch, exec engine.Execution, hash string, begun bool) (node.Response, error) {
@@ -144,18 +145,10 @@ func checkBuildStopResponse(response node.Response, exec engine.Execution, hash 
 func (s *Service) beginBuildStopDispatch(ctx context.Context, exec engine.Execution, hash string, dispatch *buildStopDispatch) (bool, error) {
 	already := false
 	_, owned, err := s.mutateOwned(ctx, exec.OperationID, exec.Attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
-		if op.State == contract.Cancelling {
-			return errPlatformCancelled
-		}
-		if op.Kind != platform.KindBuildStop || exec.Step != deploymentBuildStopStep {
-			return contract.NewFault(contract.PreconditionFailed, "invalid build stop admission", "Use the build stop execution path.")
-		}
-		if _, found, err := tx.Steps().GetForUpdate(ctx, op.ID, exec.Step); err != nil {
+		if err := validateBuildStopAdmissionTx(ctx, tx, op, exec, dispatch); err != nil {
 			return err
-		} else if found {
-			return contract.NewFault(contract.Unavailable, "build stop already has a dispatch intent", "Recover the original effect; do not redispatch.")
 		}
-		if err := lockOriginalBuildStopClaim(ctx, tx, dispatch); err != nil {
+		if err := cancelOriginalBuildForStopTx(ctx, tx, dispatch); err != nil {
 			return err
 		}
 		if err := tx.SetBuildStopPlacement(ctx, exec.OperationID, dispatch.placement); err != nil {
@@ -174,27 +167,109 @@ func (s *Service) beginBuildStopDispatch(ctx context.Context, exec engine.Execut
 	return already, nil
 }
 
-func lockOriginalBuildStopClaim(ctx context.Context, tx *entities.StoreTx, dispatch *buildStopDispatch) error {
-	unknown := contract.NewFault(contract.Unavailable, "original build claim changed",
-		"Inspect the original builder before dispatching the stop.")
-	if dispatch.claim == nil {
-		return unknown
+func validateBuildStopAdmissionTx(ctx context.Context, tx *entities.StoreTx, op *contract.Operation, exec engine.Execution, dispatch *buildStopDispatch) error {
+	if op.State == contract.Cancelling {
+		return errPlatformCancelled
 	}
-	if _, found, err := tx.Operations().Lock(ctx, dispatch.claim.OperationID); err != nil || !found {
-		return unknown
+	if op.Kind != platform.KindBuildStop || exec.Step != deploymentBuildStopStep {
+		return contract.NewFault(contract.PreconditionFailed, "invalid build stop admission", "Use the build stop execution path.")
 	}
-	matches, err := tx.BuildCapacity().MatchesForStop(ctx, *dispatch.claim)
+	raw, found, err := tx.Operations().Input(ctx, op.ID)
+	if err != nil || !found {
+		return unavailable(err)
+	}
+	normalized, err := platform.Default().Normalize(op.Kind, op.Target, raw)
 	if err != nil {
 		return err
 	}
+	input, err := typedOperationInput[*platform.BuildStopInput](normalized.Input)
+	if err != nil {
+		return err
+	}
+	if input.BuildID != dispatch.build.ID || dispatch.claim == nil || dispatch.claim.OperationID != dispatch.build.OperationID || dispatch.build.OperationID == op.ID {
+		return pointerIntegrityFault()
+	}
+	if _, found, err := tx.Steps().GetForUpdate(ctx, op.ID, exec.Step); err != nil {
+		return err
+	} else if found {
+		return contract.NewFault(contract.Unavailable, "build stop already has a dispatch intent", "Recover the original effect; do not redispatch.")
+	}
+	return nil
+}
+
+func cancelOriginalBuildForStopTx(ctx context.Context, tx *entities.StoreTx, dispatch *buildStopDispatch) error {
+	original, err := lockOriginalBuildStopClaim(ctx, tx, dispatch)
+	if err != nil {
+		return err
+	}
+	if original.State.Terminal() {
+		return contract.NewFault(contract.Conflict, "build operation is already finished", "Inspect the build before requesting another stop.")
+	}
+	build := dispatch.build
+	if err := lockPendingBuildParentsTx(ctx, tx, build); err != nil {
+		return err
+	}
+	current, err := buildByIDTx(ctx, tx, build.ID)
+	if err != nil {
+		return err
+	}
+	if current.OperationID != build.OperationID || current.ReleaseID != build.ReleaseID {
+		return pointerIntegrityFault()
+	}
+	if current.State != platform.BuildPending && current.State != platform.BuildRunning {
+		return contract.NewFault(contract.Conflict, "build is already finished", "Inspect the build before requesting another stop.")
+	}
+	if err := cancelBuildAndReleaseForStopTx(ctx, tx, build); err != nil {
+		return err
+	}
+	if original.State != contract.Cancelling {
+		return transition(ctx, tx, &original, contract.Cancelling, "", "Build stop requested; cancelling the pack process.")
+	}
+	return nil
+}
+
+func cancelBuildAndReleaseForStopTx(ctx context.Context, tx *entities.StoreTx, build platform.BuildRecord) error {
+	rows, err := tx.Platform().Builds().MarkCancelled(ctx, build.ID, contract.Cancelled, "Build stopped by operator.")
+	if err != nil {
+		return err
+	}
+	if rows != 1 {
+		return pointerIntegrityFault()
+	}
+	if build.ReleaseID != "" {
+		rows, err = tx.Platform().Releases().MarkFailedByID(ctx, build.ReleaseID, contract.Cancelled, "Build stopped by operator.")
+		if err != nil {
+			return err
+		}
+		if rows != 1 {
+			return pointerIntegrityFault()
+		}
+	}
+	return nil
+}
+
+func lockOriginalBuildStopClaim(ctx context.Context, tx *entities.StoreTx, dispatch *buildStopDispatch) (contract.Operation, error) {
+	unknown := contract.NewFault(contract.Unavailable, "original build claim changed",
+		"Inspect the original builder before dispatching the stop.")
+	if dispatch.claim == nil {
+		return contract.Operation{}, unknown
+	}
+	original, found, err := tx.Operations().Lock(ctx, dispatch.claim.OperationID)
+	if err != nil || !found {
+		return contract.Operation{}, unknown
+	}
+	matches, err := tx.BuildCapacity().MatchesForStop(ctx, *dispatch.claim)
+	if err != nil {
+		return contract.Operation{}, err
+	}
 	if !matches {
-		return unknown
+		return contract.Operation{}, unknown
 	}
 	rec, found, err := tx.Nodes().Connection(ctx, dispatch.placement.Node)
 	if err != nil || !found || !strings.HasPrefix(dispatch.placement.Identity, buildNodeIdentity(rec)+":") {
-		return contract.NewFault(contract.Unavailable, "build stop node identity changed", "Restore the original node identity before recovery.")
+		return contract.Operation{}, contract.NewFault(contract.Unavailable, "build stop node identity changed", "Restore the original node identity before recovery.")
 	}
-	return nil
+	return original, nil
 }
 
 // New stops go to the original Pack claimant, never the mutable environment.
@@ -223,7 +298,7 @@ func (s *Service) prepareBuildStopDispatch(ctx context.Context, id contract.Oper
 		return nil, nil, contract.NewFault(contract.Unavailable, "build stop node identity cannot be verified",
 			"Restore the original authenticated node before recovering this stop.")
 	}
-	return tr, &buildStopDispatch{placement: placement, claim: claim}, nil
+	return tr, &buildStopDispatch{placement: placement, claim: claim, build: build}, nil
 }
 
 func (s *Service) recoverExistingBuildStop(ctx context.Context, id contract.OperationID) error {

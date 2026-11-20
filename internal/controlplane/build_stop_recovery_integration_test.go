@@ -785,6 +785,154 @@ func TestIntegrationBuildStopRechecksClaimBeforeIntent(t *testing.T) {
 	}
 }
 
+func TestIntegrationBuildStopAdmissionAtomicity(t *testing.T) {
+	for _, scenario := range []string{"stale", "cancelled", "replaced", "rollback", "success"} {
+		t.Run(scenario, func(t *testing.T) {
+			f := newStopRecoveryFixture(t)
+			ctx := context.Background()
+			f.seedBuildClaim(t)
+			build, err := f.service.buildByID(ctx, f.build)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, dispatch, err := f.service.prepareBuildStopDispatch(ctx, f.op.ID, build)
+			if err != nil {
+				t.Fatal(err)
+			}
+			exec := prepareStopAdmissionScenario(t, f, scenario, build.OperationID)
+			before, err := f.service.buildByID(ctx, f.build)
+			if err != nil {
+				t.Fatal(err)
+			}
+			original, err := f.service.Get(ctx, testActor, build.OperationID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			release, err := f.service.releaseByID(ctx, f.release)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.service.beginBuildStopDispatch(ctx, exec, f.hash, dispatch); err == nil {
+				t.Fatal("admission unexpectedly succeeded")
+			}
+			assertRejectedStopUnchanged(t, f, before, release, original)
+		})
+	}
+}
+
+func prepareStopAdmissionScenario(t *testing.T, f stopRecoveryFixture, scenario string, original contract.OperationID) engine.Execution {
+	t.Helper()
+	ctx := context.Background()
+	exec := f.exec
+	switch scenario {
+	case "stale":
+		exec.Attempt++
+	case "cancelled":
+		if _, err := f.service.RequestCancel(ctx, testActor, f.op.ID); err != nil {
+			t.Fatal(err)
+		}
+	case "replaced":
+		if _, err := f.pool.Exec(ctx, `UPDATE eregion_build_capacity_claims SET claim_id=gen_random_uuid()::text WHERE operation_id=$1`, original); err != nil {
+			t.Fatal(err)
+		}
+	case "rollback":
+		// Fail after the original state writes, at the intent insertion.
+		_, err := f.pool.Exec(ctx, `CREATE FUNCTION reject_stop_intent() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'intent rejected'; END $$;
+			CREATE TRIGGER reject_stop_intent BEFORE INSERT ON eregion_operation_steps FOR EACH ROW EXECUTE FUNCTION reject_stop_intent()`)
+		if err != nil {
+			t.Fatal(err)
+		}
+	case "success":
+		if err := f.service.markBuildSucceeded(ctx, f.build, f.release, "image", "commit", "digest"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return exec
+}
+
+func assertRejectedStopUnchanged(t *testing.T, f stopRecoveryFixture, before platform.BuildRecord, release platform.Release, original contract.Operation) {
+	t.Helper()
+	ctx := context.Background()
+	after, err := f.service.buildByID(ctx, f.build)
+	if err != nil || after.State != before.State {
+		t.Fatalf("build changed: before=%s after=%s err=%v", before.State, after.State, err)
+	}
+	afterRelease, err := f.service.releaseByID(ctx, f.release)
+	if err != nil || afterRelease.Status != release.Status {
+		t.Fatalf("release changed: before=%s after=%s err=%v", release.Status, afterRelease.Status, err)
+	}
+	afterOp, err := f.service.Get(ctx, testActor, before.OperationID)
+	if err != nil || afterOp.State != original.State || afterOp.LastSequence != original.LastSequence {
+		t.Fatalf("original operation changed: before=%+v after=%+v err=%v", original, afterOp, err)
+	}
+	if _, found, err := f.service.entities.BuildStopPlacement(ctx, f.op.ID); err != nil || found {
+		t.Fatalf("placement persisted: %v %v", found, err)
+	}
+	if _, found, err := f.service.stepRecord(ctx, f.op.ID, f.exec.Step); err != nil || found {
+		t.Fatalf("intent persisted: %v %v", found, err)
+	}
+}
+
+func TestIntegrationBuildStopRacesBuildSuccess(t *testing.T) {
+	f := newStopRecoveryFixture(t)
+	ctx := context.Background()
+	f.seedBuildClaim(t)
+	build, err := f.service.buildByID(ctx, f.build)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, dispatch, err := f.service.prepareBuildStopDispatch(ctx, f.op.ID, build)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	stopResult := make(chan error, 1)
+	successResult := make(chan error, 1)
+	go func() {
+		<-start
+		_, err := f.service.beginBuildStopDispatch(ctx, f.exec, f.hash, dispatch)
+		stopResult <- err
+	}()
+	go func() {
+		<-start
+		successResult <- f.service.markOwnedBuildSucceeded(ctx, build.OperationID, 1, f.build, f.release, "image", "commit", "digest")
+	}()
+	close(start)
+	stopErr, successErr := <-stopResult, <-successResult
+	current, err := f.service.buildByID(ctx, f.build)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release, err := f.service.releaseByID(ctx, f.release)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, err := f.service.Get(ctx, testActor, build.OperationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, intent, err := f.service.stepRecord(ctx, f.op.ID, f.exec.Step)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, placement, err := f.service.entities.BuildStopPlacement(ctx, f.op.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	switch {
+	case stopErr == nil && successErr != nil:
+		if current.State != platform.BuildCancelled || release.Status != platform.ReleaseFailed || original.State != contract.Cancelling || !intent || !placement {
+			t.Fatalf("inconsistent stop winner: build=%s release=%s operation=%s intent=%v placement=%v", current.State, release.Status, original.State, intent, placement)
+		}
+	case successErr == nil && stopErr != nil:
+		if current.State != platform.BuildSucceeded || release.Status != platform.ReleaseReady || original.State == contract.Cancelling || intent || placement {
+			t.Fatalf("inconsistent success winner: build=%s release=%s operation=%s intent=%v placement=%v", current.State, release.Status, original.State, intent, placement)
+		}
+	default:
+		t.Fatalf("expected exactly one winner: stop=%v success=%v", stopErr, successErr)
+	}
+}
+
 func checkStopClaimChangedBeforeIntent(t *testing.T, change string) {
 	t.Helper()
 	f := newStopRecoveryFixture(t)

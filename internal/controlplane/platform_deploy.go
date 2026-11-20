@@ -135,18 +135,6 @@ func (w *platformWorker) runBuildStop(
 	if err != nil {
 		return w.settle(ctx, id, attempt, err)
 	}
-	// Mark cancelled before signalling the worker so a pack failure is recorded
-	// as cancellation rather than a new failure.
-	if err := w.service.cancelBuild(ctx, build); err != nil {
-		return w.settle(ctx, id, attempt, err)
-	}
-	if err := w.service.requestCancelOperation(
-		ctx,
-		build.OperationID,
-		"Build stop requested; cancelling the pack process.",
-	); err != nil {
-		return w.settle(ctx, id, attempt, err)
-	}
 	if _, err := w.runStepOnWithBuild(
 		ctx,
 		tr,
@@ -2290,7 +2278,7 @@ func (s *Service) markBuildSucceeded(
 	ctx context.Context,
 	id platform.BuildID,
 	releaseID platform.ReleaseID,
-	image, commit, imageID string, //nolint:unparam // Fixture helper retains the complete transition inputs.
+	image, commit, imageID string,
 ) error {
 	err := s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
 		if err := lockBuildParentsTx(ctx, tx, id, releaseID); err != nil {
@@ -2340,31 +2328,12 @@ func (s *Service) markBuildFailed(
 	return nil
 }
 
-func (s *Service) markBuildCancelled(ctx context.Context, id platform.BuildID) error {
-	if _, err := s.entities.Platform().Builds().MarkCancelled(ctx, id, contract.Cancelled, "Build stopped by operator."); err != nil {
-		return unavailable(err)
-	}
-	return nil
-}
-
 func (s *Service) buildCancelled(ctx context.Context, id platform.BuildID) (bool, error) {
 	state, found, err := s.entities.Platform().Builds().State(ctx, id)
 	if err != nil || !found {
 		return false, unavailable(err)
 	}
 	return state == platform.BuildCancelled, nil
-}
-
-func (s *Service) cancelBuild(ctx context.Context, build platform.BuildRecord) error {
-	if err := s.markBuildCancelled(ctx, build.ID); err != nil {
-		return err
-	}
-	if build.ReleaseID != "" {
-		if _, err := s.entities.Platform().Releases().MarkFailedByID(ctx, build.ReleaseID, contract.Cancelled, "Build stopped by operator."); err != nil {
-			return unavailable(err)
-		}
-	}
-	return nil
 }
 
 func (s *Service) requestCancelOperation(
