@@ -21,7 +21,7 @@ func (s *Service) claimLocalBuildCapacity(ctx context.Context, id contract.Opera
 	if err != nil {
 		return false, err
 	}
-	already, err := s.beginBuildDispatch(ctx, id, attempt, node, identity, "fixture", exec.ExecutionID())
+	already, err := s.beginBuildDispatch(ctx, id, attempt, node, identity, "fixture", exec.ExecutionID(), "", "")
 	var snooze *river.JobSnoozeError
 	if errors.As(err, &snooze) {
 		return false, nil
@@ -96,7 +96,7 @@ func TestIntegrationDurableBuildCapacity(t *testing.T) { //nolint:gocognit,gocyc
 		t.Fatalf("load other node: found=%v err=%v", found, err)
 	}
 	exec := engine.Execution{OperationID: held[0], Attempt: 1, Step: deploymentPackStep}
-	if ok, err := s.beginBuildDispatch(ctx, held[0], 1, "other", buildNodeIdentity(rec)+":ssh", "fixture", exec.ExecutionID()); err == nil || ok {
+	if ok, err := s.beginBuildDispatch(ctx, held[0], 1, "other", buildNodeIdentity(rec)+":ssh", "fixture", exec.ExecutionID(), "", ""); err == nil || ok {
 		t.Fatalf("existing claim moved builders = %v, %v", ok, err)
 	}
 	// A new pool connection/session sees the same reservations. Reducing the

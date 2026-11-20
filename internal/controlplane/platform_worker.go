@@ -124,6 +124,9 @@ func (w *platformWorker) handleCancellingPlatformWork(ctx context.Context, op co
 	if op.State != contract.Cancelling {
 		return false, nil
 	}
+	if op.Kind == platform.KindBuildStop {
+		return true, w.service.cancelRecoveredBuildStop(ctx, op.ID, attempt)
+	}
 	if op.Kind == platform.KindDomainAdd || op.Kind == platform.KindDomainRemove {
 		normalized, err := platform.Default().Normalize(op.Kind, op.Target, raw)
 		if err != nil {
@@ -222,6 +225,9 @@ func (w *platformWorker) guardDomainRemoveRecovery(ctx context.Context, op contr
 }
 
 func (w *platformWorker) settlePlatformCancellation(ctx context.Context, op contract.Operation, attempt uint32, err error) error {
+	if errors.Is(err, errPlatformCancelled) && op.Kind == platform.KindBuildStop {
+		return w.service.cancelRecoveredBuildStop(ctx, op.ID, attempt)
+	}
 	if errors.Is(err, errPlatformCancelled) &&
 		(op.Kind == platform.KindDomainAdd || op.Kind == platform.KindDomainRemove) {
 		if handled, recoveryErr := w.stopDefinitionDNSChild(ctx, op, attempt); handled {
@@ -2051,18 +2057,20 @@ func (w *platformWorker) runStepOn(
 	payload any,
 	secrets map[string]string,
 ) (json.RawMessage, error) {
-	return w.runStepOnWithBuild(ctx, tr, id, attempt, stepID, payload, secrets, "", "", "")
+	return w.runStepOnWithBuild(ctx, tr, id, attempt, stepID, payload, secrets, "", "", "", "", "", nil)
 }
 
-func (w *platformWorker) runStepOnBuild(ctx context.Context, tr node.Transport, id contract.OperationID, attempt uint32, payload any, secrets map[string]string, nodeName, identity, source string) (json.RawMessage, error) {
-	return w.runStepOnWithBuild(ctx, tr, id, attempt, deploymentPackStep, payload, secrets, nodeName, identity, source)
+func (w *platformWorker) runStepOnBuild(ctx context.Context, tr node.Transport, id contract.OperationID, attempt uint32, payload any, secrets map[string]string, nodeName, identity, source string, buildID platform.BuildID, releaseID platform.ReleaseID) (json.RawMessage, error) {
+	return w.runStepOnWithBuild(ctx, tr, id, attempt, deploymentPackStep, payload, secrets, nodeName, identity, source, buildID, releaseID, nil)
 }
 
 func (w *platformWorker) runStepOnWithBuild( //nolint:gocognit // The effect protocol keeps status, dispatch and acknowledgement together.
 	ctx context.Context, tr node.Transport, id contract.OperationID, attempt uint32,
 	stepID string, payload any, secrets map[string]string, buildNode, buildIdentity, buildSource string,
+	buildID platform.BuildID, releaseID platform.ReleaseID,
+	stopDispatch *buildStopDispatch,
 ) (json.RawMessage, error) {
-	if platform.IsPackStep(stepID) && (buildNode == "" || buildIdentity == "" || stepID != deploymentPackStep) {
+	if platform.IsPackStep(stepID) && (buildNode == "" || buildIdentity == "" || buildID == "" || releaseID == "" || stepID != deploymentPackStep) {
 		return nil, contract.NewFault(contract.PreconditionFailed, "build dispatch has no pinned capacity admission", "Use the build execution path with its original builder.")
 	}
 	if tr == nil {
@@ -2116,14 +2124,16 @@ func (w *platformWorker) runStepOnWithBuild( //nolint:gocognit // The effect pro
 	observer := &nodeEffectObserver{w: w, ctx: ctx, id: id, attempt: attempt, stepID: stepID, policy: policy}
 	loop := nodeEffectLoop{
 		Status: func(ctx context.Context) (node.Response, error) {
-			return w.nodeEffectStatus(ctx, tr, exec, stepID, inputsHash, fence.rowExists, attempt)
+			response, err := w.nodeEffectStatus(ctx, tr, exec, stepID, inputsHash, fence.rowExists, attempt)
+			return validateBuildStopResponse(response, err, stopDispatch, exec, inputsHash, fence.rowExists)
 		},
 		Dispatch: func(ctx context.Context) (node.Response, error) {
-			return w.nodeEffectDispatch(ctx, tr, id, attempt, exec, stepID, inputsHash, raw, secrets, fence.rowExists)
+			response, err := w.nodeEffectDispatch(ctx, tr, id, attempt, exec, stepID, inputsHash, raw, secrets, fence.rowExists)
+			return validateBuildStopResponse(response, err, stopDispatch, exec, inputsHash, true)
 		},
 		Begin: func(ctx context.Context) error {
 			if buildNode != "" {
-				already, err := w.service.beginBuildDispatch(ctx, id, attempt, buildNode, buildIdentity, inputsHash, exec.ExecutionID())
+				already, err := w.service.beginBuildDispatch(ctx, id, attempt, buildNode, buildIdentity, inputsHash, exec.ExecutionID(), buildID, releaseID)
 				if err != nil {
 					var snooze *river.JobSnoozeError
 					if errors.As(err, &snooze) {
@@ -2138,6 +2148,17 @@ func (w *platformWorker) runStepOnWithBuild( //nolint:gocognit // The effect pro
 				}
 				w.service.appendWorkerEvent(ctx, id, attempt, deploymentBuildStageLabel,
 					fmt.Sprintf("build_running on node %s; %s", buildNode, buildSource))
+				return nil
+			}
+			if stopDispatch != nil {
+				already, err := w.service.beginBuildStopDispatch(ctx, exec, inputsHash, stopDispatch)
+				if err != nil {
+					return err
+				}
+				fence.rowExists, fence.begunThisAttempt = true, true
+				if already {
+					return errNodeEffectAlreadyCompleted
+				}
 				return nil
 			}
 			return fence.ensureDispatchBegun(ctx, w, id, attempt, stepID, inputsHash, exec.ExecutionID())
@@ -2187,6 +2208,14 @@ func (s *Service) reconcilePlatformOperation(ctx context.Context, op contract.Op
 		op.Kind == platform.KindRestart ||
 		op.Kind == platform.KindPromote {
 		return s.reconcileDeployment(ctx, op)
+	}
+	if op.Kind == platform.KindBuildStop {
+		if err := s.recoverBuildStopEffect(ctx, op); err != nil {
+			return err
+		}
+		if op.State == contract.Cancelling {
+			return s.settleReconciledBuildStop(ctx, op, true, "")
+		}
 	}
 	if op.State == contract.Cancelling {
 		return s.cancelPlatform(
@@ -2271,6 +2300,19 @@ func (s *Service) reconcileBuildStop(ctx context.Context, op contract.Operation)
 		return err
 	}
 	if build.State == platform.BuildCancelled {
+		// The build is marked cancelled before the stop marker is dispatched.
+		// That state alone does not prove the stop request reached the node.
+		record, found, err := s.stepRecord(ctx, op.ID, deploymentBuildStopStep)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return s.settleReconciledBuildStop(ctx, op, false, "build stop ended before a cancellation marker was dispatched")
+		}
+		if record.State != "completed" {
+			return contract.NewFault(contract.Unavailable, "build stop has no acknowledged cancellation marker",
+				"Recover the original node effect before reconciling the operation.")
+		}
 		return s.finishPlatformOperation(
 			ctx,
 			op.ID,
@@ -2278,12 +2320,7 @@ func (s *Service) reconcileBuildStop(ctx context.Context, op contract.Operation)
 			func(*entities.StoreTx, *contract.Operation) error { return nil },
 		)
 	}
-	return s.failReconciledPlatform(
-		ctx,
-		op,
-		"build stop ended before the build was recorded as cancelled",
-		contract.Unavailable,
-	)
+	return s.settleReconciledBuildStop(ctx, op, false, "build stop ended before the build was recorded as cancelled")
 }
 
 func (s *Service) reconcileNodeAction(ctx context.Context, op contract.Operation) error {

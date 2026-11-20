@@ -34,6 +34,33 @@ func (q *Queries) BindPlatformDeploymentPredecessor(ctx context.Context, arg Bin
 	return result.RowsAffected(), nil
 }
 
+const cancelPendingPlatformBuild = `-- name: CancelPendingPlatformBuild :execrows
+UPDATE eregion_platform_builds
+SET state='cancelled',error_code=$1::text,error=$2::text,
+    completed_at=clock_timestamp()
+WHERE id=$3::text AND operation_id=$4::text AND state='pending'
+`
+
+type CancelPendingPlatformBuildParams struct {
+	ErrorCode   string
+	Message     string
+	ID          string
+	OperationID string
+}
+
+func (q *Queries) CancelPendingPlatformBuild(ctx context.Context, arg CancelPendingPlatformBuildParams) (int64, error) {
+	result, err := q.db.Exec(ctx, cancelPendingPlatformBuild,
+		arg.ErrorCode,
+		arg.Message,
+		arg.ID,
+		arg.OperationID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const countPlatformActiveDeploymentsForRelease = `-- name: CountPlatformActiveDeploymentsForRelease :one
 SELECT count(*)
 FROM eregion_platform_deployments
@@ -1543,14 +1570,21 @@ func (q *Queries) MarkPlatformBuildFailedByOperation(ctx context.Context, arg Ma
 	return result.RowsAffected(), nil
 }
 
-const markPlatformBuildRunning = `-- name: MarkPlatformBuildRunning :execrows
+const markPlatformBuildRunningForOperation = `-- name: MarkPlatformBuildRunningForOperation :execrows
 UPDATE eregion_platform_builds
 SET state='running',started_at=coalesce(started_at,clock_timestamp()),error='',error_code=''
-WHERE id=$1::text AND state IN ('pending','running')
+WHERE id=$1::text AND operation_id=$2::text
+  AND release_id=$3::text AND state IN ('pending','running')
 `
 
-func (q *Queries) MarkPlatformBuildRunning(ctx context.Context, id string) (int64, error) {
-	result, err := q.db.Exec(ctx, markPlatformBuildRunning, id)
+type MarkPlatformBuildRunningForOperationParams struct {
+	ID          string
+	OperationID string
+	ReleaseID   string
+}
+
+func (q *Queries) MarkPlatformBuildRunningForOperation(ctx context.Context, arg MarkPlatformBuildRunningForOperationParams) (int64, error) {
+	result, err := q.db.Exec(ctx, markPlatformBuildRunningForOperation, arg.ID, arg.OperationID, arg.ReleaseID)
 	if err != nil {
 		return 0, err
 	}

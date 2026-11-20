@@ -68,6 +68,28 @@ func (b *BuildCapacityTx) Release(ctx context.Context, id contract.OperationID, 
 	return n == 1, err
 }
 
+// MatchesForStop locks the original reservation and rejects removal or
+// replacement between selecting a builder and recording the stop intent.
+func (b *BuildCapacityTx) MatchesForStop(ctx context.Context, claim BuildCapacityClaim) (bool, error) {
+	row, err := b.owner.q.LockBuildCapacityClaimForStop(ctx, string(claim.OperationID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return row.ClaimID == claim.ClaimID && row.NodeName == claim.Node && row.BuilderIdentity == claim.Identity, nil
+}
+
+// Exists is used while holding the original operation row lock.
+func (b *BuildCapacityTx) Exists(ctx context.Context, id contract.OperationID) (bool, error) {
+	_, err := b.owner.q.GetBuildCapacityClaim(ctx, string(id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
 type BuildCapacityClaim struct {
 	ClaimID     string
 	OperationID contract.OperationID

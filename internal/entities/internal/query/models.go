@@ -26,6 +26,12 @@ type EregionBuildCapacityClaim struct {
 	CheckedAt       pgtype.Timestamptz
 }
 
+type EregionBuildStopPlacement struct {
+	OperationID  string
+	NodeName     string
+	NodeIdentity string
+}
+
 type EregionDefinitionDnsPolicy struct {
 	Singleton bool
 	Revision  int64

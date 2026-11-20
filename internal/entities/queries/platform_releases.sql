@@ -187,10 +187,11 @@ WHERE o.state IN ('queued','running','cancelling') AND (
 )
 ORDER BY o.id;
 
--- name: MarkPlatformBuildRunning :execrows
+-- name: MarkPlatformBuildRunningForOperation :execrows
 UPDATE eregion_platform_builds
 SET state='running',started_at=coalesce(started_at,clock_timestamp()),error='',error_code=''
-WHERE id=sqlc.arg(id)::text AND state IN ('pending','running');
+WHERE id=sqlc.arg(id)::text AND operation_id=sqlc.arg(operation_id)::text
+  AND release_id=sqlc.arg(release_id)::text AND state IN ('pending','running');
 
 -- name: MarkPlatformBuildSucceeded :execrows
 UPDATE eregion_platform_builds
@@ -208,6 +209,12 @@ UPDATE eregion_platform_builds
 SET state='cancelled',error_code=sqlc.arg(error_code)::text,error=sqlc.arg(message)::text,
     completed_at=clock_timestamp()
 WHERE id=sqlc.arg(id)::text AND state NOT IN ('succeeded','failed');
+
+-- name: CancelPendingPlatformBuild :execrows
+UPDATE eregion_platform_builds
+SET state='cancelled',error_code=sqlc.arg(error_code)::text,error=sqlc.arg(message)::text,
+    completed_at=clock_timestamp()
+WHERE id=sqlc.arg(id)::text AND operation_id=sqlc.arg(operation_id)::text AND state='pending';
 
 -- name: MarkPlatformBuildFailedByOperation :execrows
 UPDATE eregion_platform_builds

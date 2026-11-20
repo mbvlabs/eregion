@@ -97,17 +97,19 @@ func (s *Service) buildTransportFor(ctx context.Context, name string) (node.Tran
 
 // beginBuildDispatch commits the reservation and the fenced dispatch intent in
 // the same transaction. There is no transaction across the node call.
-func (s *Service) beginBuildDispatch(ctx context.Context, id contract.OperationID, attempt uint32, node, identity, inputsHash, executionID string) (bool, error) {
+func (s *Service) beginBuildDispatch(ctx context.Context, id contract.OperationID, attempt uint32, node, identity, inputsHash, executionID string, buildID platform.BuildID, releaseID platform.ReleaseID) (bool, error) {
 	already := false
 	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
-		record, found, err := tx.Steps().GetForUpdate(ctx, id, deploymentPackStep)
-		if err != nil {
-			return unavailable(err)
+		// Cancellation and Pack intent serialize on this operation row. A
+		// cancellation accepted after the caller's last check wins here.
+		if op.State == contract.Cancelling {
+			return errPlatformCancelled
 		}
-		if found && record.State == "completed" {
-			if record.InputsHash != inputsHash {
-				return contract.NewFault(contract.PreconditionFailed, "step inputs changed for an existing effect", "Never reuse an operation ID with different inputs; inspect the node journal.")
-			}
+		completed, err := completedBuildDispatchTx(ctx, tx, id, inputsHash)
+		if err != nil {
+			return err
+		}
+		if completed {
 			already = true
 			return nil
 		}
@@ -117,6 +119,11 @@ func (s *Service) beginBuildDispatch(ctx context.Context, id contract.OperationI
 		}
 		if !acquired {
 			return river.JobSnooze(deploymentOwnerDefer)
+		}
+		if buildID != "" {
+			if err := markBuildDispatchRunningTx(ctx, tx, id, buildID, releaseID); err != nil {
+				return err
+			}
 		}
 		already, err = beginStepTx(ctx, tx, op, attempt, deploymentPackStep, inputsHash, executionID)
 		return err
@@ -128,6 +135,39 @@ func (s *Service) beginBuildDispatch(ctx context.Context, id contract.OperationI
 		return false, errNotOwned
 	}
 	return already, nil
+}
+
+func completedBuildDispatchTx(ctx context.Context, tx *entities.StoreTx, id contract.OperationID, inputsHash string) (bool, error) {
+	record, found, err := tx.Steps().GetForUpdate(ctx, id, deploymentPackStep)
+	if err != nil {
+		return false, unavailable(err)
+	}
+	if !found || record.State != "completed" {
+		return false, nil
+	}
+	if record.InputsHash != inputsHash {
+		return false, contract.NewFault(contract.PreconditionFailed, "step inputs changed for an existing effect", "Never reuse an operation ID with different inputs; inspect the node journal.")
+	}
+	return true, nil
+}
+
+func markBuildDispatchRunningTx(ctx context.Context, tx *entities.StoreTx, id contract.OperationID, buildID platform.BuildID, releaseID platform.ReleaseID) error {
+	updated, err := tx.Platform().Builds().MarkRunningForOperation(ctx, buildID, id, releaseID)
+	if err != nil {
+		return unavailable(err)
+	}
+	if updated {
+		return nil
+	}
+	build, found, err := tx.Platform().Builds().GetByID(ctx, buildID)
+	if err != nil {
+		return unavailable(err)
+	}
+	if found && build.OperationID == id && build.ReleaseID == releaseID && build.State == platform.BuildCancelled {
+		return errPlatformCancelled
+	}
+	return contract.NewFault(contract.PreconditionFailed, "build dispatch ownership or state changed",
+		"Inspect the original build and release before dispatching Pack.")
 }
 
 // releaseBuildCapacity is called only after the pack effect has completed and

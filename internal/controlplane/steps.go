@@ -159,16 +159,19 @@ func beginStepTx(ctx context.Context, tx *entities.StoreTx, op *contract.Operati
 // ackStep records a completed effect at most once. Only the transaction that
 // changes the step row from running/failed to completed appends progress.
 func (s *Service) ackStep(ctx context.Context, id contract.OperationID, attempt uint32, step, inputsHash, executionID string, result json.RawMessage, total int) error {
+	return s.ackStepWithExpectedExecution(ctx, id, attempt, step, inputsHash, executionID, result, total, nil)
+}
+
+// expected is used by status-only recovery: the observation must still describe
+// the exact dispatch intent after the operation and step rows are locked.
+func (s *Service) ackStepWithExpectedExecution(ctx context.Context, id contract.OperationID, attempt uint32, step, inputsHash, executionID string, result json.RawMessage, total int, expected *StepRecord) error {
 	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
 		record, found, err := tx.Steps().GetForUpdate(ctx, id, step)
 		if err != nil {
 			return unavailable(err)
 		}
-		if !found {
-			return contract.NewFault(contract.PreconditionFailed, "node step was not started in the database", "Begin the step before acknowledging its effect.")
-		}
-		if record.InputsHash != inputsHash {
-			return contract.NewFault(contract.PreconditionFailed, "step inputs changed for an existing effect", "Do not acknowledge an effect recorded with different inputs.")
+		if err := validateStepAcknowledgement(record, found, inputsHash, expected); err != nil {
+			return err
 		}
 		if record.State == "completed" {
 			return nil
@@ -199,6 +202,19 @@ func (s *Service) ackStep(ctx context.Context, id contract.OperationID, attempt 
 	}
 	if !owned {
 		return errNotOwned
+	}
+	return nil
+}
+
+func validateStepAcknowledgement(record entities.StepRecord, found bool, inputsHash string, expected *StepRecord) error {
+	if !found {
+		return contract.NewFault(contract.PreconditionFailed, "node step was not started in the database", "Begin the step before acknowledging its effect.")
+	}
+	if record.InputsHash != inputsHash {
+		return contract.NewFault(contract.PreconditionFailed, "step inputs changed for an existing effect", "Do not acknowledge an effect recorded with different inputs.")
+	}
+	if expected != nil && (record.Attempt != expected.Attempt || record.ExecutionID != expected.ExecutionID) {
+		return contract.NewFault(contract.Unavailable, "node dispatch intent changed during recovery", "Recheck the original node effect before acknowledging it.")
 	}
 	return nil
 }

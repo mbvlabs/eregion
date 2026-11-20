@@ -490,8 +490,11 @@ func (s *BuildStore) ActiveTargetsForApp(ctx context.Context, appID platform.App
 	return result, nil
 }
 
-func (s *BuildStore) MarkRunning(ctx context.Context, id platform.BuildID) (int64, error) {
-	return s.q.MarkPlatformBuildRunning(ctx, string(id))
+func (s *BuildStore) MarkRunningForOperation(ctx context.Context, id platform.BuildID, operationID contract.OperationID, releaseID platform.ReleaseID) (bool, error) {
+	n, err := s.q.MarkPlatformBuildRunningForOperation(ctx, query.MarkPlatformBuildRunningForOperationParams{
+		ID: string(id), OperationID: string(operationID), ReleaseID: string(releaseID),
+	})
+	return n == 1, err
 }
 
 func (s *BuildStore) MarkSucceeded(ctx context.Context, id platform.BuildID, commit string) (int64, error) {
@@ -504,6 +507,13 @@ func (s *BuildStore) MarkFailed(ctx context.Context, id platform.BuildID, code c
 
 func (s *BuildStore) MarkCancelled(ctx context.Context, id platform.BuildID, code contract.Code, message string) (int64, error) {
 	return s.q.MarkPlatformBuildCancelledByID(ctx, query.MarkPlatformBuildCancelledByIDParams{ID: string(id), ErrorCode: string(code), Message: message})
+}
+
+func (s *BuildStore) CancelPending(ctx context.Context, id platform.BuildID, operationID contract.OperationID, code contract.Code, message string) (bool, error) {
+	n, err := s.q.CancelPendingPlatformBuild(ctx, query.CancelPendingPlatformBuildParams{
+		ID: string(id), OperationID: string(operationID), ErrorCode: string(code), Message: message,
+	})
+	return n == 1, err
 }
 
 func (s *BuildStore) MarkFailedByOperation(ctx context.Context, id contract.OperationID, code contract.Code, message string) (int64, error) {

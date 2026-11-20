@@ -123,19 +123,14 @@ func (w *platformWorker) runBuildStop(
 	if err != nil {
 		return w.settle(ctx, id, attempt, err)
 	}
-	if build.State == platform.BuildSucceeded {
-		return w.settle(
-			ctx,
-			id,
-			attempt,
-			contract.NewFault(
-				contract.Conflict,
-				"build already succeeded",
-				"Retry with a new build after changing the source if another artifact is needed.",
-			),
-		)
+	handled, err := w.service.stopPendingBuildBeforeDispatch(ctx, id, attempt, build)
+	if err != nil {
+		return w.settle(ctx, id, attempt, err)
 	}
-	env, err := w.service.environment(ctx, build.App, build.Environment)
+	if handled {
+		return nil
+	}
+	tr, dispatch, err := w.service.prepareBuildStopDispatch(ctx, id, build)
 	if err != nil {
 		return w.settle(ctx, id, attempt, err)
 	}
@@ -151,15 +146,7 @@ func (w *platformWorker) runBuildStop(
 	); err != nil {
 		return w.settle(ctx, id, attempt, err)
 	}
-	n, err := w.service.node(ctx, env.BuildNodeName())
-	if err != nil {
-		return w.settle(ctx, id, attempt, err)
-	}
-	tr, err := w.service.resolver.TransportFor(ctx, n.Name)
-	if err != nil {
-		return w.settle(ctx, id, attempt, err)
-	}
-	if _, err := w.runStepOn(
+	if _, err := w.runStepOnWithBuild(
 		ctx,
 		tr,
 		id,
@@ -171,7 +158,11 @@ func (w *platformWorker) runBuildStop(
 			PackStep:    deploymentPackStep,
 		},
 		nil,
+		"", "", "", "", "", dispatch,
 	); err != nil {
+		if errors.Is(err, errPlatformCancelled) {
+			return w.service.cancelRecoveredBuildStop(ctx, id, attempt)
+		}
 		return w.settle(ctx, id, attempt, err)
 	}
 	if err := w.service.finishPlatformOperation(
@@ -250,10 +241,11 @@ func (w *platformWorker) prepareBuildRecord(ctx context.Context, id contract.Ope
 			"Start the build from an environment revision or retry an existing build.",
 		)
 	}
-	if err := w.service.markBuildRunning(ctx, build.ID); err != nil {
-		return build, err
+	if build.OperationID != id || build.ReleaseID != release.ID || (release.BuildID != "" && release.BuildID != build.ID) {
+		return build, contract.NewFault(contract.PreconditionFailed, "build is not owned by this release operation",
+			"Inspect the original build and release before dispatching Pack.")
 	}
-	if cancelled, _ := w.service.buildCancelled(ctx, build.ID); cancelled {
+	if build.State == platform.BuildCancelled {
 		return build, errPlatformCancelled
 	}
 	return build, nil
@@ -319,7 +311,7 @@ func (w *platformWorker) executeBuildPack(ctx context.Context, id contract.Opera
 	if err != nil {
 		return nil, err
 	}
-	result, buildErr := w.runStepOnBuild(ctx, tr, id, attempt, payload, buildSecrets, buildNode.Name, identity, build.Source.Type)
+	result, buildErr := w.runStepOnBuild(ctx, tr, id, attempt, payload, buildSecrets, buildNode.Name, identity, build.Source.Type, build.ID, release.ID)
 	if buildErr != nil {
 		var snooze *river.JobSnoozeError
 		if errors.As(buildErr, &snooze) {
@@ -2154,13 +2146,6 @@ func (s *Service) pinDeploymentCredentialSecret(
 }
 
 // --------------------------------------------------------------- build state
-
-func (s *Service) markBuildRunning(ctx context.Context, id platform.BuildID) error {
-	if _, err := s.entities.Platform().Builds().MarkRunning(ctx, id); err != nil {
-		return unavailable(err)
-	}
-	return nil
-}
 
 func (s *Service) markBuildSucceeded(
 	ctx context.Context,

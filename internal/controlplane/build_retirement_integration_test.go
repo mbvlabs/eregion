@@ -84,7 +84,7 @@ func TestIntegrationBuildDispatchAndRetirement(t *testing.T) { //nolint:gocognit
 	if _, err := s.beginStep(ctx, invalid, 1, deploymentPackStep, "original", invalidExec.ExecutionID()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.beginBuildDispatch(ctx, invalid, 1, "local", selectedIdentity, "changed", invalidExec.ExecutionID()); err == nil {
+	if _, err := s.beginBuildDispatch(ctx, invalid, 1, "local", selectedIdentity, "changed", invalidExec.ExecutionID(), "", ""); err == nil {
 		t.Fatal("changed inputs unexpectedly admitted")
 	}
 	assertClaimCount(t, ctx, pool, invalid, 0)
@@ -92,7 +92,7 @@ func TestIntegrationBuildDispatchAndRetirement(t *testing.T) { //nolint:gocognit
 		t.Fatal(err)
 	}
 	blockedExec := engine.Execution{OperationID: blocked, Attempt: 1, Step: deploymentPackStep}
-	if _, err := s.beginBuildDispatch(ctx, blocked, 1, "local", selectedIdentity, "blocked-input", blockedExec.ExecutionID()); err == nil {
+	if _, err := s.beginBuildDispatch(ctx, blocked, 1, "local", selectedIdentity, "blocked-input", blockedExec.ExecutionID(), "", ""); err == nil {
 		t.Fatal("dispatch admitted with a transport selected before identity changed")
 	}
 	assertClaimCount(t, ctx, pool, blocked, 0)
@@ -100,10 +100,10 @@ func TestIntegrationBuildDispatchAndRetirement(t *testing.T) { //nolint:gocognit
 		t.Fatal(err)
 	}
 	exec := engine.Execution{OperationID: holder, Attempt: 1, Step: deploymentPackStep, RequestID: "retire-test"}
-	if already, err := s.beginBuildDispatch(ctx, holder, 1, "local", selectedIdentity, "holder-input", exec.ExecutionID()); err != nil || already {
+	if already, err := s.beginBuildDispatch(ctx, holder, 1, "local", selectedIdentity, "holder-input", exec.ExecutionID(), "", ""); err != nil || already {
 		t.Fatalf("begin dispatch: %v %v", already, err)
 	}
-	if _, err := s.beginBuildDispatch(ctx, blocked, 1, "local", selectedIdentity, "blocked-input", blockedExec.ExecutionID()); err == nil {
+	if _, err := s.beginBuildDispatch(ctx, blocked, 1, "local", selectedIdentity, "blocked-input", blockedExec.ExecutionID(), "", ""); err == nil {
 		t.Fatal("capacity contention was admitted")
 	} else {
 		var snooze *river.JobSnoozeError
@@ -204,16 +204,16 @@ func TestIntegrationBuildIdentityRejectsMismatchedLocalState(t *testing.T) {
 		t.Fatalf("claim attempt: %v %v", ok, err)
 	}
 	exec := engine.Execution{OperationID: op.ID, Attempt: 1, Step: deploymentPackStep}
-	if _, err := s.beginBuildDispatch(ctx, op.ID, 1, "local", "", "input", exec.ExecutionID()); err == nil || contract.Classify(err).Code != contract.PreconditionFailed {
+	if _, err := s.beginBuildDispatch(ctx, op.ID, 1, "local", "", "input", exec.ExecutionID(), "", ""); err == nil || contract.Classify(err).Code != contract.PreconditionFailed {
 		t.Fatalf("empty identity dispatch = %v, want precondition failure", err)
 	}
-	if _, err := s.beginBuildDispatch(ctx, op.ID, 1, "local", pinned, "input", exec.ExecutionID()); err == nil || contract.Classify(err).Code != contract.PreconditionFailed {
+	if _, err := s.beginBuildDispatch(ctx, op.ID, 1, "local", pinned, "input", exec.ExecutionID(), "", ""); err == nil || contract.Classify(err).Code != contract.PreconditionFailed {
 		t.Fatalf("unverified dispatch = %v, want precondition failure", err)
 	}
 	w := &platformWorker{service: s}
 	payload := platform.PackPayload{Step: deploymentPackStep, Image: "127.0.0.1:5000/example:latest",
 		Path: t.TempDir(), Builder: "paketobuildpacks/builder-jammy-base", Registry: "127.0.0.1:5000"}
-	if _, err := w.runStepOnBuild(ctx, tr, op.ID, 1, payload, nil, "local", pinned, ""); err == nil || contract.Classify(err).Code != contract.PreconditionFailed {
+	if _, err := w.runStepOnBuild(ctx, tr, op.ID, 1, payload, nil, "local", pinned, "", "bld_ffffffffffffffffffffffffffffffff", "rel_ffffffffffffffffffffffffffffffff"); err == nil || contract.Classify(err).Code != contract.PreconditionFailed {
 		t.Fatalf("unverified managed build = %v, want precondition failure", err)
 	}
 	assertClaimCount(t, ctx, pool, op.ID, 0)
@@ -248,7 +248,7 @@ func TestIntegrationBuildRetirementPinsBuilderAndClaim(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.beginBuildDispatch(ctx, op.ID, 1, "local", identity, "input", exec.ExecutionID()); err != nil {
+	if _, err := s.beginBuildDispatch(ctx, op.ID, 1, "local", identity, "input", exec.ExecutionID(), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.adoptBuildCapacity(ctx, op.ID, 1, "other", ""); err == nil {

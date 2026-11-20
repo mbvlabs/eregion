@@ -2,6 +2,10 @@
 SELECT node_name, builder_identity, attempt FROM eregion_build_capacity_claims
 WHERE operation_id = sqlc.arg(operation_id)::text;
 
+-- name: LockBuildCapacityClaimForStop :one
+SELECT claim_id, node_name, builder_identity FROM eregion_build_capacity_claims
+WHERE operation_id = sqlc.arg(operation_id)::text FOR UPDATE;
+
 -- name: ListBuildCapacityClaims :many
 SELECT c.claim_id, c.operation_id, c.node_name, c.builder_identity, c.attempt, c.created_at, o.state
 FROM eregion_build_capacity_claims c

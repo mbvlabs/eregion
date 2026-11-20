@@ -48,7 +48,7 @@ func TestIntegrationBuildSlotsOperatorCleanup(t *testing.T) {
 		t.Fatal(err)
 	}
 	exec := engine.Execution{OperationID: op.ID, Attempt: 1, Step: deploymentPackStep}
-	if _, err := s.beginBuildDispatch(ctx, op.ID, 1, "local", pinned, "input", exec.ExecutionID()); err != nil {
+	if _, err := s.beginBuildDispatch(ctx, op.ID, 1, "local", pinned, "input", exec.ExecutionID(), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	actor := contract.Actor{Kind: "operator", Subject: "test-operator"}
@@ -153,7 +153,7 @@ func setupLegacyLocalBuildSlot(t *testing.T) (*Service, *pgxpool.Pool, *engine.E
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.beginBuildDispatch(ctx, op.ID, 1, "local", pinned, hash, exec.ExecutionID()); err != nil {
+	if _, err := s.beginBuildDispatch(ctx, op.ID, 1, "local", pinned, hash, exec.ExecutionID(), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	rec, found, err := s.entities.Nodes().Connection(ctx, "local")

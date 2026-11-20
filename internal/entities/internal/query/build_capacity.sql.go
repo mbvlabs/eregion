@@ -255,6 +255,24 @@ func (q *Queries) ListTerminalBuildCapacityClaims(ctx context.Context, maxRows i
 	return items, nil
 }
 
+const lockBuildCapacityClaimForStop = `-- name: LockBuildCapacityClaimForStop :one
+SELECT claim_id, node_name, builder_identity FROM eregion_build_capacity_claims
+WHERE operation_id = $1::text FOR UPDATE
+`
+
+type LockBuildCapacityClaimForStopRow struct {
+	ClaimID         string
+	NodeName        string
+	BuilderIdentity string
+}
+
+func (q *Queries) LockBuildCapacityClaimForStop(ctx context.Context, operationID string) (LockBuildCapacityClaimForStopRow, error) {
+	row := q.db.QueryRow(ctx, lockBuildCapacityClaimForStop, operationID)
+	var i LockBuildCapacityClaimForStopRow
+	err := row.Scan(&i.ClaimID, &i.NodeName, &i.BuilderIdentity)
+	return i, err
+}
+
 const touchTerminalBuildCapacityClaim = `-- name: TouchTerminalBuildCapacityClaim :execrows
 UPDATE eregion_build_capacity_claims c SET checked_at = clock_timestamp()
 WHERE c.claim_id = $1::text
