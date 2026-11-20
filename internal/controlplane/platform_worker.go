@@ -2569,9 +2569,10 @@ func (s *Service) reconcileResourceOperation(ctx context.Context, op contract.Op
 		"resource execution ended before its durable state was recorded",
 		"Inspect resource status; the container may still exist. Re-apply or re-destroy explicitly after checking the node.",
 	)
-	s.recordResourceFailure(
+	s.recordOwnedResourceFailure(
 		ctx,
 		op.ID,
+		op.Attempt,
 		resource.App,
 		resource.Environment,
 		resource.Name,

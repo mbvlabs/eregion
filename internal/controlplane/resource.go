@@ -391,14 +391,14 @@ func (s *Service) resourceTargets(ctx context.Context, app, environment string) 
 }
 
 func (w *platformWorker) runResourceApply(ctx context.Context, id contract.OperationID, attempt uint32, input *platform.ResourceApplyInput) error {
-	if err := w.service.markResourceState(ctx, id, input.Target().String(), platform.ResourceProvisioning); err != nil {
+	if err := w.service.markResourceState(ctx, id, attempt, input.Target().String(), platform.ResourceProvisioning); err != nil {
 		return w.settle(ctx, id, attempt, err)
 	}
 	err := w.applyResource(ctx, id, attempt, input)
 	if err == nil {
 		return nil
 	}
-	w.service.recordResourceFailure(ctx, id, input.App, input.Environment, input.Name, err)
+	w.service.recordOwnedResourceFailure(ctx, id, attempt, input.App, input.Environment, input.Name, err)
 	return w.settle(ctx, id, attempt, err)
 }
 
@@ -524,7 +524,7 @@ func (w *platformWorker) applyResource(ctx context.Context, id contract.Operatio
 	// between the create steps and the final resource update must not leave
 	// data volumes that destroy --delete-data cannot find. The merge also keeps
 	// identities whose mount a later declaration removed.
-	ownedVolumes, err := w.service.persistOwnedResourceVolumes(ctx, id, resource.ID, platform.PlannedResourceVolumes(plan))
+	ownedVolumes, err := w.service.persistOwnedResourceVolumes(ctx, id, attempt, resource.ID, platform.PlannedResourceVolumes(plan))
 	if err != nil {
 		return err
 	}
@@ -549,7 +549,7 @@ func (w *platformWorker) applyResource(ctx context.Context, id contract.Operatio
 	if err := w.service.checkCancelled(ctx, id); err != nil {
 		return err
 	}
-	if err := w.service.recordResourceContainer(ctx, id, resource.ID, plan, imageID, imageDigest, ownedVolumes); err != nil {
+	if err := w.service.recordResourceContainer(ctx, id, attempt, resource.ID, plan, imageID, imageDigest, ownedVolumes); err != nil {
 		return err
 	}
 
@@ -586,14 +586,14 @@ func (w *platformWorker) applyResource(ctx context.Context, id contract.Operatio
 }
 
 func (w *platformWorker) runResourceDestroy(ctx context.Context, id contract.OperationID, attempt uint32, input *platform.ResourceDestroyInput) error {
-	if err := w.service.markResourceState(ctx, id, input.Target().String(), platform.ResourceDestroying); err != nil {
+	if err := w.service.markResourceState(ctx, id, attempt, input.Target().String(), platform.ResourceDestroying); err != nil {
 		return w.settle(ctx, id, attempt, err)
 	}
 	err := w.destroyResource(ctx, id, attempt, input)
 	if err == nil {
 		return nil
 	}
-	w.service.recordResourceFailure(ctx, id, input.App, input.Environment, input.Name, err)
+	w.service.recordOwnedResourceFailure(ctx, id, attempt, input.App, input.Environment, input.Name, err)
 	return w.settle(ctx, id, attempt, err)
 }
 
@@ -725,14 +725,33 @@ func (s *Service) finishResourceOperation(ctx context.Context, id contract.Opera
 	return nil
 }
 
-func (s *Service) markResourceState(ctx context.Context, id contract.OperationID, target string, state platform.ResourceState) error {
-	if _, err := s.entities.Resources().SetStateForTarget(ctx, id, target, state); err != nil {
-		return unavailable(err)
+func (s *Service) markResourceState(ctx context.Context, id contract.OperationID, attempt uint32, target string, state platform.ResourceState) error {
+	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx *entities.StoreTx, _ *contract.Operation) error {
+		rows, err := tx.Resources().SetStateForTarget(ctx, id, target, state)
+		if err != nil {
+			return unavailable(err)
+		}
+		if rows != 1 {
+			return resourceSuperseded()
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if !owned {
+		return errNotOwned
 	}
 	return nil
 }
 
-func (s *Service) recordResourceFailure(ctx context.Context, id contract.OperationID, app, environment, name string, cause error) {
+func resourceSuperseded() error {
+	return contract.NewFault(contract.PreconditionFailed, "resource operation was superseded", "Refresh resource inventory and retry from its current operation.")
+}
+
+// Failure bookkeeping is best effort, but must not outlive its attempt.
+// Cancellation still settles through the operation's normal terminal path.
+func (s *Service) recordOwnedResourceFailure(ctx context.Context, id contract.OperationID, attempt uint32, app, environment, name string, cause error) {
 	if cause == nil || errors.Is(cause, errPlatformCancelled) {
 		return
 	}
@@ -741,9 +760,18 @@ func (s *Service) recordResourceFailure(ctx context.Context, id contract.Operati
 	if message == "" {
 		message = "resource operation failed"
 	}
-	_, _ = s.entities.Resources().RecordFailure(ctx, entities.ResourceFailure{
-		App: app, Environment: environment, Name: name, OperationID: id,
-		Code: fault.Code, Message: message,
+	_, _, _ = s.mutateOwned(ctx, id, attempt, func(tx *entities.StoreTx, _ *contract.Operation) error {
+		rows, err := tx.Resources().RecordFailure(ctx, entities.ResourceFailure{
+			App: app, Environment: environment, Name: name, OperationID: id,
+			Code: fault.Code, Message: message,
+		})
+		if err != nil {
+			return unavailable(err)
+		}
+		if rows != 1 {
+			return resourceSuperseded()
+		}
+		return nil
 	})
 }
 
@@ -786,15 +814,15 @@ func (s *Service) reconcileTerminalResourceStates(ctx context.Context) error {
 // persistOwnedResourceVolumes merges newly planned volume identities into the
 // row's cumulative ledger before any Docker volume is created. The operation ID
 // fence rejects a worker that was superseded while preparing the effect.
-func (s *Service) persistOwnedResourceVolumes(ctx context.Context, id contract.OperationID, resourceID platform.ResourceID, planned []platform.ResourceVolumeStatus) ([]platform.ResourceVolumeStatus, error) {
+func (s *Service) persistOwnedResourceVolumes(ctx context.Context, id contract.OperationID, attempt uint32, resourceID platform.ResourceID, planned []platform.ResourceVolumeStatus) ([]platform.ResourceVolumeStatus, error) {
 	var volumes []platform.ResourceVolumeStatus
-	err := s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx *entities.StoreTx, _ *contract.Operation) error {
 		raw, found, err := tx.Resources().LockVolumes(ctx, resourceID, id)
 		if err != nil {
 			return unavailable(err)
 		}
 		if !found {
-			return contract.NewFault(contract.PreconditionFailed, "resource operation was superseded", "Refresh resource inventory and retry from its current operation.")
+			return resourceSuperseded()
 		}
 		existing := []platform.ResourceVolumeStatus{}
 		if len(raw) > 0 {
@@ -807,27 +835,44 @@ func (s *Service) persistOwnedResourceVolumes(ctx context.Context, id contract.O
 		if err != nil {
 			return unavailable(err)
 		}
-		if _, err := tx.Resources().SetVolumes(ctx, resourceID, id, encoded); err != nil {
+		rows, err := tx.Resources().SetVolumes(ctx, resourceID, id, encoded)
+		if err != nil {
 			return unavailable(err)
+		}
+		if rows != 1 {
+			return resourceSuperseded()
 		}
 		return nil
 	})
 	if err != nil {
-		if entities.IsBeginFailure(err) || entities.IsCommitFailure(err) {
-			return nil, unavailable(err)
-		}
 		return nil, err
+	}
+	if !owned {
+		return nil, errNotOwned
 	}
 	return volumes, nil
 }
 
-func (s *Service) recordResourceContainer(ctx context.Context, id contract.OperationID, resourceID platform.ResourceID, plan platform.ResourcePlan, imageID, imageDigest string, volumes []platform.ResourceVolumeStatus) error {
-	if _, err := s.entities.Resources().RecordContainer(ctx, entities.ResourceContainer{
-		ID: resourceID, OperationID: id, Image: plan.Spec.Image, ImageID: imageID,
-		ImageDigest: imageDigest, ContainerName: plan.Container, NetworkName: plan.Network,
-		Volumes: volumes,
-	}); err != nil {
-		return unavailable(err)
+func (s *Service) recordResourceContainer(ctx context.Context, id contract.OperationID, attempt uint32, resourceID platform.ResourceID, plan platform.ResourcePlan, imageID, imageDigest string, volumes []platform.ResourceVolumeStatus) error {
+	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx *entities.StoreTx, _ *contract.Operation) error {
+		rows, err := tx.Resources().RecordContainer(ctx, entities.ResourceContainer{
+			ID: resourceID, OperationID: id, Image: plan.Spec.Image, ImageID: imageID,
+			ImageDigest: imageDigest, ContainerName: plan.Container, NetworkName: plan.Network,
+			Volumes: volumes,
+		})
+		if err != nil {
+			return unavailable(err)
+		}
+		if rows != 1 {
+			return resourceSuperseded()
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if !owned {
+		return errNotOwned
 	}
 	return nil
 }
