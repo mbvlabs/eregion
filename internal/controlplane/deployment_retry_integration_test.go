@@ -371,54 +371,40 @@ func TestIntegrationDeploymentOwnerRouteSelectionIsNotCreationOrder(t *testing.T
 	}
 }
 
-func TestIntegrationDeploymentInterruptionAfterApplyBeforeAckRestoresExactTarget(t *testing.T) {
+func TestIntegrationDeploymentInterruptionAfterApplyBeforeAckRetainsOwner(t *testing.T) {
 	transport := &recordingDeployTransport{scriptedDeployTransport: newScriptedDeployTransport()}
 	fixture := newDeploymentRetryFixtureWithTransport(t, transport)
 	fixture.deploy(t)
 	env := fixture.environment(t)
 	servingRelease, servingDeployment := env.ServingRelease, env.ServingDeploymentID
-	servingInstances, err := routeInstancesForTest(fixture.ctx, fixture.service.entities, "retry.example.com")
-	if err != nil {
-		t.Fatal(err)
-	}
 	op, _, _, _ := fixture.prepareOwnedCandidate(t, "interrupt-ack", "registry.example/live:interrupt", "running")
 	if got := routeNames(t, fixture); !reflect.DeepEqual(got, []string{"interrupt-ack-candidate"}) {
 		t.Fatalf("pre-recovery route = %v, want owner intent candidate", got)
 	}
 	transport.events = nil
-	fixture.service.routeSync = func(ctx context.Context) error {
-		selected, err := routeInstancesForTest(ctx, fixture.service.entities, "retry.example.com")
-		if err != nil {
-			return err
-		}
-		if !reflect.DeepEqual(selected, servingInstances) {
-			return fmt.Errorf("restore wrote %+v, want exact serving %+v", selected, servingInstances)
-		}
+	fixture.service.routeSync = func(context.Context) error {
 		transport.events = append(transport.events, "restore:ok")
 		return nil
 	}
 
-	if err := runPlatformAttempt(fixture.ctx, fixture.service, op.ID, 1); err != nil {
-		t.Fatalf("interrupted operation attempt: %v", err)
+	if err := runPlatformAttempt(fixture.ctx, fixture.service, op.ID, 1); contract.Classify(err).Code != contract.Unavailable {
+		t.Fatalf("unacknowledged route accepted: %v", err)
 	}
 	final, err := fixture.service.Get(fixture.ctx, testActor, op.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if final.State != contract.Failed || final.ErrorCode != contract.Unavailable {
-		t.Fatalf("interrupted operation = %+v, want failed/unavailable", final)
+	if final.State.Terminal() {
+		t.Fatalf("unacknowledged route allowed terminal state: %+v", final)
 	}
-	if owner, has := ownerForFixture(t, fixture, env); has {
-		t.Fatalf("owner remained after safe terminal recovery: %+v", owner)
+	if owner, has := ownerForFixture(t, fixture, env); !has || owner.OperationID != op.ID {
+		t.Fatalf("unacknowledged route lost ownership: %+v", owner)
 	}
-	restoreIndex := transport.eventIndex("restore:")
-	cleanupIndex := transport.eventIndex("run:" + cleanupStepID("interrupt-ack-candidate"))
-	if restoreIndex < 0 || cleanupIndex < 0 || restoreIndex > cleanupIndex {
-		t.Fatalf("restore/cleanup order events=%v", transport.events)
+	if err := fixture.service.retryDueContainerCleanups(fixture.ctx); err != nil {
+		t.Fatalf("maintenance cleanup: %v", err)
 	}
-	if got, want := routeNames(t, fixture), instanceNames(servingInstances); !reflect.DeepEqual(got, want) {
-		// The owner is released, so the query now follows the serving pointer.
-		t.Fatalf("route after release = %v, want previous serving route %v", got, want)
+	if transport.eventIndex("restore:") >= 0 || transport.eventIndex("run:"+cleanupStepID("interrupt-ack-candidate")) >= 0 {
+		t.Fatalf("restore or cleanup dispatched with an unacknowledged route: %v", transport.events)
 	}
 	if release, deployment := fixture.serving(t); release != servingRelease || deployment != servingDeployment {
 		t.Fatalf("serving after recovery = %s/%s, want %s/%s", release, deployment, servingRelease, servingDeployment)
@@ -431,7 +417,7 @@ func TestIntegrationDeploymentCancellationRestoresBeforeCancel(t *testing.T) {
 	fixture.deploy(t)
 	env := fixture.environment(t)
 	servingRelease, servingDeployment := env.ServingRelease, env.ServingDeploymentID
-	op, _, _, _ := fixture.prepareOwnedCandidate(t, "cancel-route", "registry.example/live:cancel", "running")
+	op, _, _, _ := fixture.prepareOwnedCandidate(t, "cancel-route", "registry.example/live:cancel", "completed")
 	if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_operations SET state='cancelling' WHERE id=$1`, op.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -454,6 +440,9 @@ func TestIntegrationDeploymentCancellationRestoresBeforeCancel(t *testing.T) {
 	if owner, has := ownerForFixture(t, fixture, env); has {
 		t.Fatalf("owner remained after cancellation: %+v", owner)
 	}
+	if err := fixture.service.retryDueContainerCleanups(fixture.ctx); err != nil {
+		t.Fatalf("maintenance cleanup: %v", err)
+	}
 	restoreIndex := transport.eventIndex("restore:")
 	cleanupIndex := transport.eventIndex("run:" + cleanupStepID("cancel-route-candidate"))
 	if restoreIndex < 0 || cleanupIndex < 0 || restoreIndex > cleanupIndex {
@@ -469,7 +458,7 @@ func TestIntegrationDeploymentFailedRestoreRetainsOwnerAndCandidates(t *testing.
 	fixture := newDeploymentRetryFixtureWithTransport(t, transport)
 	fixture.deploy(t)
 	env := fixture.environment(t)
-	op, _, _, _ := fixture.prepareOwnedCandidate(t, "failed-restore", "registry.example/live:failed-restore", "running")
+	op, _, _, _ := fixture.prepareOwnedCandidate(t, "failed-restore", "registry.example/live:failed-restore", "completed")
 	restoreFails := true
 	fixture.service.routeSync = func(context.Context) error {
 		if restoreFails {
@@ -500,23 +489,21 @@ func TestIntegrationDeploymentFailedRestoreRetainsOwnerAndCandidates(t *testing.
 
 	restoreFails = false
 	transport.events = nil
-	if err := runPlatformAttempt(fixture.ctx, fixture.service, op.ID, 1); err != nil {
-		t.Fatalf("restore retry: %v", err)
+	if err := runPlatformAttempt(fixture.ctx, fixture.service, op.ID, 1); contract.Classify(err).Code != contract.Unavailable {
+		t.Fatalf("unacknowledged restore retry: %v", err)
 	}
 	current, err = fixture.service.Get(fixture.ctx, testActor, op.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if current.State != contract.Failed || current.ErrorCode != contract.Unavailable {
-		t.Fatalf("restored operation = %+v, want failed/unavailable", current)
+	if current.State.Terminal() {
+		t.Fatalf("unacknowledged restore allowed terminal state: %+v", current)
 	}
-	if owner, has := ownerForFixture(t, fixture, env); has {
-		t.Fatalf("owner remained after successful restore: %+v", owner)
+	if owner, has := ownerForFixture(t, fixture, env); !has || owner.OperationID != op.ID {
+		t.Fatalf("unacknowledged restore lost ownership: %+v", owner)
 	}
-	restoreIndex := transport.eventIndex("restore:")
-	cleanupIndex := transport.eventIndex("run:" + cleanupStepID("failed-restore-candidate"))
-	if restoreIndex < 0 || cleanupIndex < 0 || restoreIndex > cleanupIndex {
-		t.Fatalf("restore retry order events=%v", transport.events)
+	if transport.eventIndex("restore:") >= 0 || transport.eventIndex("run:"+cleanupStepID("failed-restore-candidate")) >= 0 {
+		t.Fatalf("resent restore or ran cleanup before proof: %v", transport.events)
 	}
 }
 
@@ -623,6 +610,51 @@ func TestIntegrationContainerCleanupDefersServingAndOwnerTarget(t *testing.T) {
 	}
 }
 
+func TestIntegrationContainerCleanupImmediateHandoffAfterLegacyLock(t *testing.T) {
+	fixture, transport, env := newDeployedRecordingFixture(t)
+	releaseID := fixture.createRelease("handoff", "registry.example/live:handoff")
+	op := platformSubmit(t, fixture.service, platform.KindDeploy, "env/live/production", "handoff", map[string]any{"release_id": releaseID})
+	deploymentID := platform.DeploymentID(deploymentForOperation(t, fixture.pool, op.ID))
+	if err := fixture.service.ensureContainerCleanup(fixture.ctx, "handoff-candidate", env.ID, env.Node, deploymentID, "candidate", nil); err != nil {
+		t.Fatal(err)
+	}
+	release, err := fixture.service.lockTargets(fixture.ctx, []string{"env/live/production"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.service.removeDeploymentCleanupRowsNow(fixture.ctx, env, deploymentID)
+	release()
+	if transport.eventIndex("run:"+cleanupStepID("handoff-candidate")) >= 0 {
+		t.Fatal("cleanup ran while the legacy lock was held")
+	}
+	if err := fixture.service.retryDueContainerCleanups(fixture.ctx); err != nil {
+		t.Fatalf("maintenance cleanup: %v", err)
+	}
+	if transport.eventIndex("run:"+cleanupStepID("handoff-candidate")) < 0 {
+		t.Fatal("maintenance did not remove the deferred container")
+	}
+	var remaining int
+	if err := fixture.pool.QueryRow(fixture.ctx, `SELECT count(*) FROM eregion_platform_container_cleanup WHERE container_name='handoff-candidate'`).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 0 {
+		t.Fatalf("cleanup row remains after successful removal: %d", remaining)
+	}
+	if err := fixture.service.ensureContainerCleanup(fixture.ctx, "immediate-candidate", env.ID, env.Node, deploymentID, "candidate", nil); err != nil {
+		t.Fatal(err)
+	}
+	fixture.service.removeDeploymentCleanupRowsNow(fixture.ctx, env, deploymentID)
+	if transport.eventIndex("run:"+cleanupStepID("immediate-candidate")) < 0 {
+		t.Fatal("uncontended immediate cleanup did not remove the container")
+	}
+	if err := fixture.pool.QueryRow(fixture.ctx, `SELECT count(*) FROM eregion_platform_container_cleanup WHERE container_name='immediate-candidate'`).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 0 {
+		t.Fatalf("immediate cleanup row remains after successful removal: %d", remaining)
+	}
+}
+
 func TestIntegrationDeploymentLegacyAmbiguousOwnerRecoversConservatively(t *testing.T) {
 	transport := &recordingDeployTransport{scriptedDeployTransport: newScriptedDeployTransport()}
 	fixture := newDeploymentRetryFixtureWithTransport(t, transport)
@@ -678,7 +710,7 @@ func TestIntegrationDeploymentExhaustionRestoresBeforeTerminalFailure(t *testing
 	transport := &recordingDeployTransport{scriptedDeployTransport: newScriptedDeployTransport()}
 	fixture := newDeploymentRetryFixtureWithTransport(t, transport)
 	fixture.deploy(t)
-	op, _, env, _ := fixture.prepareOwnedCandidate(t, "exhausted", "registry.example/live:exhausted", "running")
+	op, _, env, _ := fixture.prepareOwnedCandidate(t, "exhausted", "registry.example/live:exhausted", "completed")
 	var jobID int64
 	if err := fixture.pool.QueryRow(fixture.ctx, `SELECT job_id FROM eregion_operations WHERE id=$1`, op.ID).Scan(&jobID); err != nil {
 		t.Fatal(err)
@@ -721,6 +753,9 @@ func TestIntegrationDeploymentExhaustionRestoresBeforeTerminalFailure(t *testing
 	}
 	if owner, has := ownerForFixture(t, fixture, env); has {
 		t.Fatalf("exhaustion left owner: %+v", owner)
+	}
+	if err := fixture.service.retryDueContainerCleanups(fixture.ctx); err != nil {
+		t.Fatalf("maintenance cleanup: %v", err)
 	}
 	restoreIndex := transport.eventIndex("restore:")
 	cleanupIndex := transport.eventIndex("run:" + cleanupStepID("exhausted-candidate"))
@@ -785,6 +820,9 @@ func TestIntegrationDeploymentVerifiedCancellationRecoveryRestores(t *testing.T)
 	}
 	if release, deployment := fixture.serving(t); release != servingRelease || deployment != servingDeployment {
 		t.Fatalf("serving pair = %s/%s, want %s/%s", release, deployment, servingRelease, servingDeployment)
+	}
+	if err := fixture.service.retryDueContainerCleanups(fixture.ctx); err != nil {
+		t.Fatalf("maintenance cleanup: %v", err)
 	}
 	restoreIndex := transport.eventIndex("restore:")
 	cleanupIndex := transport.eventIndex("run:" + cleanupStepID("verified-cancel-candidate"))
@@ -1184,7 +1222,7 @@ func TestIntegrationDeploymentCleanupProtectsFrozenRestoreTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	op, candidateDeployment, _, owner := fixture.prepareOwnedCandidate(t, "restore-protect", "registry.example/live:restore-protect", "running")
+	op, candidateDeployment, _, owner := fixture.prepareOwnedCandidate(t, "restore-protect", "registry.example/live:restore-protect", "completed")
 	// Simulate the pre-finalization state: the candidate is recorded serving,
 	// while the owner still freezes A as its restore target.
 	var candidateRelease string
@@ -1262,6 +1300,11 @@ func TestIntegrationDeploymentPreRecordFailureRetainsOwner(t *testing.T) {
 			assertOperationNotTerminal(t, fixture, op.ID, "pre-record failure")
 			assertOwnerPhase(t, fixture, env, deploymentOwnerServing, "pre-record failure")
 			repairPreRecordFailure(t, fixture, previous, previousInstances, failLookup)
+			err := runPlatformAttempt(fixture.ctx, fixture.service, op.ID, 1)
+			var snooze *river.JobSnoozeError
+			if !errors.As(err, &snooze) {
+				t.Fatalf("expected verified handoff before retry: %v", err)
+			}
 			if err := runPlatformAttempt(fixture.ctx, fixture.service, op.ID, 1); err != nil {
 				t.Fatalf("retry after pre-record repair: %v", err)
 			}
@@ -1347,12 +1390,11 @@ func TestIntegrationTerminalOwnerCleanupUsesPostRestoreState(t *testing.T) {
 	}
 }
 
-func TestIntegrationDeploymentPostSwitchNonretryableSyncFailureRestores(t *testing.T) {
+func TestIntegrationDeploymentPostSwitchNonretryableErrorDoesNotProveQuiescence(t *testing.T) {
 	transport := &recordingDeployTransport{scriptedDeployTransport: newScriptedDeployTransport()}
 	fixture := newDeploymentRetryFixtureWithTransport(t, transport)
 	fixture.deploy(t)
 	env := fixture.environment(t)
-	servingRelease, servingDeployment := env.ServingRelease, env.ServingDeploymentID
 	var switches int
 	fixture.service.routeSwitch = func(context.Context, platform.Environment, []string) error {
 		switches++
@@ -1367,58 +1409,58 @@ func TestIntegrationDeploymentPostSwitchNonretryableSyncFailureRestores(t *testi
 	}
 	release := fixture.createRelease("post-sync", "registry.example/live:post-sync")
 	op := platformSubmit(t, fixture.service, platform.KindDeploy, "env/live/production", "post-sync", map[string]any{"release_id": release})
-	if err := runPlatformAttempt(fixture.ctx, fixture.service, op.ID, 1); err != nil {
-		t.Fatalf("post-switch sync attempt: %v", err)
+	if err := runPlatformAttempt(fixture.ctx, fixture.service, op.ID, 1); err == nil {
+		t.Fatal("post-switch attempt completed without a route acknowledgement")
 	}
 	final, err := fixture.service.Get(fixture.ctx, testActor, op.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if final.State != contract.Failed || final.ErrorCode != contract.PreconditionFailed {
-		t.Fatalf("post-switch operation = %+v, want failed/precondition", final)
+	if final.State.Terminal() {
+		t.Fatalf("unacknowledged reassertion terminalized: %+v", final)
 	}
-	if release, deployment := fixture.serving(t); release != servingRelease || deployment != servingDeployment {
-		t.Fatalf("serving after post-switch failure = %s/%s, want %s/%s", release, deployment, servingRelease, servingDeployment)
+	if owner, has := ownerForFixture(t, fixture, env); !has || owner.OperationID != op.ID {
+		t.Fatalf("owner was lost after unacknowledged reassertion: %+v", owner)
 	}
-	if owner, has := ownerForFixture(t, fixture, env); has {
-		t.Fatalf("owner remained after restored failure: %+v", owner)
-	}
-	if transport.eventIndex("restore:") < 0 {
-		t.Fatalf("post-switch failure did not restore: %v", transport.events)
+	if transport.eventIndex("restore:") >= 0 {
+		t.Fatalf("post-switch failure attempted another load: %v", transport.events)
 	}
 }
 
-func TestIntegrationDeploymentPostSwitchRestoreFailureRetainsOwner(t *testing.T) {
+func TestIntegrationDeploymentRecoveredReassertionCancellationRetainsOwner(t *testing.T) {
 	transport := &recordingDeployTransport{scriptedDeployTransport: newScriptedDeployTransport()}
 	fixture := newDeploymentRetryFixtureWithTransport(t, transport)
 	fixture.deploy(t)
 	env := fixture.environment(t)
-	var switches int
-	fixture.service.routeSwitch = func(context.Context, platform.Environment, []string) error {
-		switches++
-		if switches == 2 {
-			return contract.NewFault(contract.PreconditionFailed, "post-switch resync failed", "test")
+	op, dep, _, _ := fixture.prepareOwnedCandidate(t, "retry-cancel", "registry.example/live:retry-cancel", "completed")
+	insertCompletedStep(t, fixture.pool, op.ID, deploymentPublicStep, strings.Repeat("b", 64))
+	var publishes int
+	fixture.service.routeSync = func(ctx context.Context) error {
+		publishes++
+		if publishes == 1 {
+			if _, err := fixture.service.RequestCancel(ctx, testActor, op.ID); err != nil {
+				t.Fatal(err)
+			}
 		}
-		return nil
+		return contract.NewFault(contract.Unavailable, "serving reassertion lost its reply", "test")
 	}
-	fixture.service.routeSync = func(context.Context) error {
-		return contract.NewFault(contract.Unavailable, "restore writer unavailable", "test")
-	}
-	release := fixture.createRelease("post-sync-fail", "registry.example/live:post-sync-fail")
-	op := platformSubmit(t, fixture.service, platform.KindDeploy, "env/live/production", "post-sync-fail", map[string]any{"release_id": release})
 	if err := runPlatformAttempt(fixture.ctx, fixture.service, op.ID, 1); err == nil {
-		t.Fatal("attempt succeeded while post-switch restoration failed")
+		t.Fatal("attempt settled while the serving route load was unacknowledged")
 	}
 	current, err := fixture.service.Get(fixture.ctx, testActor, op.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if current.State.Terminal() {
-		t.Fatalf("operation terminalized with unresolved post-switch restore: %+v", current)
+	if current.State != contract.Cancelling || publishes != 1 {
+		t.Fatalf("unacknowledged reload: state=%s publishes=%d", current.State, publishes)
 	}
 	owner, has := ownerForFixture(t, fixture, env)
-	if !has || owner.Phase != deploymentOwnerRestoring || owner.RestoreDeploymentID != env.ServingDeploymentID {
-		t.Fatalf("owner after post-switch restore failure = %+v, has=%t", owner, has)
+	if !has || owner.Phase != deploymentOwnerServing || owner.RouteTarget != dep {
+		t.Fatalf("owner after unacknowledged reassertion = %+v, has=%t", owner, has)
+	}
+	claims := claimFixture{t: t, ctx: fixture.ctx, a: fixture.service.entities, b: fixture.service.entities}
+	if claims.acquire(claims.b, claimID("reassertion-competitor", "reassertion-competitor"), op.Target) {
+		t.Fatal("unacknowledged reassertion released the environment")
 	}
 }
 
@@ -1451,18 +1493,18 @@ func TestIntegrationDeploymentPostSwitchRetryableSyncFailureRetainsOwner(t *test
 	if !has || owner.Phase != deploymentOwnerServing {
 		t.Fatalf("owner after retryable post-switch failure = %+v, has=%t", owner, has)
 	}
-	if err := runPlatformAttempt(fixture.ctx, fixture.service, op.ID, 1); err != nil {
-		t.Fatalf("post-switch retry: %v", err)
+	if err := runPlatformAttempt(fixture.ctx, fixture.service, op.ID, 1); contract.Classify(err).Code != contract.Unavailable {
+		t.Fatalf("post-switch retry without reload proof: %v", err)
 	}
 	current, err = fixture.service.Get(fixture.ctx, testActor, op.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if current.State != contract.Succeeded {
-		t.Fatalf("retried post-switch deployment = %+v, want succeeded", current)
+	if current.State.Terminal() || switches != 2 {
+		t.Fatalf("unknown reload was treated as settled: state=%s switches=%d", current.State, switches)
 	}
-	if _, has := ownerForFixture(t, fixture, env); has {
-		t.Fatal("owner remained after successful retry")
+	if owner, has := ownerForFixture(t, fixture, env); !has || owner.OperationID != op.ID {
+		t.Fatal("owner released without reload proof")
 	}
 }
 
@@ -1966,13 +2008,13 @@ func assertUnresolvablePinnedCleanupNodeRetainsOwnership(t *testing.T, scenario 
 	}
 }
 
-// TestIntegrationDeploymentRetryableFailureRetainsCandidates proves a retryable
-// pre-switch failure does not remove containers whose completed step rows make
-// the retry skip recreation.
+// TestIntegrationDeploymentRetryableFailureRetainsCandidates proves that a
+// retry does not replace or clean up candidates while the admitted health
+// check has no durable acknowledgement.
 func TestIntegrationDeploymentRetryableFailureRetainsCandidates(t *testing.T) {
 	state := newRetryableCandidateTest(t)
 	assertRetryableFailureRetained(t, state)
-	assertRetryableRetrySucceeded(t, state)
+	assertUnacknowledgedHealthRetryRetained(t, state)
 }
 
 type retryableCandidateTest struct {
@@ -2053,21 +2095,15 @@ func assertRetryableFailureRetained(t *testing.T, state *retryableCandidateTest)
 	assertServingDeployment(t, state.fixture, state.previousRelease, state.previousDeployID, "retryable pre-switch failure")
 }
 
-func assertRetryableRetrySucceeded(t *testing.T, state *retryableCandidateTest) {
+func assertUnacknowledgedHealthRetryRetained(t *testing.T, state *retryableCandidateTest) {
 	t.Helper()
 	state.transport.failure = nil
-	if err := runPlatformAttempt(state.fixture.ctx, state.fixture.service, state.op.ID, 1); err != nil {
-		t.Fatalf("retry after retryable failure: %v", err)
+	if err := runPlatformAttempt(state.fixture.ctx, state.fixture.service, state.op.ID, 2); contract.Classify(err).Code != contract.Unavailable {
+		t.Fatalf("retry without health completion proof: %v", err)
 	}
-	assertOperationState(t, state.fixture, state.op.ID, contract.Succeeded, "retryable failure retry")
-	for _, planned := range state.plan {
-		step := containerStepID(planned.Process.Name, planned.Replica)
-		if runs := state.transport.runCount(state.op.ID, step); runs != 1 {
-			t.Fatalf("container step %s ran %d times across retry, want 1", step, runs)
-		}
-	}
-	assertServingDeployment(t, state.fixture, state.release, state.depID, "retryable failure retry")
-	assertOwnerReleased(t, state.fixture, state.env, "retryable failure retry")
+	assertOperationNotTerminal(t, state.fixture, state.op.ID, "unacknowledged health retry")
+	assertOwnerRetained(t, state.fixture, state.env, "unacknowledged health retry")
+	assertRetryableFailureRetained(t, state)
 }
 
 // TestIntegrationLiveCleanupIntentFailureRetainsOwner covers both live terminal
@@ -2106,10 +2142,11 @@ func assertPreSwitchTerminalCleanupIntent(t *testing.T) {
 	}
 	dropBlock()
 	transport.failure = nil
-	if err := runPlatformAttempt(fixture.ctx, fixture.service, op.ID, 1); err != nil {
-		t.Fatalf("retry after cleanup intent repair: %v", err)
+	if err := runPlatformAttempt(fixture.ctx, fixture.service, op.ID, 2); contract.Classify(err).Code != contract.Unavailable {
+		t.Fatalf("cleanup repair is not proof of health completion: %v", err)
 	}
-	assertOperationState(t, fixture, op.ID, contract.Succeeded, "terminal cleanup intent retry")
+	assertOperationNotTerminal(t, fixture, op.ID, "health evidence still absent after cleanup repair")
+	assertOwnerRetained(t, fixture, env, "health evidence still absent after cleanup repair")
 }
 
 func assertPostSwitchPublicCleanupIntent(t *testing.T) {
@@ -2131,11 +2168,11 @@ func assertPostSwitchPublicCleanupIntent(t *testing.T) {
 	assertServingDeployment(t, fixture, previousRelease, previousDeployment, "public cleanup intent failure")
 	dropBlock()
 	fixture.service.publicVerify = func(context.Context, platform.Environment, string) error { return nil }
-	if err := runPlatformAttempt(fixture.ctx, fixture.service, op.ID, 1); err != nil {
-		t.Fatalf("recovery after cleanup intent repair: %v", err)
+	if err := runPlatformAttempt(fixture.ctx, fixture.service, op.ID, 2); contract.Classify(err).Code != contract.Unavailable {
+		t.Fatalf("cleanup repair is not proof that every original effect settled: %v", err)
 	}
-	assertOperationState(t, fixture, op.ID, contract.Failed, "public cleanup intent recovery")
-	assertOwnerReleased(t, fixture, env, "public cleanup intent recovery")
+	assertOperationNotTerminal(t, fixture, op.ID, "public cleanup intent recovery awaiting proof")
+	assertOwnerRetained(t, fixture, env, "public cleanup intent recovery awaiting proof")
 	assertServingDeployment(t, fixture, previousRelease, previousDeployment, "public cleanup intent recovery")
 }
 
@@ -2389,17 +2426,14 @@ func assertCleanupRowCount(t *testing.T, fixture *deploymentRetryFixture, depID 
 	}
 }
 
-// TestIntegrationDeploymentTerminalRetryWithRetainedCandidates covers a retry
-// that turns terminal before any new transport work. An unknown prior effect
-// must retain the owner; when that prior effect is observably quiescent, the
-// durable cleanup-intent failpoint must be reached before the prepared owner is
-// released.
+// An unknown prior effect must retain the owner even when a subsequent
+// transport would report no journal record.
 func TestIntegrationDeploymentTerminalRetryWithRetainedCandidates(t *testing.T) {
 	t.Run("placement failure retains owner while effect is unknown", func(t *testing.T) {
 		assertPlacementFailureRetainsUnknownEffect(t, setupTerminalRetryCandidates(t))
 	})
-	t.Run("cleanup record failure retains owner", func(t *testing.T) {
-		assertTerminalCleanupRecordFailureRetainsOwner(t, setupTerminalRetryCandidates(t))
+	t.Run("replacement transport cannot prove cleanup is safe", func(t *testing.T) {
+		assertReplacementTransportRetainsOwner(t, setupTerminalRetryCandidates(t))
 	})
 }
 
@@ -2473,31 +2507,22 @@ func assertPlacementFailureRetainsUnknownEffect(t *testing.T, state *terminalRet
 	}
 }
 
-func assertTerminalCleanupRecordFailureRetainsOwner(t *testing.T, state *terminalRetryCandidateTest) {
+func assertReplacementTransportRetainsOwner(t *testing.T, state *terminalRetryCandidateTest) {
 	t.Helper()
 	env := state.fixture.environment(t)
-	// Model the previous health/live effect as quiescent with an observable
-	// terminal-safe status on the pinned node. This exercises the real terminal
-	// cleanup insert failpoint instead of stopping at the unknown-effect guard.
+	// Absence from a replacement transport cannot account for the original
+	// dispatch. The live cleanup tests exercise the separate insert boundary.
 	absent := &fixedStatusTransport{status: engine.StatusAbsent}
 	state.fixture.service.resolver = newTestNodeResolver(t, state.fixture.pool, map[string]node.Transport{env.Node: absent})
-	dropBlock := blockContainerCleanupInserts(t, state.fixture.pool)
-	defer dropBlock()
-	err := runPlatformAttempt(state.fixture.ctx, state.fixture.service, state.op.ID, 1)
-	if err == nil {
-		t.Fatal("terminal placement failure settled without durable cleanup intent")
+	err := runPlatformAttempt(state.fixture.ctx, state.fixture.service, state.op.ID, 2)
+	if contract.Classify(err).Code != contract.Unavailable {
+		t.Fatalf("retry against unauthenticated replacement: %v", err)
 	}
-	fault := contract.Classify(err)
-	if fault.Code != contract.Unavailable ||
-		!strings.Contains(fault.Message, "candidate cleanup intent could not be recorded durably") ||
-		!strings.Contains(fault.Hint, "Keep the deployment owner and candidate containers") {
-		t.Fatalf("cleanup failpoint error = %+v, want the durable cleanup-intent fault", fault)
+	if absent.callCount() != 0 {
+		t.Fatal("retry asked the replacement node to prove the original effect")
 	}
-	if absent.callCount() == 0 {
-		t.Fatal("cleanup retry did not observe the pinned node before the cleanup insert")
-	}
-	assertOperationNotTerminal(t, state.fixture, state.op.ID, "terminal cleanup intent failure")
-	assertOwnerRetained(t, state.fixture, env, "terminal cleanup intent failure")
+	assertOperationNotTerminal(t, state.fixture, state.op.ID, "replacement health transport")
+	assertOwnerRetained(t, state.fixture, env, "replacement health transport")
 }
 
 // TestIntegrationOwnerRestoreTargetCandidateFailsClosed keeps the unsafe
@@ -2563,7 +2588,6 @@ type crashGapScenario struct {
 	env                 platform.Environment
 	staleRelease        platform.ReleaseID
 	staleDeployment     platform.DeploymentID
-	staleRow            platform.Deployment
 	candidateDeployment platform.DeploymentID
 	predecessorRelease  platform.ReleaseID
 	predecessorDeploy   platform.DeploymentID
@@ -2579,7 +2603,6 @@ func newCrashGapScenario(t *testing.T) *crashGapScenario {
 		fixture: fixture, transport: transport, env: env,
 		staleRelease: env.ServingRelease, staleDeployment: env.ServingDeploymentID,
 	}
-	state.staleRow = previousDeploymentFor(t, fixture, env)
 	releaseB := fixture.createRelease("gap-b", "registry.example/live:gap-b")
 	opB := platformSubmit(t, fixture.service, platform.KindDeploy, "env/live/production", "gap-b", map[string]any{"release_id": releaseB})
 	state.releaseC = fixture.createRelease("gap-c", "registry.example/live:gap-c")
@@ -2636,6 +2659,32 @@ func assertCrashGapRecovered(t *testing.T, state *crashGapScenario) {
 		t.Fatalf("renewal bound C previous = %s/%s, want owner predecessor %s/%s", afterRelease, afterDeployment, state.predecessorRelease, state.predecessorDeploy)
 	}
 	assertServingDeployment(t, state.fixture, state.releaseC, state.candidateDeployment, "crash-gap recovery")
+	assertCrashGapCleanup(t, state)
+}
+
+func assertCrashGapCleanup(t *testing.T, state *crashGapScenario) {
+	t.Helper()
+	if len(state.predecessorRow.Instances) == 0 {
+		t.Fatal("true predecessor has no instances to clean up")
+	}
+	for _, instance := range state.predecessorRow.Instances {
+		if instance.Name == "" {
+			continue
+		}
+		var deployment, reason string
+		if err := state.fixture.pool.QueryRow(state.fixture.ctx, `SELECT deployment_id,reason FROM eregion_platform_container_cleanup
+            WHERE container_name=$1`, instance.Name).Scan(&deployment, &reason); err != nil {
+			t.Fatalf("true predecessor cleanup intent %s: %v", instance.Name, err)
+		}
+		if deployment != string(state.predecessorDeploy) || reason != "previous" {
+			t.Fatalf("cleanup intent for %s = %s/%s, want %s/previous", instance.Name, deployment, reason, state.predecessorDeploy)
+		}
+	}
+	// Maintenance is global: B may already have queued A for removal. Only C's
+	// exact previous linkage and B's cleanup row identify C's intended target.
+	if err := state.fixture.service.retryDueContainerCleanups(state.fixture.ctx); err != nil {
+		t.Fatalf("maintenance cleanup: %v", err)
+	}
 	for _, instance := range state.predecessorRow.Instances {
 		if instance.Name == "" {
 			continue
@@ -2643,13 +2692,13 @@ func assertCrashGapRecovered(t *testing.T, state *crashGapScenario) {
 		if state.transport.eventIndex("run:"+cleanupStepID(instance.Name)) < 0 {
 			t.Fatalf("cleanup did not target true predecessor %s; events=%v", instance.Name, state.transport.events)
 		}
-	}
-	for _, instance := range state.staleRow.Instances {
-		if instance.Name == "" {
-			continue
+		var remaining int
+		if err := state.fixture.pool.QueryRow(state.fixture.ctx, `SELECT count(*) FROM eregion_platform_container_cleanup
+            WHERE container_name=$1`, instance.Name).Scan(&remaining); err != nil {
+			t.Fatal(err)
 		}
-		if state.transport.eventIndex("run:"+cleanupStepID(instance.Name)) >= 0 {
-			t.Fatalf("cleanup targeted stale predecessor %s; events=%v", instance.Name, state.transport.events)
+		if remaining != 0 {
+			t.Fatalf("true predecessor cleanup row %s remains", instance.Name)
 		}
 	}
 }

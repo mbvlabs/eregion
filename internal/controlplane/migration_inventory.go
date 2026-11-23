@@ -10,7 +10,7 @@ import (
 )
 
 var migrationCreate = regexp.MustCompile(`(?s)^CREATE (TABLE|(?:UNIQUE )?INDEX) (eregion_[a-z0-9_]+)\b`)
-var migrationIndexOwner = regexp.MustCompile(`^CREATE (?:UNIQUE )?INDEX (eregion_[a-z0-9_]+) ON (eregion_[a-z0-9_]+)\s*\(`)
+var migrationIndexOwner = regexp.MustCompile(`^CREATE (?:UNIQUE )?INDEX (eregion_[a-z0-9_]+)\s+ON (eregion_[a-z0-9_]+)\s*\(`)
 var migrationComment = regexp.MustCompile(`(?m)--[^\n]*`)
 
 // applicationInventory is deliberately limited to this CREATE-only history.

@@ -124,6 +124,16 @@ type EregionDefinitionStep struct {
 	DnsProgress       json.RawMessage
 }
 
+type EregionDeploymentHealthDispatch struct {
+	OperationID  string
+	Step         string
+	NodeName     string
+	NodeIdentity string
+	Attempt      int64
+	ExecutionID  string
+	InputsHash   string
+}
+
 type EregionIntegrationAudit struct {
 	ID         int64
 	Entry      json.RawMessage
@@ -477,6 +487,12 @@ type EregionProviderCredentialRevision struct {
 	CreatedAt        pgtype.Timestamptz
 }
 
+type EregionResourceDispatchNode struct {
+	OperationID  string
+	NodeName     string
+	NodeIdentity string
+}
+
 type EregionRetentionRun struct {
 	ID                    string
 	OperationID           pgtype.Text
@@ -492,6 +508,13 @@ type EregionRetentionRun struct {
 	CacheMeasuredAt       pgtype.Timestamptz
 	CacheMeasurementError string
 	GcGeneration          int64
+}
+
+type EregionRetiredBuildEffect struct {
+	OperationID string
+	Step        string
+	ExecutionID string
+	InputsHash  string
 }
 
 type EregionSecret struct {
@@ -529,6 +552,19 @@ type EregionServerSetting struct {
 	Retention          json.RawMessage
 	UpdatedAt          pgtype.Timestamptz
 	RetentionGcPending bool
+}
+
+type EregionTargetClaim struct {
+	Token       string
+	OperationID string
+	CreatedAt   pgtype.Timestamptz
+	SealedAt    pgtype.Timestamptz
+	ReleasedAt  pgtype.Timestamptz
+}
+
+type EregionTargetClaimTarget struct {
+	Target string
+	Token  string
 }
 
 type EregionWebhookDelivery struct {

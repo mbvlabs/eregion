@@ -515,6 +515,9 @@ func (s *Service) mutateOwned(
 		if op.State.Terminal() || op.Attempt != attempt {
 			return nil
 		}
+		if err := guardBuildTargetExecutor(ctx, tx, op); err != nil {
+			return err
+		}
 		if err := change(tx, &op); err != nil {
 			return err
 		}

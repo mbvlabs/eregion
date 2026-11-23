@@ -41,6 +41,9 @@ func (e *SavepointError) Unwrap() error { return e.cause }
 // rollback cannot clear it.
 type transactionState struct {
 	poison *SavepointError
+	// Conservative across savepoint rollbacks: release must wait for a new
+	// root transaction whenever this transaction has sealed the claim.
+	sealedClaims map[TargetClaimID]bool
 }
 
 func (s *transactionState) record(failure *SavepointError) {

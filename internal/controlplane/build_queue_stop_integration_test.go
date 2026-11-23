@@ -9,10 +9,35 @@ import (
 
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/riverqueue/river"
 )
+
+func TestIntegrationPendingStopRejectsOrphanPackPlacement(t *testing.T) {
+	f := newStopRecoveryFixture(t)
+	ctx := context.Background()
+	original := f.pointerBuildFixture.op.ID
+	err := f.service.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		return tx.InsertBuildPlacement(ctx, original, entities.PackPlacement{Node: "local", Identity: f.identity})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	build, err := f.service.buildByID(ctx, f.build)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handled, err := f.service.stopPendingBuildBeforeDispatch(ctx, f.op.ID, 1, build)
+	if err != nil || handled {
+		t.Fatalf("orphan placement must not be treated as undispatched: handled=%v err=%v", handled, err)
+	}
+	build, err = f.service.buildByID(ctx, f.build)
+	if err != nil || build.State != platform.BuildPending {
+		t.Fatalf("build changed: %+v %v", build, err)
+	}
+}
 
 func TestIntegrationBuildStopWhileCapacityQueued(t *testing.T) {
 	f := newStopRecoveryFixture(t)

@@ -47,7 +47,8 @@ SQL
 
 The test migrates the fresh database through the session pool, then uses the
 unchanged transaction URL for readiness, backend reassignment on one client
-connection, runtime startup, submission and River completion. It writes data
+connection, durable target claim lifecycle and contention (including backend
+reassignment while a claim is held), runtime startup, submission and River completion. It writes data
 and refuses a database with existing migration ledgers. The names and ports
 below are for this disposable fixture only.
 
@@ -66,8 +67,16 @@ docker rm -f eregion-pgbouncer-test-session eregion-pgbouncer-test-tx eregion-pg
 docker network rm eregion-pgbouncer-test
 ```
 
-This diagnostic operation does not exercise paths that hold session advisory
-locks. It is not evidence that migrations or all runtime operations are safe
-through transaction pooling. Vaire ignores `search_path` and `options` startup
+With `EREGION_TEST_PGBOUNCER_DOCKER=1` on an isolated Docker daemon, this test
+also exercises resource ownership and BuildStop contention. It does not prove
+that every runtime path is safe through transaction pooling. Migrations still
+require a direct or session-pooled URL.
+
+The durable claims do not exclude old binaries that acquire session locks.
+Use a fresh installation for this fixture. A live cutover must exclude old
+workers and upload entry points and account for their external effects before
+starting the new writers; do not assume mixed-version safety.
+
+Vaire ignores `search_path` and `options` startup
 parameters on that pool; readiness still requires exactly one existing
 installation schema, so URL search-path parameters cannot establish it there.

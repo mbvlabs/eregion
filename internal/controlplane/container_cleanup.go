@@ -173,11 +173,14 @@ func (s *Service) retryDueContainerCleanups(ctx context.Context) error {
 }
 
 func (s *Service) retryContainerCleanup(ctx context.Context, row containerCleanupRow) error {
-	release, err := s.lockTargets(ctx, []string{"env/" + row.App + "/" + row.Environment})
+	claim, err := s.acquireCleanupClaim(ctx, row)
 	if err != nil {
 		return err
 	}
-	defer release()
+	safe := true
+	defer func() {
+		s.settleCleanupClaim(ctx, claim, safe)
+	}()
 	env, err := s.environment(ctx, row.App, row.Environment)
 	if err != nil {
 		if isNotFound(err) {
@@ -192,13 +195,55 @@ func (s *Service) retryContainerCleanup(ctx context.Context, row containerCleanu
 	if protected {
 		return errCleanupDeferred
 	}
-	return s.removeContainerCleanupRow(ctx, row)
+	return s.runContainerCleanupRow(ctx, row, &safe)
 }
 
-// removeContainerCleanupRow performs one maintenance-style removal without
-// taking the environment lock. It is used by the post-success best-effort pass
-// while the worker already holds the lock.
+// acquireCleanupClaim uses the detached cleanup identity, not the deployment
+// operation. A crash or ambiguous node reply leaves this claim in place.
+func (s *Service) acquireCleanupClaim(ctx context.Context, row containerCleanupRow) (entities.TargetClaimID, error) {
+	token, err := contract.NewOperationID()
+	if err != nil {
+		return entities.TargetClaimID{}, err
+	}
+	claim := entities.TargetClaimID{OperationID: cleanupOperationID(row), Token: string(token)}
+	err = s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		acquired, err := acquirePlatformTargetClaimTx(ctx, tx, claim, []string{"env/" + row.App + "/" + row.Environment})
+		if err != nil {
+			return err
+		}
+		if !acquired {
+			return errCleanupDeferred
+		}
+		return nil
+	})
+	return claim, err
+}
+
+// Sealing and release are separate commits. An uncertain node call, including
+// cancellation, never supplies proof that the remote effect has stopped.
+func (s *Service) settleCleanupClaim(ctx context.Context, claim entities.TargetClaimID, safe bool) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if err := s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		_, err := tx.SealTargetClaim(ctx, claim)
+		return err
+	}); err != nil || !safe {
+		return
+	}
+	_ = s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		_, err := tx.ReleaseTargetClaim(ctx, claim)
+		return err
+	})
+}
+
+// Immediate callers use the same claim and protection checks as maintenance.
+// If a caller still holds the legacy environment lock, the nonblocking claim
+// acquisition defers the row to maintenance after that lock is released.
 func (s *Service) removeContainerCleanupRow(ctx context.Context, row containerCleanupRow) error {
+	return s.retryContainerCleanup(ctx, row)
+}
+
+func (s *Service) runContainerCleanupRow(ctx context.Context, row containerCleanupRow, safe *bool) error {
 	if s.resolver == nil {
 		return contract.NewFault(contract.Unavailable, "the worker has no node resolver", "Run cleanup in a worker configured with node transports.")
 	}
@@ -218,6 +263,7 @@ func (s *Service) removeContainerCleanupRow(ctx context.Context, row containerCl
 		OperationID: cleanupOperationID(row), Attempt: uint32(row.Attempts), //nolint:gosec // G115: cleanup attempts are a non-negative database counter.
 		Step: step, RequestID: newRequestID(),
 	}
+	*safe = false
 	response, err := tr.Call(ctx, node.Request{
 		Method: node.MethodRun, RequestID: exec.RequestID, Execution: exec, Payload: payload,
 	}, nil)
@@ -226,8 +272,11 @@ func (s *Service) removeContainerCleanupRow(ctx context.Context, row containerCl
 	}
 	switch response.Status {
 	case engine.StatusCompleted:
+		*safe = true
 		return nil
 	case engine.StatusFailed:
+		// A failed Docker client or an interrupted daemon request does not
+		// establish that the removal is quiescent.
 		return s.containerCleanupFailure(contract.Code(response.ErrorCode), response.Detail)
 	case engine.StatusAbsent, engine.StatusRunning, engine.StatusDeferred, engine.StatusStale:
 		fallthrough
@@ -260,7 +309,9 @@ func (s *Service) removeDeploymentCleanupRowsNow(ctx context.Context, env platfo
 	}
 	for _, row := range due {
 		if err := s.removeContainerCleanupRow(ctx, row); err != nil {
-			_ = s.recordContainerCleanup(ctx, row.ContainerName, row.EnvironmentID, row.Node, row.DeploymentID, row.Reason, err)
+			if !errors.Is(err, errCleanupDeferred) {
+				_ = s.recordContainerCleanup(ctx, row.ContainerName, row.EnvironmentID, row.Node, row.DeploymentID, row.Reason, err)
+			}
 			continue
 		}
 		if _, err := s.entities.Platform().Cleanup().Delete(ctx, row.ContainerName); err != nil {
@@ -292,7 +343,9 @@ func (s *Service) removePreviousDeploymentCleanupNow(ctx context.Context, env pl
 	}
 	for _, row := range due {
 		if err := s.removeContainerCleanupRow(ctx, row); err != nil {
-			_ = s.recordContainerCleanup(ctx, row.ContainerName, row.EnvironmentID, row.Node, row.DeploymentID, row.Reason, err)
+			if !errors.Is(err, errCleanupDeferred) {
+				_ = s.recordContainerCleanup(ctx, row.ContainerName, row.EnvironmentID, row.Node, row.DeploymentID, row.Reason, err)
+			}
 			continue
 		}
 		if _, err := s.entities.Platform().Cleanup().Delete(ctx, row.ContainerName); err != nil {

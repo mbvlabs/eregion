@@ -312,6 +312,20 @@ func (s *Service) discardExhaustedPlatformJobTx(ctx context.Context, tx *entitie
 	if op.Attempt > jobAttempt {
 		return nil
 	}
+	if usesBuildTargetClaim(op.Kind) {
+		return appendEvent(ctx, tx, op, contract.Event{
+			Kind:    "warning",
+			Stage:   "owner",
+			Message: "River attempts are exhausted; reconciliation will verify the original build effect before settling.",
+		})
+	}
+	if resourceTargetOperation(op.Kind) {
+		return appendEvent(ctx, tx, op, contract.Event{
+			Kind:    "warning",
+			Stage:   "owner",
+			Message: "River attempts are exhausted; the resource reservation remains until reconciliation accounts for its node effects.",
+		})
+	}
 	if deploymentLifecycleKind(op.Kind) {
 		// Restore the owner's exact traffic target before the terminal failure.
 		// Reconcile sees the discarded job and completes the owner recovery;
@@ -1327,6 +1341,9 @@ func (w *workloadRepairWorker) Work(ctx context.Context, _ *river.Job[jobargs.Wo
 // returned by Work. Domain terminal state cannot depend on an in-process callback.
 func (s *Service) Reconcile(ctx context.Context) error {
 	var failures []error
+	if err := s.reconcileSettledTargets(ctx); err != nil {
+		failures = append(failures, fmt.Errorf("reconcile settled targets: %w", err))
+	}
 	if err := s.reconcileTerminalBuildCapacity(ctx); err != nil {
 		failures = append(failures, fmt.Errorf("reconcile terminal build capacity: %w", err))
 	}
@@ -1383,7 +1400,7 @@ func (s *Service) reconcileOperation(ctx context.Context, id contract.OperationI
 		)
 	}
 	if strings.HasPrefix(op.Kind, "platform.") {
-		return s.reconcilePlatformOperation(ctx, op)
+		return s.reconcilePlatformJob(ctx, op)
 	}
 	var input operations.TestInput
 	rawInput, found, err := s.entities.Operations().Input(ctx, id)
@@ -1404,6 +1421,16 @@ func (s *Service) reconcileOperation(ctx context.Context, id contract.OperationI
 		return nil
 	}
 	return s.finishReconciledOperation(ctx, id, op, input, live)
+}
+
+func (s *Service) reconcilePlatformJob(ctx context.Context, op contract.Operation) error {
+	switch {
+	case usesBuildTargetClaim(op.Kind):
+		return s.reconcileBuildTarget(ctx, op)
+	case resourceTargetOperation(op.Kind):
+		return s.reconcileResourceTarget(ctx, op)
+	}
+	return s.reconcilePlatformOperation(ctx, op)
 }
 
 func (s *Service) reconcileOperationSteps(ctx context.Context, id contract.OperationID, op contract.Operation, input operations.TestInput) (live, stop bool, err error) {

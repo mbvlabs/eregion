@@ -683,17 +683,18 @@ func observeReleaseImage(ctx context.Context, tr node.Transport, reference strin
 // ------------------------------------------------------------ deployment
 
 type deploymentRun struct {
-	id            contract.OperationID
-	attempt       uint32
-	normalized    platform.Normalized
-	dep           platform.Deployment
-	env           platform.Environment
-	owner         deploymentOwner
-	release       platform.Release
-	tr            node.Transport
-	secretValues  map[string]string
-	credentialKey string
-	credentialVal string
+	id              contract.OperationID
+	attempt         uint32
+	normalized      platform.Normalized
+	dep             platform.Deployment
+	env             platform.Environment
+	owner           deploymentOwner
+	release         platform.Release
+	tr              node.Transport
+	healthPlacement entities.PackPlacement
+	secretValues    map[string]string
+	credentialKey   string
+	credentialVal   string
 }
 
 func (w *platformWorker) runDeployment(
@@ -854,6 +855,8 @@ func (w *platformWorker) prepareDeploymentNetwork(ctx context.Context, run *depl
 	return network, containerEnv, false, nil
 }
 
+const deploymentServingRouteStep = "platform-route-serving-01-v1"
+
 // switchDeploymentTraffic records candidate intent, switches Caddy, verifies
 // the public route and moves the owner to serving.
 func (w *platformWorker) switchDeploymentTraffic(ctx context.Context, run *deploymentRun, upstreams []string, candidates []platform.DeploymentInstance) (deploymentOwner, bool, error) {
@@ -926,7 +929,7 @@ func (w *platformWorker) finalizeDeploymentRun(ctx context.Context, run *deploym
 		// Tests replace Caddy; the switch seam renders the same upstreams.
 		resync = func(ctx context.Context) error { return w.service.routeSwitch(ctx, run.env, upstreams) }
 	}
-	if err := resync(ctx); err != nil {
+	if err := w.service.reassertDeploymentRoute(ctx, run.id, run.attempt, run.dep.ID, resync); err != nil {
 		settled, handleErr := w.service.handlePostSwitchRouteFailure(ctx,
 			contract.Operation{ID: run.id, Attempt: run.attempt}, run.dep, run.env, owner, err)
 		if settled {
@@ -1176,13 +1179,14 @@ func (w *platformWorker) startDeploymentRun(ctx context.Context, id contract.Ope
 				"serving deployment changed since the repair was queued",
 				"The next maintenance run will re-observe the serving workload."))
 	}
-	tr, err := w.service.resolver.TransportFor(ctx, env.Node)
+	tr, identity, err := w.service.buildTransportFor(ctx, env.Node)
 	if err != nil {
 		return nil, true, w.finishDeploymentFailure(ctx, id, attempt, env, dep, nil, err)
 	}
 	return &deploymentRun{
 		id: id, attempt: attempt, normalized: normalized,
 		dep: dep, env: env, owner: owner, release: release, tr: tr,
+		healthPlacement: entities.PackPlacement{Node: env.Node, Identity: identity},
 	}, false, nil
 }
 func (w *platformWorker) prepareDeploymentSecrets(ctx context.Context, run *deploymentRun) (bool, error) {
@@ -1526,7 +1530,7 @@ func (w *platformWorker) checkDeploymentHealth(ctx context.Context, run *deploym
 		}
 		target := deploymentHealthTarget(run.env, instance.HostPort)
 		healthResult, healthErr := w.runStepOn(
-			ctx,
+			context.WithValue(ctx, deploymentHealthDispatchKey{}, run.healthPlacement),
 			run.tr,
 			run.id,
 			run.attempt,
@@ -1559,6 +1563,12 @@ func (w *platformWorker) checkDeploymentHealth(ctx context.Context, run *deploym
 
 func (w *platformWorker) handleRouteSwitchFailure(ctx context.Context, run *deploymentRun, owner deploymentOwner, candidates []platform.DeploymentInstance, cause error) (deploymentOwner, error) {
 	record, has, recordErr := w.service.stepRecord(ctx, run.id, deploymentRouteStep)
+	if executor, ok := ctx.Value(buildTargetContextKey{}).(buildTargetExecutor); ok && executor.claim.OperationID == run.id &&
+		(recordErr != nil || !has || record.State != "completed") {
+		// Without a durable acknowledgement the earlier load may still run.
+		// Do not queue another load or remove either set of containers.
+		return owner, errors.Join(cause, recordErr)
+	}
 	if recordErr != nil {
 		return owner, w.finishDeploymentFailure(ctx, run.id, run.attempt, run.env, run.dep, candidates, recordErr)
 	}
@@ -2645,6 +2655,9 @@ func (s *Service) restoreDeploymentRoute(
 	env platform.Environment,
 	owner deploymentOwner,
 ) error {
+	if err := s.requireSettledDeploymentSwitch(ctx, id); err != nil {
+		return err
+	}
 	owner, err := s.setDeploymentOwnerRoute(
 		ctx,
 		owner,
@@ -2688,6 +2701,35 @@ func (s *Service) restoreDeploymentRoute(
 		deploymentOwnerRestored,
 		attempt,
 	)
+	return err
+}
+
+func (s *Service) requireSettledDeploymentSwitch(ctx context.Context, id contract.OperationID) error {
+	for _, step := range []string{deploymentRouteStep, deploymentServingRouteStep} {
+		if err := s.requireSettledDeploymentPublish(ctx, id, step); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Service) requireSettledDeploymentPublish(ctx context.Context, id contract.OperationID, step string) error {
+	record, found, err := s.stepRecord(ctx, id, step)
+	if err != nil {
+		return err
+	}
+	if found && record.State != "completed" {
+		return contract.NewFault(contract.Unavailable, "the previous route load is not acknowledged", "Keep ownership and both sets of containers until the previous route load is proven stopped.")
+	}
+	return nil
+}
+
+func (s *Service) reassertDeploymentRoute(ctx context.Context, id contract.OperationID, attempt uint32, deployment platform.DeploymentID, publish func(context.Context) error) error {
+	if err := s.requireSettledDeploymentPublish(ctx, id, deploymentServingRouteStep); err != nil {
+		return err
+	}
+	_, err := s.runControlStep(ctx, id, attempt, deploymentServingRouteStep,
+		map[string]any{"deployment_id": deployment}, func() error { return publish(ctx) })
 	return err
 }
 

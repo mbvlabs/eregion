@@ -105,6 +105,9 @@ func (s *Service) beginBuildDispatch(ctx context.Context, id contract.OperationI
 		if op.State == contract.Cancelling {
 			return errPlatformCancelled
 		}
+		if err := guardBuildTargetDispatch(ctx, tx, op); err != nil {
+			return err
+		}
 		placement, placed, err := tx.BuildPlacement(ctx, id)
 		if err != nil {
 			return unavailable(err)

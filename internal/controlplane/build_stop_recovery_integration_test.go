@@ -474,7 +474,7 @@ func checkStopRecoveryResult(t *testing.T, f stopRecoveryFixture, cancelling boo
 	want := contract.Succeeded
 	if cancelling {
 		worker := &platformWorker{service: f.service}
-		handled, err := worker.handleCancellingPlatformWork(ctx, f.op, nil, 2)
+		handled, err := worker.handleCancellingPlatformWork(ctx, f.op, 2)
 		if err != nil || !handled {
 			t.Fatalf("cancel recovery: %v %v", handled, err)
 		}

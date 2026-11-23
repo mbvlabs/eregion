@@ -3,8 +3,6 @@ package controlplane
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -93,21 +91,26 @@ func (w *platformWorker) Work(ctx context.Context, job *river.Job[jobargs.Platfo
 	if !claimed {
 		return w.service.waitForNewerAttempt(ctx, op.ID, attempt)
 	}
+	if usesBuildTargetClaim(op.Kind) {
+		return w.workWithBuildTarget(ctx, op, raw, attempt)
+	}
+	if op.Kind == platform.KindDefinitionApply {
+		return w.workClaimed(ctx, op, raw, attempt)
+	}
+	return w.workWithPlatformTarget(ctx, op, raw, attempt)
+}
+
+func (w *platformWorker) workClaimed(ctx context.Context, op contract.Operation, raw json.RawMessage, attempt uint32) error {
 	if op.Kind == platform.KindDefinitionApply {
 		return w.runDefinitionApply(ctx, op, attempt)
 	}
-	if handled, err := w.handleCancellingPlatformWork(ctx, op, raw, attempt); handled {
+	if handled, err := w.handleCancellingPlatformWork(ctx, op, attempt); handled {
 		return err
 	}
 	normalized, err := platform.Default().Normalize(op.Kind, op.Target, raw)
 	if err != nil {
 		return w.settle(ctx, op.ID, attempt, err)
 	}
-	releaseLock, err := w.acquirePlatformRunLock(ctx, op, normalized)
-	if err != nil {
-		return err
-	}
-	defer releaseLock()
 	if err := w.guardDomainRemoveRecovery(ctx, op, attempt); err != nil {
 		return err
 	}
@@ -120,7 +123,7 @@ func (w *platformWorker) Work(ctx context.Context, job *river.Job[jobargs.Platfo
 	return w.dispatchPlatformAction(ctx, op, attempt, normalized)
 }
 
-func (w *platformWorker) handleCancellingPlatformWork(ctx context.Context, op contract.Operation, raw json.RawMessage, attempt uint32) (bool, error) {
+func (w *platformWorker) handleCancellingPlatformWork(ctx context.Context, op contract.Operation, attempt uint32) (bool, error) {
 	if op.State != contract.Cancelling {
 		return false, nil
 	}
@@ -131,28 +134,11 @@ func (w *platformWorker) handleCancellingPlatformWork(ctx context.Context, op co
 		return true, w.service.reconcileBuildRetry(ctx, op)
 	}
 	if op.Kind == platform.KindDomainAdd || op.Kind == platform.KindDomainRemove {
-		normalized, err := platform.Default().Normalize(op.Kind, op.Target, raw)
-		if err != nil {
-			return true, err
-		}
-		release, err := w.service.lockPlatformTargets(ctx, normalized)
-		if err != nil {
-			return true, err
-		}
-		defer release()
 		if handled, err := w.stopDefinitionDNSChild(ctx, op, attempt); handled {
 			return true, err
 		}
 	}
 	if deploymentLifecycleKind(op.Kind) {
-		release, acquired, lockErr := w.service.tryLockTargets(ctx, []string{op.Target})
-		if lockErr != nil {
-			return true, lockErr
-		}
-		if !acquired {
-			return true, river.JobSnooze(deploymentOwnerDefer)
-		}
-		defer release()
 		return true, w.cancelOwnedDeployment(ctx, op.ID, attempt)
 	}
 	return true, w.service.cancelPlatform(
@@ -161,30 +147,6 @@ func (w *platformWorker) handleCancellingPlatformWork(ctx context.Context, op co
 		attempt,
 		"Cancellation requested before execution started.",
 	)
-}
-
-func (w *platformWorker) acquirePlatformRunLock(ctx context.Context, op contract.Operation, normalized platform.Normalized) (func(), error) {
-	if deploymentLifecycleKind(op.Kind) {
-		release, acquired, err := w.service.tryLockTargets(ctx, []string{normalized.Target.String()})
-		if err != nil {
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
-			}
-			return nil, err
-		}
-		if !acquired {
-			return nil, river.JobSnooze(deploymentOwnerDefer)
-		}
-		return release, nil
-	}
-	release, err := w.service.lockPlatformTargets(ctx, normalized)
-	if err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		return nil, err
-	}
-	return release, nil
 }
 
 // guardDomainRemoveRecovery latches read-only definition DNS recovery once any
@@ -487,24 +449,6 @@ func (w *platformWorker) settle(
 		}
 		return err
 	}
-}
-
-// lockTarget serializes every operation for one canonical target across control
-// plane processes. It includes extension actions and node targets, not just
-// environment built-ins. A session lock is released automatically if the worker
-// process dies, so it cannot wedge a target permanently.
-func (s *Service) lockTarget(ctx context.Context, target string) (func(), error) {
-	sum := sha256.Sum256([]byte(target))
-	// Preserve the exact 64-bit key bits; advisory locks only compare identity.
-	key := int64(binary.BigEndian.Uint64(sum[:8])) //nolint:gosec // G115: intentional two's-complement preservation of a 64-bit advisory key.
-	lease, err := s.entities.Platform().Locks().AcquireTargets(ctx, []int64{key})
-	if err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		return nil, unavailable(err)
-	}
-	return func() { _ = lease.Release() }, nil
 }
 
 func (w *platformWorker) runRecordAction(
@@ -1099,10 +1043,7 @@ func (s *Service) failPlatformOperationTx(
 	if op.State.Terminal() {
 		return nil
 	}
-	if op.Kind == platform.KindBuildStop && op.State == contract.Cancelling {
-		return errPlatformCancelled
-	}
-	if err := guardDefinitionDNSTerminalTx(ctx, tx, op); err != nil {
+	if err := guardPlatformFailureTx(ctx, tx, op); err != nil {
 		return err
 	}
 	if err := lockOperationParentsTx(
@@ -1181,6 +1122,16 @@ func (s *Service) failPlatformOperationTx(
 	return transition(ctx, tx, op, contract.Failed, code, message)
 }
 
+func guardPlatformFailureTx(ctx context.Context, tx *entities.StoreTx, op *contract.Operation) error {
+	if op.Kind == platform.KindBuildStop && op.State == contract.Cancelling {
+		return errPlatformCancelled
+	}
+	if err := requireSettledResourceDispatchesTx(ctx, tx, op); err != nil {
+		return err
+	}
+	return guardDefinitionDNSTerminalTx(ctx, tx, op)
+}
+
 func servingSuffix(releaseID string) string {
 	if releaseID == "" {
 		return ""
@@ -1231,6 +1182,9 @@ func (s *Service) cancelPlatform(
 }
 
 func (s *Service) cancelPlatformTx(ctx context.Context, tx *entities.StoreTx, op *contract.Operation, id contract.OperationID, message string) error {
+	if err := requireSettledResourceDispatchesTx(ctx, tx, op); err != nil {
+		return err
+	}
 	if err := guardDefinitionDNSTerminalTx(ctx, tx, op); err != nil {
 		return err
 	}
@@ -1924,6 +1878,9 @@ func (w *platformWorker) nodeEffectStatus(ctx context.Context, tr node.Transport
 }
 
 func (w *platformWorker) nodeEffectDispatch(ctx context.Context, tr node.Transport, id contract.OperationID, attempt uint32, exec engine.Execution, stepID, inputsHash string, raw json.RawMessage, secrets map[string]string, rowExists bool) (node.Response, error) {
+	if err := w.service.checkClaimedNodeDispatch(ctx, id, attempt, exec, inputsHash); err != nil {
+		return node.Response{}, err
+	}
 	w.service.registerSecretValues(secrets)
 	events := w.service.newNodeEventStream(ctx, id, attempt)
 	response, err := tr.Call(ctx, node.Request{
@@ -2113,6 +2070,9 @@ func (w *platformWorker) runStepOnWithBuild( //nolint:gocognit,gocyclo // The ef
 			"Run this work in a worker configured with a node transport.",
 		)
 	}
+	if err := w.service.checkResourceDispatchPlacement(ctx, id); err != nil {
+		return nil, err
+	}
 	started := time.Now()
 	raw, err := json.Marshal(payload)
 	if err != nil {
@@ -2137,6 +2097,21 @@ func (w *platformWorker) runStepOnWithBuild( //nolint:gocognit,gocyclo // The ef
 	if err != nil {
 		return nil, err
 	}
+	if placement, ok := ctx.Value(deploymentHealthDispatchKey{}).(entities.PackPlacement); ok && hasRecord {
+		err := w.service.entities.WithinReadTx(ctx, func(tx *entities.StoreTx) error {
+			d, found, err := tx.DeploymentHealthDispatch(ctx, id, stepID)
+			if err != nil {
+				return err
+			}
+			if !found || d.Placement != placement || d.Attempt != record.Attempt || d.ExecutionID != record.ExecutionID || d.InputsHash != record.InputsHash {
+				return unknownDeploymentHealth()
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
 	if hasRecord {
 		if record.InputsHash != inputsHash {
 			return nil, contract.NewFault(
@@ -2158,6 +2133,9 @@ func (w *platformWorker) runStepOnWithBuild( //nolint:gocognit,gocyclo // The ef
 	loop := nodeEffectLoop{
 		Status: func(ctx context.Context) (node.Response, error) {
 			response, err := w.nodeEffectStatus(ctx, tr, exec, stepID, inputsHash, fence.rowExists, attempt)
+			if _, ok := ctx.Value(deploymentHealthDispatchKey{}).(entities.PackPlacement); ok && !fence.rowExists && err == nil && response.Status != engine.StatusAbsent {
+				return node.Response{}, unknownDeploymentHealth()
+			}
 			if err == nil && buildNode != "" && !fence.rowExists && response.Status != engine.StatusAbsent {
 				return node.Response{}, unknownBuildPlacement()
 			}
@@ -2200,6 +2178,10 @@ func (w *platformWorker) runStepOnWithBuild( //nolint:gocognit,gocyclo // The ef
 			return fence.ensureDispatchBegun(ctx, w, id, attempt, stepID, inputsHash, exec.ExecutionID())
 		},
 		Completed: func(ctx context.Context, response node.Response, recovered bool) error {
+			if _, ok := ctx.Value(deploymentHealthDispatchKey{}).(entities.PackPlacement); ok &&
+				(response.ExecutionID != exec.ExecutionID() || response.InputsHash != inputsHash || (response.Attempt != 0 && response.Attempt != attempt)) {
+				return unknownDeploymentHealth()
+			}
 			return w.nodeEffectCompleted(ctx, fence, id, attempt, stepID, inputsHash, started, response, recovered)
 		},
 		Failed: func(ctx context.Context, response node.Response) error {
@@ -2374,11 +2356,15 @@ func (s *Service) reconcileDomainOperation(ctx context.Context, op contract.Oper
 	if err != nil {
 		return err
 	}
-	releaseLock, err := s.lockPlatformTargets(ctx, normalized)
-	if err != nil {
+	workCtx, claim, acquired, err := s.acquireDeploymentRecoveryTarget(ctx, normalized.Target.App, normalized.Target.Environment)
+	if err != nil || !acquired {
 		return err
 	}
-	defer releaseLock()
+	recoveryErr := s.reconcileDomainWithTarget(workCtx, op, input)
+	return errors.Join(recoveryErr, s.settleDeploymentRecoveryTarget(ctx, claim, recoveryErr == nil))
+}
+
+func (s *Service) reconcileDomainWithTarget(ctx context.Context, op contract.Operation, input *platform.DomainInput) error {
 	if err := s.revalidateDomainOperation(ctx, op, input); err != nil {
 		fault := contract.Classify(err)
 		return s.failReconciledPlatform(ctx, op, err.Error(), fault.Code)
@@ -3165,7 +3151,7 @@ func (s *Service) finishRecoveredOwnedDeployment(ctx context.Context, op contrac
 		}
 		return false, err
 	}
-	if err := s.syncRoutes(ctx); err != nil {
+	if err := s.reassertDeploymentRoute(ctx, op.ID, op.Attempt, dep.ID, s.syncRoutes); err != nil {
 		return s.handlePostSwitchRouteFailure(ctx, op, dep, env, owner, err)
 	}
 	if err := s.ensurePreviousDeploymentCleanup(ctx, env, dep); err != nil {
@@ -3453,11 +3439,15 @@ func (s *Service) reconcileDeployment(ctx context.Context, op contract.Operation
 			contract.Unavailable,
 		)
 	}
-	releaseLock, err := s.lockTargets(ctx, []string{"env/" + dep.App + "/" + dep.Environment})
-	if err != nil {
+	workCtx, claim, acquiredTarget, err := s.acquireDeploymentRecoveryTarget(ctx, dep.App, dep.Environment)
+	if err != nil || !acquiredTarget {
 		return err
 	}
-	defer releaseLock()
+	recoveryErr := s.reconcileDeploymentWithTarget(workCtx, op, dep)
+	return errors.Join(recoveryErr, s.settleDeploymentRecoveryTarget(ctx, claim, recoveryErr == nil))
+}
+
+func (s *Service) reconcileDeploymentWithTarget(ctx context.Context, op contract.Operation, dep platform.Deployment) error {
 	env, err := s.environment(ctx, dep.App, dep.Environment)
 	if err != nil {
 		return err

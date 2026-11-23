@@ -229,8 +229,10 @@ eregion server init --host root@203.0.113.10 --hostname app.example.com \
 By default the runtime and migrations use the same PostgreSQL URL. Pass
 `--migration-database-url-file /protected/migration-database-url` (or set
 `EREGION_MIGRATION_DATABASE_URL`) only when migrations use a distinct role; both
-URLs must reach the same database and installation schema. Use direct or
-session-pooled endpoints for both; transaction pooling is not supported.
+URLs must reach the same database and installation schema. The migration URL
+must use a direct or session-pooled endpoint. The runtime URL can use a
+transaction pool; use a direct or session-pooled endpoint in one-URL mode so
+that migrations can use the same URL.
 The runtime role needs schema usage and read/write access to Eregion and River
 tables and sequences, including objects created by future migrations. Eregion
 does not create roles or change your provider's grants.

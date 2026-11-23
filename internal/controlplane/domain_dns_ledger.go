@@ -365,11 +365,15 @@ func (s *Service) applyDomainDNSLedger(ctx context.Context, op contract.Operatio
 }
 
 func (s *Service) executeDomainDNSLedgerEffect(ctx context.Context, op contract.Operation, attempt uint32, ledger domainDNSLedger, request integrations.DomainDNSRequest, guard func(context.Context) error) (int, int, *definitionDNSProgressStore, error) {
+	executor, _ := ctx.Value(buildTargetContextKey{}).(buildTargetExecutor)
 	step, err := s.definitionDNSChild(ctx, op.ID)
 	if err != nil {
 		return 0, 0, nil, err
 	}
 	if step == nil {
+		if executor.dnsReadback {
+			return 0, 0, nil, errNotOwned
+		}
 		plan, err := s.domainDNS.ApplyWithGuard(ctx, op.Actor, op.ID, request, guard)
 		if err != nil {
 			return 0, 0, nil, err
@@ -380,11 +384,28 @@ func (s *Service) executeDomainDNSLedgerEffect(ctx context.Context, op contract.
 		return 0, 0, nil, definitionDNSConflict()
 	}
 	store := newDefinitionDNSProgressStore(s, op, attempt, ledger, step)
+	if executor.dnsReadback {
+		return s.readbackDomainDNSPlan(ctx, op, request, *step.Plan, store)
+	}
 	applied, err := s.domainDNS.ExecuteApprovedDefinitionDNS(ctx, op.Actor, op.ID, request, *step.Plan, store)
 	if err != nil {
 		return 0, 0, store, err
 	}
 	return applied, 0, store, nil
+}
+
+func (s *Service) readbackDomainDNSPlan(ctx context.Context, op contract.Operation, request integrations.DomainDNSRequest, plan integrations.DefinitionDNSPlan, store *definitionDNSProgressStore) (int, int, *definitionDNSProgressStore, error) {
+	if err := s.domainDNS.ResolveApprovedDefinitionDNS(ctx, op.Actor, op.ID, request, plan, store); err != nil {
+		return 0, 0, store, err
+	}
+	entries, err := store.Load(ctx)
+	if err != nil {
+		return 0, 0, store, err
+	}
+	if len(entries) != len(plan.Changes) || len(entries) > 0 && entries[len(entries)-1].Result == nil {
+		return 0, 0, store, contract.NewFault(contract.Unavailable, "approved DNS plan still has unapplied changes", "Keep the reservation; readback cannot admit new provider writes.")
+	}
+	return len(entries), 0, store, nil
 }
 
 // preflightDomainDNSLedger performs every read-only check and ownership plan

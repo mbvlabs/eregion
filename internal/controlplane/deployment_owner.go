@@ -233,15 +233,50 @@ func frozenPredecessor(dep platform.Deployment, env platform.Environment, routeC
 // setDeploymentOwnerRoute changes the exclusive route intent. A stale attempt
 // gets errNotOwned and must not touch the route or candidates.
 func (s *Service) setDeploymentOwnerRoute(ctx context.Context, owner deploymentOwner, target platform.DeploymentID, phase deploymentOwnerPhase, attempt uint32) (deploymentOwner, error) {
-	updated, found, err := s.entities.Platform().Owners().SetRoute(ctx,
-		owner.EnvironmentID, owner.OperationID, owner.DeploymentID, target, string(phase), attempt)
+	var updated entities.Owner
+	err := s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		if err := guardDeploymentRouteIntent(ctx, tx, owner.OperationID, attempt); err != nil {
+			return err
+		}
+		result, found, err := tx.Platform().Owners().SetRoute(ctx,
+			owner.EnvironmentID, owner.OperationID, owner.DeploymentID, target, string(phase), attempt)
+		if err != nil {
+			return unavailable(err)
+		}
+		if !found {
+			return errNotOwned
+		}
+		updated = result
+		return nil
+	})
 	if err != nil {
-		return owner, unavailable(err)
-	}
-	if !found {
-		return owner, errNotOwned
+		return owner, err
 	}
 	return deploymentOwnerFromEntities(updated), nil
+}
+
+func guardDeploymentRouteIntent(ctx context.Context, tx *entities.StoreTx, id contract.OperationID, attempt uint32) error {
+	if id == "" {
+		return nil
+	}
+	op, found, err := tx.Operations().Lock(ctx, id)
+	if err != nil {
+		return unavailable(err)
+	}
+	if executor, ok := ctx.Value(buildTargetContextKey{}).(buildTargetExecutor); ok && executor.claim.OperationID == id {
+		if !found || op.Attempt != attempt || op.State.Terminal() {
+			return errNotOwned
+		}
+		return guardBuildTargetExecutor(ctx, tx, op)
+	}
+	_, held, err := tx.UnreleasedTargetClaimByOperation(ctx, id)
+	if err != nil {
+		return err
+	}
+	if held || (found && op.Attempt != attempt) {
+		return errNotOwned
+	}
+	return nil
 }
 
 // releaseRestoredDeploymentOwnerTx removes an owner after the exact frozen
@@ -506,7 +541,11 @@ func (s *Service) cleanupInstancesForDeployment(ctx context.Context, env platfor
 }
 
 func (s *Service) persistDeploymentCleanupInstances(ctx context.Context, env platform.Environment, dep platform.Deployment, instances []platform.DeploymentInstance, attempt uint32) error {
-	s.captureCandidateDiagnostics(ctx, env, dep, attempt)
+	// Route recovery records cleanup intent only. Diagnostic capture dispatches
+	// node work and has a different uncertainty boundary.
+	if ctx.Value(deploymentRouteRecoveryKey{}) == nil {
+		s.captureCandidateDiagnostics(ctx, env, dep, attempt)
+	}
 	if len(instances) == 0 {
 		var err error
 		instances, err = s.cleanupInstancesForDeployment(ctx, env, dep)
@@ -646,27 +685,34 @@ func (s *Service) reconcileDeploymentOwners(ctx context.Context) error {
 	}
 	var failures []error
 	for _, row := range rows {
-		release, err := s.lockTargets(ctx, []string{"env/" + row.App + "/" + row.Environment})
-		if err != nil {
-			failures = append(failures, fmt.Errorf("lock deployment owner for %s/%s: %w", row.App, row.Environment, err))
-			continue
-		}
-		env, envErr := s.environment(ctx, row.App, row.Environment)
-		if envErr == nil {
-			owner, has, ownerErr := s.deploymentOwnerByEnvironment(ctx, s.entities.Platform().Owners(), env.ID)
-			if ownerErr != nil {
-				envErr = ownerErr
-			} else if has {
-				_, envErr = s.recoverStaleDeploymentOwner(ctx, owner, env)
-			}
-		}
-		release()
-		if envErr != nil {
-			failures = append(failures, fmt.Errorf("recover deployment owner for %s/%s: %w", row.App, row.Environment, envErr))
+		if err := s.reconcileDeploymentOwnerTarget(ctx, row); err != nil {
+			failures = append(failures, fmt.Errorf("recover deployment owner for %s/%s: %w", row.App, row.Environment, err))
 		}
 	}
 	if len(failures) > 0 {
 		return errors.Join(failures...)
 	}
 	return nil
+}
+
+func (s *Service) reconcileDeploymentOwnerTarget(ctx context.Context, row deploymentOwnerRow) error {
+	workCtx, claim, acquired, err := s.acquireDeploymentRecoveryTarget(ctx, row.App, row.Environment)
+	if err != nil || !acquired {
+		return err
+	}
+	recoveryErr := s.recoverCurrentOwner(workCtx, row)
+	return errors.Join(recoveryErr, s.settleDeploymentRecoveryTarget(ctx, claim, recoveryErr == nil))
+}
+
+func (s *Service) recoverCurrentOwner(ctx context.Context, row deploymentOwnerRow) error {
+	env, err := s.environment(ctx, row.App, row.Environment)
+	if err != nil {
+		return err
+	}
+	owner, found, err := s.deploymentOwnerByEnvironment(ctx, s.entities.Platform().Owners(), env.ID)
+	if err != nil || !found || owner != row.deploymentOwner {
+		return err
+	}
+	_, err = s.recoverStaleDeploymentOwner(ctx, owner, env)
+	return err
 }

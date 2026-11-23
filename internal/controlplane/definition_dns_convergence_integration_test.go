@@ -536,6 +536,10 @@ func assertDefinitionDNSFailureTerminal(t *testing.T, run definitionDNSFailureRu
 
 func assertDefinitionDNSAcceptedRecovery(t *testing.T, run definitionDNSFailureRun) {
 	t.Helper()
+	var claim string
+	if err := run.pool.QueryRow(run.ctx, `SELECT token FROM eregion_target_claims WHERE operation_id=$1 AND sealed_at IS NOT NULL AND released_at IS NULL`, run.child).Scan(&claim); err != nil {
+		t.Fatalf("uncertain write must retain a sealed claim: %v", err)
+	}
 	run.provider.mu.Lock()
 	run.provider.readStatus = http.StatusForbidden
 	run.provider.mu.Unlock()
@@ -547,6 +551,11 @@ func assertDefinitionDNSAcceptedRecovery(t *testing.T, run definitionDNSFailureR
 	if err := run.pool.QueryRow(run.ctx, `SELECT c.state,r.finished_at IS NULL FROM eregion_operations c JOIN eregion_definition_runs r ON r.operation_id=$2 WHERE c.id=$1`, run.child, run.parent).Scan(&state, &reserved); err != nil || state.Terminal() || !reserved {
 		t.Fatalf("rejected read state=%s reserved=%v err=%v", state, reserved, err)
 	}
+	var retained bool
+	if err := run.pool.QueryRow(run.ctx, `SELECT EXISTS (SELECT 1 FROM eregion_target_claims WHERE operation_id=$1 AND token=$2 AND sealed_at IS NOT NULL AND released_at IS NULL)`, run.child, claim).Scan(&retained); err != nil || !retained {
+		t.Fatalf("rejected read claim retained=%v err=%v", retained, err)
+	}
+	assertDefinitionDNSFailureWrites(t, run)
 	run.provider.mu.Lock()
 	run.provider.readStatus = 0
 	run.provider.mu.Unlock()
@@ -555,6 +564,9 @@ func assertDefinitionDNSAcceptedRecovery(t *testing.T, run definitionDNSFailureR
 	}
 	if err := run.pool.QueryRow(run.ctx, `SELECT state FROM eregion_operations WHERE id=$1`, run.child).Scan(&state); err != nil || state != contract.Succeeded {
 		t.Fatalf("reconciled state=%s err=%v", state, err)
+	}
+	if err := run.pool.QueryRow(run.ctx, `SELECT EXISTS (SELECT 1 FROM eregion_target_claims WHERE operation_id=$1 AND released_at IS NULL)`, run.child).Scan(&retained); err != nil || retained {
+		t.Fatalf("reconciled claim retained=%v err=%v", retained, err)
 	}
 }
 

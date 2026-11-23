@@ -65,6 +65,9 @@ func (s *Service) checkCancellingRetryIntent(ctx context.Context, op contract.Op
 		if !released {
 			return unknownRetryPack()
 		}
+		if err := tx.RecordBuildEffectRetirement(ctx, op.ID, record.Step, record.ExecutionID, record.InputsHash); err != nil {
+			return unavailable(err)
+		}
 		return s.cancelPlatformTx(ctx, tx, current, op.ID, "Cancellation reconciled after the original builder confirmed Pack retirement.")
 	})
 	if err != nil {

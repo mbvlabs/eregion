@@ -58,7 +58,7 @@ func (t *blockingResourceTransport) Call(ctx context.Context, request node.Reque
 	return t.base.Call(ctx, request, emit)
 }
 
-func TestIntegrationResourceCancelSettlesStateAndAllowsRetryAndDestroy(t *testing.T) {
+func TestIntegrationResourceCancelWithLostReplyRetainsTarget(t *testing.T) {
 	pool, _ := testPool(t, true)
 	ctx := context.Background()
 	fake := newBlockingResourceTransport("-run-")
@@ -107,61 +107,35 @@ func TestIntegrationResourceCancelSettlesStateAndAllowsRetryAndDestroy(t *testin
 	if _, err := s.RequestCancel(ctx, testActor, apply.ID); err != nil {
 		t.Fatal(err)
 	}
-	// Let the in-flight step report a safe-boundary cancellation, exactly as a
-	// worker does after seeing the cancelling operation.
+	// A transport error after admission is not proof that Docker stopped.
 	fake.setBlockStep("")
 	fake.release <- errPlatformCancelled
-	cancelled := platformAwait(t, s, apply, contract.Canceled)
-	if cancelled.ID != apply.ID {
-		t.Fatalf("cancelled operation = %s", cancelled.ID)
-	}
-	var errorCode string
-	if err := pool.QueryRow(ctx, `SELECT state,volumes::text,error_code FROM eregion_platform_resources r
-        JOIN eregion_platform_apps a ON a.id=r.app_id
-        WHERE a.name='cancelapi' AND r.name='db'`).Scan(&state, &volumes, &errorCode); err != nil {
-		t.Fatal(err)
-	}
-	if state != string(platform.ResourceDegraded) || errorCode != string(contract.Cancelled) {
-		t.Fatalf("after cancellation: state=%s error=%s", state, errorCode)
-	}
-	if !strings.Contains(volumes, "er-res-") {
-		t.Fatalf("cancellation lost the volume ledger: %s", volumes)
-	}
-	retainedVolumes := volumes
+	checkUncertainResourceCancellation(t, s, apply.ID)
+}
 
-	platformAwait(t, s, platformSubmit(t, s, platform.KindResourceApply, "resource/cancelapi/pr/db", "resource-cancel-retry", spec), contract.Succeeded)
-	if err := pool.QueryRow(ctx, `SELECT state,volumes::text FROM eregion_platform_resources r
-        JOIN eregion_platform_apps a ON a.id=r.app_id
-        WHERE a.name='cancelapi' AND r.name='db'`).Scan(&state, &volumes); err != nil {
-		t.Fatal(err)
+func checkUncertainResourceCancellation(t *testing.T, s *Service, id contract.OperationID) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	for ctx.Err() == nil {
+		var sealed bool
+		if err := s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+			claim, found, err := tx.UnreleasedTargetClaimByOperation(ctx, id)
+			sealed = found && claim.Sealed
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if sealed {
+			current, err := s.Get(ctx, testActor, id)
+			if err != nil || current.State != contract.Cancelling {
+				t.Fatalf("unknown effect terminalized cancellation: %+v %v", current, err)
+			}
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
 	}
-	if state != string(platform.ResourceReady) || volumes != retainedVolumes {
-		t.Fatalf("retry: state=%s volumes=%s want %s", state, volumes, retainedVolumes)
-	}
-	platformAwait(t, s, platformSubmit(t, s, platform.KindResourceDestroy, "resource/cancelapi/pr/db", "resource-cancel-destroy", map[string]any{
-		"confirm": "cancelapi/pr/db",
-	}), contract.Succeeded)
-	if err := pool.QueryRow(ctx, `SELECT state,volumes::text FROM eregion_platform_resources r
-        JOIN eregion_platform_apps a ON a.id=r.app_id
-        WHERE a.name='cancelapi' AND r.name='db'`).Scan(&state, &volumes); err != nil {
-		t.Fatal(err)
-	}
-	if state != string(platform.ResourceDestroyed) || volumes != retainedVolumes {
-		t.Fatalf("destroy after cancel: state=%s volumes=%s", state, volumes)
-	}
-	// A destroyed resource no longer blocks the environment deletion guard.
-	// The full delete command is not exercised here because this fake node has
-	// no Caddy routes file; the resource guard is the state this bug affected.
-	var appID string
-	if err := pool.QueryRow(ctx, `SELECT id FROM eregion_platform_apps WHERE name='cancelapi'`).Scan(&appID); err != nil {
-		t.Fatal(err)
-	}
-	err = s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
-		return s.ensureNoLiveResourcesTx(ctx, tx, appID, "")
-	})
-	if err != nil {
-		t.Fatalf("destroyed resource still blocks environment deletion: %v", err)
-	}
+	t.Fatal("resource worker did not retain a sealed claim after the lost reply")
 }
 
 // TestIntegrationResourceCancelAfterSuccessfulStepIsHonored covers a

@@ -379,17 +379,6 @@ func (s *Service) ensureNoLiveResourcesTx(ctx context.Context, tx *entities.Stor
 	return nil
 }
 
-func (s *Service) resourceTargets(ctx context.Context, app, environment string) ([]string, error) {
-	targets, err := s.entities.Resources().Targets(ctx, app, environment)
-	if err != nil {
-		return nil, unavailable(err)
-	}
-	if targets == nil {
-		targets = []string{}
-	}
-	return targets, nil
-}
-
 func (w *platformWorker) runResourceApply(ctx context.Context, id contract.OperationID, attempt uint32, input *platform.ResourceApplyInput) error {
 	if err := w.service.markResourceState(ctx, id, attempt, input.Target().String(), platform.ResourceProvisioning); err != nil {
 		return w.settle(ctx, id, attempt, err)
@@ -466,6 +455,7 @@ type resourceApplyRun struct {
 	env               platform.Environment
 	plan              platform.ResourcePlan
 	tr                node.Transport
+	placement         entities.PackPlacement
 	secretValues      map[string]string
 	secretFingerprint string
 }
@@ -496,12 +486,12 @@ func (w *platformWorker) prepareResourceApplyRun(ctx context.Context, id contrac
 	if err != nil {
 		return nil, err
 	}
-	tr, err := w.service.resolver.TransportFor(ctx, resource.Node)
+	tr, identity, err := w.service.buildTransportFor(ctx, resource.Node)
 	if err != nil {
 		return nil, err
 	}
 	return &resourceApplyRun{
-		resource: resource, env: env, plan: plan, tr: tr,
+		resource: resource, env: env, plan: plan, tr: tr, placement: entities.PackPlacement{Node: resource.Node, Identity: identity},
 		secretValues: secretValues, secretFingerprint: secretFingerprint,
 	}, nil
 }
@@ -512,6 +502,7 @@ func (w *platformWorker) applyResource(ctx context.Context, id contract.Operatio
 		return err
 	}
 	resource, env, plan, tr := run.resource, run.env, run.plan, run.tr
+	ctx = context.WithValue(ctx, resourceDispatchKey{}, run.placement)
 	secretValues, secretFingerprint := run.secretValues, run.secretFingerprint
 	secretKeys := platform.SortedResourceSecretEnvKeys(secretValues)
 
@@ -639,10 +630,11 @@ func (w *platformWorker) destroyResource(ctx context.Context, id contract.Operat
 	if err != nil {
 		return err
 	}
-	tr, err := w.service.resolver.TransportFor(ctx, resource.Node)
+	tr, identity, err := w.service.buildTransportFor(ctx, resource.Node)
 	if err != nil {
 		return err
 	}
+	ctx = context.WithValue(ctx, resourceDispatchKey{}, entities.PackPlacement{Node: resource.Node, Identity: identity})
 	if err := w.service.checkCancelled(ctx, id); err != nil {
 		return err
 	}

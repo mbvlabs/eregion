@@ -42,6 +42,14 @@ func TestIntegrationPgBouncerTransactionRuntime(t *testing.T) {
 
 	migratePgBouncerFixture(t, ctx, migrationPool, runtimePool)
 	checkPgBouncerBackendReassignment(t, ctx, runtimePool)
+	other, err := Open(ctx, runtimeURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	checkTargetClaims(t, ctx, runtimePool, other, func() {
+		checkPgBouncerBackendReassignment(t, ctx, runtimePool)
+	})
 	run := newPgBouncerFixtureRuntime(t, runtimePool)
 	defer run.Close()
 	checkPgBouncerRiverProcessing(t, ctx, runtimePool, run)
@@ -126,6 +134,7 @@ func newPgBouncerFixtureRuntime(t *testing.T, runtimePool *pgxpool.Pool) *Runtim
 	t.Helper()
 	run, err := New(newTestEntities(t, runtimePool), slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
 		Concurrency: 1, NodeStateDir: t.TempDir(), LocalNodeName: "local",
+		RegistryEndpoint: "127.0.0.1:5000",
 	})
 	if err != nil {
 		t.Fatalf("runtime startup: %v: %v", err, errors.Unwrap(err))
@@ -167,4 +176,5 @@ func checkPgBouncerRiverProcessing(t *testing.T, ctx context.Context, runtimePoo
 		return err == nil && state == "completed"
 	})
 	t.Log("diagnostic operation succeeded and River job completed")
+	checkPgBouncerResource(t, ctx, runtimePool, run)
 }

@@ -12,57 +12,6 @@ import (
 	"github.com/mbvlabs/eregion/internal/platform"
 )
 
-// lockPlatformTargets serializes a deletion or managed-resource operation with
-// every operation that could touch the same records. An app deletion takes the
-// app target (which also serializes environment creation) and every current
-// environment target, so a deploy cannot race the cleanup. A resource
-// operation also takes its environment target so it cannot race a deployment
-// switch. Lock order is sorted to avoid deadlocks.
-func (s *Service) lockPlatformTargets(ctx context.Context, normalized platform.Normalized) (func(), error) {
-	targets := []string{normalized.Target.String()}
-	switch input := normalized.Input.(type) {
-	case *platform.AppDeleteInput:
-		envTargets, err := s.environmentTargets(ctx, input.App)
-		if err != nil {
-			return nil, err
-		}
-		targets = append(targets, envTargets...)
-		resourceTargets, err := s.resourceTargets(ctx, input.App, "")
-		if err != nil {
-			return nil, err
-		}
-		targets = append(targets, resourceTargets...)
-	case *platform.EnvironmentDeleteInput:
-		targets = append(targets, "app/"+input.App)
-		resourceTargets, err := s.resourceTargets(ctx, input.App, input.Environment)
-		if err != nil {
-			return nil, err
-		}
-		targets = append(targets, resourceTargets...)
-	case *platform.ResourceApplyInput:
-		// A resource container is consumed by the environment's deployments.
-		// Taking the environment target serializes provisioning with a deploy
-		// switch, in addition to the resource's own target.
-		targets = append(targets, "env/"+input.App+"/"+input.Environment)
-	case *platform.ResourceDestroyInput:
-		// The same environment lock keeps destroy out of a deployment switch;
-		// the resource target keeps it out of another resource operation.
-		targets = append(targets, "env/"+input.App+"/"+input.Environment)
-	}
-	return s.lockTargets(ctx, targets)
-}
-
-func (s *Service) environmentTargets(ctx context.Context, app string) ([]string, error) {
-	targets, err := s.entities.Platform().Environments().ListTargets(ctx, app)
-	if err != nil {
-		return nil, unavailable(err)
-	}
-	if targets == nil {
-		targets = []string{}
-	}
-	return targets, nil
-}
-
 // environmentWorkloadNodes lists every node that may still hold this
 // environment's containers: its current node and the runtime node recorded on
 // each deployment's revision. A deployment's instances do not carry a node
@@ -109,42 +58,6 @@ func uniqueTargets(targets []string) []string {
 		}
 	}
 	return unique
-}
-
-// tryLockTargets is the nonblocking worker form. A contended deployment target
-// returns acquired=false immediately, so a queued job can snooze without
-// holding a pool connection or consuming a River failure attempt.
-func (s *Service) tryLockTargets(ctx context.Context, targets []string) (func(), bool, error) {
-	keys := make([]int64, 0, len(targets))
-	for _, target := range uniqueTargets(targets) {
-		keys = append(keys, targetLockKey(target))
-	}
-	lease, acquired, err := s.entities.Platform().Locks().TryTargets(ctx, keys)
-	if err != nil {
-		if ctx.Err() != nil {
-			return nil, false, ctx.Err()
-		}
-		return nil, false, unavailable(err)
-	}
-	if !acquired {
-		return nil, false, nil
-	}
-	return func() { _ = lease.Release() }, true, nil
-}
-
-func (s *Service) lockTargets(ctx context.Context, targets []string) (func(), error) {
-	keys := make([]int64, 0, len(targets))
-	for _, target := range uniqueTargets(targets) {
-		keys = append(keys, targetLockKey(target))
-	}
-	lease, err := s.entities.Platform().Locks().AcquireTargets(ctx, keys)
-	if err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		return nil, unavailable(err)
-	}
-	return func() { _ = lease.Release() }, nil
 }
 
 // ensureNoActiveDeleteTargets refuses a deletion while another operation for

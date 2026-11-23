@@ -120,6 +120,14 @@ func (s *Service) mutateOwnedOrClaim(ctx context.Context, id contract.OperationI
 func (s *Service) beginStep(ctx context.Context, id contract.OperationID, attempt uint32, step, inputsHash, executionID string) (bool, error) {
 	already := false
 	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
+		if err := pinDeploymentHealthDispatchTx(ctx, tx, id, attempt, step, inputsHash, executionID); err != nil {
+			return err
+		}
+		if placement, ok := ctx.Value(resourceDispatchKey{}).(entities.PackPlacement); ok && resourceTargetOperation(op.Kind) {
+			if err := pinResourceDispatchTx(ctx, tx, op.ID, placement); err != nil {
+				return err
+			}
+		}
 		var err error
 		already, err = beginStepTx(ctx, tx, op, attempt, step, inputsHash, executionID)
 		return err

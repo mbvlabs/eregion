@@ -239,7 +239,14 @@ func pushNodeImage(ctx context.Context, params rpcImagePushParams, payload io.Re
 	if err != nil {
 		return rpcImagePushResult{}, err
 	}
-	defer lease.Release() //nolint:contextcheck // Lease cleanup must release locks even after the upload context is canceled.
+	uncertain := false
+	defer func() {
+		if uncertain {
+			lease.Abandon(ctx)
+		} else {
+			lease.Release(ctx)
+		}
+	}()
 	registry, err := host.ManagedRegistryEndpoint(os.Getenv)
 	if err != nil {
 		return rpcImagePushResult{}, err
@@ -253,19 +260,27 @@ func pushNodeImage(ctx context.Context, params rpcImagePushParams, payload io.Re
 	}
 	defer dockerCleanup()
 	progress := &imagePushProgress{out: out}
+	// A failed or interrupted Docker command may leave daemon-side work
+	// running even after its CLI exits. Retain the claim in that case.
+	uncertain = true
 	size, loaded, err := loadDockerImage(ctx, payload, progress, dockerEnv)
 	if err != nil {
 		return rpcImagePushResult{}, err
 	}
+	uncertain = false
 	repository := registry + "/" + lease.ImageRepository
 	tagReference := repository + ":" + params.Tag
+	uncertain = true
 	if _, err := runDockerImageCommand(ctx, []string{"docker", "tag", loaded, tagReference}, progress, false, dockerEnv); err != nil {
 		return rpcImagePushResult{}, err
 	}
+	uncertain = false
 	progress.emit("pushing " + tagReference)
+	uncertain = true
 	if _, err := runDockerImageCommand(ctx, []string{"docker", "push", tagReference}, progress, true, dockerEnv); err != nil {
 		return rpcImagePushResult{}, err
 	}
+	uncertain = false
 	raw, err := runDockerImageCommand(ctx, []string{"docker", "inspect", "--format", "{{json .RepoDigests}}", tagReference}, nil, false, dockerEnv)
 	if err != nil {
 		return rpcImagePushResult{}, err
@@ -279,9 +294,7 @@ func pushNodeImage(ctx context.Context, params rpcImagePushParams, payload io.Re
 }
 
 // acquireNodeImageUploadLease resolves the durable app identity and holds the
-// shared app advisory lock plus the actual node host lock through the complete
-// upload. The connection is dedicated to the session lock, not a pooled
-// connection that could outlive the stream.
+// durable app claim plus the actual node host lock through the complete upload.
 func acquireNodeImageUploadLease(ctx context.Context, appName string) (*controlplane.ImageUploadLease, error) {
 	if err := host.LoadServiceEnv(host.ServiceEnvPath); err != nil {
 		return nil, contract.NewFault(contract.Unavailable, "the node service configuration is not readable", err.Error())

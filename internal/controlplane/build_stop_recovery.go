@@ -84,6 +84,11 @@ func (s *Service) stopPendingBuildTx(ctx context.Context, tx *entities.StoreTx, 
 }
 
 func requireNoPackDispatchTx(ctx context.Context, tx *entities.StoreTx, id contract.OperationID) error {
+	if _, found, err := tx.BuildPlacement(ctx, id); err != nil {
+		return err
+	} else if found {
+		return errNotUndispatchedPendingBuild
+	}
 	claimed, err := tx.BuildCapacity().Exists(ctx, id)
 	if err != nil {
 		return err
@@ -170,6 +175,9 @@ func (s *Service) beginBuildStopDispatch(ctx context.Context, exec engine.Execut
 func validateBuildStopAdmissionTx(ctx context.Context, tx *entities.StoreTx, op *contract.Operation, exec engine.Execution, dispatch *buildStopDispatch) error {
 	if op.State == contract.Cancelling {
 		return errPlatformCancelled
+	}
+	if err := guardBuildTargetDispatch(ctx, tx, op); err != nil {
+		return err
 	}
 	if op.Kind != platform.KindBuildStop || exec.Step != deploymentBuildStopStep {
 		return contract.NewFault(contract.PreconditionFailed, "invalid build stop admission", "Use the build stop execution path.")
@@ -587,6 +595,11 @@ func (s *Service) settleCancellingBuildStop(ctx context.Context, op contract.Ope
 	_, owned, err := s.mutateOwned(ctx, op.ID, op.Attempt, func(tx *entities.StoreTx, current *contract.Operation) error {
 		if err := validateCancellingBuildStopTx(ctx, tx, *current, record, placement); err != nil {
 			return err
+		}
+		if record != nil && record.State != "completed" {
+			if err := tx.RecordBuildEffectRetirement(ctx, op.ID, record.Step, record.ExecutionID, record.InputsHash); err != nil {
+				return unavailable(err)
+			}
 		}
 		return s.cancelPlatformTx(ctx, tx, current, op.ID, message)
 	})

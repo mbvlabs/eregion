@@ -269,7 +269,7 @@ func TestIntegrationBuildRetryRecoversDurablePackAcknowledgement(t *testing.T) {
 				t.Fatal(err)
 			}
 			if cancelling {
-				_, err = (&platformWorker{service: f.service}).handleCancellingPlatformWork(ctx, op, nil, op.Attempt)
+				_, err = (&platformWorker{service: f.service}).handleCancellingPlatformWork(ctx, op, op.Attempt)
 			} else {
 				err = f.service.reconcilePlatformOperation(ctx, op)
 			}

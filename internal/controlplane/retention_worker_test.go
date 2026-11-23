@@ -24,13 +24,15 @@ import (
 // retentionFakeTransport answers the retention inventory and records every
 // node effect. It never touches Docker or a real journal.
 type retentionFakeTransport struct {
-	inventory     retention.Inventory
-	steps         []string
-	payloads      []platform.RetentionRemovePayload
-	failSteps     map[string]int
-	skipSteps     map[string]string
-	conflictSteps map[string]bool
-	onRun         func(string)
+	inventory      retention.Inventory
+	steps          []string
+	payloads       []platform.RetentionRemovePayload
+	failSteps      map[string]int
+	skipSteps      map[string]string
+	conflictSteps  map[string]bool
+	failed         map[string]node.Response
+	statusOverride *node.Response
+	onRun          func(string)
 }
 
 func (*retentionFakeTransport) Name() string         { return "retention-fake" }
@@ -42,39 +44,60 @@ func (f *retentionFakeTransport) Call(_ context.Context, request node.Request, _
 		raw, _ := json.Marshal(f.inventory)
 		return node.Response{Status: engine.StatusCompleted, Result: raw}, nil
 	case node.MethodStatus:
+		if response, ok := f.failed[string(request.Execution.OperationID)+"/"+request.Execution.Step]; ok {
+			if f.statusOverride != nil {
+				return *f.statusOverride, nil
+			}
+			return response, nil
+		}
 		return node.Response{Status: engine.StatusAbsent}, nil
 	case node.MethodRun:
-		step := request.Execution.Step
-		if f.onRun != nil {
-			f.onRun(step)
-		}
-		var payload platform.RetentionRemovePayload
-		if json.Unmarshal(request.Payload, &payload) == nil && payload.Kind != "" {
-			f.payloads = append(f.payloads, payload)
-		}
-		f.steps = append(f.steps, step)
-		if reason, ok := f.skipSteps[step]; ok {
-			result, _ := json.Marshal(map[string]any{"skipped": true, "reason": reason})
-			return node.Response{Status: engine.StatusCompleted, Result: result}, nil
-		}
-		if f.conflictSteps[step] {
-			return node.Response{
-				Status: engine.StatusFailed, ErrorCode: string(contract.Conflict),
-				Retryable: false, Detail: "image is referenced in multiple repositories",
-				Attempt: request.Execution.Attempt, ExecutionID: request.Execution.ExecutionID(),
-			}, nil
-		}
-		if f.failSteps[step] > 0 {
-			f.failSteps[step]--
-			return node.Response{Status: engine.StatusFailed, ErrorCode: string(contract.Unavailable), Retryable: true, Detail: "transient node failure",
-				Attempt: request.Execution.Attempt, ExecutionID: request.Execution.ExecutionID()}, nil
-		}
-		return node.Response{Status: engine.StatusCompleted, Result: json.RawMessage(`{"removed":true}`)}, nil
+		return f.run(request)
 	case node.MethodObserve, node.MethodObserveImage, node.MethodRetireBuild, node.MethodRetireBuildStopMarker:
 		return node.Response{}, fmt.Errorf("unexpected method %q", request.Method)
 	default:
 		return node.Response{}, fmt.Errorf("unexpected method %q", request.Method)
 	}
+}
+
+func (f *retentionFakeTransport) run(request node.Request) (node.Response, error) {
+	step := request.Execution.Step
+	if f.onRun != nil {
+		f.onRun(step)
+	}
+	var payload platform.RetentionRemovePayload
+	if json.Unmarshal(request.Payload, &payload) == nil && payload.Kind != "" {
+		f.payloads = append(f.payloads, payload)
+	}
+	f.steps = append(f.steps, step)
+	if reason, ok := f.skipSteps[step]; ok {
+		result, _ := json.Marshal(map[string]any{"skipped": true, "reason": reason})
+		return node.Response{Status: engine.StatusCompleted, Result: result}, nil
+	}
+	if f.conflictSteps[step] {
+		return f.recordFailure(request, contract.Conflict, false, "image is referenced in multiple repositories")
+	}
+	if f.failSteps[step] > 0 {
+		f.failSteps[step]--
+		return f.recordFailure(request, contract.Unavailable, true, "transient node failure")
+	}
+	delete(f.failed, string(request.Execution.OperationID)+"/"+step)
+	return node.Response{Status: engine.StatusCompleted, Result: json.RawMessage(`{"removed":true}`)}, nil
+}
+
+func (f *retentionFakeTransport) recordFailure(request node.Request, code contract.Code, retryable bool, detail string) (node.Response, error) {
+	effect, err := node.DefaultRegistry().Build(request.Execution, request.Payload)
+	if err != nil {
+		return node.Response{}, err
+	}
+	inputs, err := effect.Inputs()
+	if err != nil {
+		return node.Response{}, err
+	}
+	response := node.Response{Status: engine.StatusFailed, ErrorCode: string(code), Retryable: retryable, Detail: detail,
+		Attempt: request.Execution.Attempt, ExecutionID: request.Execution.ExecutionID(), InputsHash: engine.InputsHash(effect.ID(), inputs)}
+	f.failed[string(request.Execution.OperationID)+"/"+request.Execution.Step] = response
+	return response, nil
 }
 
 type retentionFixture struct {
@@ -142,6 +165,7 @@ func newRetentionFixture(t *testing.T) *retentionFixture {
 		failSteps:     map[string]int{},
 		skipSteps:     map[string]string{},
 		conflictSteps: map[string]bool{},
+		failed:        map[string]node.Response{},
 	}
 	s.transport = transport
 	return &retentionFixture{
@@ -369,7 +393,7 @@ func TestIntegrationRetentionWorkerMarksRemovesThenGCs(t *testing.T) {
 	assertRetentionRemovalPayloads(t, fixture)
 }
 
-func TestIntegrationRetentionWorkerRetriesAFailedEffect(t *testing.T) {
+func TestIntegrationRetentionWorkerRetainsFailedEffect(t *testing.T) {
 	fixture := newRetentionFixture(t)
 	s := fixture.service
 	op := submitRetentionWorkerPrune(t, s, "retention-worker-retry")
@@ -404,21 +428,9 @@ func TestIntegrationRetentionWorkerRetriesAFailedEffect(t *testing.T) {
 		t.Fatalf("operation state after a retryable failure = %s, want running", state)
 	}
 
-	if err := worker.Work(context.Background(), retentionWorkerJob(op.ID, 2, 8)); err != nil {
-		t.Fatalf("%v: %v", err, errors.Unwrap(err))
-	}
-	if err := fixture.pool.QueryRow(context.Background(), `SELECT status,errors FROM eregion_retention_runs WHERE operation_id=$1`, op.ID).
-		Scan(&status, &runErrors); err != nil {
-		t.Fatal(err)
-	}
-	if status != string(retention.RunSucceeded) {
-		t.Fatalf("retried run status = %s errors=%s", status, runErrors)
-	}
-	if err := fixture.pool.QueryRow(context.Background(), `SELECT state FROM eregion_operations WHERE id=$1`, op.ID).Scan(&state); err != nil {
-		t.Fatal(err)
-	}
-	if state != contract.Succeeded {
-		t.Fatalf("operation state after retry = %s, want succeeded", state)
+	var snooze *river.JobSnoozeError
+	if err := worker.Work(context.Background(), retentionWorkerJob(op.ID, 2, 8)); !errors.As(err, &snooze) {
+		t.Fatalf("unproven failed dispatch must block retry: %v", err)
 	}
 	dispatches := 0
 	for _, step := range fixture.transport.steps {
@@ -426,22 +438,43 @@ func TestIntegrationRetentionWorkerRetriesAFailedEffect(t *testing.T) {
 			dispatches++
 		}
 	}
-	if dispatches != 2 {
-		t.Fatalf("registry effect dispatched %d times, want the failed attempt plus one retry", dispatches)
-	}
-	if got := fixture.transport.steps[len(fixture.transport.steps)-1]; got != platform.RetentionGCStepID(1) {
-		t.Fatalf("the retried registry delete was not followed by GC: %s", got)
-	}
-	var pendingAfterSuccess bool
-	if err := fixture.pool.QueryRow(context.Background(), `SELECT retention_gc_pending FROM eregion_server_settings WHERE singleton`).Scan(&pendingAfterSuccess); err != nil {
-		t.Fatal(err)
-	}
-	if pendingAfterSuccess {
-		t.Fatal("the completed GC did not clear the pending flag")
+	if dispatches != 1 {
+		t.Fatalf("registry effect dispatched %d times, want one", dispatches)
 	}
 }
 
-func TestIntegrationRetentionWorkerRecordsADeterministicConflictAsSkip(t *testing.T) {
+func TestIntegrationRetentionRetryRejectsUnprovenTerminalStatus(t *testing.T) {
+	for _, response := range []node.Response{
+		{Status: engine.StatusAbsent},
+		{Status: engine.StatusFailed, Attempt: 1, ExecutionID: "wrong", InputsHash: "wrong"},
+	} {
+		t.Run(string(response.Status), func(t *testing.T) {
+			fixture := newRetentionFixture(t)
+			op := submitRetentionWorkerPrune(t, fixture.service, "retention-proof")
+			step := platform.RetentionRemoveStepID(retention.ItemRegistryArtifact, fixture.orphan)
+			fixture.transport.failSteps[step] = 1
+			fixture.transport.statusOverride = &response
+			worker := &retentionWorker{service: fixture.service}
+			if err := worker.Work(context.Background(), retentionWorkerJob(op.ID, 1, 8)); err == nil {
+				t.Fatal("expected first attempt failure")
+			}
+			var snooze *river.JobSnoozeError
+			if err := worker.Work(context.Background(), retentionWorkerJob(op.ID, 2, 8)); !errors.As(err, &snooze) {
+				t.Fatalf("unproven dispatch must retain claim: %v", err)
+			}
+			count := len(fixture.transport.steps)
+			fixture.transport.statusOverride = nil
+			if err := worker.Work(context.Background(), retentionWorkerJob(op.ID, 3, 8)); !errors.As(err, &snooze) {
+				t.Fatalf("matching terminal status must not release an unpinned action: %v", err)
+			}
+			if len(fixture.transport.steps) != count {
+				t.Fatal("unproven action was redispatched")
+			}
+		})
+	}
+}
+
+func TestIntegrationRetentionWorkerRetainsFailedConflict(t *testing.T) {
 	fixture := newRetentionFixture(t)
 	s := fixture.service
 	op := submitRetentionWorkerPrune(t, s, "retention-worker-conflict-skip")
@@ -456,22 +489,21 @@ func TestIntegrationRetentionWorkerRecordsADeterministicConflictAsSkip(t *testin
 		Scan(&status, &errorsRaw, &plannedRaw); err != nil {
 		t.Fatal(err)
 	}
-	if status != string(retention.RunSucceededWithSkips) {
-		t.Fatalf("run status = %s, want %s", status, retention.RunSucceededWithSkips)
+	if status != string(retention.RunFailed) {
+		t.Fatalf("run status = %s, want failed", status)
 	}
-	if !strings.Contains(string(errorsRaw), `"stage": "skipped"`) ||
-		!strings.Contains(string(errorsRaw), "referenced in multiple repositories") {
-		t.Fatalf("run did not record the conflict skip reason: %s", errorsRaw)
+	if !strings.Contains(string(errorsRaw), "referenced in multiple repositories") {
+		t.Fatalf("run did not record the conflict: %s", errorsRaw)
 	}
-	if strings.Contains(string(plannedRaw), oldConfig) {
-		t.Fatalf("a skipped image remained in the retry plan: %s", plannedRaw)
+	if !strings.Contains(string(plannedRaw), oldConfig) {
+		t.Fatalf("failed image was dropped from the plan: %s", plannedRaw)
 	}
 	var state contract.State
 	if err := fixture.pool.QueryRow(context.Background(), `SELECT state FROM eregion_operations WHERE id=$1`, op.ID).Scan(&state); err != nil {
 		t.Fatal(err)
 	}
-	if state != contract.Succeeded {
-		t.Fatalf("operation state = %s, want succeeded with warnings", state)
+	if state != contract.Failed {
+		t.Fatalf("operation state = %s, want failed", state)
 	}
 }
 
@@ -565,7 +597,7 @@ func TestIntegrationRetentionWorkerRemovesAPrunedReleasesPresentImage(t *testing
 	}
 }
 
-func TestIntegrationRetentionWorkerRevalidatesOnRetry(t *testing.T) {
+func TestIntegrationRetentionLegacyMutationDoesNotUnblockUncertainRetry(t *testing.T) {
 	fixture := newRetentionFixture(t)
 	s := fixture.service
 	orphanConfig := "sha256:" + strings.Repeat("e", 64)
@@ -577,12 +609,13 @@ func TestIntegrationRetentionWorkerRevalidatesOnRetry(t *testing.T) {
 	if err := worker.Work(context.Background(), retentionWorkerJob(op.ID, 1, 8)); err == nil {
 		t.Fatal("the first attempt did not fail the registry effect")
 	}
-	// The new retained release owns the orphan manifest's config digest, so a
-	// retry must not delete the now-protected registry artifact.
+	// This direct legacy write bypasses the claim admission protocol. It is not
+	// evidence that an admitted concurrent mutation is safe.
 	insertRetentionWorkerRelease(t, fixture.pool, fixture.app, fixture.env,
 		"127.0.0.1:5000/api:protector", orphanConfig, time.Now().UTC())
-	if err := worker.Work(context.Background(), retentionWorkerJob(op.ID, 2, 8)); err != nil {
-		t.Fatal(err)
+	var snooze *river.JobSnoozeError
+	if err := worker.Work(context.Background(), retentionWorkerJob(op.ID, 2, 8)); !errors.As(err, &snooze) {
+		t.Fatalf("unproven dispatch must block retry: %v", err)
 	}
 	dispatches := 0
 	for _, step := range fixture.transport.steps {
@@ -590,7 +623,7 @@ func TestIntegrationRetentionWorkerRevalidatesOnRetry(t *testing.T) {
 			dispatches++
 		}
 		if strings.HasPrefix(step, "platform-retention-gc-01-v1") {
-			t.Fatalf("GC ran after the registry deletion was dropped: %v", fixture.transport.steps)
+			t.Fatalf("GC ran while the failed dispatch remained uncertain: %v", fixture.transport.steps)
 		}
 	}
 	if dispatches != 1 {
@@ -866,18 +899,7 @@ func TestIntegrationRetentionPendingGCRunsWithoutNewDeletions(t *testing.T) {
         VALUES (true,'{}'::jsonb,clock_timestamp(),true) ON CONFLICT (singleton) DO UPDATE SET retention_gc_pending=true`); err != nil {
 		t.Fatal(err)
 	}
-	fixture.transport.failSteps[platform.RetentionGCStepID(1)] = 1
-	first := submitRetentionWorkerPrune(t, s, "retention-worker-gc-pending-1")
-	if err := (&retentionWorker{service: s}).Work(ctx, retentionWorkerJob(first.ID, 1, 8)); err == nil {
-		t.Fatal("the first GC attempt did not fail")
-	}
 	var pending bool
-	if err := fixture.pool.QueryRow(ctx, `SELECT retention_gc_pending FROM eregion_server_settings WHERE singleton`).Scan(&pending); err != nil {
-		t.Fatal(err)
-	}
-	if !pending {
-		t.Fatal("a failed GC did not leave the durable pending flag")
-	}
 	second := submitRetentionWorkerPrune(t, s, "retention-worker-gc-pending-2")
 	if err := (&retentionWorker{service: s}).Work(ctx, retentionWorkerJob(second.ID, 1, 8)); err != nil {
 		t.Fatal(err)

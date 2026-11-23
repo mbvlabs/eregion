@@ -141,6 +141,9 @@ func (s *Service) recordPlatformSubmissionTx(
 	if !inserted {
 		return s.replayPlatformSubmissionTx(ctx, tx, operationKey, inputHash)
 	}
+	if err := guardTopologyAdmissionTx(ctx, tx, normalized); err != nil {
+		return zero, err
+	}
 	var activated bool
 	if err := s.preparePlatform(
 		ctx,
@@ -765,16 +768,24 @@ func (s *Service) prepareProcessScaleTx(
 	input *platform.ProcessScaleInput,
 	actor contract.Actor,
 ) error {
-	// Scale publishes a revision and queues a restart during submission.
-	// Try the same advisory target lock as deployment execution before the
-	// environment row lock. A conflict is returned immediately instead of
-	// holding a pool connection in a blocking lock wait; the order remains
-	// advisory -> row.
-	lockAcquired, err := tx.Platform().Locks().TryTargetXact(ctx, targetLockKey("env/"+input.App+"/"+input.Environment))
+	// This transaction gate excludes legacy session locks and serializes the
+	// durable claim check with acquisition. Environment claim acquisition must
+	// take the same gate in its transaction.
+	target := "env/" + input.App + "/" + input.Environment
+	lockAcquired, err := tx.Platform().Locks().TryTargetXact(ctx, targetLockKey(target))
 	if err != nil {
 		return unavailable(err)
 	}
 	if !lockAcquired {
+		return contract.NewFault(contract.Conflict,
+			"a deployment lifecycle owns this environment",
+			"Wait for the current deployment, rollback or restart to settle before scaling.")
+	}
+	claimed, err := tx.TargetClaimed(ctx, target)
+	if err != nil {
+		return unavailable(err)
+	}
+	if claimed {
 		return contract.NewFault(contract.Conflict,
 			"a deployment lifecycle owns this environment",
 			"Wait for the current deployment, rollback or restart to settle before scaling.")

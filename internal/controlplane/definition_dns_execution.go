@@ -294,7 +294,7 @@ func (s *Service) definitionDNSChildMode(ctx context.Context, child contract.Ope
 	return step, nil
 }
 
-// stopDefinitionDNSChild is called with the target's session lock held. It
+// stopDefinitionDNSChild is called with the target reserved. It
 // never repeats provider writes. An unresolved intent keeps both operations
 // nonterminal and is retried with bounded read-only probes.
 func (w *platformWorker) stopDefinitionDNSChild(ctx context.Context, op contract.Operation, attempt uint32) (bool, error) {

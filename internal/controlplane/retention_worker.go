@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -53,11 +54,151 @@ func (w *retentionWorker) Work(ctx context.Context, job *river.Job[jobargs.Reten
 	if op.State == contract.Cancelling {
 		return w.service.cancelPlatform(ctx, op.ID, attempt, "Cancellation requested before retention execution started.")
 	}
-	runErr := w.service.runRetentionAttempt(ctx, op, attempt)
-	if runErr == nil {
-		return w.service.finishRetentionOperation(ctx, op.ID, attempt)
+	workCtx, claim, err := w.service.acquireRetentionTargets(ctx, op)
+	if err != nil {
+		return err
 	}
-	return w.service.settleRetentionFailure(ctx, op, attempt, job, runErr)
+	runErr := w.service.runRetentionAttempt(workCtx, op, attempt)
+	if runErr == nil {
+		runErr = w.service.finishRetentionOperation(workCtx, op.ID, attempt)
+	} else {
+		runErr = w.service.settleRetentionFailure(workCtx, op, attempt, job, runErr)
+	}
+	return errors.Join(runErr, w.service.settleRetentionTargets(ctx, claim))
+}
+
+// Reserve the complete set in the same transaction that gates platform
+// submissions. Platform/environment creation must honor this same gate and
+// the committed platform claim so the environment set cannot grow afterward.
+func (s *Service) acquireRetentionTargets(ctx context.Context, op contract.Operation) (context.Context, entities.TargetClaimID, error) {
+	target, err := platform.ParseTarget(op.Target)
+	if err != nil || target.Kind != platform.TargetNode {
+		return ctx, entities.TargetClaimID{}, contract.NewFault(contract.PreconditionFailed, "retention target is not a node", "Submit prune as node/<server>.")
+	}
+	// Only a previously sealed executor may be reconciled by a retry.
+	var previous entities.TargetClaim
+	var found bool
+	err = s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		var err error
+		previous, found, err = tx.UnreleasedTargetClaimByOperation(ctx, op.ID)
+		return err
+	})
+	if err != nil {
+		return ctx, entities.TargetClaimID{}, err
+	}
+	if found && previous.Sealed {
+		if err := s.settleRetentionTargets(ctx, previous.ID); err != nil {
+			return ctx, entities.TargetClaimID{}, err
+		}
+	}
+	token, err := contract.NewOperationID()
+	if err != nil {
+		return ctx, entities.TargetClaimID{}, err
+	}
+	claim := entities.TargetClaimID{OperationID: op.ID, Token: fmt.Sprintf("%d/%s", op.Attempt, token)}
+	_, owned, err := s.mutateOwned(ctx, op.ID, op.Attempt, func(tx *entities.StoreTx, current *contract.Operation) error {
+		if current.Kind != platform.KindRetentionPrune || current.Target != op.Target {
+			return errNotOwned
+		}
+		return reserveRetentionTargetsTx(ctx, tx, claim, op.Target, target.Node)
+	})
+	if err != nil {
+		return ctx, entities.TargetClaimID{}, err
+	}
+	if !owned {
+		return ctx, entities.TargetClaimID{}, errNotOwned
+	}
+	return context.WithValue(ctx, buildTargetContextKey{}, buildTargetExecutor{claim: claim, target: op.Target}), claim, nil
+}
+
+func reserveRetentionTargetsTx(ctx context.Context, tx *entities.StoreTx, claim entities.TargetClaimID, target, nodeName string) error {
+	_, found, err := tx.UnreleasedTargetClaimByOperation(ctx, claim.OperationID)
+	if err != nil {
+		return err
+	}
+	if found {
+		return river.JobSnooze(deploymentOwnerDefer)
+	}
+	locked, err := tx.Platform().Locks().TryTargetXact(ctx, targetLockKey("platform"))
+	if err != nil {
+		return err
+	}
+	if !locked {
+		return river.JobSnooze(deploymentOwnerDefer)
+	}
+	rows, err := tx.Platform().Environments().RetentionRows(ctx, nodeName)
+	if err != nil {
+		return err
+	}
+	targets := []string{"platform", target, "registry"}
+	for _, row := range rows {
+		targets = append(targets, "env/"+row.App+"/"+row.Name)
+	}
+	acquired, err := acquirePlatformTargetClaimTx(ctx, tx, claim, targets)
+	if err != nil {
+		return err
+	}
+	if !acquired {
+		return river.JobSnooze(deploymentOwnerDefer)
+	}
+	return nil
+}
+
+// An incomplete dispatch is not proof that the node stopped. Leave its
+// sealed reservation durable rather than allowing a conflicting mutation.
+func (s *Service) settleRetentionTargets(ctx context.Context, claim entities.TargetClaimID) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if err := s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		current, err := retentionSettlementClaim(ctx, tx, claim)
+		if err != nil || current.Sealed {
+			return err
+		}
+		_, err = tx.SealTargetClaim(ctx, claim)
+		return err
+	}); err != nil {
+		return err
+	}
+	// Neither a failed journal entry nor a status from a freshly resolved node
+	// proves the original Docker action is quiescent on its original placement.
+	return s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		current, err := retentionSettlementClaim(ctx, tx, claim)
+		if err != nil {
+			return err
+		}
+		if !current.Sealed {
+			return errNotOwned
+		}
+		steps, err := tx.Steps().List(ctx, claim.OperationID)
+		if err != nil {
+			return err
+		}
+		for _, step := range steps {
+			if step.State != "completed" {
+				return nil
+			}
+		}
+		_, err = tx.ReleaseTargetClaim(ctx, claim)
+		return err
+	})
+}
+
+func retentionSettlementClaim(ctx context.Context, tx *entities.StoreTx, claim entities.TargetClaimID) (entities.TargetClaim, error) {
+	_, found, err := tx.Operations().Lock(ctx, claim.OperationID)
+	if err != nil {
+		return entities.TargetClaim{}, err
+	}
+	if !found {
+		return entities.TargetClaim{}, errNotOwned
+	}
+	current, found, err := tx.UnreleasedTargetClaimByOperation(ctx, claim.OperationID)
+	if err != nil {
+		return entities.TargetClaim{}, err
+	}
+	if !found || current.ID != claim {
+		return entities.TargetClaim{}, errNotOwned
+	}
+	return current, nil
 }
 
 // retentionDailyCheckInterval is how often the maintenance queue checks
@@ -189,29 +330,6 @@ func (s *Service) runRetentionAttempt(ctx context.Context, op contract.Operation
 		return contract.NewFault(contract.PreconditionFailed, "retention target is not a node", "Submit prune as node/<server>.")
 	}
 	nodeName := target.Node
-	// Platform and node locks come first: an application or environment cannot
-	// be created while they are held, so the environment lock set cannot grow
-	// after it is read. Environment locks then serialize the planner with a
-	// deploy, rollback, restart or delete for each served environment.
-	baseLocks, err := s.lockTargets(ctx, []string{"platform", "node/" + nodeName})
-	if err != nil {
-		return err
-	}
-	defer baseLocks()
-	environments, err := s.retentionEnvironmentRows(ctx, nodeName)
-	if err != nil {
-		return err
-	}
-	targets := make([]string, 0, len(environments))
-	for _, environment := range environments {
-		targets = append(targets, "env/"+environment.App+"/"+environment.Name)
-	}
-	environmentLocks, err := s.lockTargets(ctx, targets)
-	if err != nil {
-		return err
-	}
-	defer environmentLocks()
-
 	run, exists, err := s.retentionRunForOperation(ctx, op.ID)
 	if err != nil {
 		return err
@@ -299,16 +417,12 @@ func (s *Service) retentionRunForOperation(ctx context.Context, id contract.Oper
 }
 
 func (s *Service) insertRetentionRun(ctx context.Context, run retention.Run) error {
-	planned, removed, runErrors, err := retentionRunJSON(run)
+	record, err := retentionRunRecord(run)
 	if err != nil {
 		return unavailable(err)
 	}
-	if err := s.entities.Retention().InsertRun(ctx, entities.RetentionRunInsert{
-		ID: run.ID, OperationID: contract.OperationID(run.OperationID), Status: string(run.Status),
-		PlannedItems: planned, RemovedItems: removed, PlannedBytes: run.PlannedBytes,
-		ReclaimedBytes: run.ReclaimedBytes, Errors: runErrors, StartedAt: run.StartedAt,
-		FinishedAt: run.FinishedAt, CacheBytes: run.CacheBytes, CacheMeasuredAt: run.CacheMeasuredAt,
-		CacheMeasurementError: run.CacheError, GCGeneration: run.GCGeneration,
+	if err := s.retentionWrite(ctx, func(tx *entities.StoreTx) error {
+		return tx.Retention().InsertRun(ctx, entities.RetentionRunInsert(record))
 	}); err != nil {
 		return unavailable(err)
 	}
@@ -316,20 +430,55 @@ func (s *Service) insertRetentionRun(ctx context.Context, run retention.Run) err
 }
 
 func (s *Service) updateRetentionRun(ctx context.Context, run retention.Run) error {
-	planned, removed, runErrors, err := retentionRunJSON(run)
+	record, err := retentionRunRecord(run)
 	if err != nil {
 		return unavailable(err)
 	}
-	if err := s.entities.Retention().UpdateRun(ctx, entities.RetentionRun{
+	if err := s.retentionWrite(ctx, func(tx *entities.StoreTx) error {
+		return tx.Retention().UpdateRun(ctx, record)
+	}); err != nil {
+		return unavailable(err)
+	}
+	return nil
+}
+
+func retentionRunRecord(run retention.Run) (entities.RetentionRun, error) {
+	planned, removed, runErrors, err := retentionRunJSON(run)
+	if err != nil {
+		return entities.RetentionRun{}, err
+	}
+	return entities.RetentionRun{
 		ID: run.ID, OperationID: contract.OperationID(run.OperationID), Status: string(run.Status),
 		PlannedItems: planned, RemovedItems: removed, PlannedBytes: run.PlannedBytes,
 		ReclaimedBytes: run.ReclaimedBytes, Errors: runErrors, StartedAt: run.StartedAt,
 		FinishedAt: run.FinishedAt, CacheBytes: run.CacheBytes, CacheMeasuredAt: run.CacheMeasuredAt,
 		CacheMeasurementError: run.CacheError, GCGeneration: run.GCGeneration,
-	}); err != nil {
-		return unavailable(err)
-	}
-	return nil
+	}, nil
+}
+
+// Retention rows and release marks must be fenced in the same transaction as
+// the write, not by a check before an external observation or effect.
+func (s *Service) retentionWrite(ctx context.Context, write func(*entities.StoreTx) error) error {
+	return s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		if executor, ok := ctx.Value(buildTargetContextKey{}).(buildTargetExecutor); ok {
+			generation, _, _ := strings.Cut(executor.claim.Token, "/")
+			attempt, err := strconv.ParseUint(generation, 10, 32)
+			if err != nil {
+				return errNotOwned
+			}
+			op, found, err := tx.Operations().Lock(ctx, executor.claim.OperationID)
+			if err != nil {
+				return err
+			}
+			if !found || op.State.Terminal() || op.Attempt != uint32(attempt) {
+				return errNotOwned
+			}
+			if err := guardBuildTargetExecutor(ctx, tx, op); err != nil {
+				return err
+			}
+		}
+		return write(tx)
+	})
 }
 
 func retentionRunJSON(run retention.Run) (planned, removed, runErrors []byte, err error) {
@@ -645,16 +794,6 @@ func (e *retentionExecution) removalPrecondition(item retention.Item) bool {
 }
 
 func (e *retentionExecution) handleRemovalError(item retention.Item, err error) {
-	// A deterministic conflict is a per-item skip, not a failed run: retrying
-	// cannot make the node accept the same removal.
-	if contract.Classify(err).Code == contract.Conflict {
-		reason := e.service.cleanupCauseText(err)
-		if reason == "" {
-			reason = "the node refused the removal with a deterministic conflict"
-		}
-		e.recordSkip("skipped", item, reason, "")
-		return
-	}
 	if item.Kind == retention.ItemRegistryArtifact {
 		e.registryFailedThisAttempt = true
 	}
@@ -999,7 +1138,9 @@ func (s *Service) retentionGCPending(ctx context.Context) (bool, error) {
 }
 
 func (s *Service) setRetentionGCPending(ctx context.Context, pending bool) error {
-	if err := s.entities.Retention().SetGCPending(ctx, pending); err != nil {
+	if err := s.retentionWrite(ctx, func(tx *entities.StoreTx) error {
+		return tx.Retention().SetGCPending(ctx, pending)
+	}); err != nil {
 		return unavailable(err)
 	}
 	return nil
@@ -1019,7 +1160,7 @@ func (s *Service) markRetentionReleaseForAttempt(ctx context.Context, releaseID 
 // never marked. The returned bool is false for that protection, not an error.
 func (s *Service) markRetentionRelease(ctx context.Context, releaseID string) (bool, error) {
 	var safe bool
-	err := s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+	err := s.retentionWrite(ctx, func(tx *entities.StoreTx) error {
 		releases := tx.Platform().Releases()
 		environment, found, err := releases.LockServingEnvironment(ctx, platform.ReleaseID(releaseID))
 		if err != nil {

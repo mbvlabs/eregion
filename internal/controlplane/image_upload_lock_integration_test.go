@@ -10,6 +10,7 @@ import (
 
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/operations"
 	"github.com/mbvlabs/eregion/internal/platform"
@@ -38,7 +39,7 @@ func hostLockContended(t *testing.T, ctx context.Context, lockPath string) bool 
 	return errors.Is(err, engine.ErrLockHeld)
 }
 
-func TestIntegrationImageUploadLeaseUsesTheSameAppAdvisoryKeyAndHostLock(t *testing.T) {
+func TestIntegrationImageUploadLeaseUsesDurableAppClaimAndHostLock(t *testing.T) {
 	service, fixture, identity := imageUploadFixture(t)
 	lockPath := node.HostLockPath(identity.StateDir)
 	config, err := ParseDatabaseConfig(fixture.dsn)
@@ -49,30 +50,28 @@ func TestIntegrationImageUploadLeaseUsesTheSameAppAdvisoryKeyAndHostLock(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer lease.Release()
+	defer lease.Release(fixture.ctx)
 	if lease.App != "live" || lease.ImageRepository != "live" {
 		t.Fatalf("lease identity = %+v", lease)
 	}
-	release, acquired, err := service.tryLockTargets(fixture.ctx, []string{"app/live"})
-	if err != nil {
-		t.Fatal(err)
+	assertUploadClaim(t, fixture, lease.claim, false, false)
+	other, err := AcquireImageUploadLease(fixture.ctx, config.ConnConfig, identity, "live")
+	if other != nil {
+		other.Release(fixture.ctx)
 	}
-	if acquired {
-		release()
-		t.Fatal("the upload lease did not hold the app session advisory lock")
+	if err == nil || contract.Classify(err).Code != contract.Conflict {
+		t.Fatalf("second upload = %v, want claim conflict", err)
 	}
 	if !hostLockContended(t, fixture.ctx, lockPath) {
 		t.Fatal("the upload lease did not hold the shared host lock")
 	}
-	lease.Release()
-	release, acquired, err = service.tryLockTargets(fixture.ctx, []string{"app/live"})
+	lease.Release(fixture.ctx)
+	assertUploadClaim(t, fixture, lease.claim, true, true)
+	other, err = AcquireImageUploadLease(fixture.ctx, config.ConnConfig, identity, "live")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !acquired {
-		t.Fatal("releasing the upload lease did not release the app advisory lock")
-	}
-	release()
+	other.Release(fixture.ctx)
 	ctx, cancel := context.WithTimeout(fixture.ctx, time.Second)
 	defer cancel()
 	hostRelease, err := service.acquireRegistryHostLock(ctx)
@@ -82,7 +81,51 @@ func TestIntegrationImageUploadLeaseUsesTheSameAppAdvisoryKeyAndHostLock(t *test
 	hostRelease()
 }
 
-func TestIntegrationImageUploadLeaseKeepsHostFenceAfterAdvisorySessionLoss(t *testing.T) {
+func TestIntegrationImageUploadLeaseSharesAdmissionGate(t *testing.T) {
+	_, fixture, identity := imageUploadFixture(t)
+	config, err := ParseDatabaseConfig(fixture.dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	locked := make(chan error, 1)
+	release := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- fixture.service.entities.WithinTx(fixture.ctx, func(tx *entities.StoreTx) error {
+			ok, err := tx.Platform().Locks().TryTargetXact(fixture.ctx, targetLockKey("app/live"))
+			if err == nil && !ok {
+				err = errors.New("could not acquire app admission gate")
+			}
+			locked <- err
+			if err != nil {
+				return err
+			}
+			<-release
+			return nil
+		})
+	}()
+	select {
+	case err = <-locked:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case err = <-done:
+		t.Fatalf("admission gate transaction failed: %v", err)
+	}
+	lease, admissionErr := AcquireImageUploadLease(fixture.ctx, config.ConnConfig, identity, "live")
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if lease != nil {
+		lease.Release(fixture.ctx)
+	}
+	if admissionErr == nil || contract.Classify(admissionErr).Code != contract.Conflict {
+		t.Fatalf("upload during admission gate = %v, want conflict before payload", admissionErr)
+	}
+}
+
+func TestIntegrationImageUploadLeaseRetainsClaimAfterOwnerLoss(t *testing.T) {
 	service, fixture, identity := imageUploadFixture(t)
 	lockPath := node.HostLockPath(identity.StateDir)
 	config, err := ParseDatabaseConfig(fixture.dsn)
@@ -96,15 +139,22 @@ func TestIntegrationImageUploadLeaseKeepsHostFenceAfterAdvisorySessionLoss(t *te
 	if lease.session == nil {
 		t.Fatal("lease has no dedicated connection")
 	}
-	// Simulate the PostgreSQL session dying while the upload child is still
-	// running. The host lock must still block final metadata deletion.
+	// Connection loss cannot release the durable claim or host fence.
 	if err := lease.session.Close(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if !hostLockContended(t, fixture.ctx, lockPath) {
 		t.Fatal("final metadata deletion ignored the held host lock after advisory session loss")
 	}
-	lease.Release()
+	lease.Abandon(fixture.ctx)
+	assertUploadClaim(t, fixture, lease.claim, false, false)
+	other, err := AcquireImageUploadLease(fixture.ctx, config.ConnConfig, identity, "live")
+	if other != nil {
+		other.Release(fixture.ctx)
+	}
+	if err == nil || contract.Classify(err).Code != contract.Conflict {
+		t.Fatalf("upload after owner loss = %v, want durable claim conflict", err)
+	}
 	ctx, cancel := context.WithTimeout(fixture.ctx, time.Second)
 	defer cancel()
 	hostRelease, err := service.acquireRegistryHostLock(ctx)
@@ -112,6 +162,26 @@ func TestIntegrationImageUploadLeaseKeepsHostFenceAfterAdvisorySessionLoss(t *te
 		t.Fatalf("host lock was not released after session loss: %v", err)
 	}
 	hostRelease()
+}
+
+func assertUploadClaim(t *testing.T, fixture *deploymentRetryFixture, id entities.TargetClaimID, sealed, released bool) {
+	t.Helper()
+	err := fixture.service.entities.WithinReadTx(fixture.ctx, func(tx *entities.StoreTx) error {
+		claim, found, err := tx.TargetClaim(fixture.ctx, id.Token)
+		if err != nil {
+			return err
+		}
+		if !found || claim.ID != id || claim.Sealed != sealed || claim.Released != released {
+			t.Fatalf("claim = %+v, found %v; want sealed=%v released=%v", claim, found, sealed, released)
+		}
+		if !released && (len(claim.Targets) != 2 || claim.Targets[0] != "app/live" || claim.Targets[1] != "registry") {
+			t.Fatalf("claim targets = %v, want app/live and registry", claim.Targets)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestIntegrationImageUploadLeaseRefusesStaleDeleteRecreateBeforePayload(t *testing.T) {
@@ -128,7 +198,7 @@ func TestIntegrationImageUploadLeaseRefusesStaleDeleteRecreateBeforePayload(t *t
 		return insertFixtureApp(ctx, fixture.pool, recreated, "live", "live")
 	})
 	if lease != nil {
-		lease.Release()
+		lease.Release(fixture.ctx)
 	}
 	if err == nil || contract.Classify(err).Code != contract.Conflict {
 		t.Fatalf("stale delete/recreate = %v, want conflict before payload", err)
@@ -157,11 +227,11 @@ func TestIntegrationFinalMetadataHostLockWaitsForUploadLease(t *testing.T) {
 	}()
 	select {
 	case err := <-acquired:
-		lease.Release()
+		lease.Release(fixture.ctx)
 		t.Fatalf("final metadata host lock did not wait for the upload: %v", err)
 	case <-time.After(100 * time.Millisecond):
 	}
-	lease.Release()
+	lease.Release(fixture.ctx)
 	select {
 	case err := <-acquired:
 		if err != nil {
@@ -183,11 +253,12 @@ func TestIntegrationCrossHostUploadIdentityCannotAuthorizeAnotherHost(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer leaseA.Release()
+	defer leaseA.Release(fixture.ctx)
 	if leaseA.session == nil {
 		t.Fatal("lease has no dedicated connection")
 	}
-	// The advisory session dies, but the A host lock and payload work remain.
+	// The database connection dies, but the A claim, host lock and payload
+	// work remain.
 	if err := leaseA.session.Close(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -215,8 +286,7 @@ func assertCrossHostDeletionRefused(t *testing.T, fixture *deploymentRetryFixtur
 	if !hostLockContended(t, fixture.ctx, lockPathA) {
 		t.Fatal("A upload lease did not hold the A host lock")
 	}
-	// B can acquire the app advisory lock after A's PostgreSQL session dies;
-	// that alone must not authorize B's deletion.
+	// A legacy advisory lock alone must not authorize B's deletion.
 	release, acquired, err := serviceB.tryLockTargets(fixture.ctx, []string{"app/live"})
 	if err != nil {
 		t.Fatal(err)

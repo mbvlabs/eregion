@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
 	"github.com/mbvlabs/eregion/internal/entities"
@@ -15,23 +16,23 @@ import (
 )
 
 // ImageUploadLease is the exclusive, identity-fenced right to publish one
-// image into an app repository. It holds the app session advisory lock and the
-// node host lock through the complete upload and all child processes. The
-// database connection is dedicated to the lease; it is never a pooled
-// connection returned while a session lock might still be held.
+// image into an app repository. Its durable claim survives connection and
+// process loss; its host lock protects the local node during the upload.
 type ImageUploadLease struct {
 	AppID           platform.AppID
 	App             string
 	ImageRepository string
 
 	session     *entities.SessionStore
-	advisoryKey int64
+	store       *entities.Store
+	pool        *pgxpool.Pool
+	claim       entities.TargetClaimID
 	hostRelease engine.Release
 	released    bool
 }
 
 // AcquireImageUploadLease reads the durable app identity, takes the app target
-// session advisory lock non-blocking, then takes the shared node host lock with
+// durable claim non-blocking, then takes the shared node host lock with
 // zero wait, then re-reads the app identity and requires it to be exactly the
 // one observed before the locks. No SQL transaction spans the subsequent
 // upload. The caller must hold the lease until every upload helper has exited.
@@ -77,74 +78,129 @@ func acquireImageUploadLease(ctx context.Context, config *pgx.ConnConfig, observ
 			return closeWithError(ctx, err)
 		}
 	}
-	key := targetLockKey("app/" + appName)
-	var advisory bool
-	if advisory, err = session.TrySessionLock(ctx, key); err != nil {
-		return closeWithError(ctx, contract.NewFault(contract.Unavailable, "the application upload lock is unavailable", "Retry after the control database is reachable."))
+	lease, err := acquireImageUploadClaim(ctx, config, appName)
+	if err != nil {
+		return closeWithError(ctx, err)
 	}
-	if !advisory {
-		return closeWithError(ctx, contract.NewFault(contract.Conflict, "the application is being deleted or changed", "Wait for the current application mutation to finish, then retry the upload."))
-	}
-	releaseAdvisory := func(ctx context.Context) {
-		_, _ = session.UnlockSession(context.WithoutCancel(ctx), key)
-	}
+	lease.session = session
 	hostRelease, err := engine.Acquire(ctx, hostLockPath, engine.LockExclusive, 0)
 	if err != nil {
-		releaseAdvisory(ctx)
+		lease.Release(ctx)
 		if errors.Is(err, engine.ErrLockHeld) {
-			return closeWithError(ctx, contract.NewFault(contract.Unavailable, "another host mutation is running on the node", "Wait for the running build, apply, garbage collection or app deletion to finish, then retry the upload."))
+			return nil, contract.NewFault(contract.Unavailable, "another host mutation is running on the node", "Wait for the running build, apply, garbage collection or app deletion to finish, then retry the upload.")
 		}
-		return closeWithError(ctx, contract.NewFault(contract.Unavailable, "the node host lock is not available", err.Error()))
+		return nil, contract.NewFault(contract.Unavailable, "the node host lock is not available", err.Error())
 	}
-	releaseBoth := func(ctx context.Context) {
-		hostRelease()
-		releaseAdvisory(ctx)
-	}
+	lease.hostRelease = hostRelease
 	after, err := readImageUploadIdentity(ctx, session, appName)
 	if err != nil {
-		releaseBoth(ctx)
-		return closeWithError(ctx, err)
+		lease.Release(ctx)
+		return nil, err
 	}
 	if after.AppID != initial.AppID || after.App != initial.App || after.ImageRepository != initial.ImageRepository {
-		releaseBoth(ctx)
-		return closeWithError(ctx, contract.NewFault(contract.Conflict, "the application was deleted or recreated during upload admission", "The upload was refused before reading the image payload; retry against the current application identity."))
+		lease.Release(ctx)
+		return nil, contract.NewFault(contract.Conflict, "the application was deleted or recreated during upload admission", "The upload was refused before reading the image payload; retry against the current application identity.")
 	}
 	if after.ImageRepository == "" {
-		releaseBoth(ctx)
-		return closeWithError(ctx, contract.NewFault(contract.PreconditionFailed, "application has no image repository", "Recreate the app under the app-level image repository contract before uploading an image."))
+		lease.Release(ctx)
+		return nil, contract.NewFault(contract.PreconditionFailed, "application has no image repository", "Recreate the app under the app-level image repository contract before uploading an image.")
 	}
 	if _, err := platform.NormalizeImageRepository(after.ImageRepository); err != nil {
-		releaseBoth(ctx)
-		return closeWithError(ctx, err)
+		lease.Release(ctx)
+		return nil, err
 	}
-	return &ImageUploadLease{
-		AppID: after.AppID, App: after.App, ImageRepository: after.ImageRepository,
-		session: session, advisoryKey: key, hostRelease: hostRelease,
-	}, nil
+	lease.AppID, lease.App, lease.ImageRepository = after.AppID, after.App, after.ImageRepository
+	return lease, nil
 }
 
-// Release drops the host lock first, then the app session advisory lock, then
-// closes the dedicated connection. If the advisory unlock is uncertain the
-// connection is closed anyway; it is never returned to a pool while a session
-// lock might survive.
-func (l *ImageUploadLease) Release() {
+func acquireImageUploadClaim(ctx context.Context, config *pgx.ConnConfig, appName string) (*ImageUploadLease, error) {
+	poolConfig, err := pgxpool.ParseConfig(config.ConnString())
+	if err != nil {
+		return nil, err
+	}
+	poolConfig.ConnConfig = config.Copy()
+	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
+	if err != nil {
+		return nil, err
+	}
+	store, err := entities.NewStore(pool)
+	if err != nil {
+		pool.Close()
+		return nil, err
+	}
+	op, err := contract.NewOperationID()
+	if err != nil {
+		pool.Close()
+		return nil, err
+	}
+	token, err := contract.NewOperationID()
+	if err != nil {
+		pool.Close()
+		return nil, err
+	}
+	claim := entities.TargetClaimID{OperationID: op, Token: string(token)}
+	acquired := false
+	err = store.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		var err error
+		acquired, err = acquirePlatformTargetClaimTx(ctx, tx, claim, []string{"app/" + appName, "registry"})
+		return err
+	})
+	if err != nil {
+		// An uncertain commit may have installed the claim. Never perform work
+		// or reuse this token; the claim remains for explicit recovery.
+		pool.Close()
+		return nil, contract.NewFault(contract.Unavailable, "the application upload claim is unavailable", "Retry after the control database is reachable; an uncertain claim requires recovery.")
+	}
+	if !acquired {
+		pool.Close()
+		return nil, contract.NewFault(contract.Conflict, "the application is being deleted or changed", "Wait for the current application mutation to finish, then retry the upload.")
+	}
+	return &ImageUploadLease{store: store, pool: pool, claim: claim}, nil
+}
+
+// Release is only safe after all admitted upload effects and helpers have
+// finished. A failed seal or release leaves the durable claim in place.
+func (l *ImageUploadLease) Release(ctx context.Context) {
+	l.close(ctx, true)
+}
+
+// Abandon retains the claim when effects may still be running.
+func (l *ImageUploadLease) Abandon(ctx context.Context) {
+	l.close(ctx, false)
+}
+
+func (l *ImageUploadLease) close(ctx context.Context, finished bool) {
 	if l == nil || l.released {
 		return
 	}
 	l.released = true
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if finished && l.store != nil {
+		sealed := false
+		err := l.store.WithinTx(ctx, func(tx *entities.StoreTx) error {
+			var err error
+			sealed, err = tx.SealTargetClaim(ctx, l.claim)
+			return err
+		})
+		if err == nil && sealed {
+			_ = l.store.WithinTx(ctx, func(tx *entities.StoreTx) error {
+				_, err := tx.ReleaseTargetClaim(ctx, l.claim)
+				return err
+			})
+		}
+	}
 	if l.hostRelease != nil {
 		l.hostRelease()
 		l.hostRelease = nil
 	}
 	if l.session != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-
-		_, _ = l.session.UnlockSession(ctx, l.advisoryKey)
-		cancel()
-		// The connection is dedicated to this lease. Close/discard it in every
-		// case; an uncertain unlock is never returned to a pool.
-		_ = l.session.Close(context.Background())
+		_ = l.session.Close(ctx)
 		l.session = nil
+	}
+	if l.pool != nil {
+		l.pool.Close()
+		l.pool = nil
 	}
 }
 
